@@ -1,0 +1,14 @@
+# Vocabulary used by examples/shop/mapping.ttl. Declaring property kinds lets
+# Ontop reject a mapping that uses a data property for IRIs or vice versa.
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/shop> a owl:Ontology .
+
+ex:Customer a owl:Class .
+ex:Order a owl:Class .
+
+ex:name a owl:DatatypeProperty .
+ex:tier a owl:DatatypeProperty .
+ex:amount a owl:DatatypeProperty .
+ex:placedBy a owl:ObjectProperty .
