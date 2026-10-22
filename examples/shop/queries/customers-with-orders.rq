@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# Customers that placed at least one order, each once.
+SELECT DISTINCT ?customer WHERE {
+  ?order ex:placedBy ?customer .
+}

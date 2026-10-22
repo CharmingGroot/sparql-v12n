@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# Customers in the VIP tier: a constant literal object.
+SELECT ?customer WHERE {
+  ?customer ex:tier "VIP" .
+}

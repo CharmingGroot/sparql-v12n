@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Every order with the name of the customer who placed it.
+SELECT ?order ?name WHERE {
+  ?order ex:placedBy ?customer .
+  ?customer ex:name ?name .
+}

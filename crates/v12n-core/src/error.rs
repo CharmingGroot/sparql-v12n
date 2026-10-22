@@ -28,6 +28,10 @@ pub enum Error {
     /// The query would unfold into more UNION branches than the limit.
     #[error("query unfolds into more than {limit} UNION branches")]
     TooManyBranches { limit: usize },
+    /// A result row cannot be turned into an RDF term, such as a column
+    /// value that is not an absolute IRI.
+    #[error("invalid term: {0}")]
+    InvalidTerm(String),
     /// A valid construct this engine does not support yet.
     #[error("unsupported feature: {0}")]
     UnsupportedFeature(String),
