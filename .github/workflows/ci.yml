@@ -1,47 +1,87 @@
 name: CI
 
+# Documentation-only pull requests still run every job. A paths-ignore filter
+# here would skip the whole workflow, including pr-conventions and dco.
 on:
   pull_request:
   push:
     branches: [main]
 
+# A new commit on a pull request cancels the run for the previous one.
+# Runs on main are queued, never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 permissions:
   contents: read
 
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
       - name: Keep tool-specific agent guidance out of the repository
         run: |
           if git ls-files | grep -E '(^|/)(AGENTS|CLAUDE|GEMINI)\.md$|(^|/)\.cursorrules$|(^|/)\.(claude|codex|cursor)/|^(worklog|plan|notes)/|^\.github/(copilot-instructions\.md$|instructions/|agents/)'; then
             echo '::error::Tool-specific agent guidance must stay local.'
             exit 1
           fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # Only main saves the cache, so pull requests do not evict each other.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      # --no-tests=pass: the workspace has no tests yet.
+      - run: cargo nextest run --workspace --locked --profile ci --no-tests=pass
+      # nextest does not run doctests.
+      - run: cargo test --workspace --doc --locked
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: junit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
 
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --workspace --all-targets --locked
 
   # PR title becomes the squash commit, so it must follow the commit convention.
   pr-conventions:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check PR title and linked issue
         env:
@@ -71,6 +111,7 @@ jobs:
   dco:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
         with:
@@ -93,6 +134,7 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2

@@ -1,0 +1,12 @@
+# cargo-nextest configuration. CI runs `cargo nextest run --profile ci`.
+
+[profile.ci]
+# Report every failing test in one run instead of stopping at the first.
+fail-fast = false
+# A test that hangs is killed after 60s so it cannot eat the job timeout.
+slow-timeout = { period = "30s", terminate-after = 2 }
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+# Written to target/nextest/ci/junit.xml and uploaded as a CI artifact.
+path = "junit.xml"
