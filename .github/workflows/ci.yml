@@ -38,6 +38,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
+  # PR title becomes the squash commit, so it must follow the commit convention.
+  pr-conventions:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title and linked issue
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          fail=0
+          types='feat|fix|perf|refactor|test|docs|build|ci|chore|revert'
+          scopes='core|postgres|server|cli|mapping|sparql|unfold|optimize|sql|deps|release'
+          if ! printf '%s' "$TITLE" | grep -qE "^($types)(\(($scopes)\))?!?: [a-z0-9\`].*[^.]$"; then
+            echo "::error::PR title must be '<type>(<scope>): <subject>' (got: $TITLE)"; fail=1
+          fi
+          if [ "${#TITLE}" -gt 72 ]; then echo "::error::PR title is longer than 72 characters"; fail=1; fi
+          case "$HEAD_REF" in dependabot/*) exit $fail ;; esac
+          if ! printf '%s' "$BODY" | grep -qiE '(closes|fixes|resolves|refs) #[0-9]+'; then
+            echo "::error::PR body must link an issue (Closes #N or Refs #N)"; fail=1
+          fi
+          if ! printf '%s' "$HEAD_REF" | grep -qE "^($types)/[0-9]+-[a-z0-9-]+$"; then
+            echo "::error::Branch must be '<type>/<issue>-<short-name>' (got: $HEAD_REF)"; fail=1
+          fi
+          exit $fail
+
   dco:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
