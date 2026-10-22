@@ -22,6 +22,12 @@ pub enum Error {
     /// An `rr:template` string is malformed.
     #[error("invalid template {template:?}: {reason}")]
     InvalidTemplate { template: String, reason: String },
+    /// The query is not valid SPARQL.
+    #[error("query syntax error: {0}")]
+    QuerySyntax(String),
+    /// The query would unfold into more UNION branches than the limit.
+    #[error("query unfolds into more than {limit} UNION branches")]
+    TooManyBranches { limit: usize },
     /// A valid construct this engine does not support yet.
     #[error("unsupported feature: {0}")]
     UnsupportedFeature(String),

@@ -109,8 +109,80 @@ fn terms_table_format_prints_one_row_per_term() {
     assert!(lines[6].ends_with("<#OrderMap>"));
 }
 
+const VIP_ORDERS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../examples/shop/queries/vip-orders.rq"
+);
+
 #[test]
-fn explain_is_not_implemented_yet() {
-    let output = v12n(&["explain", SHOP, "query.rq"], "");
+fn explain_json_prints_sql_params_and_variables() {
+    let output = v12n(&["explain", SHOP, VIP_ORDERS], "");
+    assert_eq!(output.status.code(), Some(0));
+    let plan = stdout_json(&output);
+    let sql = plan["sql"].as_str().unwrap();
+    assert!(
+        sql.contains(r#"JOIN "orders" t1 ON t1."customer_id" = t0."id""#),
+        "{sql}"
+    );
+    assert!(sql.contains(r#"t0."tier" = $1"#), "{sql}");
+    assert_eq!(plan["params"], json!(["VIP"]));
+    assert_eq!(
+        plan["variables"],
+        json!([
+            { "name": "order", "term_type": "iri", "columns": ["order"] },
+            { "name": "amount", "term_type": "literal", "columns": ["amount"] },
+        ])
+    );
+}
+
+#[test]
+fn explain_query_from_stdin_table_format_prints_sql() {
+    let output = v12n(
+        &["explain", "--format", "table", SHOP, "-"],
+        "SELECT ?c WHERE { ?c a <http://example.org/Customer> }",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("SELECT t0.\"id\" AS \"c\"\nFROM \"customers\" t0"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn explain_unsupported_feature_exits_one() {
+    let output = v12n(
+        &["explain", SHOP, "-"],
+        "SELECT * WHERE { ?c <http://example.org/name> ?n OPTIONAL { ?c <http://example.org/tier> ?t } }",
+    );
     assert_eq!(output.status.code(), Some(1));
+    let error = stdout_json(&output);
+    assert_eq!(error["error"]["kind"], json!("unsupported"));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("OPTIONAL")
+    );
+}
+
+#[test]
+fn explain_query_syntax_error_exits_one() {
+    let output = v12n(&["explain", SHOP, "-"], "SELECT ?x WHERE {");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout_json(&output)["error"]["kind"], json!("query"));
+}
+
+#[test]
+fn explain_invalid_mapping_exits_two() {
+    let output = v12n(&["explain", "-", VIP_ORDERS], "not turtle");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_json(&output)["error"]["kind"], json!("mapping"));
+}
+
+#[test]
+fn explain_missing_query_file_exits_one() {
+    let output = v12n(&["explain", SHOP, "does-not-exist.rq"], "");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout_json(&output)["error"]["kind"], json!("input"));
 }
