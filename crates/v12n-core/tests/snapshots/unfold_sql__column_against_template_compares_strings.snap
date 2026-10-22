@@ -1,0 +1,17 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain(MULTI,\n&format!(\"{PREFIXES}SELECT ?o WHERE {{ ?o ex:homepage ?c . ?c ex:name ?name }}\"))"
+---
+SELECT t0."id" AS "o"
+FROM "orders" t0
+JOIN "retail_customers" t1 ON $1 || t1."id"::text = t0."url"
+WHERE t0."id" IS NOT NULL AND t1."name" IS NOT NULL
+UNION ALL
+SELECT t0."id" AS "o"
+FROM "orders" t0
+JOIN (SELECT code, title FROM shop.wholesale) t1 ON $2 || t1."code"::text = t0."url"
+WHERE t0."id" IS NOT NULL AND t1."title" IS NOT NULL
+
+-- params
+$1 = "http://example.org/customer/"
+$2 = "http://example.org/customer/"

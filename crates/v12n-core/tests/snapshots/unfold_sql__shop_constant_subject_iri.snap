@@ -1,0 +1,10 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "shop(\"SELECT ?name WHERE { <http://example.org/customer/7> ex:name ?name }\")"
+---
+SELECT t0."name" AS "name"
+FROM "customers" t0
+WHERE t0."id" = $1 AND t0."name" IS NOT NULL
+
+-- params
+$1 = "7"

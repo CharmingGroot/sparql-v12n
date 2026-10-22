@@ -1,0 +1,9 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "shop(\"SELECT DISTINCT ?c WHERE { ?o ex:placedBy ?c }\")"
+---
+SELECT DISTINCT t0."customer_id" AS "c"
+FROM "orders" t0
+WHERE t0."id" IS NOT NULL AND t0."customer_id" IS NOT NULL
+
+-- params

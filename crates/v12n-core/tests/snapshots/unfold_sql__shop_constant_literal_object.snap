@@ -1,0 +1,10 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "shop(r#\"SELECT ?c WHERE { ?c ex:tier \"VIP\" }\"#)"
+---
+SELECT t0."id" AS "c"
+FROM "customers" t0
+WHERE t0."tier" = $1 AND t0."id" IS NOT NULL
+
+-- params
+$1 = "VIP"

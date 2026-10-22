@@ -7,7 +7,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use v12n_core::mapping::{Mapping, MappingIndex, TriplesMapId};
+use v12n_core::mapping::{Mapping, MappingIndex, TermType, TriplesMapId};
+use v12n_core::{sparql, unfold};
 
 /// Exit codes are part of the CLI contract; scripts and agents rely on them.
 const EXIT_INPUT: u8 = 1;
@@ -50,7 +51,15 @@ enum Command {
         mapping: PathBuf,
     },
     /// Print the SQL a SPARQL query unfolds to, without a database
-    Explain { mapping: PathBuf, query: PathBuf },
+    #[command(after_help = "Examples:\n  v12n explain mapping.ttl query.rq\n  \
+                            echo 'SELECT ?c WHERE { ?c a <http://example.org/Customer> }' | v12n explain mapping.ttl -\n  \
+                            v12n explain mapping.ttl query.rq --format json")]
+    Explain {
+        /// R2RML mapping in Turtle, or `-` for stdin
+        mapping: PathBuf,
+        /// SPARQL SELECT query, or `-` for stdin
+        query: PathBuf,
+    },
     /// Run a SPARQL query against the database
     Query { mapping: PathBuf, query: PathBuf },
     /// Serve the SPARQL 1.1 Protocol endpoint
@@ -81,7 +90,7 @@ fn main() -> ExitCode {
     let result = match &cli.command {
         Command::Check { mapping } => check(mapping, format),
         Command::Terms { mapping } => terms(mapping, format),
-        Command::Explain { .. } => not_implemented("explain"),
+        Command::Explain { mapping, query } => explain(mapping, query, format),
         Command::Query { .. } => not_implemented("query"),
         Command::Serve => not_implemented("serve"),
     };
@@ -111,7 +120,7 @@ fn not_implemented(command: &str) -> Result<(), Failure> {
     })
 }
 
-fn load_mapping(path: &Path) -> Result<Mapping, Failure> {
+fn read_input(path: &Path) -> Result<String, Failure> {
     let mut text = String::new();
     let read = if path == Path::new("-") {
         io::stdin().read_to_string(&mut text).map(|_| ())
@@ -123,6 +132,11 @@ fn load_mapping(path: &Path) -> Result<Mapping, Failure> {
         kind: "input",
         message: format!("cannot read {}: {e}", path.display()),
     })?;
+    Ok(text)
+}
+
+fn load_mapping(path: &Path) -> Result<Mapping, Failure> {
+    let text = read_input(path)?;
     Mapping::from_turtle(&text).map_err(|e| Failure {
         code: EXIT_MAPPING,
         kind: "mapping",
@@ -197,6 +211,69 @@ fn terms(path: &Path, format: Format) -> Result<(), Failure> {
         }
     }
     Ok(())
+}
+
+fn explain(mapping_path: &Path, query_path: &Path, format: Format) -> Result<(), Failure> {
+    let stdin = Path::new("-");
+    if mapping_path == stdin && query_path == stdin {
+        return Err(Failure {
+            code: EXIT_INPUT,
+            kind: "input",
+            message: "only one of the mapping and the query can be read from stdin".to_owned(),
+        });
+    }
+    let mapping = load_mapping(mapping_path)?;
+    let query = read_input(query_path)?;
+    // Errors past this point are about the query, not the mapping.
+    let plan = sparql::parse(&query)
+        .and_then(|query| unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping)))
+        .map_err(|e| Failure {
+            code: EXIT_INPUT,
+            kind: match e {
+                v12n_core::Error::QuerySyntax(_) => "query",
+                _ => "unsupported",
+            },
+            message: e.to_string(),
+        })?;
+    let rendered = plan.to_sql();
+
+    match format {
+        Format::Json => {
+            let variables: Vec<Value> = plan
+                .projection
+                .iter()
+                .map(|p| {
+                    json!({
+                        "name": p.variable,
+                        "term_type": p.term.as_ref().map(|t| term_type(t.term_type)),
+                        "columns": p.term.as_ref().map(|t| t.value.columns()).unwrap_or_default(),
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                json!({ "sql": rendered.sql, "params": rendered.params, "variables": variables })
+            );
+        }
+        Format::Table => {
+            println!("{}", rendered.sql);
+            if !rendered.params.is_empty() {
+                println!();
+                for (i, param) in rendered.params.iter().enumerate() {
+                    println!("${} = {}", i + 1, Value::from(param.as_str()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn term_type(term_type: TermType) -> &'static str {
+    match term_type {
+        TermType::Iri => "iri",
+        TermType::BlankNode => "blank_node",
+        TermType::Literal => "literal",
+    }
 }
 
 /// A triples map can provide the same property through several
