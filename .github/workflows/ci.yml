@@ -56,6 +56,9 @@ jobs:
             echo "::error::PR title must be '<type>(<scope>): <subject>' (got: $TITLE)"; fail=1
           fi
           if [ "${#TITLE}" -gt 72 ]; then echo "::error::PR title is longer than 72 characters"; fail=1; fi
+          if printf '%s' "$TITLE" | grep -qP '[\p{Hangul}\p{Han}\p{Hiragana}\p{Katakana}]'; then
+            echo "::error::PR title must be in English (it becomes the commit title)"; fail=1
+          fi
           case "$HEAD_REF" in dependabot/*) exit $fail ;; esac
           if ! printf '%s' "$BODY" | grep -qiE '(closes|fixes|resolves|refs) #[0-9]+'; then
             echo "::error::PR body must link an issue (Closes #N or Refs #N)"; fail=1
