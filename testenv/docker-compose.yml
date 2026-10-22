@@ -1,5 +1,6 @@
 # Local test environment. Development credentials only, bound to localhost.
-# The Ontop reference endpoint for differential tests is added in V0.
+# Ontop is the reference endpoint for differential tests. Run ./fetch-jdbc.sh
+# first: the image ships without a PostgreSQL JDBC driver.
 services:
   postgres:
     image: postgres:17
@@ -12,3 +13,26 @@ services:
     volumes:
       - ../examples/shop/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
       - ../examples/shop/data.sql:/docker-entrypoint-initdb.d/02-data.sql:ro
+    healthcheck:
+      # TCP, not the socket: the init-time server listens on the socket only,
+      # so this stays unhealthy until the init scripts have loaded the data.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "v12n", "-d", "shop"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  ontop:
+    image: ontop/ontop:5.5.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ONTOP_MAPPING_FILE: /opt/ontop/shop/mapping.ttl
+      ONTOP_ONTOLOGY_FILE: /opt/ontop/input/shop.ttl
+      ONTOP_PROPERTIES_FILE: /opt/ontop/input/shop.properties
+    ports:
+      - "127.0.0.1:58080:8080"
+    volumes:
+      - ./ontop:/opt/ontop/input:ro
+      - ./jdbc:/opt/ontop/jdbc:ro
+      - ../examples/shop:/opt/ontop/shop:ro
