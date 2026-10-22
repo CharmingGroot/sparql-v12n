@@ -17,6 +17,7 @@ v12n-core.workspace = true
 v12n-postgres.workspace = true
 v12n-server.workspace = true
 clap.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
