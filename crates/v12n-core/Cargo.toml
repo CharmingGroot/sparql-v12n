@@ -9,6 +9,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+oxrdf.workspace = true
+oxttl.workspace = true
 thiserror.workspace = true
 
 [lints]
