@@ -22,7 +22,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Keep tool-specific agent guidance out of the repository
         run: |
-          if git ls-files | grep -E '(^|/)(AGENTS|CLAUDE|GEMINI)\.md$|(^|/)\.cursorrules$|(^|/)\.(claude|codex|cursor)/|^\.github/(copilot-instructions\.md$|instructions/|agents/)'; then
+          if git ls-files | grep -E '(^|/)(AGENTS|CLAUDE|GEMINI)\.md$|(^|/)\.cursorrules$|(^|/)\.(claude|codex|cursor)/|^(worklog|plan|notes)/|^\.github/(copilot-instructions\.md$|instructions/|agents/)'; then
             echo '::error::Tool-specific agent guidance must stay local.'
             exit 1
           fi

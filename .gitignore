@@ -1,6 +1,7 @@
-# ── Local only: plans and design notes (kept outside the repository) ──
+# ── Local only: plans, design notes and work logs ──
 /plan/
 /notes/
+/worklog/
 PLAN.md
 *.plan.md
 
