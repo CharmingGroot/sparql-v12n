@@ -1,0 +1,55 @@
+# ── Local only: plans and design notes (kept outside the repository) ──
+/plan/
+/notes/
+PLAN.md
+*.plan.md
+
+# ── Local only: AI agent instructions ──
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+AGENTS.md
+.cursor/
+.cursorrules
+.aider*
+.continue/
+.codex/
+GEMINI.md
+
+# ── Secrets and local config ──
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+config.local.toml
+*.local.toml
+
+# ── Rust build output ──
+/target/
+**/*.rs.bk
+
+# ── Test, bench and profiling output ──
+*.snap.new
+*.pending-snap
+/bench/results/
+/bench/data/
+flamegraph*.svg
+perf.data*
+*.profraw
+*.profdata
+lcov.info
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/coverage/
+
+# ── Differential test environment (downloaded) ──
+/testenv/ontop/*.jar
+/testenv/jdbc/
+/testenv/pgdata/
+
+# ── Editors and OS ──
+.idea/
+.vscode/
+*.swp
+.DS_Store

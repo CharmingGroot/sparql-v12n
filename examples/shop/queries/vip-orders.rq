@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Orders placed by VIP customers.
+SELECT ?order ?amount WHERE {
+  ?customer a ex:Customer ; ex:tier "VIP" .
+  ?order ex:placedBy ?customer ; ex:amount ?amount .
+}

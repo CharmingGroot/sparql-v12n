@@ -1,0 +1,17 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#CustomerMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "customers" ] ;
+  rr:subjectMap [ rr:template "http://example.org/customer/{id}" ; rr:class ex:Customer ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:tier ; rr:objectMap [ rr:column "tier" ] ] .
+
+<#OrderMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "orders" ] ;
+  rr:subjectMap [ rr:template "http://example.org/order/{id}" ; rr:class ex:Order ] ;
+  rr:predicateObjectMap [ rr:predicate ex:amount ; rr:objectMap [ rr:column "amount" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:placedBy ;
+    rr:objectMap [ rr:template "http://example.org/customer/{customer_id}" ]
+  ] .

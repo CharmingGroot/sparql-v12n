@@ -1,0 +1,15 @@
+[package]
+name = "v12n-postgres"
+description = "PostgreSQL execution and metadata introspection for sparql-v12n"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+v12n-core.workspace = true
+
+[lints]
+workspace = true

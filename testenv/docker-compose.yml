@@ -1,0 +1,14 @@
+# Local test environment. Development credentials only, bound to localhost.
+# The Ontop reference endpoint for differential tests is added in V0.
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: v12n
+      POSTGRES_PASSWORD: v12n-dev
+      POSTGRES_DB: shop
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - ../examples/shop/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ../examples/shop/data.sql:/docker-entrypoint-initdb.d/02-data.sql:ro

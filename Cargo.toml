@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/CharmingGroot/sparql-v12n"
+keywords = ["sparql", "r2rml", "obda", "knowledge-graph", "postgresql"]
+categories = ["database", "command-line-utilities"]
+publish = false
+
+[workspace.dependencies]
+v12n-core = { path = "crates/v12n-core" }
+v12n-postgres = { path = "crates/v12n-postgres" }
+v12n-server = { path = "crates/v12n-server" }
+clap = { version = "4.6", features = ["derive"] }
+thiserror = "2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
