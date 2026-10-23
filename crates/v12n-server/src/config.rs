@@ -12,9 +12,31 @@ use v12n_postgres::{DEFAULT_ROW_LIMIT, DEFAULT_STATEMENT_TIMEOUT, Limits};
 
 use crate::Error;
 
-/// Prefix of the environment variables that override the file. A section
-/// and a key are joined with `__`, as in `V12N_LIMITS__ROW_LIMIT`.
+/// Prefix of the environment variables that override the file.
 pub const ENV_PREFIX: &str = "V12N_";
+/// The environment variables `serve` reads, one per setting, in the order
+/// of the file. `v12n query` reads the ones it shares with `serve`.
+pub mod env {
+    pub const ADDRESS: &str = "V12N_ADDRESS";
+    pub const PORT: &str = "V12N_PORT";
+    pub const DATABASE_URL: &str = "V12N_DATABASE_URL";
+    pub const MAPPING: &str = "V12N_MAPPING";
+    pub const STATEMENT_TIMEOUT: &str = "V12N_STATEMENT_TIMEOUT";
+    pub const ROW_LIMIT: &str = "V12N_ROW_LIMIT";
+    pub const MAX_QUERY_BYTES: &str = "V12N_MAX_QUERY_BYTES";
+    pub const MAX_CONCURRENT_REQUESTS: &str = "V12N_MAX_CONCURRENT_REQUESTS";
+
+    pub const ALL: [&str; 8] = [
+        ADDRESS,
+        PORT,
+        DATABASE_URL,
+        MAPPING,
+        STATEMENT_TIMEOUT,
+        ROW_LIMIT,
+        MAX_QUERY_BYTES,
+        MAX_CONCURRENT_REQUESTS,
+    ];
+}
 /// Default listen address: loopback, so that exposing the endpoint is a
 /// deliberate choice.
 pub const DEFAULT_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -130,7 +152,7 @@ enum RawDuration {
 
 impl Config {
     /// Reads the file at `path`, if any, then applies the process
-    /// environment.
+    /// environment. Unrecognized `V12N_*` variables are logged as warnings.
     pub fn load(path: Option<&Path>) -> Result<Self, Error> {
         let file = match path {
             Some(path) => Some((
@@ -140,20 +162,31 @@ impl Config {
             )),
             None => None,
         };
+        let vars: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        // Before parsing, so that the warning also explains a missing
+        // setting that was given under a misspelled name.
+        for name in unrecognized_env(vars.iter().map(|(k, _)| k.as_str())) {
+            tracing::warn!(
+                "ignoring environment variable {name}: not a setting; known: {}",
+                env::ALL.join(", ")
+            );
+        }
         Self::from_sources(
             file.as_ref().map(|(text, path)| (text.as_str(), *path)),
-            std::env::vars_os()
-                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+            vars,
             |name| std::env::var(name).ok(),
         )
     }
 
     /// Builds the configuration from file text and its path (relative
     /// mapping paths are resolved against the file's directory), the
-    /// environment variables, and a lookup for `password_env`.
+    /// environment variables, and a lookup for `password_env`. Variables
+    /// that name no setting are ignored; see [`unrecognized_env`].
     pub fn from_sources(
         file: Option<(&str, &Path)>,
-        env: impl IntoIterator<Item = (String, String)>,
+        vars: impl IntoIterator<Item = (String, String)>,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, Error> {
         let mut raw = match file {
@@ -178,21 +211,33 @@ impl Config {
             }
             None => RawConfig::default(),
         };
-        let mut env: Vec<(String, String)> = env
+        let mut vars: Vec<(String, String)> = vars
             .into_iter()
-            .filter(|(k, _)| k.starts_with(ENV_PREFIX) && k.contains("__"))
+            .filter(|(k, _)| k.starts_with(ENV_PREFIX))
             .collect();
-        env.sort();
-        for (key, value) in &env {
-            raw.apply_env(key, value)?;
+        vars.sort();
+        for (key, value) in vars {
+            raw.apply_env(&key, &value)?;
         }
         raw.resolve(lookup)
     }
 }
 
+/// The `V12N_*` names among `names` that are not settings. They are
+/// ignored, as unknown variables usually are, but worth a warning: a
+/// misspelled name, or one in an older style such as
+/// `V12N_DATABASE__URL`, would otherwise silently do nothing.
+pub fn unrecognized_env<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut out: Vec<&str> = names
+        .into_iter()
+        .filter(|name| name.starts_with(ENV_PREFIX) && !env::ALL.contains(name))
+        .collect();
+    out.sort_unstable();
+    out
+}
+
 impl RawConfig {
     fn apply_env(&mut self, key: &str, value: &str) -> Result<(), Error> {
-        let name = key[ENV_PREFIX.len()..].to_ascii_lowercase();
         let invalid = |reason: String| Error::Config(format!("{key}: {reason}"));
         let number = |value: &str| {
             value
@@ -202,41 +247,39 @@ impl RawConfig {
         let size = |value: &str| {
             number(value).and_then(|n| usize::try_from(n).map_err(|e| invalid(e.to_string())))
         };
-        match name.as_str() {
-            "server__address" => {
+        match key {
+            env::ADDRESS => {
                 self.server.address = Some(
                     value
                         .parse()
                         .map_err(|_| invalid(format!("{value:?} is not an IP address")))?,
                 );
             }
-            "server__port" => {
+            env::PORT => {
                 self.server.port = Some(
                     value
                         .parse()
                         .map_err(|_| invalid(format!("{value:?} is not a port number")))?,
                 );
             }
-            "database__url" => self.database.url = Some(value.to_owned()),
-            "database__password_env" => self.database.password_env = Some(value.to_owned()),
-            "mapping__path" => self.mapping.path = Some(PathBuf::from(value)),
-            "limits__statement_timeout" => {
+            env::DATABASE_URL => self.database.url = Some(value.to_owned()),
+            env::MAPPING => self.mapping.path = Some(PathBuf::from(value)),
+            env::STATEMENT_TIMEOUT => {
                 self.limits.statement_timeout = Some(RawDuration::Text(value.to_owned()));
             }
-            "limits__row_limit" => self.limits.row_limit = Some(number(value)?),
-            "limits__max_query_bytes" => self.limits.max_query_bytes = Some(size(value)?),
-            "limits__max_concurrent_requests" => {
+            env::ROW_LIMIT => self.limits.row_limit = Some(number(value)?),
+            env::MAX_QUERY_BYTES => self.limits.max_query_bytes = Some(size(value)?),
+            env::MAX_CONCURRENT_REQUESTS => {
                 self.limits.max_concurrent_requests = Some(size(value)?);
             }
-            // A typo would otherwise be ignored silently.
-            _ => return Err(invalid("unknown setting".to_owned())),
+            _ => {}
         }
         Ok(())
     }
 
     fn resolve(self, lookup: impl Fn(&str) -> Option<String>) -> Result<Config, Error> {
         let url = self.database.url.ok_or_else(|| {
-            Error::Config("no database URL: set [database] url or V12N_DATABASE__URL".to_owned())
+            Error::Config("no database URL: set [database] url or V12N_DATABASE_URL".to_owned())
         })?;
         let password = match self.database.password_env {
             Some(name) => Some(lookup(&name).ok_or_else(|| {
@@ -247,7 +290,7 @@ impl RawConfig {
             None => None,
         };
         let mapping = self.mapping.path.ok_or_else(|| {
-            Error::Config("no mapping: set [mapping] path or V12N_MAPPING__PATH".to_owned())
+            Error::Config("no mapping: set [mapping] path or V12N_MAPPING".to_owned())
         })?;
         let statement_timeout = match self.limits.statement_timeout {
             None => DEFAULT_STATEMENT_TIMEOUT,
@@ -361,31 +404,54 @@ max_concurrent_requests = 4
     }
 
     #[test]
-    fn config_environment_overrides_the_file() {
+    fn config_environment_overrides_every_setting_of_the_file() {
         let config = load(
             Some(FILE),
             &[
-                ("V12N_SERVER__PORT", "9000"),
-                ("V12N_DATABASE__URL", "postgresql://other/shop"),
-                ("V12N_DATABASE__PASSWORD_ENV", "SHOP_PASSWORD"),
-                ("V12N_MAPPING__PATH", "m.ttl"),
-                ("V12N_LIMITS__STATEMENT_TIMEOUT", "250ms"),
-                ("V12N_LIMITS__ROW_LIMIT", "0"),
-                // Not a setting of `serve`; `v12n query` reads it.
-                ("V12N_DATABASE_URL", "ignored"),
+                ("V12N_ADDRESS", "::1"),
+                ("V12N_PORT", "9000"),
+                ("V12N_DATABASE_URL", "postgresql://other/shop"),
+                ("V12N_MAPPING", "m.ttl"),
+                ("V12N_STATEMENT_TIMEOUT", "250ms"),
+                ("V12N_ROW_LIMIT", "0"),
+                ("V12N_MAX_QUERY_BYTES", "10"),
+                ("V12N_MAX_CONCURRENT_REQUESTS", "2"),
                 ("HOME", "/home/x"),
             ],
         )
         .unwrap();
-        assert_eq!(config.listen, "0.0.0.0:9000".parse().unwrap());
+        assert_eq!(config.listen, "[::1]:9000".parse().unwrap());
         assert_eq!(config.database.url, "postgresql://other/shop");
-        assert_eq!(config.database.password.as_deref(), Some("from-env"));
         assert_eq!(config.mapping, Path::new("m.ttl"));
         assert_eq!(
-            config.limits.query.statement_timeout,
-            Duration::from_millis(250)
+            config.limits,
+            ServerLimits {
+                query: Limits {
+                    statement_timeout: Duration::from_millis(250),
+                    row_limit: 0,
+                },
+                max_query_bytes: 10,
+                max_concurrent_requests: 2,
+            }
         );
-        assert_eq!(config.limits.query.row_limit, 0);
+    }
+
+    #[test]
+    fn config_ignores_unrecognized_v12n_variables_and_names_them() {
+        let vars = [
+            ("V12N_DATABASE__URL", "postgresql://old-style/shop"),
+            ("V12N_ROWLIMIT", "1"),
+            ("V12N_PORT", "9000"),
+            ("OTHER_PORT", "1"),
+        ];
+        let config = load(Some(FILE), &vars).unwrap();
+        assert_eq!(config.database.url, "postgresql://reader:secret@db/shop");
+        assert_eq!(config.limits.query.row_limit, 100);
+        assert_eq!(config.listen.port(), 9000);
+        assert_eq!(
+            unrecognized_env(vars.iter().map(|(k, _)| *k)),
+            ["V12N_DATABASE__URL", "V12N_ROWLIMIT"]
+        );
     }
 
     #[test]
@@ -393,8 +459,8 @@ max_concurrent_requests = 4
         let config = load(
             None,
             &[
-                ("V12N_DATABASE__URL", "postgresql://db/shop"),
-                ("V12N_MAPPING__PATH", "mapping.ttl"),
+                ("V12N_DATABASE_URL", "postgresql://db/shop"),
+                ("V12N_MAPPING", "mapping.ttl"),
             ],
         )
         .unwrap();
@@ -417,32 +483,35 @@ max_concurrent_requests = 4
         );
     }
 
+    fn with_password_env(name: &str) -> String {
+        FILE.replace(
+            "[mapping]",
+            &format!("password_env = \"{name}\"\n\n[mapping]"),
+        )
+    }
+
+    #[test]
+    fn config_password_env_reads_the_named_variable() {
+        let config = load(Some(&with_password_env("SHOP_PASSWORD")), &[]).unwrap();
+        assert_eq!(config.database.password.as_deref(), Some("from-env"));
+    }
+
     #[test]
     fn config_errors_name_the_setting() {
         let error =
             |file: Option<&str>, vars: &[(&str, &str)]| load(file, vars).unwrap_err().to_string();
-        assert!(error(None, &[]).contains("V12N_DATABASE__URL"));
-        assert!(error(Some("[database]\nurl = \"u\"\n"), &[]).contains("V12N_MAPPING__PATH"));
+        assert!(error(None, &[]).contains("V12N_DATABASE_URL"));
+        assert!(error(Some("[database]\nurl = \"u\"\n"), &[]).contains("V12N_MAPPING"));
         assert!(error(Some("[limits]\nrow_limt = 1\n"), &[]).contains("row_limt"));
-        assert!(error(Some(FILE), &[("V12N_LIMITS__ROWLIMIT", "1")]).contains("unknown setting"));
-        assert!(
-            error(Some(FILE), &[("V12N_LIMITS__ROW_LIMIT", "-1")])
-                .contains("V12N_LIMITS__ROW_LIMIT")
-        );
-        assert!(
-            error(Some(FILE), &[("V12N_LIMITS__MAX_CONCURRENT_REQUESTS", "0")])
-                .contains("at least 1")
-        );
-        assert!(error(Some(FILE), &[("V12N_DATABASE__PASSWORD_ENV", "UNSET")]).contains("UNSET"));
+        assert!(error(Some(FILE), &[("V12N_ROW_LIMIT", "-1")]).contains("V12N_ROW_LIMIT"));
+        assert!(error(Some(FILE), &[("V12N_PORT", "70000")]).contains("V12N_PORT"));
+        assert!(error(Some(FILE), &[("V12N_MAX_CONCURRENT_REQUESTS", "0")]).contains("at least 1"));
+        assert!(error(Some(&with_password_env("UNSET")), &[]).contains("UNSET"));
     }
 
     #[test]
     fn config_debug_hides_the_database_url_and_password() {
-        let config = load(
-            Some(FILE),
-            &[("V12N_DATABASE__PASSWORD_ENV", "SHOP_PASSWORD")],
-        )
-        .unwrap();
+        let config = load(Some(&with_password_env("SHOP_PASSWORD")), &[]).unwrap();
         let debug = format!("{config:?}");
         assert!(!debug.contains("secret"), "{debug}");
         assert!(!debug.contains("from-env"), "{debug}");

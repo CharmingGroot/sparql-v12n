@@ -250,6 +250,7 @@ async fn answer(
         )
     })?;
     let lease = app.pool.get().await.map_err(database_failure)?;
+    let sql_started = Instant::now();
     let mut solutions = lease
         .database()
         .execute(&plan)
@@ -258,7 +259,7 @@ async fn answer(
     // The status line goes out before the body (RFC 9110 §15), so the
     // first row is awaited while an error can still become a status.
     let first = solutions.try_next().await.map_err(database_failure)?;
-    let first_row_ms = started.elapsed().as_millis() as u64;
+    let sql_ms = sql_started.elapsed().as_millis() as u64;
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
@@ -285,7 +286,7 @@ async fn answer(
         _permit: permit,
         query_id,
         started,
-        first_row_ms,
+        sql_ms,
         rows: 0,
     };
     let body = futures_util::stream::unfold(stream, |mut stream| async move {
@@ -336,7 +337,9 @@ struct ResultStream {
     truncated: bool,
     query_id: u64,
     started: Instant,
-    first_row_ms: u64,
+    /// From sending the SQL to the first row, which with a row limit
+    /// covers most of the execution (see `v12n_postgres`).
+    sql_ms: u64,
     rows: u64,
 }
 
@@ -381,7 +384,7 @@ impl ResultStream {
             status = 200,
             row_count = self.rows,
             truncated = self.truncated,
-            first_row_ms = self.first_row_ms,
+            sql_ms = self.sql_ms,
             total_ms = self.started.elapsed().as_millis() as u64,
             "answered"
         );

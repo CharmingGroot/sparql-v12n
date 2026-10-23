@@ -44,27 +44,43 @@ change it: the server aborts the response (the JSON stays unterminated) and
 logs the error. Whether a result is truncated is known before the first row,
 because PostgreSQL counts the rows up to the limit before sending them.
 
-Settings come from a TOML file and `V12N_<SECTION>__<KEY>` environment
-variables, which win over the file:
+Settings come from a TOML file (`--config`); environment variables override it:
 
 ```toml
 [server]
-address = "127.0.0.1"          # V12N_SERVER__ADDRESS
-port = 7878                     # V12N_SERVER__PORT
+address = "127.0.0.1"
+port = 7878
 
 [database]
-url = "postgresql://reader@localhost/shop"   # V12N_DATABASE__URL
-password_env = "SHOP_DB_PASSWORD"            # optional: read the password from this variable
+url = "postgresql://reader@localhost/shop"
+password_env = "SHOP_DB_PASSWORD"   # optional: read the password from this variable
 
 [mapping]
-path = "mapping.ttl"            # relative to this file; V12N_MAPPING__PATH
+path = "mapping.ttl"                # relative to this file
 
 [limits]
-statement_timeout = "30s"       # 0 disables
-row_limit = 10000               # 0 disables
+statement_timeout = "30s"           # 0 disables
+row_limit = 10000                   # 0 disables
 max_query_bytes = 65536
-max_concurrent_requests = 16    # more are refused with 503, not queued
+max_concurrent_requests = 16        # more are refused with 503, not queued
 ```
+
+| Setting | Environment variable | Default |
+|---|---|---|
+| `[server] address` | `V12N_ADDRESS` | `127.0.0.1` |
+| `[server] port` | `V12N_PORT` | `7878` |
+| `[database] url` | `V12N_DATABASE_URL` | required |
+| `[database] password_env` | (file only) | none |
+| `[mapping] path` | `V12N_MAPPING` | required |
+| `[limits] statement_timeout` | `V12N_STATEMENT_TIMEOUT` | `30s` |
+| `[limits] row_limit` | `V12N_ROW_LIMIT` | `10000` |
+| `[limits] max_query_bytes` | `V12N_MAX_QUERY_BYTES` | `65536` |
+| `[limits] max_concurrent_requests` | `V12N_MAX_CONCURRENT_REQUESTS` | `16` |
+
+`v12n query` reads the same `V12N_DATABASE_URL`, `V12N_ROW_LIMIT` and
+`V12N_STATEMENT_TIMEOUT`, below its command-line options. `serve` ignores other
+`V12N_*` variables and logs a warning for each, so a misspelled name is
+visible.
 
 Connect as a database user that can only read; sessions are also set to
 read-only transactions. The database URL and password are never logged. Request

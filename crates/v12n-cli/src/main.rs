@@ -13,7 +13,7 @@ use v12n_core::results::JsonResultsWriter;
 use v12n_core::sql::SqlPlan;
 use v12n_core::{sparql, unfold};
 use v12n_postgres::{DEFAULT_ROW_LIMIT, Database, Limits, Solutions};
-use v12n_server::config::{Config, parse_duration};
+use v12n_server::config::{Config, env, parse_duration};
 
 /// Exit codes are part of the CLI contract; scripts and agents rely on them.
 const EXIT_INPUT: u8 = 1;
@@ -52,19 +52,22 @@ output has started is reported on stderr and leaves stdout incomplete.
 
 const SERVE_HELP: &str = "Examples:
   v12n serve --config v12n.toml
-  V12N_DATABASE__URL=postgresql://reader@localhost/shop V12N_MAPPING__PATH=mapping.ttl v12n serve
+  V12N_DATABASE_URL=postgresql://reader@localhost/shop V12N_MAPPING=mapping.ttl v12n serve
   curl -H 'Accept: application/sparql-results+json' --data-urlencode query@query.rq http://127.0.0.1:7878/sparql
 
 Settings (file key, environment variable, default):
-  [server] address                  V12N_SERVER__ADDRESS                  127.0.0.1
-  [server] port                     V12N_SERVER__PORT                     7878
-  [database] url                    V12N_DATABASE__URL                    required
-  [database] password_env           V12N_DATABASE__PASSWORD_ENV           none
-  [mapping] path                    V12N_MAPPING__PATH                    required
-  [limits] statement_timeout        V12N_LIMITS__STATEMENT_TIMEOUT        30s
-  [limits] row_limit                V12N_LIMITS__ROW_LIMIT                10000 (0: none)
-  [limits] max_query_bytes          V12N_LIMITS__MAX_QUERY_BYTES          65536
-  [limits] max_concurrent_requests  V12N_LIMITS__MAX_CONCURRENT_REQUESTS  16
+  [server] address                  V12N_ADDRESS                  127.0.0.1
+  [server] port                     V12N_PORT                     7878
+  [database] url                    V12N_DATABASE_URL             required
+  [database] password_env           (file only)                   none
+  [mapping] path                    V12N_MAPPING                  required
+  [limits] statement_timeout        V12N_STATEMENT_TIMEOUT        30s (0: none)
+  [limits] row_limit                V12N_ROW_LIMIT                10000 (0: none)
+  [limits] max_query_bytes          V12N_MAX_QUERY_BYTES          65536
+  [limits] max_concurrent_requests  V12N_MAX_CONCURRENT_REQUESTS  16
+
+Environment variables override the file. Other V12N_* variables are
+ignored with a warning in the log.
 
 A relative mapping path in the file is relative to the file. Connect as a
 database user that can only read; sessions are also set read-only.
@@ -128,19 +131,19 @@ enum Command {
         /// SPARQL SELECT query, or `-` for stdin
         query: PathBuf,
         /// PostgreSQL connection URL, e.g. postgresql://reader@localhost/shop
-        #[arg(long, env = "V12N_DATABASE_URL", hide_env_values = true)]
+        #[arg(long, env = env::DATABASE_URL, hide_env_values = true)]
         db: Option<String>,
         /// Most solutions to return; 0 means no limit
-        #[arg(long, default_value_t = DEFAULT_ROW_LIMIT)]
+        #[arg(long, env = env::ROW_LIMIT, default_value_t = DEFAULT_ROW_LIMIT)]
         row_limit: u64,
         /// Statement timeout such as 500ms, 30s or 2m; 0 disables it
-        #[arg(long, default_value = "30s", value_parser = parse_duration)]
+        #[arg(long, env = env::STATEMENT_TIMEOUT, default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
     },
     /// Serve the SPARQL 1.1 Protocol endpoint at /sparql
     #[command(after_help = SERVE_HELP)]
     Serve {
-        /// TOML settings file; V12N_* environment variables override it
+        /// TOML settings file; the environment variables below override it
         #[arg(long)]
         config: Option<PathBuf>,
     },
