@@ -3,7 +3,7 @@
 
 mod index;
 mod parse;
-mod template;
+pub(crate) mod template;
 
 use std::fmt;
 

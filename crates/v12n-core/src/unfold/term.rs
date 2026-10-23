@@ -4,6 +4,7 @@
 
 use oxrdf::Term;
 
+use crate::mapping::template::{iri_safe, is_iunreserved};
 use crate::mapping::{Template, TemplatePart, TermMap, TermMapValue, TermType};
 use crate::sql::{Condition, SqlExpr};
 
@@ -320,32 +321,6 @@ fn fixed_suffix(template: &Template) -> &str {
 /// (used by the encoding).
 fn is_safe_separator(separator: &str) -> bool {
     separator.chars().any(|c| !is_iunreserved(c) && c != '%')
-}
-
-/// `iunreserved` from RFC 3987, which R2RML's IRI-safe version keeps.
-fn is_iunreserved(c: char) -> bool {
-    let code = c as u32;
-    c.is_ascii_alphanumeric()
-        || matches!(c, '-' | '.' | '_' | '~')
-        || matches!(code, 0xA0..=0xD7FF | 0xF900..=0xFDCF | 0xFDF0..=0xFFEF)
-        || ((0x10000..=0xEFFFD).contains(&code) && code & 0xFFFF <= 0xFFFD)
-}
-
-/// R2RML §7.3 IRI-safe version of a string: everything except
-/// `iunreserved` is percent-encoded as UTF-8.
-fn iri_safe(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        if is_iunreserved(c) {
-            out.push(c);
-        } else {
-            let mut buf = [0; 4];
-            for byte in c.encode_utf8(&mut buf).bytes() {
-                out.push_str(&format!("%{byte:02X}"));
-            }
-        }
-    }
-    out
 }
 
 fn percent_decode(value: &str) -> Option<String> {

@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# Every customer with name and tier.
+SELECT ?customer ?name ?tier WHERE {
+  ?customer a ex:Customer ; ex:name ?name ; ex:tier ?tier .
+}

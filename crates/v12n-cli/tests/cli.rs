@@ -13,6 +13,7 @@ const SHOP: &str = concat!(
 fn v12n(args: &[&str], stdin: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_v12n"))
         .args(args)
+        .env_remove("V12N_DATABASE_URL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -185,4 +186,95 @@ fn explain_missing_query_file_exits_one() {
     let output = v12n(&["explain", SHOP, "does-not-exist.rq"], "");
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(stdout_json(&output)["error"]["kind"], json!("input"));
+}
+
+#[test]
+fn query_without_database_url_exits_one() {
+    let output = v12n(&["query", SHOP, VIP_ORDERS], "");
+    assert_eq!(output.status.code(), Some(1));
+    let error = stdout_json(&output);
+    assert_eq!(error["error"]["kind"], json!("input"));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("V12N_DATABASE_URL")
+    );
+}
+
+#[test]
+fn query_unreachable_database_exits_three() {
+    let output = v12n(
+        &[
+            "query",
+            SHOP,
+            VIP_ORDERS,
+            "--db",
+            "postgresql://nobody:secret-password@127.0.0.1:1/shop",
+        ],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(3));
+    let error = stdout_json(&output);
+    assert_eq!(error["error"]["kind"], json!("database"));
+    assert!(!error.to_string().contains("secret-password"), "{error}");
+}
+
+#[test]
+fn query_invalid_timeout_exits_one() {
+    let output = v12n(&["query", SHOP, VIP_ORDERS, "--timeout", "soon"], "");
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn query_unsupported_feature_fails_before_connecting() {
+    let output = v12n(
+        &["query", "--db", "postgresql://127.0.0.1:1/shop", SHOP, "-"],
+        "ASK { ?c a <http://example.org/Customer> }",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout_json(&output)["error"]["kind"], json!("unsupported"));
+}
+
+/// Runs against the `testenv` PostgreSQL; skipped unless
+/// `V12N_TEST_DATABASE_URL` is set.
+#[test]
+fn query_shop_vip_orders_prints_sparql_json_results() {
+    let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
+        eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let output = v12n(&["query", SHOP, VIP_ORDERS, "--db", &url], "");
+    assert_eq!(output.status.code(), Some(0));
+    let results = stdout_json(&output);
+    assert_eq!(results["head"], json!({ "vars": ["order", "amount"] }));
+    let mut orders: Vec<&str> = results["results"]["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["order"]["value"].as_str().unwrap())
+        .collect();
+    orders.sort_unstable();
+    assert_eq!(
+        orders,
+        [
+            "http://example.org/order/1001",
+            "http://example.org/order/1003",
+            "http://example.org/order/1004"
+        ]
+    );
+
+    let output = v12n(
+        &["query", SHOP, VIP_ORDERS, "--db", &url, "--row-limit", "1"],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&output)["results"]["bindings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--row-limit"));
 }

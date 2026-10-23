@@ -10,6 +10,14 @@ publish.workspace = true
 
 [dependencies]
 v12n-core.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tokio-postgres.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 [lints]
 workspace = true

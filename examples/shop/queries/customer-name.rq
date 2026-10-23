@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# Name of one customer: a constant subject IRI.
+SELECT ?name WHERE {
+  <http://example.org/customer/7> ex:name ?name .
+}
