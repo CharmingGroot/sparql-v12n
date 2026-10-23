@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A join over duplicate rows, with ex:name from three term maps.
+SELECT ?p ?n ?c WHERE { ?p ex:name ?n ; ex:city ?c }

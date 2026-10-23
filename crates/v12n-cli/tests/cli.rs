@@ -177,8 +177,10 @@ fn explain_query_from_stdin_table_format_prints_sql() {
     );
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).unwrap();
+    // Without a database there are no keys to show that `customers` has
+    // no duplicate rows, so the SQL removes them.
     assert!(
-        stdout.starts_with("SELECT t0.\"id\" AS \"c\"\nFROM \"customers\" t0"),
+        stdout.starts_with("SELECT DISTINCT t0.\"id\" AS \"c\"\nFROM \"customers\" t0"),
         "{stdout}"
     );
 }
@@ -428,13 +430,18 @@ fn query_timeout_after_output_started_exits_four_with_one_stderr_line() {
         eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
         return;
     };
-    // Rows larger than PostgreSQL's 8 kB send buffer reach the client one by
-    // one, so output starts well before the timeout. Without a row limit
-    // no window function holds them back.
-    let (mapping, query) = slow_rows(
-        "SELECT g AS id, repeat('x', 20000) AS pad FROM generate_series(1, 1000) g \
-         WHERE pg_sleep(0.02) IS NOT NULL",
-    );
+    // A cross join of 13 scans of the 3 customers has 3^13 (1.6 million)
+    // rows, which stream: every scan is keyed by the subject, so no
+    // duplicates need removing, and without a row limit no window function
+    // holds rows back. Reading them takes the client far longer than the
+    // timeout, and PostgreSQL waits for it.
+    let patterns: String = (1..=13)
+        .map(|i| format!("?c{i} <http://example.org/name> ?n{i} . "))
+        .collect();
+    let query = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("many-rows.rq");
+    std::fs::write(&query, format!("SELECT ?n1 WHERE {{ {patterns}}}")).unwrap();
+    let query = query.to_str().unwrap().to_owned();
+    let mapping = std::fs::read_to_string(SHOP).unwrap();
     let output = v12n(
         &[
             "query",

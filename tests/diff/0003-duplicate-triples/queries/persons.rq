@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Every person once, though person 1 has three rows.
+SELECT ?p WHERE { ?p a ex:Person }

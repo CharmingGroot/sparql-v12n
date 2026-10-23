@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Two accounts of Ann: her name twice, once per account.
+SELECT ?n WHERE { ?a ex:owner ?p . ?p ex:name ?n }

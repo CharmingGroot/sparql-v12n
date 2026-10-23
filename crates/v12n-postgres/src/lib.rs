@@ -13,8 +13,12 @@ use std::time::Duration;
 use futures_util::TryStreamExt;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config, NoTls, RowStream, Statement};
+use v12n_core::mapping::LogicalTable;
 use v12n_core::solution::{Solution, SolutionBuilder, SqlValue};
-use v12n_core::sql::{ColumnTypes, RenderOptions, SqlPlan, column_type_probe, quote_identifier};
+use v12n_core::sql::{
+    ColumnTypes, RenderOptions, SqlPlan, TableKeys, column_type_probe, quote_identifier,
+    quote_table_name,
+};
 
 use bind::{Bound, bind};
 use decode::{Decoder, Raw, column_type};
@@ -108,9 +112,11 @@ impl Database {
         let timeout = self.limits.statement_timeout;
         let pg = |e| Error::from_postgres(e, timeout);
         let column_types = self.column_types(plan).await.map_err(pg)?;
+        let keys = self.load_table_keys(plan).await.map_err(pg)?;
         let options = RenderOptions {
             text_params: &[],
             column_types: column_types.as_ref(),
+            keys: keys.as_ref(),
         };
         let rendered = plan.to_sql_with(&options)?;
         // One row past the limit tells a cut-off result from one that
@@ -194,6 +200,66 @@ impl Database {
             self.query(&statement, &bound, fetch).await.map_err(pg)?,
         ));
         Ok(solutions)
+    }
+
+    /// Unique keys of the tables that can show the plan has no duplicate
+    /// solutions (`SqlPlan::key_tables`), read from the catalog on every
+    /// query so that a dropped key is never trusted. `None` when keys
+    /// cannot help.
+    ///
+    /// Only keys that hold for every row at any time count: unique
+    /// indexes that are valid, not deferrable, not partial, and on plain
+    /// columns. A view or a table that does not exist has none, and so
+    /// does a table with inheritance children, whose rows the scan reads
+    /// but its indexes do not cover (a partitioned table's keys cover its
+    /// partitions).
+    pub async fn table_keys(&self, plan: &SqlPlan) -> Result<Option<TableKeys>, Error> {
+        let timeout = self.limits.statement_timeout;
+        self.load_table_keys(plan)
+            .await
+            .map_err(|e| Error::from_postgres(e, timeout))
+    }
+
+    async fn load_table_keys(
+        &self,
+        plan: &SqlPlan,
+    ) -> Result<Option<TableKeys>, tokio_postgres::Error> {
+        let tables = plan.key_tables();
+        if tables.is_empty() {
+            return Ok(None);
+        }
+        let names: Vec<String> = tables
+            .iter()
+            .map(|t| match t {
+                LogicalTable::TableName(name) => quote_table_name(name),
+                LogicalTable::SqlQuery(_) => unreachable!("key_tables lists tables only"),
+            })
+            .collect();
+        let rows = self
+            .client
+            .query(
+                "SELECT t.n::int4, array_agg(a.attname::text ORDER BY c.ord)
+                 FROM unnest($1::text[]) WITH ORDINALITY AS t(name, n)
+                 JOIN pg_index i ON i.indrelid = to_regclass(t.name)
+                 JOIN pg_class r ON r.oid = i.indrelid
+                 CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS c(attnum, ord)
+                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = c.attnum
+                 WHERE i.indisunique AND i.indimmediate AND i.indisvalid
+                   AND i.indpred IS NULL AND i.indexprs IS NULL AND c.ord <= i.indnkeyatts
+                   AND (r.relkind = 'p'
+                     OR NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = r.oid))
+                 GROUP BY t.n, i.indexrelid",
+                &[&names],
+            )
+            .await?;
+        let mut keys = TableKeys::new();
+        for row in rows {
+            let position: i32 = row.get(0);
+            let columns: Vec<String> = row.get(1);
+            let table = usize::try_from(position - 1).expect("ordinality starts at 1");
+            keys.entry(tables[table].clone()).or_default().push(columns);
+        }
+        Ok(Some(keys))
     }
 
     /// Types of the columns the plan compares as RDF terms, read by

@@ -12,11 +12,29 @@ use crate::mapping::{LogicalTable, TemplatePart, TermType};
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 /// An unfolded query: one `SELECT` per branch, combined with `UNION ALL`
-/// (or `UNION` under `DISTINCT`).
+/// (or `UNION` under `DISTINCT`, or when duplicate triples are removed).
+///
+/// An RDF graph is a set of triples, so a basic graph pattern has one
+/// solution per distinct mapping of all its variables (SPARQL 1.1 §18.5),
+/// while duplicate rows of a logical table, or two term maps producing the
+/// same triple, give one SQL row each. Unless the database's keys prove
+/// that no two rows give the same solution, the rendered SQL removes
+/// duplicates over the columns of every variable of the pattern, and only
+/// then projects the selected ones, which keeps the bag semantics of the
+/// projection (see [`SqlPlan::to_sql_with`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlPlan {
     /// Result column aliases, shared by every branch.
     pub columns: Vec<String>,
+    /// Aliases of the columns of variables that occur in the pattern but
+    /// are not selected. They take part in removing duplicates only.
+    pub hidden_columns: Vec<String>,
+    /// The entries of [`SqlBranch::select`] in the order duplicates are
+    /// removed over: by first occurrence of their variable in the pattern,
+    /// so that an index on the first subject can deliver the rows sorted
+    /// for `DISTINCT` and the first rows arrive without reading them all.
+    /// Empty means the order of [`SqlBranch::select`].
+    pub distinct_order: Vec<usize>,
     /// How to rebuild each projected variable from the result columns.
     pub projection: Vec<ProjectedTerm>,
     /// No branches means the query has no answers.
@@ -29,11 +47,17 @@ pub struct SqlPlan {
 pub struct SqlBranch {
     /// Logical tables; the one at position `n` is aliased `tn`.
     pub from: Vec<LogicalTable>,
-    /// One expression per entry of [`SqlPlan::columns`].
+    /// One expression per entry of [`SqlPlan::columns`], then one per
+    /// entry of [`SqlPlan::hidden_columns`].
     pub select: Vec<SqlExpr>,
     /// Conjunction of conditions. Rendering puts a condition that links
     /// two tables in the `ON` clause of the later one, the rest in `WHERE`.
     pub conditions: Vec<Condition>,
+    /// For each entry of `from`, the columns whose values a solution
+    /// fixes: those of terms that distinct column values always render as
+    /// distinct terms. When they include a unique key of the table, the
+    /// table contributes at most one row to each solution.
+    pub fixed_columns: Vec<BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +195,10 @@ pub enum Lexical {
 /// Column types by logical table and column name.
 pub type ColumnTypes = HashMap<(LogicalTable, String), ColumnType>;
 
+/// Unique keys of logical tables, each the column names as the database
+/// stores them ([`identifier_name`]).
+pub type TableKeys = HashMap<LogicalTable, Vec<Vec<String>>>;
+
 /// What a database adapter learned before rendering, see
 /// [`SqlPlan::to_sql_with`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -179,6 +207,8 @@ pub struct RenderOptions<'a> {
     pub text_params: &'a [usize],
     /// Types of the columns that [`SqlPlan::term_columns`] lists.
     pub column_types: Option<&'a ColumnTypes>,
+    /// Unique keys of the tables that [`SqlPlan::key_tables`] lists.
+    pub keys: Option<&'a TableKeys>,
 }
 
 /// A projected variable and how to rebuild its RDF term from a result row.
@@ -268,6 +298,14 @@ impl SqlPlan {
     ///   column whose lexical form SQL cannot compute is an
     ///   [`Error::UnsupportedFeature`], rather than a comparison that
     ///   fails in the database or gives wrong answers.
+    /// - With `keys`, duplicates are not removed when the keys prove that
+    ///   there are none (see [`has_duplicates`](Self::has_duplicates)).
+    ///
+    /// Duplicates are removed with `DISTINCT` (one branch) or `UNION`
+    /// over the columns of all variables, in a subquery when some of them
+    /// are not selected. This compares column values, so two different
+    /// values that a template renders as the same string (see
+    /// [`SqlPlan::hidden_columns`]) still count twice.
     pub fn to_sql_with(&self, options: &RenderOptions<'_>) -> Result<RenderedSql, Error> {
         let mut r = Renderer {
             options: *options,
@@ -276,17 +314,53 @@ impl SqlPlan {
         if self.branches.is_empty() {
             r.sql.push_str("SELECT 1 WHERE false");
         }
+        let dedup = self.has_duplicates(options.keys);
+        let distinct = self.distinct || dedup;
         let single = self.branches.len() == 1;
+        let mut select = Select {
+            aliases: self.columns.clone(),
+            order: (0..self.columns.len()).collect(),
+            typed_text_from: None,
+        };
+        if dedup {
+            select.aliases.extend(self.hidden_columns.iter().cloned());
+            if self.distinct_order.is_empty() {
+                select.order = (0..select.aliases.len()).collect();
+            } else {
+                select.order.clone_from(&self.distinct_order);
+            }
+            if !single {
+                select.typed_text_from = Some(self.columns.len());
+            }
+        }
+        let subquery = select.aliases.len() > self.columns.len()
+            || select.order.iter().enumerate().any(|(i, &o)| i != o);
+        if subquery {
+            r.sql.push_str("SELECT ");
+            if self.columns.is_empty() {
+                r.sql.push('1');
+            }
+            let outer: Vec<String> = self
+                .columns
+                .iter()
+                .map(|c| format!("q.{}", quote_identifier(c)))
+                .collect();
+            r.sql.push_str(&outer.join(", "));
+            r.sql.push_str("\nFROM (\n");
+        }
         for (i, branch) in self.branches.iter().enumerate() {
             if i > 0 {
-                r.sql.push_str(if self.distinct {
+                r.sql.push_str(if distinct {
                     "\nUNION\n"
                 } else {
                     "\nUNION ALL\n"
                 });
             }
             r.branch_index = i;
-            r.branch(branch, &self.columns, self.distinct && single)?;
+            r.branch(branch, &select, distinct && single)?;
+        }
+        if subquery {
+            r.sql.push_str("\n) q");
         }
         Ok(RenderedSql {
             sql: r.sql,
@@ -294,6 +368,56 @@ impl SqlPlan {
             param_datatypes: r.param_datatypes,
             param_branches: r.param_branches,
         })
+    }
+
+    /// Whether two SQL rows may give the same solution of the pattern, so
+    /// that rendering removes duplicates. Never under `DISTINCT`, which
+    /// already does. Otherwise true unless the plan has one branch and
+    /// `keys` holds, for every table it reads, a unique key among the
+    /// table's [`SqlBranch::fixed_columns`]: then each solution fixes one
+    /// row of every table, and so one row of the result.
+    pub fn has_duplicates(&self, keys: Option<&TableKeys>) -> bool {
+        if self.distinct || self.branches.is_empty() {
+            return false;
+        }
+        let ([branch], Some(keys)) = (self.branches.as_slice(), keys) else {
+            return true;
+        };
+        !branch
+            .from
+            .iter()
+            .zip(&branch.fixed_columns)
+            .all(|(table, fixed)| {
+                let fixed: BTreeSet<String> = fixed.iter().map(|c| identifier_name(c)).collect();
+                keys.get(table).is_some_and(|keys| {
+                    keys.iter().any(|key| key.iter().all(|c| fixed.contains(c)))
+                })
+            })
+    }
+
+    /// The tables whose keys can show that the plan has no duplicates
+    /// ([`has_duplicates`](Self::has_duplicates)), each once. Empty when
+    /// keys cannot help: under `DISTINCT`, with several branches, or when
+    /// a branch reads an `rr:sqlQuery`, which has no keys.
+    pub fn key_tables(&self) -> Vec<LogicalTable> {
+        let [branch] = self.branches.as_slice() else {
+            return Vec::new();
+        };
+        if self.distinct
+            || branch
+                .from
+                .iter()
+                .any(|t| matches!(t, LogicalTable::SqlQuery(_)))
+        {
+            return Vec::new();
+        }
+        let mut out: Vec<LogicalTable> = Vec::new();
+        for table in &branch.from {
+            if !out.contains(table) {
+                out.push(table.clone());
+            }
+        }
+        out
     }
 
     /// The columns [`Condition::SameTerm`]s read, each once, in order of
@@ -361,6 +485,17 @@ pub fn column_type_probe(columns: &[(LogicalTable, String)]) -> String {
     )
 }
 
+/// The select list of every branch.
+struct Select {
+    /// Alias of each entry of [`SqlBranch::select`] that is rendered.
+    aliases: Vec<String>,
+    /// The entries in the order they are selected.
+    order: Vec<usize>,
+    /// Entries from here on are only compared, never decoded, and are
+    /// selected as their type and text output.
+    typed_text_from: Option<usize>,
+}
+
 #[derive(Default)]
 struct Renderer<'a> {
     sql: String,
@@ -377,7 +512,7 @@ impl<'a> Renderer<'a> {
     fn branch(
         &mut self,
         branch: &'a SqlBranch,
-        columns: &[String],
+        select: &Select,
         distinct: bool,
     ) -> Result<(), Error> {
         self.from = &branch.from;
@@ -385,16 +520,31 @@ impl<'a> Renderer<'a> {
         if distinct {
             self.sql.push_str("DISTINCT ");
         }
-        if branch.select.is_empty() {
+        if select.order.is_empty() {
             self.sql.push('1');
         }
-        for (i, (expr, alias)) in branch.select.iter().zip(columns).enumerate() {
+        for (i, &entry) in select.order.iter().enumerate() {
             if i > 0 {
                 self.sql.push_str(", ");
             }
-            self.expr(expr);
+            if select.typed_text_from.is_some_and(|from| entry >= from) {
+                // UNION matches columns by position, and the same variable
+                // may read columns of different types in different
+                // branches. Equal type and text output imply the same
+                // value, hence the same term; the reverse can fail
+                // (`numeric` 1.0 and 1.00, or `varchar` and `text`), which
+                // only keeps a duplicate.
+                let start = self.sql.len();
+                self.expr(&branch.select[entry]);
+                let column = self.sql.split_off(start);
+                self.sql.push_str(&format!(
+                    "pg_typeof({column})::text || ' ' || {column}::text"
+                ));
+            } else {
+                self.expr(&branch.select[entry]);
+            }
             self.sql.push_str(" AS ");
-            self.sql.push_str(&quote_identifier(alias));
+            self.sql.push_str(&quote_identifier(&select.aliases[entry]));
         }
 
         let mut on: Vec<Vec<&Condition>> = vec![Vec::new(); branch.from.len()];
@@ -711,15 +861,27 @@ fn logical_table(table: &LogicalTable) -> String {
 /// quotes with embedded quotes doubled, which makes it impossible to
 /// break out of the identifier.
 pub fn quote_identifier(name: &str) -> String {
-    let delimited = name.len() >= 2
-        && name.starts_with('"')
-        && name.ends_with('"')
-        && !name[1..name.len() - 1].replace("\"\"", "").contains('"');
-    if delimited {
+    if is_delimited(name) {
         name.to_owned()
     } else {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
+}
+
+/// The name [`quote_identifier`] refers to, as the database stores it.
+pub fn identifier_name(name: &str) -> String {
+    if is_delimited(name) {
+        name[1..name.len() - 1].replace("\"\"", "\"")
+    } else {
+        name.to_owned()
+    }
+}
+
+fn is_delimited(name: &str) -> bool {
+    name.len() >= 2
+        && name.starts_with('"')
+        && name.ends_with('"')
+        && !name[1..name.len() - 1].replace("\"\"", "").contains('"')
 }
 
 /// Quotes each part of a possibly schema-qualified `rr:tableName`.
@@ -787,6 +949,8 @@ mod tests {
     fn to_sql_places_linking_conditions_in_on_and_numbers_params_in_order() {
         let plan = SqlPlan {
             columns: vec!["x".into()],
+            hidden_columns: Vec::new(),
+            distinct_order: Vec::new(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 from: vec![
@@ -803,6 +967,7 @@ mod tests {
                     ),
                     Condition::IsNotNull(column(2, "v")),
                 ],
+                fixed_columns: Vec::new(),
             }],
             distinct: true,
         };
@@ -837,9 +1002,12 @@ mod tests {
                     }),
                 ),
             ],
+            fixed_columns: Vec::new(),
         };
         let plan = SqlPlan {
             columns: vec!["x".into()],
+            hidden_columns: Vec::new(),
+            distinct_order: Vec::new(),
             projection: Vec::new(),
             branches: vec![branch("1", None), branch("2", Some("http://ex/dt"))],
             distinct: false,
@@ -855,7 +1023,7 @@ mod tests {
             "SELECT t0.\"id\" AS \"x\"\n\
              FROM \"t\" t0\n\
              WHERE t0.\"a\" = $1 || t0.\"b\"::text AND t0.\"v\" = $2\n\
-             UNION ALL\n\
+             UNION\n\
              SELECT t0.\"id\" AS \"x\"\n\
              FROM \"t\" t0\n\
              WHERE t0.\"a\" = $3 || t0.\"b\"::text AND t0.\"v\"::text = $4"
@@ -907,11 +1075,14 @@ mod tests {
         );
         let plan = SqlPlan {
             columns: Vec::new(),
+            hidden_columns: Vec::new(),
+            distinct_order: Vec::new(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 from: vec![l.clone(), r.clone()],
                 select: Vec::new(),
                 conditions: vec![Condition::SameTerm(left, right)],
+                fixed_columns: Vec::new(),
             }],
             distinct: false,
         };
@@ -986,10 +1157,106 @@ mod tests {
         assert!(sql.contains(r"\U000E1000-\U000EFFFD]$'"), "{sql}");
     }
 
+    fn keyed_plan(fixed: &[&str], hidden: bool) -> SqlPlan {
+        SqlPlan {
+            columns: vec!["s".into()],
+            hidden_columns: if hidden { vec!["o".into()] } else { Vec::new() },
+            distinct_order: Vec::new(),
+            projection: Vec::new(),
+            branches: vec![SqlBranch {
+                from: vec![LogicalTable::TableName("\"T\"".into())],
+                select: vec![column(0, "\"Id\""), column(0, "v")],
+                conditions: Vec::new(),
+                fixed_columns: vec![fixed.iter().map(|c| c.to_string()).collect()],
+            }],
+            distinct: false,
+        }
+    }
+
+    #[test]
+    fn duplicates_are_removed_over_all_variables_then_projected() {
+        assert_eq!(
+            keyed_plan(&[], true).to_sql().sql,
+            "SELECT q.\"s\"\nFROM (\n\
+             SELECT DISTINCT t0.\"Id\" AS \"s\", t0.\"v\" AS \"o\"\n\
+             FROM \"T\" t0\n\
+             ) q"
+        );
+        assert_eq!(
+            keyed_plan(&[], false).to_sql().sql,
+            "SELECT DISTINCT t0.\"Id\" AS \"s\"\nFROM \"T\" t0"
+        );
+        let mut no_columns = keyed_plan(&[], true);
+        no_columns.columns.clear();
+        no_columns.branches[0].select.remove(0);
+        assert_eq!(
+            no_columns.to_sql().sql,
+            "SELECT 1\nFROM (\n\
+             SELECT DISTINCT t0.\"v\" AS \"o\"\n\
+             FROM \"T\" t0\n\
+             ) q"
+        );
+    }
+
+    #[test]
+    fn a_unique_key_among_the_fixed_columns_keeps_the_rows() {
+        let table = LogicalTable::TableName("\"T\"".into());
+        let keys: TableKeys = [(table.clone(), vec![vec!["Id".to_owned()]])].into();
+        let options = RenderOptions {
+            keys: Some(&keys),
+            ..RenderOptions::default()
+        };
+        let plan = keyed_plan(&["\"Id\"", "v"], true);
+        assert_eq!(plan.key_tables(), std::slice::from_ref(&table));
+        assert!(!plan.has_duplicates(Some(&keys)));
+        assert_eq!(
+            plan.to_sql_with(&options).unwrap().sql,
+            "SELECT t0.\"Id\" AS \"s\"\nFROM \"T\" t0"
+        );
+        // Not fixed by the solution, unknown keys, or no metadata.
+        assert!(keyed_plan(&["v"], true).has_duplicates(Some(&keys)));
+        assert!(plan.has_duplicates(Some(&TableKeys::new())));
+        assert!(plan.has_duplicates(None));
+        // A composite key needs all its columns.
+        let composite: TableKeys = [(table, vec![vec!["Id".to_owned(), "w".to_owned()]])].into();
+        assert!(plan.has_duplicates(Some(&composite)));
+    }
+
+    #[test]
+    fn keys_cannot_help_with_several_branches_views_or_distinct() {
+        let mut two = keyed_plan(&["\"Id\""], false);
+        two.branches.push(two.branches[0].clone());
+        assert!(two.key_tables().is_empty());
+        assert!(two.has_duplicates(Some(&TableKeys::new())));
+
+        let mut view = keyed_plan(&["\"Id\""], false);
+        view.branches[0].from[0] = LogicalTable::SqlQuery("SELECT 1".into());
+        assert!(view.key_tables().is_empty());
+
+        let mut distinct = keyed_plan(&[], true);
+        distinct.distinct = true;
+        assert!(distinct.key_tables().is_empty());
+        assert!(!distinct.has_duplicates(None));
+        assert_eq!(
+            distinct.to_sql().sql,
+            "SELECT DISTINCT t0.\"Id\" AS \"s\"\nFROM \"T\" t0"
+        );
+    }
+
+    #[test]
+    fn identifier_name_unquotes_delimited_names() {
+        assert_eq!(identifier_name("id"), "id");
+        assert_eq!(identifier_name("\"Id\""), "Id");
+        assert_eq!(identifier_name("\"a\"\"b\""), "a\"b");
+        assert_eq!(identifier_name("a\"b"), "a\"b");
+    }
+
     #[test]
     fn to_sql_without_branches_returns_no_rows() {
         let plan = SqlPlan {
             columns: Vec::new(),
+            hidden_columns: Vec::new(),
+            distinct_order: Vec::new(),
             projection: Vec::new(),
             branches: Vec::new(),
             distinct: false,

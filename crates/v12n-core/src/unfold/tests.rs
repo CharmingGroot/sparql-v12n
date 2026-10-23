@@ -272,3 +272,57 @@ fn unfold_literal_constants_are_parameters_not_sql_text() {
     assert!(!rendered.sql.contains("DROP"));
     assert_eq!(rendered.params, ["x'; DROP TABLE customers; --"]);
 }
+
+#[test]
+fn unfold_selects_hidden_variables_for_removing_duplicates() {
+    let plan = unfold_query(
+        SHOP,
+        r#"SELECT ?order WHERE { ?order ex:placedBy ?c ; ex:amount ?a . _:b ex:name ?n }"#,
+    )
+    .unwrap();
+    assert_eq!(plan.columns, ["order"]);
+    // Every variable of the pattern, blank nodes included, in order of
+    // first occurrence.
+    assert_eq!(plan.hidden_columns, ["c", "a", "_:b", "n"]);
+    assert_eq!(plan.branches[0].select.len(), 5);
+    // DISTINCT over the selected variables needs none.
+    let plan = unfold_query(SHOP, "SELECT DISTINCT ?order WHERE { ?order ex:amount ?a }").unwrap();
+    assert!(plan.hidden_columns.is_empty());
+}
+
+#[test]
+fn unfold_fixed_columns_are_those_of_injective_terms() {
+    let mapping = with_prefixes(
+        r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/{x}/{y}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:template "{u}-{v}" ; rr:termType rr:Literal ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:q ; rr:objectMap [ rr:column "w" ] ] ."#,
+    );
+    let plan = unfold_query(&mapping, "SELECT ?s WHERE { ?s ex:p ?o ; ex:q ?w }").unwrap();
+    let fixed: Vec<Vec<&str>> = plan.branches[0]
+        .fixed_columns
+        .iter()
+        .map(|c| c.iter().map(String::as_str).collect())
+        .collect();
+    // The literal template can render the same string from different
+    // values, so it fixes neither of its columns.
+    assert_eq!(fixed, [vec!["x", "y"], vec!["w", "x", "y"]]);
+}
+
+#[test]
+fn unfold_hidden_variable_of_different_shapes_is_unsupported() {
+    let mapping = with_prefixes(
+        r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/a/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "v" ] ] .
+<#B> rr:logicalTable [ rr:tableName "b" ] ;
+  rr:subjectMap [ rr:template "http://ex/b/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "v" ] ] ."#,
+    );
+    let err = unfold_query(&mapping, "SELECT ?v WHERE { ?s ex:p ?v }").unwrap_err();
+    assert!(
+        matches!(&err, Error::UnsupportedFeature(f) if f.contains("?s")),
+        "{err}"
+    );
+    assert!(unfold_query(&mapping, "SELECT DISTINCT ?v WHERE { ?s ex:p ?v }").is_ok());
+}

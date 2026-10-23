@@ -2,16 +2,19 @@
 source: crates/v12n-core/tests/unfold_sql.rs
 expression: "explain(MULTI,\n&format!(\"{PREFIXES}SELECT ?o ?name WHERE {{ ?o ex:placedBy ?c . ?c ex:name ?name }}\"))"
 ---
-SELECT t0."id" AS "o", t2."name" AS "name"
+SELECT q."o", q."name"
+FROM (
+SELECT t0."id" AS "o", pg_typeof(t1."id")::text || ' ' || t1."id"::text AS "c", t2."name" AS "name"
 FROM "orders" t0
 JOIN "retail_customers" t1 ON t1."id" = t0."customer_id"
 JOIN "retail_customers" t2 ON t2."id" = t1."id"
 WHERE t0."id" IS NOT NULL AND t2."name" IS NOT NULL
-UNION ALL
-SELECT t0."id" AS "o", t2."title" AS "name"
+UNION
+SELECT t0."id" AS "o", pg_typeof(t1."id")::text || ' ' || t1."id"::text AS "c", t2."title" AS "name"
 FROM "orders" t0
 JOIN "retail_customers" t1 ON t1."id" = t0."customer_id"
 JOIN (SELECT code, title FROM shop.wholesale) t2 ON t2."code" = t1."id"
 WHERE t0."id" IS NOT NULL AND t2."title" IS NOT NULL
+) q
 
 -- params

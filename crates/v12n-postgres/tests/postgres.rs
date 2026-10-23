@@ -9,7 +9,7 @@ use tokio_postgres::NoTls;
 use tokio_postgres::types::Type;
 use v12n_core::mapping::{Mapping, MappingIndex};
 use v12n_core::solution::canonical_decimal;
-use v12n_core::sql::SqlPlan;
+use v12n_core::sql::{RenderOptions, SqlPlan};
 use v12n_core::{sparql, unfold};
 use v12n_postgres::{Database, Error, Limits};
 
@@ -76,10 +76,19 @@ async fn constant_subject_binds_an_integer_parameter_that_uses_the_index() {
     assert_eq!(rows, ["?n=\"Kim\""]);
 
     // The prepared statement takes the parameter type from `id`, so the
-    // comparison stays on the integer column and can use its primary key.
+    // comparison stays on the integer column and can use its primary key,
+    // which also shows that no duplicates need removing.
     let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(connection);
-    let sql = plan.to_sql().sql;
+    let database = Database::connect(&url, Limits::default()).await.unwrap();
+    let keys = database.table_keys(&plan).await.unwrap();
+    let sql = plan
+        .to_sql_with(&RenderOptions {
+            keys: keys.as_ref(),
+            ..RenderOptions::default()
+        })
+        .unwrap()
+        .sql;
     let statement = client.prepare(&sql).await.unwrap();
     assert_eq!(statement.params(), [Type::INT4]);
     client
@@ -740,5 +749,151 @@ async fn trim_scale_matches_the_canonical_decimal_formatter() {
     assert_eq!(
         checked,
         edge_cases.len() + 4000 + 1000 + 1001 + 401 + 7 + 121
+    );
+}
+
+/// An RDF graph is a set: a triple from duplicate rows, or from two
+/// triples maps, is matched once (SPARQL 1.1 §18.5), while projecting
+/// variables away keeps one solution per match.
+#[tokio::test]
+async fn duplicate_triples_count_once_and_projection_keeps_the_bag() {
+    let Some(url) = database_url() else { return };
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#A> rr:logicalTable [ rr:sqlQuery """SELECT * FROM (VALUES (1, 'a'), (1, 'a'), (1, 'b'), (2, 'a')) v(id, name)""" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+        <#B> rr:logicalTable [ rr:sqlQuery "SELECT 2 AS id, 'a' AS name" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+    "#;
+    let rows = |query: &str| {
+        let plan = plan(
+            mapping,
+            &format!("PREFIX ex: <http://example.org/> {query}"),
+        );
+        let url = url.clone();
+        async move { run(&url, Limits::default(), &plan).await.unwrap().0 }
+    };
+    let row = |id: u8| format!("?s=<http://example.org/row/{id}>");
+    assert_eq!(
+        rows("SELECT ?s ?n WHERE { ?s ex:name ?n }").await,
+        [
+            format!("{} ?n=\"a\"", row(1)),
+            format!("{} ?n=\"b\"", row(1)),
+            format!("{} ?n=\"a\"", row(2)),
+        ]
+    );
+    // Two triples about row 1 give it twice; row 2 has one triple, from
+    // both triples maps.
+    assert_eq!(
+        rows("SELECT ?s WHERE { ?s ex:name ?n }").await,
+        [row(1), row(1), row(2)]
+    );
+    assert_eq!(
+        rows("SELECT ?s WHERE { ?s ex:name \"a\" }").await,
+        [row(1), row(2)]
+    );
+    assert_eq!(
+        rows("SELECT ?n WHERE { ?s ex:name ?n . ?t ex:name ?n }")
+            .await
+            .len(),
+        // ?n = "a": ?s and ?t each row 1 or 2; ?n = "b": row 1 only.
+        5
+    );
+    assert_eq!(
+        rows("SELECT DISTINCT ?s WHERE { ?s ex:name ?n }").await,
+        [row(1), row(2)]
+    );
+}
+
+/// Unique keys are read from the catalog only when they count: unique,
+/// valid, immediate, not partial, on plain columns, only the key columns
+/// of an index with `INCLUDE`, and not on a table with inheritance
+/// children (partitions are fine).
+#[tokio::test]
+async fn table_keys_come_from_unique_indexes_that_always_hold() {
+    let Some(url) = database_url() else { return };
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            r#"DROP SCHEMA IF EXISTS v12n_keys CASCADE;
+            CREATE SCHEMA v12n_keys;
+            CREATE TABLE v12n_keys.pk (id int PRIMARY KEY, v text);
+            CREATE TABLE v12n_keys.composite (a int, b int, v text, PRIMARY KEY (a, b), UNIQUE (v));
+            CREATE TABLE v12n_keys.partial (id int, v text);
+            CREATE UNIQUE INDEX ON v12n_keys.partial (id) WHERE id > 0;
+            CREATE TABLE v12n_keys.expression (id int, v text);
+            CREATE UNIQUE INDEX ON v12n_keys.expression (lower(v));
+            CREATE TABLE v12n_keys.deferrable (id int UNIQUE DEFERRABLE, v text);
+            CREATE TABLE v12n_keys.include (id int, v text);
+            CREATE UNIQUE INDEX ON v12n_keys.include (id) INCLUDE (v);
+            CREATE TABLE v12n_keys."Mixed" ("Id" int PRIMARY KEY, v text);
+            CREATE TABLE v12n_keys.parent (id int PRIMARY KEY, v text);
+            CREATE TABLE v12n_keys.child () INHERITS (v12n_keys.parent);
+            CREATE TABLE v12n_keys.partitioned (id int PRIMARY KEY, v text) PARTITION BY RANGE (id);
+            CREATE TABLE v12n_keys.partition PARTITION OF v12n_keys.partitioned FOR VALUES FROM (0) TO (10);
+            CREATE TABLE v12n_keys.none (id int, v text);
+            CREATE VIEW v12n_keys.view AS SELECT * FROM v12n_keys.pk;"#,
+        )
+        .await
+        .unwrap();
+    let database = Database::connect(&url, Limits::default()).await.unwrap();
+    let mut keys = Vec::new();
+    for table in [
+        "v12n_keys.pk",
+        "v12n_keys.composite",
+        "v12n_keys.partial",
+        "v12n_keys.expression",
+        "v12n_keys.deferrable",
+        "v12n_keys.include",
+        r#"v12n_keys.\"Mixed\""#,
+        "v12n_keys.parent",
+        "v12n_keys.partitioned",
+        "v12n_keys.none",
+        "v12n_keys.view",
+        "v12n_keys.missing",
+    ] {
+        let mapping = format!(
+            "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
+             <#M> rr:logicalTable [ rr:tableName \"{table}\" ] ;\n\
+               rr:subjectMap [ rr:template \"http://example.org/{{v}}\" ] ;\n\
+               rr:predicateObjectMap [ rr:predicate <http://example.org/v> ; rr:objectMap [ rr:column \"v\" ] ] ."
+        );
+        let plan = plan(&mapping, "SELECT ?s WHERE { ?s <http://example.org/v> ?v }");
+        let mut found: Vec<Vec<String>> = database
+            .table_keys(&plan)
+            .await
+            .unwrap()
+            .expect("one table scan can use keys")
+            .into_values()
+            .flatten()
+            .collect();
+        found.sort();
+        keys.push(found);
+    }
+    client
+        .batch_execute("DROP SCHEMA v12n_keys CASCADE")
+        .await
+        .unwrap();
+    let k = |columns: &[&str]| columns.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        [
+            vec![k(&["id"])],
+            vec![k(&["a", "b"]), k(&["v"])],
+            vec![],
+            vec![],
+            vec![],
+            vec![k(&["id"])],
+            vec![k(&["Id"])],
+            vec![],
+            vec![k(&["id"])],
+            vec![],
+            vec![],
+            vec![],
+        ]
     );
 }

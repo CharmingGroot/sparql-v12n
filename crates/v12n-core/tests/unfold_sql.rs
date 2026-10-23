@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Snapshots of the SQL generated for example queries.
 
-use v12n_core::mapping::{Mapping, MappingIndex};
+use v12n_core::mapping::{LogicalTable, Mapping, MappingIndex};
+use v12n_core::sql::{RenderOptions, TableKeys};
 use v12n_core::{sparql, unfold};
 
 const SHOP: &str = include_str!("../../../examples/shop/mapping.ttl");
@@ -10,11 +11,20 @@ const VIP_ORDERS: &str = include_str!("../../../examples/shop/queries/vip-orders
 const PREFIXES: &str = "PREFIX ex: <http://example.org/>\n";
 
 fn explain(mapping: &str, query: &str) -> String {
+    explain_with_keys(mapping, query, None)
+}
+
+fn explain_with_keys(mapping: &str, query: &str, keys: Option<&TableKeys>) -> String {
     let mapping = Mapping::from_turtle(mapping).unwrap();
     let index = MappingIndex::new(&mapping);
     let query = sparql::parse(query).unwrap();
     let plan = unfold::unfold(&query, &mapping, &index).unwrap();
-    let rendered = plan.to_sql();
+    let rendered = plan
+        .to_sql_with(&RenderOptions {
+            keys,
+            ..RenderOptions::default()
+        })
+        .unwrap();
     let mut out = rendered.sql;
     out.push_str("\n\n-- params\n");
     for (i, p) in rendered.params.iter().enumerate() {
@@ -40,6 +50,22 @@ fn shop_constant_literal_object() {
 #[test]
 fn shop_vip_orders_join_decomposes_templates() {
     insta::assert_snapshot!(explain(SHOP, VIP_ORDERS));
+}
+
+/// With the primary keys of `customers` and `orders`, every solution fixes
+/// one row of each scan, so no duplicates need removing.
+#[test]
+fn shop_vip_orders_with_keys_keeps_rows() {
+    let keys: TableKeys = ["customers", "orders"]
+        .into_iter()
+        .map(|t| {
+            (
+                LogicalTable::TableName(t.into()),
+                vec![vec!["id".to_owned()]],
+            )
+        })
+        .collect();
+    insta::assert_snapshot!(explain_with_keys(SHOP, VIP_ORDERS, Some(&keys)));
 }
 
 #[test]
@@ -75,7 +101,7 @@ const MULTI: &str = r#"
 "#;
 
 #[test]
-fn multiple_triples_maps_union_all() {
+fn multiple_triples_maps_union() {
     insta::assert_snapshot!(explain(
         MULTI,
         &format!("{PREFIXES}SELECT ?c ?name WHERE {{ ?c a ex:Customer ; ex:name ?name }}")

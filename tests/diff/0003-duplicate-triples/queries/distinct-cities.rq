@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# DISTINCT over the projection.
+SELECT DISTINCT ?c WHERE { ?p ex:city ?c }
