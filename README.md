@@ -87,6 +87,43 @@ read-only transactions. The database URL and password are never logged. Request
 logs (stderr, level from `RUST_LOG`) carry the generated SQL and timings, not
 result values. TLS, authentication and CORS belong to a reverse proxy in front.
 
+## Constants in a query
+
+Constants in triple patterns are matched as RDF terms, as SPARQL requires:
+the lexical form and the datatype must both be equal. A column value takes
+part through its R2RML natural mapping (`integer` columns give
+`xsd:integer` in canonical form, `numeric` gives canonical `xsd:decimal`,
+and so on). So, for an integer column holding 7:
+
+| Constant | Matches | Why |
+|---|---|---|
+| `7`, `<…/customer/7>` | yes | |
+| `"7"`, `"7"^^xsd:decimal`, `7.0` | no | Different datatype |
+| `"07"^^xsd:integer`, `<…/customer/007>`, `<…/customer/+7>` | no | Not the canonical form the mapping produces |
+| `99999999999`, `<…/customer/99999999999>` | no | Out of range for the column, so no row holds it |
+
+Constants are sent to PostgreSQL as bound parameters, never inside the
+SQL text. Before binding, the engine checks each one against the
+parameter type PostgreSQL infers from the column: it reads the constant
+as that type and formats it back with the same code that builds result
+terms, and only an identical round trip is sent, in binary where the type
+allows. A constant that cannot match empties its own `UNION` branch
+instead of making PostgreSQL fail on input it cannot parse; the query
+skips the database when no branch is left. The comparison stays on the
+column's own type, so its indexes are used. For column types without a
+natural datatype (such as `interval`), results carry the column cast to
+text, and constants are compared with that same text (`col::text = $1`),
+which cannot use an index on the column.
+
+Value comparisons across datatypes, such as `FILTER(?amount = 7.0)` on an
+integer column, belong to `FILTER`, which is not supported yet. When it
+is, the plan is to convert the constant to the column's type in the
+engine when the value is exactly representable (`7.0` becomes `7`) and to
+treat the equality as false otherwise (`7.5`), rather than casting the
+column, which in
+PostgreSQL turns `id = 7.0` into `id::numeric = 7.0` and stops it from
+using an index on `id`.
+
 ## Layout
 
 | Path | Contents |

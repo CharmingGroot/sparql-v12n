@@ -230,3 +230,158 @@ async fn session_is_read_only() {
         "{error}"
     );
 }
+
+/// Subjects matched by `?row <predicate> <object>`, sorted.
+async fn subjects(url: &str, mapping: &str, predicate: &str, object: &str) -> Vec<String> {
+    let query = format!("SELECT ?row WHERE {{ ?row <http://example.org/{predicate}> {object} }}");
+    match run(url, Limits::default(), &plan(mapping, &query)).await {
+        Ok((rows, _)) => rows,
+        Err(e) => panic!("{query}: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn out_of_range_and_non_canonical_constants_match_nothing_without_an_error() {
+    let Some(url) = database_url() else { return };
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    // `amount` is an integer column holding 120000 for order 1001.
+    assert_eq!(
+        subjects(&url, SHOP, "amount", "120000").await,
+        ["?row=<http://example.org/order/1001>"]
+    );
+    for object in [
+        "99999999999".to_owned(),
+        "120000.0".to_owned(),
+        "\"120000\"".to_owned(),
+        format!("\"120000\"^^<{xsd}decimal>"),
+        format!("\"0120000\"^^<{xsd}integer>"),
+        format!("\"+120000\"^^<{xsd}integer>"),
+    ] {
+        assert!(
+            subjects(&url, SHOP, "amount", &object).await.is_empty(),
+            "{object}"
+        );
+    }
+    // Template values: `id` is an integer column with customer 7.
+    for id in ["99999999999", "7.0", "007", "+7", "seven"] {
+        let query = format!(
+            "SELECT ?n WHERE {{ <http://example.org/customer/{id}> <http://example.org/name> ?n }}"
+        );
+        let (rows, _) = run(&url, Limits::default(), &plan(SHOP, &query))
+            .await
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert!(rows.is_empty(), "{id}: {rows:?}");
+    }
+    // A plain literal is not the integer a natural integer column yields,
+    // and a text column yields no integers.
+    assert!(subjects(&url, SHOP, "name", "7").await.is_empty());
+}
+
+#[tokio::test]
+async fn unrepresentable_constant_drops_only_its_branch() {
+    let Some(url) = database_url() else { return };
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#Text> rr:logicalTable [ rr:sqlQuery "SELECT 1 AS id, 'abc'::text AS v" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column "v" ] ] .
+        <#Int> rr:logicalTable [ rr:sqlQuery "SELECT 2 AS id, 5::int4 AS v" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column "v" ] ] .
+    "#;
+    assert_eq!(
+        subjects(&url, mapping, "v", "\"abc\"").await,
+        ["?row=<http://example.org/row/1>"]
+    );
+    assert_eq!(
+        subjects(&url, mapping, "v", "5").await,
+        ["?row=<http://example.org/row/2>"]
+    );
+    assert!(subjects(&url, mapping, "v", "\"5\"").await.is_empty());
+    assert!(subjects(&url, mapping, "v", "99999999999").await.is_empty());
+}
+
+#[tokio::test]
+async fn constants_round_trip_through_the_result_formatting() {
+    let Some(url) = database_url() else { return };
+    let columns = [
+        "d", "f", "b", "dt", "ts", "tz", "bin", "u", "iv", "i2", "i8",
+    ];
+    let mapping = sql_query_mapping(
+        r"SELECT 1 AS id, 12.50::numeric AS d, 1.5::float8 AS f, true AS b,
+          DATE '2024-02-29' AS dt, TIMESTAMP '2024-01-02 03:04:05.5' AS ts,
+          TIMESTAMPTZ '2024-01-02 03:04:05+09' AS tz, '\\x0a0b'::bytea AS bin,
+          '00000000-0000-0000-0000-00000000000a'::uuid AS u,
+          INTERVAL '1 day' AS iv, 5::int2 AS i2, 99999999999::int8 AS i8",
+        &columns,
+    );
+    let xsd = |lexical: &str, datatype: &str| {
+        format!("\"{lexical}\"^^<http://www.w3.org/2001/XMLSchema#{datatype}>")
+    };
+    let uuid = "00000000-0000-0000-0000-00000000000a";
+    let cases = [
+        ("d", "12.5".to_owned(), true),
+        ("d", "12.50".to_owned(), false),
+        ("d", "\"12.5\"".to_owned(), false),
+        ("f", "1.5E0".to_owned(), true),
+        ("f", xsd("1.5", "double"), false),
+        ("b", "true".to_owned(), true),
+        ("b", xsd("1", "boolean"), false),
+        ("dt", xsd("2024-02-29", "date"), true),
+        ("dt", xsd("2024-2-29", "date"), false),
+        // PostgreSQL rejects these as input instead of matching nothing.
+        ("dt", xsd("2024-02-30", "date"), false),
+        ("dt", xsd("soon", "date"), false),
+        ("ts", xsd("2024-01-02T03:04:05.5", "dateTime"), true),
+        ("ts", xsd("2024-01-02 03:04:05.5", "dateTime"), false),
+        ("tz", xsd("2024-01-01T18:04:05Z", "dateTime"), true),
+        ("tz", xsd("2024-01-02T03:04:05+09:00", "dateTime"), false),
+        ("bin", xsd("0A0B", "hexBinary"), true),
+        ("bin", xsd("0a0b", "hexBinary"), false),
+        ("u", format!("\"{uuid}\""), true),
+        ("u", format!("\"{}\"", uuid.to_uppercase()), false),
+        ("u", "\"abc\"".to_owned(), false),
+        // No natural datatype: compared with the column's text form.
+        ("iv", "\"1 day\"".to_owned(), true),
+        ("iv", "\"24 hours\"".to_owned(), false),
+        ("iv", "\"abc\"".to_owned(), false),
+        ("i2", "5".to_owned(), true),
+        ("i2", "40000".to_owned(), false),
+        ("i8", "99999999999".to_owned(), true),
+    ];
+    for (column, object, expected) in cases {
+        let rows = subjects(&url, &mapping, column, &object).await;
+        assert_eq!(!rows.is_empty(), expected, "{column} {object}: {rows:?}");
+    }
+}
+
+#[tokio::test]
+async fn numeric_template_matches_the_canonical_form_of_any_scale() {
+    let Some(url) = database_url() else { return };
+    // PostgreSQL prints 12.50 with its scale; the IRI has the canonical 12.5.
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#Price> rr:logicalTable [ rr:sqlQuery "SELECT 12.50::numeric AS p, 'x' AS v" ] ;
+          rr:subjectMap [ rr:template "http://example.org/price/{p}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column "v" ] ] .
+    "#;
+    let (rows, _) = run(
+        &url,
+        Limits::default(),
+        &plan(mapping, "SELECT ?p WHERE { ?p <http://example.org/v> ?v }"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows, ["?p=<http://example.org/price/12.5>"]);
+    for (iri, expected) in [("12.5", true), ("12.50", false), ("12.500", false)] {
+        let query = format!(
+            "SELECT ?v WHERE {{ <http://example.org/price/{iri}> <http://example.org/v> ?v }}"
+        );
+        let (rows, _) = run(&url, Limits::default(), &plan(mapping, &query))
+            .await
+            .unwrap();
+        assert_eq!(!rows.is_empty(), expected, "{iri}");
+    }
+}

@@ -2,9 +2,11 @@
 //! Runs SQL produced by `v12n-core` on PostgreSQL and streams rows back as
 //! SPARQL solutions.
 
+mod bind;
 mod decode;
 mod error;
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -14,7 +16,8 @@ use tokio_postgres::{Client, Config, NoTls, RowStream, Statement};
 use v12n_core::solution::{Solution, SolutionBuilder, SqlValue};
 use v12n_core::sql::{SqlPlan, quote_identifier};
 
-use decode::{Decoder, Raw, TextParam, can_match};
+use bind::{Bound, bind};
+use decode::{Decoder, Raw};
 pub use error::Error;
 
 /// Default for [`Limits::statement_timeout`].
@@ -124,10 +127,29 @@ impl Database {
             .iter()
             .map(|c| Decoder::for_type(c.type_()))
             .collect();
-        if decoders.iter().any(Option::is_none) && decoders.len() == plan.columns.len() {
-            let sql = cast_to_text(&rendered.sql, &plan.columns, &decoders);
+        // Values of types without a decoder become terms through their text
+        // output (see `cast_to_text`), so a constant compared with one is
+        // matched against that text instead of parsed as the type.
+        let text_params: Vec<usize> = statement.params()[..rendered.params.len()]
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| Decoder::for_type(ty).is_none())
+            .map(|(i, _)| i)
+            .collect();
+        let cast_columns =
+            decoders.iter().any(Option::is_none) && decoders.len() == plan.columns.len();
+        let rendered = if cast_columns || !text_params.is_empty() {
+            let rendered = plan.to_sql_with_text_params(&text_params);
+            let sql = if cast_columns {
+                cast_to_text(&rendered.sql, &plan.columns, &decoders)
+            } else {
+                rendered.sql.clone()
+            };
             statement = self.client.prepare(&limited(&sql)).await.map_err(pg)?;
-        }
+            rendered
+        } else {
+            rendered
+        };
         let decoders = statement.columns()[..data_columns]
             .iter()
             .map(|c| Decoder::for_type(c.type_()).unwrap_or(Decoder::Text))
@@ -142,19 +164,26 @@ impl Database {
             truncated: false,
             timeout,
         };
-        let types = statement.params();
-        if rendered
+        let bound: Vec<Bound> = rendered
             .params
             .iter()
-            .zip(types)
-            .any(|(value, ty)| !can_match(ty, value))
-        {
+            .zip(&rendered.param_datatypes)
+            .zip(statement.params())
+            .map(|((value, datatype), ty)| bind(ty, value, datatype.as_deref()))
+            .collect();
+        // Skipping the round trip when no branch can produce a row also
+        // covers the common single-branch case.
+        let empty_branches: HashSet<usize> = bound
+            .iter()
+            .zip(&rendered.param_branches)
+            .filter(|(b, _)| b.is_no_match())
+            .map(|(_, &branch)| branch)
+            .collect();
+        if !plan.branches.is_empty() && empty_branches.len() == plan.branches.len() {
             return Ok(solutions);
         }
         solutions.rows = Some(Box::pin(
-            self.query(&statement, &rendered.params, fetch)
-                .await
-                .map_err(pg)?,
+            self.query(&statement, &bound, fetch).await.map_err(pg)?,
         ));
         Ok(solutions)
     }
@@ -162,12 +191,11 @@ impl Database {
     async fn query(
         &self,
         statement: &Statement,
-        params: &[String],
+        params: &[Bound],
         fetch: Option<i64>,
     ) -> Result<RowStream, tokio_postgres::Error> {
-        let texts: Vec<TextParam<'_>> = params.iter().map(|p| TextParam(p)).collect();
         let mut bound: Vec<&(dyn ToSql + Sync)> =
-            texts.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+            params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
         if let Some(fetch) = &fetch {
             bound.push(fetch);
         }
