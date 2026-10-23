@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Ann once: from two rows, two predicate-object maps and two triples maps.
+SELECT ?p ?n WHERE { ?p ex:name ?n }

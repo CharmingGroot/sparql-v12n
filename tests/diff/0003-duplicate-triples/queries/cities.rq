@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Projecting ?p away keeps one solution per person: Oslo twice.
+SELECT ?c WHERE { ?p ex:city ?c }

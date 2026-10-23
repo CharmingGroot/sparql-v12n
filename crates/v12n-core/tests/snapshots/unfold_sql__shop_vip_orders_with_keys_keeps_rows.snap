@@ -1,0 +1,12 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_with_keys(SHOP, VIP_ORDERS, Some(&keys))"
+---
+SELECT t1."id" AS "order", t2."amount" AS "amount"
+FROM "customers" t0
+JOIN "orders" t1 ON t1."customer_id" = t0."id"
+JOIN "orders" t2 ON t2."id" = t1."id"
+WHERE t0."tier" = $1 AND t2."amount" IS NOT NULL
+
+-- params
+$1 = "VIP"

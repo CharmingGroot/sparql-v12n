@@ -1,24 +1,9 @@
-# Duplicate rows: v12n returns the triple once per row, Ontop once (#32).
-
+# Ontop writes an xsd:double as PostgreSQL text output ("30"); v12n writes the
+# XSD canonical form ("3.0E1"), as the W3C expected output does (#25,
+# Discussion #35).
 [query.amount]
 expect = "mismatch"
-issue = 32
-
-[query.city]
-expect = "mismatch"
-issue = 32
-
-[query.fname]
-expect = "mismatch"
-issue = 32
-
-[query.lname]
-expect = "mismatch"
-issue = 32
-
-[query.type-lives]
-expect = "mismatch"
-issue = 32
+issue = 25
 
 # The join on ?s compares blank nodes built from a float8 column.
 [query.type-ious]

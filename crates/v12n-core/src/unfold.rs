@@ -3,7 +3,7 @@
 
 mod term;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use oxrdf::Term;
 
@@ -277,6 +277,28 @@ impl<'a> Branch<'a> {
     }
 }
 
+impl Branch<'_> {
+    /// [`SqlBranch::fixed_columns`]: every term of the branch is bound to a
+    /// variable, equal to one, or equal to a constant, so a solution fixes
+    /// its value, and the columns too when the term map is injective.
+    fn fixed_columns(&self) -> Vec<BTreeSet<String>> {
+        let mut fixed = vec![BTreeSet::new(); self.from.len()];
+        for term in &self.terms {
+            let injective = match term.value {
+                TermValue::Constant(_) => continue,
+                TermValue::Column { .. } => true,
+                TermValue::Template { template, .. } => is_injective(template, term.term_type),
+            };
+            if injective {
+                for (table, name) in term.columns() {
+                    fixed[table].insert(name.to_owned());
+                }
+            }
+        }
+        fixed
+    }
+}
+
 fn collect_columns(expr: &SqlExpr, out: &mut HashSet<(usize, String)>) {
     match expr {
         SqlExpr::Column { table, name } => {
@@ -346,10 +368,29 @@ fn shape<'a>(term: &TermExpr<'a>) -> Shape<'a> {
     }
 }
 
+/// Variables of the pattern that are not selected, in order of first
+/// occurrence.
+fn hidden_variables(query: &SelectQuery) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for pattern in &query.patterns {
+        for term in [&pattern.subject, &pattern.object] {
+            if let PatternTerm::Variable(name) = term
+                && !query.variables.contains(name)
+                && !out.contains(&name.as_str())
+            {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
 fn plan(query: &SelectQuery, branches: Vec<Branch<'_>>) -> Result<SqlPlan, Error> {
     let Some(first) = branches.first() else {
         return Ok(SqlPlan {
             columns: Vec::new(),
+            hidden_columns: Vec::new(),
+            distinct_order: Vec::new(),
             projection: query
                 .variables
                 .iter()
@@ -364,11 +405,23 @@ fn plan(query: &SelectQuery, branches: Vec<Branch<'_>>) -> Result<SqlPlan, Error
     };
 
     // Every branch must rebuild a variable the same way, since the result
-    // rows do not say which branch they came from.
-    for variable in &query.variables {
-        let reference = first.bindings.get(variable.as_str()).map(shape);
+    // rows do not say which branch they came from. Removing duplicate
+    // solutions compares the columns of every variable across branches,
+    // which is only sound when they are built the same way too.
+    let hidden = if query.distinct {
+        Vec::new()
+    } else {
+        hidden_variables(query)
+    };
+    for variable in query
+        .variables
+        .iter()
+        .map(String::as_str)
+        .chain(hidden.iter().copied())
+    {
+        let reference = first.bindings.get(variable).map(shape);
         for branch in &branches[1..] {
-            if branch.bindings.get(variable.as_str()).map(shape) != reference {
+            if branch.bindings.get(variable).map(shape) != reference {
                 return Err(Error::UnsupportedFeature(format!(
                     "?{variable} takes values from differently shaped term maps in different \
                      UNION branches"
@@ -379,7 +432,7 @@ fn plan(query: &SelectQuery, branches: Vec<Branch<'_>>) -> Result<SqlPlan, Error
             value: TermValue::Template { template, .. },
             term_type,
             ..
-        }) = first.bindings.get(variable.as_str())
+        }) = first.bindings.get(variable)
             && query.distinct
             && !is_injective(template, *term_type)
         {
@@ -390,7 +443,12 @@ fn plan(query: &SelectQuery, branches: Vec<Branch<'_>>) -> Result<SqlPlan, Error
         }
     }
 
-    let reserved: HashSet<&str> = query.variables.iter().map(String::as_str).collect();
+    let reserved: HashSet<&str> = query
+        .variables
+        .iter()
+        .map(String::as_str)
+        .chain(hidden.iter().copied())
+        .collect();
     let mut used: HashSet<String> = HashSet::new();
     let mut columns = Vec::new();
     let mut projection = Vec::new();
@@ -438,29 +496,76 @@ fn plan(query: &SelectQuery, branches: Vec<Branch<'_>>) -> Result<SqlPlan, Error
         });
     }
 
+    let mut hidden_columns = Vec::new();
+    for variable in &hidden {
+        let term = first
+            .bindings
+            .get(variable)
+            .expect("every variable of the pattern is bound in every branch");
+        for slot in 0..term.columns().len() {
+            let alias = column_alias(variable, slot, &reserved, &used);
+            used.insert(alias.clone());
+            hidden_columns.push(alias);
+        }
+    }
+
+    // Select entries of each variable, then the variables in order of
+    // first occurrence in the pattern.
+    let mut entries: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut next = 0;
+    for variable in query
+        .variables
+        .iter()
+        .map(String::as_str)
+        .chain(hidden.iter().copied())
+    {
+        let width = first
+            .bindings
+            .get(variable)
+            .map_or(0, |t| t.columns().len());
+        entries.insert(variable, (next..next + width).collect());
+        next += width;
+    }
+    let mut distinct_order = Vec::new();
+    for pattern in &query.patterns {
+        for term in [&pattern.subject, &pattern.object] {
+            if let PatternTerm::Variable(name) = term
+                && let Some(slots) = entries.remove(name.as_str())
+            {
+                distinct_order.extend(slots);
+            }
+        }
+    }
+
     let branches = branches
         .into_iter()
         .map(|branch| {
             let select = query
                 .variables
                 .iter()
-                .filter_map(|v| branch.bindings.get(v.as_str()))
+                .map(String::as_str)
+                .chain(hidden.iter().copied())
+                .filter_map(|v| branch.bindings.get(v))
                 .flat_map(|term| term.columns())
                 .map(|(table, name)| SqlExpr::Column {
                     table,
                     name: name.to_owned(),
                 })
                 .collect();
+            let fixed_columns = branch.fixed_columns();
             SqlBranch {
                 from: branch.from,
                 select,
                 conditions: branch.conditions,
+                fixed_columns,
             }
         })
         .collect();
 
     Ok(SqlPlan {
         columns,
+        hidden_columns,
+        distinct_order,
         projection,
         branches,
         distinct: query.distinct,

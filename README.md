@@ -194,6 +194,32 @@ and then:
   date/time template value against a text column, instead of failing in
   PostgreSQL or returning wrong rows.
 
+## Duplicate triples
+
+An RDF graph is a set of triples, so a triple counts once however many
+rows produce it: duplicate rows of a table without a key, an R2RML view
+that repeats rows, or two term maps that produce the same triple. A basic
+graph pattern has one solution per distinct binding of all its variables,
+and only then does `SELECT` project, so `SELECT ?city WHERE { ?p ex:city
+?city }` still returns a city once per person.
+
+The generated SQL removes duplicates with `DISTINCT` (or `UNION` across
+term maps) over the columns of every variable of the pattern, in a
+subquery when some are not selected. Before running a query that reads
+tables (not views) through a single combination of term maps, the engine
+reads their unique keys from the catalog; when every table has a key
+among the columns the solution fixes, no two rows can give the same
+solution and the SQL keeps all rows without `DISTINCT`. Otherwise
+PostgreSQL has to deduplicate, which costs a hash or sort over the rows
+and, unless an index delivers them in order, reads all of them before the
+first one is returned. `v12n explain` has no database and always shows the
+`DISTINCT`.
+
+Duplicates are compared by column values, so two different values that a
+template renders as the same string (`{a}-{b}` with `x-`, `y` and `x`,
+`-y`), or columns of different types that give the same term in two term
+maps, still count twice.
+
 ## Layout
 
 | Path | Contents |

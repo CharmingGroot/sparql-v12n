@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Keyed rows: savings twice, once per account.
+SELECT ?k WHERE { ?a ex:kind ?k }

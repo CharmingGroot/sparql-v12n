@@ -5,17 +5,17 @@ expression: "explain(MULTI,\n&format!(\"{PREFIXES}SELECT ?c ?name WHERE {{ ?c a 
 SELECT t0."id" AS "c", t0."name" AS "name"
 FROM "retail_customers" t0
 WHERE t0."id" IS NOT NULL AND t0."name" IS NOT NULL
-UNION ALL
+UNION
 SELECT t0."id" AS "c", t1."title" AS "name"
 FROM "retail_customers" t0
 JOIN (SELECT code, title FROM shop.wholesale) t1 ON t1."code" = t0."id"
 WHERE t1."title" IS NOT NULL
-UNION ALL
+UNION
 SELECT t0."code" AS "c", t1."name" AS "name"
 FROM (SELECT code, title FROM shop.wholesale) t0
 JOIN "retail_customers" t1 ON t1."id" = t0."code"
 WHERE t1."name" IS NOT NULL
-UNION ALL
+UNION
 SELECT t0."code" AS "c", t0."title" AS "name"
 FROM (SELECT code, title FROM shop.wholesale) t0
 WHERE t0."code" IS NOT NULL AND t0."title" IS NOT NULL
