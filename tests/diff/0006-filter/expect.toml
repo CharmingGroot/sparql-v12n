@@ -16,3 +16,6 @@ expect = "rejected"
 [query.string-order-code-points]
 expect = "mismatch"
 issue = 26
+
+[query.regex-digit-class]
+expect = "rejected"

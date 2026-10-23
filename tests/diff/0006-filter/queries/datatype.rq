@@ -1,0 +1,9 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+SELECT ?i WHERE {
+  ?i ex:qty ?q ; ex:name ?n ; ex:label ?l ; ex:price ?p
+  FILTER(DATATYPE(?q) = xsd:integer && DATATYPE(?n) = xsd:string
+         && DATATYPE(?l) = rdf:langString && DATATYPE(?p) != xsd:integer)
+}

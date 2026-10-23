@@ -2,15 +2,28 @@
 //! `FILTER` expressions over the terms a branch binds.
 
 use super::{Branch, Env, Scope, Source};
+use oxrdf::Term;
+
 use crate::Error;
 use crate::sparql::Expression;
 use crate::sql::{Condition, Filter, FilterTerm, FilterValue, TermMatch};
+use crate::xpath_regex::{Untranslated, translate};
 
 use super::term::{Equality, TermExpr, TermValue, term_eq};
 
-/// A way an operand is bound: in the rows where the guard holds, or in
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
+/// A way a variable is bound: in the rows where the guard holds, or in
 /// every row without one.
 type Bound<'a> = (Option<Condition>, TermExpr<'a>);
+
+/// An operand in the rows where its guard holds.
+struct Leaf<'a> {
+    value: FilterValue,
+    /// The term itself, for a variable or a constant, which RDF term
+    /// equality can compare through templates and columns.
+    term: Option<TermExpr<'a>>,
+}
 
 impl<'a> Branch<'a> {
     /// The filter `expression` over the variables of `env`. Sources in
@@ -55,47 +68,90 @@ impl<'a> Context<'_, 'a> {
             Expression::Not(a) => Filter::Not(boxed(a)?),
             Expression::Compare(op, a, b) => self.binary(a, b, |l, r| Filter::Compare {
                 op: *op,
-                left: value(l),
-                right: value(r),
+                left: l.value.clone(),
+                right: r.value.clone(),
                 same_term: same_term(l, r),
             })?,
             Expression::SameTerm(a, b) => self.binary(a, b, |l, r| Filter::SameTerm {
-                left: value(l),
-                right: value(r),
+                left: l.value.clone(),
+                right: r.value.clone(),
                 same_term: same_term(l, r),
             })?,
             Expression::Bound(variable) => self.bound(variable)?,
-            Expression::Test(test, a) => self.unary(a, |t| Filter::Test(*test, value(t)))?,
+            Expression::Test(test, a) => {
+                self.unary(a, |leaf| Filter::Test(*test, leaf.value.clone()))?
+            }
+            Expression::Regex(text, pattern, flags) => {
+                // The pattern and the flags are simple literals (SPARQL 1.1
+                // §17.4.3.14); anything else is a type error.
+                let simple = |term: &Term| match term {
+                    Term::Literal(l) if l.datatype().as_str() == XSD_STRING => {
+                        Some(l.value().to_owned())
+                    }
+                    _ => None,
+                };
+                let flags = match flags {
+                    Some(flags) => simple(flags),
+                    None => Some(String::new()),
+                };
+                let (Some(pattern), Some(flags)) = (simple(pattern), flags) else {
+                    return Ok(Filter::Constant(None));
+                };
+                match translate(&pattern, &flags) {
+                    Ok(pattern) => self.unary(text, |leaf| Filter::Regex {
+                        text: leaf.value.clone(),
+                        pattern: pattern.clone(),
+                    })?,
+                    Err(Untranslated::Invalid) => Filter::Constant(None),
+                    Err(Untranslated::Unsupported(reason)) => {
+                        return Err(Error::UnsupportedFeature(reason));
+                    }
+                }
+            }
             // A term where a boolean is expected stands for its effective
             // boolean value (SPARQL 1.1 §17.2.2).
-            Expression::Constant(_) | Expression::Variable(_) => {
-                self.unary(expression, |t| Filter::Ebv(value(t)))?
-            }
+            _ => self.unary(expression, |leaf| Filter::Ebv(leaf.value.clone()))?,
         })
     }
 
     /// The ways `expression` is bound. None for a variable that is never
     /// bound here, so that any function of it is an error (SPARQL 1.1
     /// §17.2: arguments are unbound).
-    fn operand(&self, expression: &'a Expression) -> Result<Vec<Bound<'a>>, Error> {
+    fn operand(
+        &self,
+        expression: &'a Expression,
+    ) -> Result<Vec<(Option<Condition>, Leaf<'a>)>, Error> {
+        let derived = |a: &'a Expression, f: fn(Box<FilterValue>) -> FilterValue| {
+            Ok(self
+                .operand(a)?
+                .into_iter()
+                .map(|(guard, leaf)| {
+                    let value = f(Box::new(leaf.value));
+                    (guard, Leaf { value, term: None })
+                })
+                .collect())
+        };
         match expression {
-            Expression::Constant(term) => Ok(vec![(None, TermExpr::constant(term))]),
-            Expression::Variable(name) => self.operand_of(name),
+            Expression::Constant(term) => Ok(vec![(None, leaf(TermExpr::constant(term)))]),
+            Expression::Variable(name) => Ok(self
+                .operand_of(name)?
+                .into_iter()
+                .map(|(guard, term)| (guard, leaf(term)))
+                .collect()),
+            Expression::Str(a) => derived(a, FilterValue::Str),
+            Expression::Lang(a) => derived(a, FilterValue::Lang),
+            Expression::Datatype(a) => derived(a, FilterValue::Datatype),
             _ => Err(Error::UnsupportedFeature(
-                "expressions other than variables and constants as arguments in FILTER".to_owned(),
+                "expressions other than terms as arguments in FILTER".to_owned(),
             )),
         }
     }
 
-    fn unary(
-        &self,
-        a: &'a Expression,
-        f: impl Fn(&TermExpr<'a>) -> Filter,
-    ) -> Result<Filter, Error> {
+    fn unary(&self, a: &'a Expression, f: impl Fn(&Leaf<'a>) -> Filter) -> Result<Filter, Error> {
         Ok(cases(
             self.operand(a)?
                 .into_iter()
-                .map(|(guard, term)| (guard.into_iter().collect(), f(&term)))
+                .map(|(guard, leaf)| (guard.into_iter().collect(), f(&leaf)))
                 .collect(),
         ))
     }
@@ -106,7 +162,7 @@ impl<'a> Context<'_, 'a> {
         &self,
         a: &'a Expression,
         b: &'a Expression,
-        f: impl Fn(&TermExpr<'a>, &TermExpr<'a>) -> Filter,
+        f: impl Fn(&Leaf<'a>, &Leaf<'a>) -> Filter,
     ) -> Result<Filter, Error> {
         let right = self.operand(b)?;
         let mut out = Vec::new();
@@ -159,6 +215,13 @@ fn cases(mut cases: Vec<(Vec<Condition>, Filter)>) -> Filter {
     }
 }
 
+fn leaf(term: TermExpr<'_>) -> Leaf<'_> {
+    Leaf {
+        value: value(&term),
+        term: Some(term),
+    }
+}
+
 fn value(term: &TermExpr<'_>) -> FilterValue {
     match term.value {
         TermValue::Constant(constant) => FilterValue::Constant(constant.clone()),
@@ -170,9 +233,9 @@ fn value(term: &TermExpr<'_>) -> FilterValue {
     }
 }
 
-fn same_term(left: &TermExpr<'_>, right: &TermExpr<'_>) -> TermMatch {
-    match term_eq(left, right) {
+fn same_term(left: &Leaf<'_>, right: &Leaf<'_>) -> Option<TermMatch> {
+    Some(match term_eq(left.term.as_ref()?, right.term.as_ref()?) {
         Equality::Never => TermMatch::Never,
         Equality::When(conditions) => TermMatch::When(conditions),
-    }
+    })
 }

@@ -14,6 +14,8 @@ use crate::solution::canonical_double;
 use crate::sparql::{CompareOp, TermTest};
 use crate::xsd::{self, Num, Number, Value, XSD};
 
+const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
+
 /// How much of a filter's result matters where it is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Mode {
@@ -49,18 +51,41 @@ enum Kind {
     Unknown,
     /// Comparing it is not supported, for this reason.
     Unsupported(String),
+    /// A type error, such as `STR` of a blank node.
+    Error,
 }
 
 impl Kind {
     fn is_literal(&self) -> bool {
-        !matches!(self, Self::Iri | Self::BlankNode)
+        !matches!(self, Self::Iri | Self::BlankNode | Self::Error)
     }
 }
 
+/// How SQL writes an operand's string: the IRI, a blank node's label, or
+/// a literal's lexical form.
+#[derive(Debug, Clone)]
+enum Text<'v> {
+    /// The term map's term (R2RML §11.2 for IRIs).
+    Term(&'v super::TermSql),
+    Constant(String),
+    /// The datatype of a column's natural literals, which is `xsd:string`
+    /// for its infinite values (see the decoder).
+    NaturalDatatype {
+        column: (usize, &'v str),
+        datatype: String,
+    },
+    /// Not known without the column types.
+    Unknown,
+}
+
 /// An operand of a comparison, with what its rendering needs.
+#[derive(Clone)]
 struct Operand<'v> {
     value: &'v FilterValue,
     kind: Kind,
+    /// `None` for a type error.
+    term_type: Option<TermType>,
+    text: Text<'v>,
     /// The column of a literal whose value is the column's own value.
     column: Option<(usize, &'v str)>,
     /// A constant literal's value.
@@ -142,22 +167,23 @@ impl<'a> Renderer<'a> {
                 right,
                 same_term,
             } => {
-                for side in [left, right] {
-                    if self.operand(side).float {
-                        return Err(unsupported(
-                            "sameTerm on literals from real or double precision columns, \
-                             whose -0 and 0 PostgreSQL compares as equal",
-                        ));
-                    }
+                let (l, r) = (self.operand(left), self.operand(right));
+                if l.float || r.float {
+                    return Err(unsupported(
+                        "sameTerm on literals from real or double precision columns, \
+                         whose -0 and 0 PostgreSQL compares as equal",
+                    ));
                 }
-                self.term_match(same_term, mode)?;
+                match same_term {
+                    Some(same_term) => self.term_match(same_term, mode)?,
+                    None => self.same_strings(&l, &r)?,
+                }
             }
+            Filter::Regex { text, pattern } => self.regex(text, pattern)?,
             Filter::Test(test, value) => {
-                let term_type = match value {
-                    FilterValue::Term(term) => term.term_type,
-                    FilterValue::Constant(Term::NamedNode(_)) => TermType::Iri,
-                    FilterValue::Constant(Term::BlankNode(_)) => TermType::BlankNode,
-                    FilterValue::Constant(_) => TermType::Literal,
+                let Some(term_type) = self.operand(value).term_type else {
+                    self.sql.push_str("NULL::bool");
+                    return Ok(());
                 };
                 let holds = match test {
                     TermTest::IsIri => term_type == TermType::Iri,
@@ -176,29 +202,46 @@ impl<'a> Renderer<'a> {
         let mut operand = Operand {
             value,
             kind: Kind::Unknown,
+            term_type: Some(TermType::Literal),
+            text: Text::Unknown,
             column: None,
             constant: None,
             infinite: false,
             float: false,
         };
         match value {
-            FilterValue::Constant(Term::NamedNode(_)) => operand.kind = Kind::Iri,
-            FilterValue::Constant(Term::BlankNode(_)) => operand.kind = Kind::BlankNode,
-            FilterValue::Constant(Term::Literal(literal)) => match literal.language() {
-                Some(language) => operand.kind = Kind::Lang(language.to_ascii_lowercase()),
-                None => {
-                    let datatype = literal.datatype().as_str();
-                    let value = xsd::value(literal.value(), datatype);
-                    operand.kind = kind_of(&value, datatype);
-                    operand.constant = Some(value);
+            FilterValue::Constant(Term::NamedNode(iri)) => {
+                operand.kind = Kind::Iri;
+                operand.term_type = Some(TermType::Iri);
+                operand.text = Text::Constant(iri.as_str().to_owned());
+            }
+            FilterValue::Constant(Term::BlankNode(_)) => {
+                operand.kind = Kind::BlankNode;
+                operand.term_type = Some(TermType::BlankNode);
+            }
+            FilterValue::Constant(Term::Literal(literal)) => {
+                operand.text = Text::Constant(literal.value().to_owned());
+                match literal.language() {
+                    Some(language) => operand.kind = Kind::Lang(language.to_ascii_lowercase()),
+                    None => {
+                        let datatype = literal.datatype().as_str();
+                        let value = xsd::value(literal.value(), datatype);
+                        operand.kind = kind_of(&value, datatype);
+                        operand.constant = Some(value);
+                    }
                 }
-            },
+            }
             // Quoted triples exist only with oxrdf's `rdf-12` feature.
             #[allow(unreachable_patterns)]
             FilterValue::Constant(_) => {
                 operand.kind = Kind::Unsupported("quoted triples in FILTER".to_owned())
             }
+            FilterValue::Str(inner) | FilterValue::Lang(inner) | FilterValue::Datatype(inner) => {
+                return self.derived(value, self.operand(inner));
+            }
             FilterValue::Term(term) => {
+                operand.term_type = Some(term.term_type);
+                operand.text = Text::Term(&term.term);
                 let column = match &term.term.value {
                     TermSqlValue::Column { table, name } => Some((*table, name.as_str())),
                     _ => None,
@@ -252,15 +295,94 @@ impl<'a> Renderer<'a> {
         operand
     }
 
+    /// `STR`, `LANG` or `DATATYPE` (SPARQL 1.1 §17.4.2) of `inner`.
+    fn derived<'v>(&self, value: &'v FilterValue, inner: Operand<'v>) -> Operand<'v> {
+        let mut operand = Operand {
+            value,
+            kind: Kind::String,
+            term_type: Some(TermType::Literal),
+            text: Text::Unknown,
+            column: None,
+            constant: None,
+            infinite: false,
+            float: false,
+        };
+        let error = Operand {
+            kind: Kind::Error,
+            term_type: None,
+            ..operand.clone()
+        };
+        let literal = inner.term_type == Some(TermType::Literal);
+        match value {
+            FilterValue::Str(_) if literal || inner.term_type == Some(TermType::Iri) => {
+                operand.text = inner.text;
+            }
+            FilterValue::Lang(_) if literal => {
+                operand.text = Text::Constant(match &inner.kind {
+                    Kind::Lang(tag) => tag.clone(),
+                    _ => String::new(),
+                });
+            }
+            FilterValue::Datatype(_) if literal => {
+                operand.kind = Kind::Iri;
+                operand.term_type = Some(TermType::Iri);
+                operand.text = self.datatype(&inner);
+            }
+            _ => return error,
+        }
+        operand
+    }
+
+    /// The datatype IRI of a literal operand.
+    fn datatype<'v>(&self, literal: &Operand<'v>) -> Text<'v> {
+        if let Kind::Lang(_) = literal.kind {
+            return Text::Constant(RDF_LANG_STRING.to_owned());
+        }
+        match literal.value {
+            FilterValue::Constant(Term::Literal(l)) => {
+                Text::Constant(l.datatype().as_str().to_owned())
+            }
+            FilterValue::Term(term) => match (&term.term.datatype, &term.term.value) {
+                (Some(TermDatatype::Iri(datatype)), _) => Text::Constant(datatype.clone()),
+                (Some(TermDatatype::Natural), TermSqlValue::Column { table, name }) => {
+                    match self.column_type(*table, name) {
+                        Some(ty) => {
+                            let datatype = ty
+                                .natural_datatype
+                                .clone()
+                                .unwrap_or_else(|| XSD_STRING.to_owned());
+                            if literal.infinite {
+                                Text::NaturalDatatype {
+                                    column: (*table, name.as_str()),
+                                    datatype,
+                                }
+                            } else {
+                                Text::Constant(datatype)
+                            }
+                        }
+                        None => Text::Unknown,
+                    }
+                }
+                _ => Text::Unknown,
+            },
+            // The results of STR and LANG are simple literals.
+            _ => Text::Constant(XSD_STRING.to_owned()),
+        }
+    }
+
     fn compare(
         &mut self,
         op: CompareOp,
         left: &FilterValue,
         right: &FilterValue,
-        same_term: &TermMatch,
+        same_term: &Option<TermMatch>,
         mode: Mode,
     ) -> Result<(), Error> {
         let (mut l, mut r) = (self.operand(left), self.operand(right));
+        if l.kind == Kind::Error || r.kind == Kind::Error {
+            self.sql.push_str("NULL::bool");
+            return Ok(());
+        }
         // Without column types: as if the column had the other side's
         // datatype, which shows the SQL of the common case.
         match (&l.kind, &r.kind) {
@@ -280,7 +402,7 @@ impl<'a> Renderer<'a> {
         match (&l.kind, &r.kind) {
             (Kind::Numeric(_), Kind::Numeric(_)) => self.numeric(op, &l, &r, mode),
             (Kind::String, Kind::String) if op == CompareOp::Equal => {
-                self.term_match(same_term, mode)
+                self.same_term_or_strings(same_term, &l, &r, mode)
             }
             (Kind::String, Kind::String) => {
                 if self.options.non_utf8 {
@@ -289,9 +411,9 @@ impl<'a> Renderer<'a> {
                          byte order is not code point order",
                     ));
                 }
-                self.string(&l)?;
+                self.text(&l)?;
                 self.sql.push_str(&format!(" COLLATE \"C\" {} ", op.sql()));
-                self.string(&r)
+                self.text(&r)
             }
             (Kind::Boolean, Kind::Boolean) => {
                 self.typed_value(&l, "bool")?;
@@ -333,7 +455,7 @@ impl<'a> Renderer<'a> {
         op: CompareOp,
         l: &Operand<'_>,
         r: &Operand<'_>,
-        same_term: &TermMatch,
+        same_term: &Option<TermMatch>,
         mode: Mode,
     ) -> Result<(), Error> {
         if (l.infinite && r.kind == Kind::String) || (r.infinite && l.kind == Kind::String) {
@@ -347,7 +469,7 @@ impl<'a> Renderer<'a> {
             let sql = match (op, a, b) {
                 (CompareOp::Equal, Kind::Iri, Kind::Iri)
                 | (CompareOp::Equal, Kind::BlankNode, Kind::BlankNode) => {
-                    return self.term_match(same_term, mode);
+                    return self.same_term_or_strings(same_term, l, r, mode);
                 }
                 (CompareOp::Equal, ..) => "false",
                 _ => "NULL::bool",
@@ -366,11 +488,11 @@ impl<'a> Renderer<'a> {
             // compare the values of more datatypes (an extension SPARQL
             // allows, §17.3.1) turn some of these errors into false, which
             // is told apart only under negation: accepted where it is not.
-            CompareOp::Equal if ill_typed => self.only_same_term(same_term, mode),
+            CompareOp::Equal if ill_typed => self.only_same_term(same_term, l, r, mode),
             CompareOp::Equal
                 if same_type && mode == Mode::Positive && matches!(a, Kind::Lang(_)) =>
             {
-                self.term_match(same_term, mode)
+                self.same_term_or_strings(same_term, l, r, mode)
             }
             _ if same_type => Err(unsupported(&format!(
                 "comparing two {} literals with {}{}: SPARQL 1.1 only finds the same RDF term \
@@ -396,16 +518,84 @@ impl<'a> Renderer<'a> {
 
     /// RDFterm-equal of two literals: true for the same term, an error
     /// otherwise.
-    fn only_same_term(&mut self, same_term: &TermMatch, mode: Mode) -> Result<(), Error> {
+    fn only_same_term(
+        &mut self,
+        same_term: &Option<TermMatch>,
+        l: &Operand<'_>,
+        r: &Operand<'_>,
+        mode: Mode,
+    ) -> Result<(), Error> {
         match mode {
-            Mode::Positive => self.term_match(same_term, mode),
+            Mode::Positive => self.same_term_or_strings(same_term, l, r, mode),
             Mode::Exact => {
                 self.sql.push_str("CASE WHEN ");
-                self.term_match(same_term, Mode::Positive)?;
+                self.same_term_or_strings(same_term, l, r, Mode::Positive)?;
                 self.sql.push_str(" THEN true END");
                 Ok(())
             }
         }
+    }
+
+    fn same_term_or_strings(
+        &mut self,
+        same_term: &Option<TermMatch>,
+        l: &Operand<'_>,
+        r: &Operand<'_>,
+        mode: Mode,
+    ) -> Result<(), Error> {
+        match same_term {
+            Some(same_term) => self.term_match(same_term, mode),
+            None => self.same_strings(l, r),
+        }
+    }
+
+    /// Whether two operands are the same RDF term, by kind and string:
+    /// for the results of `STR`, `LANG` and `DATATYPE`, which are simple
+    /// literals and IRIs. Never an error.
+    fn same_strings(&mut self, l: &Operand<'_>, r: &Operand<'_>) -> Result<(), Error> {
+        let same_kind = match (&l.kind, &r.kind) {
+            (Kind::Error, _) | (_, Kind::Error) => {
+                self.sql.push_str("NULL::bool");
+                return Ok(());
+            }
+            (Kind::Lang(a), Kind::Lang(b)) => a == b,
+            (Kind::Iri, Kind::Iri)
+            | (Kind::BlankNode, Kind::BlankNode)
+            | (Kind::String | Kind::Unknown, Kind::String | Kind::Unknown) => true,
+            _ => false,
+        };
+        if !same_kind {
+            self.sql.push_str("false");
+            return Ok(());
+        }
+        self.sql.push('(');
+        self.text(l)?;
+        self.sql.push_str(" = ");
+        self.text(r)?;
+        self.sql.push(')');
+        Ok(())
+    }
+
+    /// `REGEX` over a string literal (SPARQL 1.1 §17.4.3.14); anything else
+    /// is a type error.
+    fn regex(&mut self, text: &FilterValue, pattern: &str) -> Result<(), Error> {
+        let operand = self.operand(text);
+        if !matches!(operand.kind, Kind::String | Kind::Lang(_) | Kind::Unknown) {
+            self.sql.push_str("NULL::bool");
+            return Ok(());
+        }
+        if self.options.non_utf8 {
+            return Err(unsupported(
+                "REGEX in a database whose encoding is not UTF-8, where PostgreSQL's \
+                 regular expressions do not see Unicode characters",
+            ));
+        }
+        self.sql.push('(');
+        self.text(&operand)?;
+        self.sql.push_str(" COLLATE \"C\" ~ ");
+        self.expr(&super::SqlExpr::Param(pattern.into()));
+        self.sql.push_str("::text)");
+        Ok(())
     }
 
     /// Whether two terms are the same RDF term, never an error.
@@ -630,28 +820,51 @@ impl<'a> Renderer<'a> {
         Ok(())
     }
 
-    /// A string literal's lexical form as text.
-    fn string(&mut self, operand: &Operand<'_>) -> Result<(), Error> {
-        match operand.value {
-            FilterValue::Constant(Term::Literal(literal)) => {
-                if literal.value().contains('\0') {
+    /// The operand's string as text: an IRI, a blank node's label or a
+    /// literal's lexical form.
+    fn text(&mut self, operand: &Operand<'_>) -> Result<(), Error> {
+        match &operand.text {
+            Text::Constant(text) => {
+                if text.contains('\0') {
                     return Err(unsupported("strings with a NUL character in FILTER"));
                 }
-                self.expr(&super::SqlExpr::Param(literal.value().into()));
+                self.expr(&super::SqlExpr::Param(text.as_str().into()));
                 self.sql.push_str("::text");
-                Ok(())
             }
-            FilterValue::Term(term) => {
+            Text::Term(term) => {
+                // A template is a concatenation, which binds looser than
+                // the COLLATE and the comparison around it.
                 let types = self.options.column_types;
-                self.term_string(&term.term, types, true)
+                self.sql.push('(');
+                if term.base_iri.is_some() {
+                    self.term_side(term, types)?;
+                } else {
+                    self.term_string(term, types, true)?;
+                }
+                self.sql.push(')');
             }
-            FilterValue::Constant(_) => unreachable!("string operands are literals"),
+            Text::NaturalDatatype { column, datatype } => {
+                self.sql.push_str(&format!(
+                    "CASE WHEN isfinite({}) THEN ",
+                    super::column_sql(column.0, column.1)
+                ));
+                self.expr(&super::SqlExpr::Param(datatype.as_str().into()));
+                self.sql.push_str("::text ELSE ");
+                self.expr(&super::SqlExpr::Param(XSD_STRING.into()));
+                self.sql.push_str("::text END");
+            }
+            Text::Unknown => self.sql.push_str("NULL::text"),
         }
+        Ok(())
     }
 
     /// The effective boolean value (SPARQL 1.1 §17.2.2).
     fn ebv(&mut self, value: &FilterValue) -> Result<(), Error> {
         let operand = self.operand(value);
+        if operand.kind == Kind::Error {
+            self.sql.push_str("NULL::bool");
+            return Ok(());
+        }
         if let Some(constant) = &operand.constant {
             let lexical = match value {
                 FilterValue::Constant(Term::Literal(l)) => l.value(),
@@ -696,7 +909,7 @@ impl<'a> Renderer<'a> {
                 .push_str(&format!("({c} <> 0 AND {c} <> 'NaN'::float8)")),
             (Kind::String | Kind::Lang(_) | Kind::Unknown, _) => {
                 self.sql.push('(');
-                self.string(&operand)?;
+                self.text(&operand)?;
                 self.sql.push_str(" <> '')");
             }
             (Kind::Unsupported(reason), _) => return Err(unsupported(reason)),
@@ -976,11 +1189,11 @@ mod tests {
         assert_eq!(x("txt", "?x = \"a\""), "(t0.\"txt\" = $1)");
         assert_eq!(
             x("txt", "?x < \"a\""),
-            "t0.\"txt\"::text COLLATE \"C\" < $1::text"
+            "(t0.\"txt\"::text) COLLATE \"C\" < $1::text"
         );
         assert_eq!(
             x("u", "?x > \"a\""),
-            "t0.\"u\"::text COLLATE \"C\" > $1::text"
+            "(t0.\"u\"::text) COLLATE \"C\" > $1::text"
         );
         assert!(rejected("?s ex:bpc ?x", "?x > \"a\"").contains("bpchar"));
         assert!(matches!(
@@ -1066,8 +1279,8 @@ mod tests {
             x("f8", "?x"),
             "(t0.\"f8\" <> 0 AND t0.\"f8\" <> 'NaN'::float8)"
         );
-        assert_eq!(x("txt", "?x"), "(t0.\"txt\"::text <> '')");
-        assert_eq!(x("label", "?x"), "(t0.\"txt\"::text <> '')");
+        assert_eq!(x("txt", "?x"), "((t0.\"txt\"::text) <> '')");
+        assert_eq!(x("label", "?x"), "((t0.\"txt\"::text) <> '')");
         assert_eq!(x("link", "?x"), "NULL::bool");
         assert_eq!(x("i4", "\"\" || \"x\""), "(false OR true)");
         assert_eq!(x("i4", "0.0 || \"abc\"^^xsd:integer"), "(false OR false)");
@@ -1092,5 +1305,84 @@ mod tests {
             x("i4", "!BOUND(?nothing) && BOUND(?x)"),
             "(NOT (false) AND true)"
         );
+    }
+
+    #[test]
+    fn str_lang_and_datatype_are_strings_and_iris() {
+        assert_eq!(
+            x("txt", "STR(?x) = \"a\""),
+            "((t0.\"txt\"::text) = $1::text)"
+        );
+        let iri = x("link", "STR(?x) < \"b\"");
+        assert!(
+            iri.starts_with("($1 || CASE WHEN t0.\"i4\"::text IS NULL"),
+            "{iri}"
+        );
+        assert!(iri.ends_with(" END) COLLATE \"C\" < $2::text"), "{iri}");
+        // LANG gives the tag, lower-cased as in the results, or "".
+        assert_eq!(x("label", "LANG(?x) = \"en\""), "($1::text = $2::text)");
+        assert_eq!(x("i4", "LANG(?x)"), "($1::text <> '')");
+        assert_eq!(
+            x("i4", "DATATYPE(?x) = xsd:integer"),
+            "($1::text = $2::text)"
+        );
+        // Infinite timestamps are plain literals.
+        assert_eq!(
+            x("ts", "DATATYPE(?x) = xsd:dateTime"),
+            "(CASE WHEN isfinite(t0.\"ts\") THEN $1::text ELSE $2::text END = $3::text)"
+        );
+        // Type errors: STR of a blank node does not exist here, LANG and
+        // DATATYPE of an IRI do.
+        assert_eq!(x("link", "LANG(?x) = \"\""), "NULL::bool");
+        assert_eq!(x("link", "isLiteral(DATATYPE(?x))"), "NULL::bool");
+        assert_eq!(
+            x("i4", "isIRI(DATATYPE(?x)) && isLiteral(STR(?x))"),
+            "(true AND true)"
+        );
+        assert_eq!(x("i4", "sameTerm(STR(?x), ?x)"), "false");
+        assert_eq!(
+            x("txt", "sameTerm(STR(?x), ?x)"),
+            "((t0.\"txt\"::text) = (t0.\"txt\"::text))"
+        );
+        // A string of a float column has no exact SQL.
+        assert!(rejected("?s ex:f8 ?x", "STR(?x) = \"1\"").contains("float8"));
+    }
+
+    #[test]
+    fn regex_matches_string_literals_under_the_c_collation() {
+        let (sql, params) = {
+            let types: ColumnTypes = COLUMNS
+                .iter()
+                .map(|(c, ty)| {
+                    (
+                        (LogicalTable::TableName("t".into()), (*c).to_owned()),
+                        column_type(ty),
+                    )
+                })
+                .collect();
+            let rendered =
+                plan("SELECT ?s WHERE { ?s ex:label ?x FILTER(REGEX(?x, \"^a.c\", \"i\")) }")
+                    .unwrap()
+                    .to_sql_with(&RenderOptions {
+                        column_types: Some(&types),
+                        ..RenderOptions::default()
+                    })
+                    .unwrap();
+            (rendered.sql, rendered.params)
+        };
+        assert!(
+            sql.contains("((t0.\"txt\"::text) COLLATE \"C\" ~ $1::text)"),
+            "{sql}"
+        );
+        assert_eq!(params, ["^[Aa][^\\u000A\\u000D][Cc]"]);
+        assert_eq!(x("i4", "REGEX(?x, \"1\")"), "NULL::bool");
+        assert_eq!(x("link", "REGEX(?x, \"1\")"), "NULL::bool");
+        assert_eq!(x("txt", "REGEX(?x, \"(\")"), "NULL::bool");
+        assert_eq!(x("txt", "REGEX(?x, \"a\"@en)"), "NULL::bool");
+        assert!(rejected("?s ex:txt ?x", "REGEX(?x, \"\\\\d\")").contains("\\d"));
+        assert!(matches!(
+            render_with("SELECT ?s WHERE { ?s ex:txt ?x FILTER(REGEX(?x, \"a\")) }", true),
+            Err(Error::UnsupportedFeature(reason)) if reason.contains("UTF-8")
+        ));
     }
 }

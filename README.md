@@ -364,9 +364,31 @@ Otherwise the column is cast to the type XPath promotes to (`?qty < 5.5`
 casts the integer column to `numeric`, `?qty < 5.5e0` to `float8`), which
 no index on the column serves.
 
-`sameTerm`, `BOUND`, `isIRI`, `isBlank` and `isLiteral` are supported,
-and a term where a boolean is expected stands for its effective boolean
-value (an empty string and zero are false).
+`sameTerm`, `BOUND`, `isIRI`, `isBlank`, `isLiteral`, `STR`, `LANG` and
+`DATATYPE` are supported, and a term where a boolean is expected stands
+for its effective boolean value (an empty string and zero are false).
+`STR` and `DATATYPE` of a column work where its lexical form or natural
+datatype is known in SQL, as for joins; `date` and `timestamp` infinities
+are plain literals, so their `DATATYPE` is `xsd:string`.
+
+`REGEX` translates the XPath regular expression into a PostgreSQL pattern
+with the same matches, applied with `~` under `COLLATE "C"`:
+
+| XPath | PostgreSQL pattern |
+|---|---|
+| `.` (without `s`) | any character but newline and carriage return, `[^\u000A\u000D]` |
+| `^`, `$` | the start and end of the string, as PostgreSQL's defaults |
+| `^`, `$` with `m` | at line boundaries, but not after a final newline (XPath 3.1), with lookaround |
+| `i` | each character expanded to its case variants (`lower-case` or `upper-case` equal), so `i` also matches `ı` and `k` the Kelvin sign, whatever the database locale |
+| `\s` | exactly space, tab, newline, carriage return |
+| `x` | whitespace outside character classes removed |
+| other characters | written as `\uXXXX` escapes unless ASCII letters or digits |
+
+Rejected as unsupported: `\d`, `\w`, `\i`, `\c`, `\p{..}` and their
+complements (Unicode classes that PostgreSQL only has through the locale),
+back-references, character class subtraction, counts above 255, `\S`
+inside a class, the `q` flag, and patterns or flags that are not
+constants. An invalid pattern or flag is an error, as in XPath.
 
 Rejected as unsupported rather than answered differently from engines
 that extend SPARQL:
@@ -380,9 +402,10 @@ that extend SPARQL:
   constants outside the years 1 to 9999 or finer than a microsecond;
 - `sameTerm` over `real` or `double precision` columns (PostgreSQL finds
   `-0` and `0` equal);
-- other functions (`STR`, `LANG`, `DATATYPE`, `REGEX` and the rest),
-  arithmetic, `IN`, `EXISTS`, and expressions other than variables and
-  constants as operands.
+- other functions, arithmetic, `IN`, `EXISTS`, and expressions other
+  than terms (variables, constants, and `STR`, `LANG` or `DATATYPE` of
+  them) as operands;
+- string ordering and `REGEX` in a database whose encoding is not UTF-8.
 
 ## Layout
 

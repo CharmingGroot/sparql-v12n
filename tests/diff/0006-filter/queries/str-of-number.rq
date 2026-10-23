@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+# STR gives the lexical form as a simple literal: compared as a string.
+SELECT ?i WHERE { ?i ex:qty ?q FILTER(STR(?q) < "6" && STR(?q) != "0") }

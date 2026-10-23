@@ -57,6 +57,29 @@ pub enum Expression {
     SameTerm(Box<Expression>, Box<Expression>),
     Bound(String),
     Test(TermTest, Box<Expression>),
+    /// `STR` (SPARQL 1.1 §17.4.2.5).
+    Str(Box<Expression>),
+    /// `LANG` (SPARQL 1.1 §17.4.2.6).
+    Lang(Box<Expression>),
+    /// `DATATYPE` (SPARQL 1.1 §17.4.2.7).
+    Datatype(Box<Expression>),
+    /// `REGEX(text, pattern, flags)` (SPARQL 1.1 §17.4.3.14), with the
+    /// pattern and the flags constants.
+    Regex(Box<Expression>, Term, Option<Term>),
+}
+
+impl Expression {
+    /// Whether the expression is an RDF term rather than a boolean.
+    pub(crate) fn is_term(&self) -> bool {
+        matches!(
+            self,
+            Self::Constant(_)
+                | Self::Variable(_)
+                | Self::Str(_)
+                | Self::Lang(_)
+                | Self::Datatype(_)
+        )
+    }
 }
 
 /// The relational operators of SPARQL 1.1 §17.3, `!=` aside.
@@ -264,17 +287,49 @@ fn filter_expression(expression: &SparqlExpression) -> Result<Expression, Error>
         SparqlExpression::GreaterOrEqual(a, b) => compare(CompareOp::GreaterOrEqual, a, b)?,
         SparqlExpression::SameTerm(a, b) => Expression::SameTerm(operand(a)?, operand(b)?),
         SparqlExpression::Bound(v) => Expression::Bound(v.as_str().to_owned()),
+        SparqlExpression::FunctionCall(Function::Regex, args) => {
+            let constant = |e: &SparqlExpression| match e {
+                SparqlExpression::NamedNode(n) => Ok(Term::from(n.clone())),
+                SparqlExpression::Literal(l) => Ok(Term::from(l.clone())),
+                _ => Err(unsupported(
+                    "REGEX with a pattern or flags that are not constants",
+                )),
+            };
+            match args.as_slice() {
+                [text, pattern] => Expression::Regex(operand(text)?, constant(pattern)?, None),
+                [text, pattern, flags] => {
+                    Expression::Regex(operand(text)?, constant(pattern)?, Some(constant(flags)?))
+                }
+                _ => {
+                    return Err(Error::QuerySyntax(
+                        "REGEX takes two or three arguments".into(),
+                    ));
+                }
+            }
+        }
         SparqlExpression::FunctionCall(function, args) => {
-            let test = match function {
-                Function::IsIri => TermTest::IsIri,
-                Function::IsBlank => TermTest::IsBlank,
-                Function::IsLiteral => TermTest::IsLiteral,
-                other => return Err(unsupported(&format!("the {other} function in FILTER"))),
-            };
             let [arg] = args.as_slice() else {
-                return Err(Error::QuerySyntax(format!("{function} takes one argument")));
+                return Err(match function {
+                    Function::IsIri
+                    | Function::IsBlank
+                    | Function::IsLiteral
+                    | Function::Str
+                    | Function::Lang
+                    | Function::Datatype => {
+                        Error::QuerySyntax(format!("{function} takes one argument"))
+                    }
+                    other => unsupported(&format!("the {other} function in FILTER")),
+                });
             };
-            Expression::Test(test, operand(arg)?)
+            match function {
+                Function::IsIri => Expression::Test(TermTest::IsIri, operand(arg)?),
+                Function::IsBlank => Expression::Test(TermTest::IsBlank, operand(arg)?),
+                Function::IsLiteral => Expression::Test(TermTest::IsLiteral, operand(arg)?),
+                Function::Str => Expression::Str(operand(arg)?),
+                Function::Lang => Expression::Lang(operand(arg)?),
+                Function::Datatype => Expression::Datatype(operand(arg)?),
+                other => return Err(unsupported(&format!("the {other} function in FILTER"))),
+            }
         }
         SparqlExpression::In(..) => return Err(unsupported("IN and NOT IN in FILTER")),
         SparqlExpression::Exists(_) => return Err(unsupported("EXISTS and NOT EXISTS")),
@@ -326,15 +381,17 @@ fn compare(op: CompareOp, a: &SparqlExpression, b: &SparqlExpression) -> Result<
     Ok(Expression::Compare(op, operand(a)?, operand(b)?))
 }
 
-/// An argument that must be an RDF term: a variable or a constant. Other
-/// expressions as arguments, such as a comparison compared with `true`,
-/// are not supported.
+/// An argument that must be an RDF term: a variable, a constant, or `STR`,
+/// `LANG` or `DATATYPE` of one. Other expressions as arguments, such as a
+/// comparison compared with `true`, are not supported.
 fn operand(expression: &SparqlExpression) -> Result<Box<Expression>, Error> {
-    match filter_expression(expression)? {
-        operand @ (Expression::Constant(_) | Expression::Variable(_)) => Ok(Box::new(operand)),
-        _ => Err(unsupported(
-            "expressions other than variables and constants as arguments in FILTER",
-        )),
+    let operand = filter_expression(expression)?;
+    if operand.is_term() {
+        Ok(Box::new(operand))
+    } else {
+        Err(unsupported(
+            "expressions other than terms as arguments in FILTER",
+        ))
     }
 }
 
@@ -640,12 +697,20 @@ mod tests {
                 "the STRLEN function",
             ),
             (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(STR(UCASE(?t)) = \"A\") }",
+                "the UCASE function",
+            ),
+            (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(UCASE(?t)) }",
                 "the UCASE function",
             ),
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER((?t > 1) = true) }",
-                "expressions other than variables and constants",
+                "expressions other than terms",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(REGEX(?t, ?t)) }",
+                "REGEX with a pattern or flags that are not constants",
             ),
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER EXISTS { ?c ex:name ?n } }",

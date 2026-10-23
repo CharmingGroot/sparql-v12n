@@ -1412,3 +1412,82 @@ async fn filter_comparisons_without_exact_sql_are_rejected() {
         );
     }
 }
+
+/// REGEX follows XPath, not PostgreSQL's defaults: `.` does not match a
+/// newline or carriage return, `$` is the end of the string, the `m` flag
+/// does not find a line after a final newline, and `i` matches the case
+/// variants XPath defines, independently of the database locale.
+#[tokio::test]
+async fn regex_follows_xpath_matching() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        r"SELECT * FROM (VALUES
+            (1, 'Alice'), (2, 'ALI'), (3, 'al' || chr(305)), (4, 'a' || chr(10) || 'b'),
+            (5, 'a' || chr(13) || 'b'), (6, 'ab' || chr(10)), (7, chr(8490) || 'elvin'),
+            (8, 'x.y'), (9, 'x1y')
+          ) AS v(id, s)",
+        &["s"],
+    );
+    let cases: [(&str, &[&str]); 12] = [
+        (r#"REGEX(?s, "^ali", "i")"#, &["1", "2", "3"]),
+        (r#"REGEX(?s, "^ALI$")"#, &["2"]),
+        (r#"REGEX(?s, "^a.b$")"#, &[]),
+        (r#"REGEX(?s, "^a.b$", "s")"#, &["4", "5"]),
+        (r#"REGEX(?s, "b$")"#, &["4", "5"]),
+        (r#"REGEX(?s, "b$", "m")"#, &["4", "5", "6"]),
+        (r#"REGEX(?s, "^$", "m")"#, &[]),
+        (r#"REGEX(?s, "^b", "m")"#, &["4"]),
+        (r#"REGEX(?s, "^Kelvin$", "i")"#, &["7"]),
+        (r#"REGEX(?s, "x\\.y")"#, &["8"]),
+        (r#"REGEX(?s, "x . y", "x")"#, &["8", "9"]),
+        (r#"REGEX(?s, "\\s")"#, &["4", "5", "6"]),
+    ];
+    for (filter, expected) in cases {
+        assert_eq!(
+            filtered_rows(&url, &mapping, "?row ex:s ?s", filter).await,
+            expected,
+            "{filter}"
+        );
+    }
+}
+
+/// STR, LANG and DATATYPE of the terms rows give, including the infinite
+/// timestamps that are plain literals.
+#[tokio::test]
+async fn str_lang_and_datatype_of_row_terms() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        r"SELECT * FROM (VALUES
+            (1, TIMESTAMP '2024-01-01 00:00:00', 5, 'a b'),
+            (2, 'infinity', 50, 'c')
+          ) AS v(id, ts, n, s)",
+        &["ts", "n", "s"],
+    );
+    let cases: [(&str, &str, &[&str]); 5] = [
+        ("?row ex:ts ?t", "DATATYPE(?t) = xsd:string", &["2"]),
+        (
+            "?row ex:ts ?t",
+            "DATATYPE(?t) = xsd:dateTime && LANG(?t) = \"\"",
+            &["1"],
+        ),
+        // Strings, not numbers: "50" < "6".
+        ("?row ex:n ?n", "STR(?n) < \"6\"", &["1", "2"]),
+        (
+            "?row ex:n ?n",
+            "REGEX(STR(?n), \"^5\") && DATATYPE(?n) = xsd:integer",
+            &["1", "2"],
+        ),
+        (
+            "?row ex:s ?s",
+            "REGEX(STR(?row), \"/row/1$\") && sameTerm(STR(?s), ?s)",
+            &["1"],
+        ),
+    ];
+    for (patterns, filter, expected) in cases {
+        assert_eq!(
+            filtered_rows(&url, &mapping, patterns, filter).await,
+            expected,
+            "{filter}"
+        );
+    }
+}
