@@ -6,7 +6,7 @@ use oxrdf::Term;
 
 use crate::mapping::template::{iri_safe, is_iunreserved};
 use crate::mapping::{Template, TemplatePart, TermMap, TermMapValue, TermType};
-use crate::sql::{Condition, Param, SqlExpr};
+use crate::sql::{Condition, Param, SqlExpr, TermDatatype, TermSql, TermSqlValue};
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -72,22 +72,55 @@ impl<'a> TermExpr<'a> {
         }
     }
 
-    /// The term's lexical form as one SQL string expression.
-    fn to_sql_string(self) -> SqlExpr {
-        match self.value {
-            TermValue::Constant(term) => SqlExpr::Param(lexical_form(term).into()),
-            TermValue::Column { table, name } => column(table, name),
-            TermValue::Template { table, template } => SqlExpr::Concat(
-                template
-                    .parts()
-                    .iter()
-                    .map(|part| match part {
-                        TemplatePart::Literal(text) => SqlExpr::Param(text.as_str().into()),
-                        TemplatePart::Column(name) => column(table, name),
-                    })
-                    .collect(),
+    /// The term as one side of a [`Condition::SameTerm`].
+    fn to_term_sql(self) -> TermSql {
+        let (value, datatype) = match self.value {
+            TermValue::Constant(term) => (TermSqlValue::Param(lexical_form(term).into()), None),
+            TermValue::Column { table, name } => (
+                TermSqlValue::Column {
+                    table,
+                    name: name.to_owned(),
+                },
+                Some(TermDatatype::Natural),
             ),
-        }
+            TermValue::Template { table, template } => (
+                TermSqlValue::Template {
+                    table,
+                    parts: template.parts().to_vec(),
+                    iri_safe: self.term_type == TermType::Iri,
+                },
+                // R2RML §7.4: a template literal is a plain string.
+                Some(TermDatatype::Iri(XSD_STRING.to_owned())),
+            ),
+        };
+        let datatype = match (self.term_type, self.language, self.datatype) {
+            (TermType::Literal, None, Some(iri)) => Some(TermDatatype::Iri(iri.to_owned())),
+            (TermType::Literal, None, None) => datatype,
+            _ => None,
+        };
+        TermSql { value, datatype }
+    }
+}
+
+/// Template columns compared pairwise: lexical forms only, the datatype
+/// of a template is fixed.
+fn template_column(table: usize, name: &str) -> TermSql {
+    TermSql {
+        value: TermSqlValue::Column {
+            table,
+            name: name.to_owned(),
+        },
+        datatype: None,
+    }
+}
+
+/// The column a non-template term reads; a constant here is compared with
+/// another constant, which `term_eq` decides without SQL.
+fn column_or_constant(term: &TermExpr<'_>) -> SqlExpr {
+    match term.value {
+        TermValue::Column { table, name } => column(table, name),
+        TermValue::Constant(term) => SqlExpr::Param(lexical_form(term).into()),
+        TermValue::Template { .. } => unreachable!("templates are matched by decompose_constant"),
     }
 }
 
@@ -148,7 +181,9 @@ pub(crate) fn term_eq(left: &TermExpr<'_>, right: &TermExpr<'_>) -> Equality {
             Decomposition::Columns(pairs) => Equality::When(
                 pairs
                     .into_iter()
-                    .map(|(lc, rc)| Condition::Eq(column(lt, lc), column(rt, rc)))
+                    .map(|(lc, rc)| {
+                        Condition::SameTerm(template_column(lt, lc), template_column(rt, rc))
+                    })
                     .collect(),
             ),
             Decomposition::Disjoint => Equality::Never,
@@ -158,12 +193,12 @@ pub(crate) fn term_eq(left: &TermExpr<'_>, right: &TermExpr<'_>) -> Equality {
     }
 }
 
-/// Fallback that compares the rendered strings. IRI-safe percent-encoding
-/// of template values (R2RML §7.3) is not applied on this path.
+/// Fallback that compares the rendered strings, IRI-safe encoding
+/// included (R2RML §7.3).
 fn string_eq(left: &TermExpr<'_>, right: &TermExpr<'_>) -> Equality {
-    Equality::When(vec![Condition::Eq(
-        left.to_sql_string(),
-        right.to_sql_string(),
+    Equality::When(vec![Condition::SameTerm(
+        left.to_term_sql(),
+        right.to_term_sql(),
     )])
 }
 
@@ -179,9 +214,9 @@ fn constant_eq(constant: &Term, other: &TermExpr<'_>, iri: bool) -> Equality {
                     .collect(),
             ),
             ConstantMatch::NoMatch => Equality::Never,
-            ConstantMatch::Unknown => Equality::When(vec![Condition::Eq(
-                other.to_sql_string(),
-                SqlExpr::Param(value.into()),
+            ConstantMatch::Unknown => Equality::When(vec![Condition::SameTerm(
+                other.to_term_sql(),
+                TermExpr::constant(constant).to_term_sql(),
             )]),
         },
         _ => {
@@ -192,7 +227,7 @@ fn constant_eq(constant: &Term, other: &TermExpr<'_>, iri: bool) -> Equality {
                 _ => None,
             };
             Equality::When(vec![Condition::Eq(
-                other.to_sql_string(),
+                column_or_constant(other),
                 SqlExpr::Param(Param {
                     value: value.to_owned(),
                     datatype,
@@ -442,7 +477,7 @@ mod tests {
     }
 
     fn eq(table_l: usize, l: &str, table_r: usize, r: &str) -> Condition {
-        Condition::Eq(column(table_l, l), column(table_r, r))
+        Condition::SameTerm(template_column(table_l, l), template_column(table_r, r))
     }
 
     #[test]
@@ -625,10 +660,62 @@ mod tests {
                 &TermExpr::from_term_map(&iri_column, 1),
                 &TermExpr::from_term_map(&t, 0)
             ),
-            Equality::When(vec![Condition::Eq(
-                column(1, "home"),
-                SqlExpr::Concat(vec![SqlExpr::Param("http://ex/".into()), column(0, "id")])
+            Equality::When(vec![Condition::SameTerm(
+                TermSql {
+                    value: TermSqlValue::Column {
+                        table: 1,
+                        name: "home".into()
+                    },
+                    datatype: None,
+                },
+                TermSql {
+                    value: TermSqlValue::Template {
+                        table: 0,
+                        parts: template("http://ex/{id}").parts().to_vec(),
+                        iri_safe: true,
+                    },
+                    datatype: None,
+                }
             )])
+        );
+    }
+
+    #[test]
+    fn term_eq_literal_columns_carry_their_datatypes() {
+        let natural = column_map("a", TermType::Literal);
+        let mut typed = column_map("b", TermType::Literal);
+        typed.datatype = Some("http://www.w3.org/2001/XMLSchema#integer".into());
+        let literal_template = TermMap {
+            value: TermMapValue::Template(template("{x}{y}")),
+            term_type: TermType::Literal,
+            datatype: None,
+            language: None,
+        };
+        let datatypes = |l: &TermMap, r: &TermMap| match term_eq(
+            &TermExpr::from_term_map(l, 0),
+            &TermExpr::from_term_map(r, 1),
+        ) {
+            Equality::When(c) => match &c[..] {
+                [Condition::SameTerm(l, r)] => (l.datatype.clone(), r.datatype.clone()),
+                other => panic!("{other:?}"),
+            },
+            Equality::Never => panic!("never"),
+        };
+        let integer = TermDatatype::Iri("http://www.w3.org/2001/XMLSchema#integer".into());
+        assert_eq!(
+            datatypes(&natural, &natural),
+            (Some(TermDatatype::Natural), Some(TermDatatype::Natural))
+        );
+        assert_eq!(
+            datatypes(&natural, &typed),
+            (Some(TermDatatype::Natural), Some(integer))
+        );
+        assert_eq!(
+            datatypes(&natural, &literal_template),
+            (
+                Some(TermDatatype::Natural),
+                Some(TermDatatype::Iri(XSD_STRING.into()))
+            )
         );
     }
 

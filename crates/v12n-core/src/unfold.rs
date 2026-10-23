@@ -189,11 +189,10 @@ impl<'a> Branch<'a> {
                 let parent = mapping
                     .triples_map(&reference.parent_triples_map)
                     .expect("parent triples maps are checked when the mapping is parsed");
-                // R2RML §8: without join conditions over the same logical
-                // table, the parent subject comes from the same row.
-                let parent_table = if reference.join_conditions.is_empty()
-                    && parent.logical_table == tm.logical_table
-                {
+                // R2RML §8: without join conditions the joint SQL query is
+                // the child query alone, so the parent subject comes from the
+                // same row. Parsing checks both use the same logical table.
+                let parent_table = if reference.join_conditions.is_empty() {
                     table
                 } else {
                     self.push_table(&parent.logical_table)
@@ -251,9 +250,18 @@ impl<'a> Branch<'a> {
     fn add_not_null(&mut self) {
         let mut covered = HashSet::new();
         for condition in &self.conditions {
-            if let Condition::Eq(left, right) = condition {
-                collect_columns(left, &mut covered);
-                collect_columns(right, &mut covered);
+            match condition {
+                Condition::Eq(left, right) => {
+                    collect_columns(left, &mut covered);
+                    collect_columns(right, &mut covered);
+                }
+                // Every rendering maps NULL to NULL, so `=` is not true.
+                Condition::SameTerm(left, right) => {
+                    for (table, name) in left.columns().into_iter().chain(right.columns()) {
+                        covered.insert((table, name.to_owned()));
+                    }
+                }
+                Condition::IsNotNull(_) => {}
             }
         }
         for term in &self.terms {

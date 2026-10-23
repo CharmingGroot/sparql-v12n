@@ -319,6 +319,10 @@ fn database_failure(error: v12n_postgres::Error) -> Failure {
     let (status, kind) = match &error {
         // Before the first row, so the client may retry later.
         Error::Timeout(_) => (StatusCode::SERVICE_UNAVAILABLE, "timeout"),
+        // A comparison the column types make impossible to do right in SQL.
+        Error::Core(v12n_core::Error::UnsupportedFeature(_)) => {
+            (StatusCode::NOT_IMPLEMENTED, "unsupported")
+        }
         Error::Core(_) => (StatusCode::INTERNAL_SERVER_ERROR, "data"),
         Error::Config(_) | Error::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "database"),
     };

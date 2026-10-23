@@ -375,3 +375,138 @@ fn from_turtle_invalid_constructs_error() {
         assert!(err.to_string().contains("<#A>"), "{err}");
     }
 }
+
+const ANONYMOUS: &str = r#"
+[] rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/a/{id}" ] .
+_:named rr:logicalTable [ rr:tableName "b" ] ;
+  rr:subjectMap [ rr:template "http://ex/b/{id}" ] .
+[ rr:logicalTable [ rr:tableName "c" ] ;
+  rr:subjectMap [ rr:template "http://ex/c/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ;
+    rr:objectMap [ rr:parentTriplesMap [
+      rr:logicalTable [ rr:tableName "d" ] ;
+      rr:subjectMap [ rr:template "http://ex/d/{id}" ] ] ;
+      rr:joinCondition [ rr:child "d_id" ; rr:parent "id" ] ] ] ] .
+"#;
+
+#[test]
+fn from_turtle_anonymous_triples_maps_get_ids_from_document_order() {
+    let first = parse(ANONYMOUS).unwrap();
+    let ids: Vec<_> = first
+        .triples_maps()
+        .iter()
+        .map(|tm| tm.id.to_string())
+        .collect();
+    assert_eq!(ids, ["[]#1", "_:named", "[]#3", "[]#4"]);
+    let [.., c, d] = first.triples_maps() else {
+        panic!("expected four triples maps");
+    };
+    assert_eq!(d.logical_table, LogicalTable::TableName("d".into()));
+    assert_eq!(
+        c.predicate_object_maps[0].object_maps[0],
+        ObjectMap::Reference(RefObjectMap {
+            parent_triples_map: TriplesMapId::Anonymous(4),
+            join_conditions: vec![JoinCondition {
+                child: "d_id".into(),
+                parent: "id".into(),
+            }],
+        })
+    );
+    // The parser labels `[]` randomly; the IDs must not follow it.
+    assert_eq!(parse(ANONYMOUS).unwrap(), first);
+}
+
+#[test]
+fn from_turtle_errors_in_anonymous_nodes_are_reproducible() {
+    let body = r#"[] rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:tempate "http://ex/{id}" ] ."#;
+    let err = parse_err(body);
+    assert_eq!(
+        err.to_string(),
+        "invalid mapping: triples map []#1: unexpected property rr:tempate on []"
+    );
+    assert_eq!(parse_err(body), err);
+}
+
+fn referencing_without_join(parent_table: &str) -> String {
+    format!(
+        r#"
+<#Child> rr:logicalTable [ rr:tableName "people" ] ;
+  rr:subjectMap [ rr:template "http://ex/person/{{id}}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:dept ;
+    rr:objectMap [ rr:parentTriplesMap <#Parent> ] ] .
+<#Parent> rr:logicalTable [ {parent_table} ] ;
+  rr:subjectMap [ rr:template "http://ex/dept/{{dept}}" ] .
+"#
+    )
+}
+
+#[test]
+fn from_turtle_reference_without_join_condition_needs_the_same_logical_table() {
+    for same in [
+        r#"rr:tableName "people""#,
+        // Identical effective SQL query (R2RML §5.1, §8).
+        r#"rr:sqlQuery "SELECT * FROM people""#,
+    ] {
+        parse(&referencing_without_join(same)).unwrap_or_else(|e| panic!("{same}: {e}"));
+    }
+    for different in [
+        r#"rr:tableName "depts""#,
+        r#"rr:tableName "\"people\"""#,
+        r#"rr:sqlQuery "SELECT * FROM people WHERE active""#,
+    ] {
+        let err = parse_err(&referencing_without_join(different));
+        assert!(
+            matches!(err, Error::InvalidMapping(_)),
+            "{different}: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("<#Child>")
+                && message.contains("<#Parent>")
+                && message.contains("rr:joinCondition"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn compact_iri_uses_the_longest_namespace() {
+    let mapping = parse(
+        r#"
+@prefix shop: <http://example.org/shop/> .
+@prefix a: <http://example.org/> .
+<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/{id}" ] .
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        mapping.prefixes().get("shop").map(String::as_str),
+        Some("http://example.org/shop/")
+    );
+    let compact = |iri: &str| mapping.compact_iri(iri);
+    assert_eq!(
+        compact("http://example.org/shop/Order").as_deref(),
+        Some("shop:Order")
+    );
+    // `a:` and `ex:` share a namespace; the smaller prefix name wins.
+    assert_eq!(
+        compact("http://example.org/Customer").as_deref(),
+        Some("a:Customer")
+    );
+    assert_eq!(
+        compact("http://www.w3.org/2001/XMLSchema#integer").as_deref(),
+        Some("xsd:integer")
+    );
+    for iri in [
+        "http://other.org/x",
+        "http://example.org/a/b",
+        "http://example.org/x?y",
+        "http://example.org/.x",
+        "http://example.org/x.",
+    ] {
+        assert_eq!(compact(iri), None, "{iri}");
+    }
+}

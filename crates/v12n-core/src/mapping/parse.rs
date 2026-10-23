@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Reads the R2RML vocabulary out of a Turtle graph into the typed model.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use oxrdf::{NamedOrBlankNode, Term, Triple};
+use oxrdf::{BlankNode, NamedOrBlankNode, Term, Triple};
 use oxttl::TurtleParser;
 
 use super::{
@@ -23,7 +23,9 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("inverseExpression", "rr:inverseExpression"),
 ];
 
-pub(super) fn parse(input: &str) -> Result<Vec<TriplesMap>, Error> {
+type Prefixes = BTreeMap<String, String>;
+
+pub(super) fn parse(input: &str) -> Result<(Vec<TriplesMap>, Prefixes), Error> {
     let graph = Graph::from_turtle(input)?;
     let nodes = graph.triples_map_nodes();
     if nodes.is_empty() {
@@ -33,25 +35,73 @@ pub(super) fn parse(input: &str) -> Result<Vec<TriplesMap>, Error> {
     }
     let reader = Reader {
         graph: &graph,
-        triples_maps: nodes.iter().collect(),
+        triples_maps: nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| (node, graph.triples_map_id(node, i + 1)))
+            .collect(),
     };
-    nodes.iter().map(|node| reader.triples_map(node)).collect()
+    let triples_maps = nodes
+        .iter()
+        .map(|node| reader.triples_map(node))
+        .collect::<Result<Vec<_>, _>>()?;
+    check_join_conditions(&triples_maps)?;
+    Ok((triples_maps, graph.prefixes))
 }
 
-struct Graph {
+/// R2RML §8: "If the child query and parent query of a referencing object
+/// map are not identical, then the referencing object map must have at
+/// least one join condition." Without one, the parent's subject is read
+/// from the child's row, which only means something on the same table.
+fn check_join_conditions(triples_maps: &[TriplesMap]) -> Result<(), Error> {
+    for tm in triples_maps {
+        let references = tm
+            .predicate_object_maps
+            .iter()
+            .flat_map(|pom| &pom.object_maps)
+            .filter_map(|om| match om {
+                ObjectMap::Reference(r) if r.join_conditions.is_empty() => Some(r),
+                _ => None,
+            });
+        for reference in references {
+            let parent = triples_maps
+                .iter()
+                .find(|p| p.id == reference.parent_triples_map)
+                .expect("parent triples maps are checked while reading");
+            let (child_query, parent_query) = (
+                tm.logical_table.effective_sql_query(),
+                parent.logical_table.effective_sql_query(),
+            );
+            if child_query != parent_query {
+                return Err(Error::InvalidMapping(format!(
+                    "triples map {}: the referencing object map to {} has no rr:joinCondition, \
+                     but its logical table ({child_query:?}) is not the parent's \
+                     ({parent_query:?}); add a join condition (R2RML §8)",
+                    tm.id, parent.id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct Graph<'i> {
+    input: &'i str,
     triples: Vec<Triple>,
     by_subject: HashMap<NamedOrBlankNode, Vec<usize>>,
+    prefixes: Prefixes,
 }
 
-impl Graph {
-    fn from_turtle(input: &str) -> Result<Self, Error> {
+impl<'i> Graph<'i> {
+    fn from_turtle(input: &'i str) -> Result<Self, Error> {
         let parser = TurtleParser::new()
             .with_base_iri(BASE_IRI)
             .expect("BASE_IRI is a valid IRI");
         let mut seen = HashSet::new();
         let mut triples = Vec::new();
         let mut by_subject: HashMap<_, Vec<usize>> = HashMap::new();
-        for triple in parser.for_slice(input) {
+        let mut parser = parser.for_slice(input);
+        for triple in parser.by_ref() {
             let triple = triple.map_err(|e| Error::MappingSyntax(e.to_string()))?;
             // An RDF graph is a set; repeated triples must not repeat classes or maps.
             if !seen.insert(triple.clone()) {
@@ -63,10 +113,41 @@ impl Graph {
                 .push(triples.len());
             triples.push(triple);
         }
+        let prefixes = parser
+            .prefixes()
+            .map(|(prefix, namespace)| (prefix.to_owned(), namespace.to_owned()))
+            .collect();
         Ok(Self {
+            input,
             triples,
             by_subject,
+            prefixes,
         })
+    }
+
+    /// The parser gives every `[ ... ]` a fresh random label, so such a
+    /// triples map is identified by its position instead. A labelled blank
+    /// node keeps its label, which always occurs in the document as written.
+    fn triples_map_id(&self, node: &NamedOrBlankNode, position: usize) -> TriplesMapId {
+        match node {
+            NamedOrBlankNode::BlankNode(b) if !self.is_labelled(b) => {
+                TriplesMapId::Anonymous(position)
+            }
+            _ => node_id(node),
+        }
+    }
+
+    fn is_labelled(&self, node: &BlankNode) -> bool {
+        self.input.contains(&format!("_:{}", node.as_str()))
+    }
+
+    /// How error messages refer to a node: `[]` for an anonymous one,
+    /// whose random label would differ on every run.
+    fn describe(&self, node: &NamedOrBlankNode) -> String {
+        match node {
+            NamedOrBlankNode::BlankNode(b) if !self.is_labelled(b) => "[]".to_owned(),
+            _ => node_id(node).to_string(),
+        }
     }
 
     /// R2RML §6 does not require `a rr:TriplesMap`, so any subject of a
@@ -139,13 +220,13 @@ enum Position {
 }
 
 struct Reader<'g> {
-    graph: &'g Graph,
-    triples_maps: HashSet<&'g NamedOrBlankNode>,
+    graph: &'g Graph<'g>,
+    triples_maps: HashMap<&'g NamedOrBlankNode, TriplesMapId>,
 }
 
 impl<'g> Reader<'g> {
     fn triples_map(&self, node: &NamedOrBlankNode) -> Result<TriplesMap, Error> {
-        let id = node_id(node);
+        let id = self.triples_maps[node].clone();
         let ctx = &Ctx(&id);
         self.check_properties(
             node,
@@ -309,12 +390,12 @@ impl<'g> Reader<'g> {
 
         self.check_properties(node, ctx, &["parentTriplesMap", "joinCondition"])?;
         let parent = resource(parent, "parentTriplesMap", ctx)?;
-        if !self.triples_maps.contains(&&parent) {
+        let Some(parent_id) = self.triples_maps.get(&parent) else {
             return Err(Error::UnknownParentTriplesMap {
                 triples_map: ctx.0.to_string(),
-                parent: node_id(&parent).to_string(),
+                parent: self.graph.describe(&parent),
             });
-        }
+        };
         let join_conditions = self
             .graph
             .objects(node, "joinCondition")
@@ -333,7 +414,7 @@ impl<'g> Reader<'g> {
             })
             .collect::<Result<_, Error>>()?;
         Ok(ObjectMap::Reference(RefObjectMap {
-            parent_triples_map: node_id(&parent),
+            parent_triples_map: parent_id.clone(),
             join_conditions,
         }))
     }
@@ -481,7 +562,7 @@ impl<'g> Reader<'g> {
             if !allowed.contains(&local) {
                 return Err(Error::InvalidMapping(format!(
                     "{ctx}: unexpected property rr:{local} on {}",
-                    node_id(node)
+                    self.graph.describe(node)
                 )));
             }
         }

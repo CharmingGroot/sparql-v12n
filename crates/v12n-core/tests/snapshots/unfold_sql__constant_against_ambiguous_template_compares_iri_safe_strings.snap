@@ -1,0 +1,12 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain(AMBIGUOUS,\n&format!(\"{PREFIXES}SELECT ?l WHERE {{ <http://example.org/pair/x%20y-z> ex:label ?l }}\"))"
+---
+SELECT t0."label" AS "l"
+FROM "pairs" t0
+WHERE $1 || CASE WHEN t0."a"::text IS NULL THEN NULL ELSE (SELECT coalesce(string_agg(CASE WHEN c ~ '^[-.0-9A-Z_a-z~\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF\U00010000-\U0001FFFD\U00020000-\U0002FFFD\U00030000-\U0003FFFD\U00040000-\U0004FFFD\U00050000-\U0005FFFD\U00060000-\U0006FFFD\U00070000-\U0007FFFD\U00080000-\U0008FFFD\U00090000-\U0009FFFD\U000A0000-\U000AFFFD\U000B0000-\U000BFFFD\U000C0000-\U000CFFFD\U000D0000-\U000DFFFD\U000E1000-\U000EFFFD]$' THEN c ELSE regexp_replace(upper(encode(convert_to(c, 'UTF8'), 'hex')), '(..)', '%\1', 'g') END, '' ORDER BY n), '') FROM generate_series(1, char_length(t0."a"::text)) AS n, substr(t0."a"::text, n, 1) AS c) END || $2 || CASE WHEN t0."b"::text IS NULL THEN NULL ELSE (SELECT coalesce(string_agg(CASE WHEN c ~ '^[-.0-9A-Z_a-z~\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF\U00010000-\U0001FFFD\U00020000-\U0002FFFD\U00030000-\U0003FFFD\U00040000-\U0004FFFD\U00050000-\U0005FFFD\U00060000-\U0006FFFD\U00070000-\U0007FFFD\U00080000-\U0008FFFD\U00090000-\U0009FFFD\U000A0000-\U000AFFFD\U000B0000-\U000BFFFD\U000C0000-\U000CFFFD\U000D0000-\U000DFFFD\U000E1000-\U000EFFFD]$' THEN c ELSE regexp_replace(upper(encode(convert_to(c, 'UTF8'), 'hex')), '(..)', '%\1', 'g') END, '' ORDER BY n), '') FROM generate_series(1, char_length(t0."b"::text)) AS n, substr(t0."b"::text, n, 1) AS c) END = $3 AND t0."label" IS NOT NULL
+
+-- params
+$1 = "http://example.org/pair/"
+$2 = "-"
+$3 = "http://example.org/pair/x%20y-z"

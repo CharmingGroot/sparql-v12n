@@ -14,10 +14,10 @@ use futures_util::TryStreamExt;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config, NoTls, RowStream, Statement};
 use v12n_core::solution::{Solution, SolutionBuilder, SqlValue};
-use v12n_core::sql::{SqlPlan, quote_identifier};
+use v12n_core::sql::{ColumnTypes, RenderOptions, SqlPlan, column_type_probe, quote_identifier};
 
 use bind::{Bound, bind};
-use decode::{Decoder, Raw};
+use decode::{Decoder, Raw, column_type};
 pub use error::Error;
 
 /// Default for [`Limits::statement_timeout`].
@@ -107,7 +107,12 @@ impl Database {
     pub async fn execute(&self, plan: &SqlPlan) -> Result<Solutions, Error> {
         let timeout = self.limits.statement_timeout;
         let pg = |e| Error::from_postgres(e, timeout);
-        let rendered = plan.to_sql();
+        let column_types = self.column_types(plan).await.map_err(pg)?;
+        let options = RenderOptions {
+            text_params: &[],
+            column_types: column_types.as_ref(),
+        };
+        let rendered = plan.to_sql_with(&options)?;
         // One row past the limit tells a cut-off result from one that
         // happens to have exactly `row_limit` rows.
         let fetch = (self.limits.row_limit > 0)
@@ -139,7 +144,10 @@ impl Database {
         let cast_columns =
             decoders.iter().any(Option::is_none) && decoders.len() == plan.columns.len();
         let rendered = if cast_columns || !text_params.is_empty() {
-            let rendered = plan.to_sql_with_text_params(&text_params);
+            let rendered = plan.to_sql_with(&RenderOptions {
+                text_params: &text_params,
+                ..options
+            })?;
             let sql = if cast_columns {
                 cast_to_text(&rendered.sql, &plan.columns, &decoders)
             } else {
@@ -186,6 +194,26 @@ impl Database {
             self.query(&statement, &bound, fetch).await.map_err(pg)?,
         ));
         Ok(solutions)
+    }
+
+    /// Types of the columns the plan compares as RDF terms, read by
+    /// preparing a statement that selects them. `None` when there are none.
+    async fn column_types(
+        &self,
+        plan: &SqlPlan,
+    ) -> Result<Option<ColumnTypes>, tokio_postgres::Error> {
+        let columns = plan.term_columns();
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        let probe = self.client.prepare(&column_type_probe(&columns)).await?;
+        Ok(Some(
+            columns
+                .into_iter()
+                .zip(probe.columns())
+                .map(|(column, c)| (column, column_type(c.type_())))
+                .collect(),
+        ))
     }
 
     async fn query(

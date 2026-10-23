@@ -296,33 +296,66 @@ fn terms(path: &Path, format: Format) -> Result<(), Failure> {
         .properties()
         .map(|(iri, candidates)| (iri, dedup(candidates.iter().map(|c| &c.triples_map))))
         .collect();
+    // Only the prefixes the listed terms use, so they can be pasted into a
+    // query as they are.
+    let mut used: Vec<(&str, &str)> = Vec::new();
+    for (iri, _) in classes.iter().chain(&properties) {
+        if let Some(name) = mapping.compact_iri(iri) {
+            let prefix = &name[..name.find(':').unwrap_or_default()];
+            if let Some((prefix, namespace)) = mapping.prefixes().get_key_value(prefix)
+                && !used.contains(&(prefix.as_str(), namespace.as_str()))
+            {
+                used.push((prefix, namespace));
+            }
+        }
+    }
+    used.sort_unstable();
 
     match format {
         Format::Json => {
+            // `iri` stays absolute, so a reader needs no prefix handling.
             let entries = |terms: &[(&str, Vec<&TriplesMapId>)]| -> Vec<Value> {
                 terms
                     .iter()
                     .map(|(iri, ids)| {
                         json!({
                             "iri": iri,
+                            "prefixed_name": mapping.compact_iri(iri),
                             "triples_maps": ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
                         })
                     })
                     .collect()
             };
+            let prefixes: serde_json::Map<String, Value> = used
+                .iter()
+                .map(|(prefix, namespace)| ((*prefix).to_owned(), Value::from(*namespace)))
+                .collect();
             println!(
                 "{}",
-                json!({ "classes": entries(&classes), "properties": entries(&properties) })
+                json!({
+                    "prefixes": prefixes,
+                    "classes": entries(&classes),
+                    "properties": entries(&properties),
+                })
             );
         }
         Format::Table => {
+            for (prefix, namespace) in &used {
+                println!("PREFIX {prefix}: <{namespace}>");
+            }
+            if !used.is_empty() {
+                println!();
+            }
             let rows: Vec<[String; 3]> = classes
                 .iter()
                 .map(|t| ("class", t))
                 .chain(properties.iter().map(|t| ("property", t)))
                 .map(|(kind, (iri, ids))| {
                     let ids: Vec<_> = ids.iter().map(|id| id.to_string()).collect();
-                    [kind.to_owned(), format!("<{iri}>"), ids.join(", ")]
+                    let term = mapping
+                        .compact_iri(iri)
+                        .unwrap_or_else(|| format!("<{iri}>"));
+                    [kind.to_owned(), term, ids.join(", ")]
                 })
                 .collect();
             print_table(["KIND", "TERM", "TRIPLES MAPS"], &rows);
@@ -474,6 +507,8 @@ fn database_failure(error: v12n_postgres::Error) -> Failure {
         Error::Config(_) => (EXIT_INPUT, "input"),
         Error::Database(_) => (EXIT_DATABASE, "database"),
         Error::Timeout(_) => (EXIT_TIMEOUT, "timeout"),
+        // A comparison the column types make impossible to do right in SQL.
+        Error::Core(v12n_core::Error::UnsupportedFeature(_)) => (EXIT_INPUT, "unsupported"),
         Error::Core(_) => (EXIT_DATABASE, "data"),
     };
     Failure::new(code, kind, error.to_string())

@@ -84,10 +84,17 @@ fn check_without_mapping_argument_exits_one() {
 fn terms_json_lists_classes_and_properties_in_order() {
     let output = v12n(&["terms", "--format", "json", SHOP], "");
     assert_eq!(output.status.code(), Some(0));
-    let term = |iri: &str, tm: &str| json!({ "iri": format!("http://example.org/{iri}"), "triples_maps": [tm] });
+    let term = |local: &str, tm: &str| {
+        json!({
+            "iri": format!("http://example.org/{local}"),
+            "prefixed_name": format!("ex:{local}"),
+            "triples_maps": [tm],
+        })
+    };
     assert_eq!(
         stdout_json(&output),
         json!({
+            "prefixes": { "ex": "http://example.org/" },
             "classes": [term("Customer", "<#CustomerMap>"), term("Order", "<#OrderMap>")],
             "properties": [
                 term("name", "<#CustomerMap>"),
@@ -100,15 +107,40 @@ fn terms_json_lists_classes_and_properties_in_order() {
 }
 
 #[test]
-fn terms_table_format_prints_one_row_per_term() {
+fn terms_table_format_prints_prefixes_and_one_row_per_term() {
     let output = v12n(&["terms", "--format", "table", SHOP], "");
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines: Vec<_> = stdout.lines().collect();
-    assert_eq!(lines.len(), 7);
-    assert!(lines[0].starts_with("KIND"));
-    assert!(lines[1].starts_with("class     <http://example.org/Customer>"));
-    assert!(lines[6].ends_with("<#OrderMap>"));
+    assert_eq!(lines.len(), 9, "{stdout}");
+    assert_eq!(lines[0], "PREFIX ex: <http://example.org/>");
+    assert_eq!(lines[1], "");
+    assert!(lines[2].starts_with("KIND"));
+    assert!(lines[3].starts_with("class     ex:Customer"), "{stdout}");
+    assert!(lines[8].ends_with("<#OrderMap>"));
+}
+
+#[test]
+fn terms_without_a_matching_prefix_prints_full_iris() {
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        [] rr:logicalTable [ rr:tableName "t" ] ;
+          rr:subjectMap [ rr:template "http://ex/{id}" ; rr:class <http://other.org/Thing> ] .
+    "#;
+    let output = v12n(&["terms", "--format", "json", "-"], mapping);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout_json(&output),
+        json!({
+            "prefixes": {},
+            "classes": [{
+                "iri": "http://other.org/Thing",
+                "prefixed_name": null,
+                "triples_maps": ["[]#1"],
+            }],
+            "properties": [],
+        })
+    );
 }
 
 const VIP_ORDERS: &str = concat!(
