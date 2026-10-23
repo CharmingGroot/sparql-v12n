@@ -317,6 +317,91 @@ impl SqlPlan {
     }
 }
 
+impl SqlPlan {
+    /// The column names that PostgreSQL may resolve differently from how
+    /// they are written ([`folded_identifier`]), with their logical tables,
+    /// each once, in order of appearance.
+    pub fn folded_columns(&self) -> Vec<(LogicalTable, String)> {
+        let mut out: Vec<(LogicalTable, String)> = Vec::new();
+        let mut plan = self.clone();
+        plan.for_each_column(|table, name| {
+            if folded_identifier(name) {
+                let key = (table.clone(), name.clone());
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+        });
+        out
+    }
+
+    /// The plan with column names replaced by the names the database
+    /// resolved them to, written as delimited identifiers so they are
+    /// taken as they are. Names missing from `resolved` are kept.
+    pub fn with_resolved_columns(
+        &self,
+        resolved: &HashMap<(LogicalTable, String), String>,
+    ) -> Self {
+        let mut plan = self.clone();
+        plan.for_each_column(|table, name| {
+            if let Some(found) = resolved.get(&(table.clone(), name.clone())) {
+                *name = quote_identifier(found);
+            }
+        });
+        plan
+    }
+
+    fn for_each_column(&mut self, mut f: impl FnMut(&LogicalTable, &mut String)) {
+        fn expr(
+            e: &mut SqlExpr,
+            from: &[LogicalTable],
+            f: &mut impl FnMut(&LogicalTable, &mut String),
+        ) {
+            match e {
+                SqlExpr::Column { table, name } => f(&from[*table], name),
+                SqlExpr::Param(_) => {}
+                SqlExpr::Concat(parts) => parts.iter_mut().for_each(|p| expr(p, from, f)),
+            }
+        }
+        fn term(
+            t: &mut TermSql,
+            from: &[LogicalTable],
+            f: &mut impl FnMut(&LogicalTable, &mut String),
+        ) {
+            match &mut t.value {
+                TermSqlValue::Column { table, name } => f(&from[*table], name),
+                TermSqlValue::Template { table, parts, .. } => {
+                    for part in parts {
+                        if let TemplatePart::Column(name) = part {
+                            f(&from[*table], name);
+                        }
+                    }
+                }
+                TermSqlValue::Param(_) => {}
+            }
+        }
+        for branch in &mut self.branches {
+            let from = &branch.from;
+            for e in &mut branch.select {
+                expr(e, from, &mut f);
+            }
+            for condition in &mut branch.conditions {
+                match condition {
+                    Condition::Eq(left, right) => {
+                        expr(left, from, &mut f);
+                        expr(right, from, &mut f);
+                    }
+                    Condition::IsNotNull(e) => expr(e, from, &mut f),
+                    Condition::SameTerm(left, right) => {
+                        term(left, from, &mut f);
+                        term(right, from, &mut f);
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl TermSql {
     /// `(table, column)` pairs the side reads.
     pub fn columns(&self) -> Vec<(usize, &str)> {
@@ -338,6 +423,23 @@ impl TermSql {
 /// prepare (not run) so the database reports them. Each logical table
 /// appears once.
 pub fn column_type_probe(columns: &[(LogicalTable, String)]) -> String {
+    probe(columns, quote_identifier)
+}
+
+/// A statement that refers to each of `columns`, all
+/// [`folded_identifier`]s, as written, without quotes, to prepare (not
+/// run): the database then resolves each one as it resolves a regular
+/// identifier and reports the name it found as the result column's name.
+/// Each logical table appears once.
+pub fn column_name_probe(columns: &[(LogicalTable, String)]) -> String {
+    assert!(
+        columns.iter().all(|(_, name)| folded_identifier(name)),
+        "only regular identifiers may appear unquoted"
+    );
+    probe(columns, str::to_owned)
+}
+
+fn probe(columns: &[(LogicalTable, String)], name_sql: impl Fn(&str) -> String) -> String {
     let mut tables: Vec<&LogicalTable> = Vec::new();
     let select: Vec<String> = columns
         .iter()
@@ -346,7 +448,7 @@ pub fn column_type_probe(columns: &[(LogicalTable, String)]) -> String {
                 tables.push(table);
                 tables.len() - 1
             });
-            format!("p{position}.{}", quote_identifier(name))
+            format!("p{position}.{}", name_sql(name))
         })
         .collect();
     let from: Vec<String> = tables
@@ -705,6 +807,34 @@ fn logical_table(table: &LogicalTable) -> String {
     }
 }
 
+/// Whether a column name from the mapping is a regular (undelimited)
+/// identifier that PostgreSQL may resolve to a different name.
+///
+/// R2RML §5 makes column names SQL identifiers: delimited ones are taken
+/// as written, regular ones are case-insensitive. PostgreSQL folds a
+/// regular identifier (PostgreSQL docs §4.1.1: a letter, `_` or a
+/// non-ASCII character, then also digits and `$`) to lower case, with
+/// encoding-dependent rules for non-ASCII letters, and truncates it to
+/// `NAMEDATALEN - 1` bytes. Quoting such a name as written would refer to
+/// a different column, so its effective name is asked from the database
+/// ([`column_name_probe`]). A name of lower-case ASCII letters, digits,
+/// `_` and `$` of at most 63 bytes folds to itself and needs no lookup.
+/// Anything else that is not a regular identifier keeps being quoted as
+/// written.
+pub fn folded_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let regular = (first.is_ascii_alphabetic() || first == '_' || !first.is_ascii())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$') || !c.is_ascii());
+    regular
+        && (name.len() > 63
+            || name
+                .chars()
+                .any(|c| c.is_ascii_uppercase() || !c.is_ascii()))
+}
+
 /// Quotes an identifier from the mapping. An identifier that is already
 /// a valid delimited identifier (`"Order Id"`) is kept as written, so
 /// R2RML mappings can use either form; anything else is wrapped in double
@@ -748,6 +878,98 @@ pub fn quote_table_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folded_identifier_is_a_regular_identifier_that_folding_may_change() {
+        for name in ["StudentId", "ID", "SPORTCOUNT", "_X", "a$B", "Ä", "nameé"] {
+            assert!(folded_identifier(name), "{name}");
+        }
+        let long = "a".repeat(64);
+        assert!(folded_identifier(&long));
+        // Folding leaves these as they are, or they are not regular
+        // identifiers and keep being quoted as written.
+        for name in [
+            "studentid",
+            "a_b$1",
+            &"a".repeat(63),
+            "\"Name\"",
+            "Order Id",
+            "1A",
+            "$A",
+            "a-B",
+            "a\"B",
+            "",
+        ] {
+            assert!(!folded_identifier(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn column_name_probe_leaves_regular_identifiers_unquoted() {
+        let view = LogicalTable::SqlQuery("SELECT 1 AS Id".into());
+        let table = LogicalTable::TableName("t".into());
+        assert_eq!(
+            column_name_probe(&[
+                (view.clone(), "Id".into()),
+                (table, "Name".into()),
+                (view, "LABEL".into()),
+            ]),
+            "SELECT p0.Id, p1.Name, p0.LABEL\nFROM (SELECT 1 AS Id) p0\nCROSS JOIN \"t\" p1\nLIMIT 0"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "only regular identifiers")]
+    fn column_name_probe_refuses_other_names() {
+        column_name_probe(&[(LogicalTable::TableName("t".into()), "a; DROP".into())]);
+    }
+
+    #[test]
+    fn resolved_columns_are_rendered_as_delimited_identifiers() {
+        let view = LogicalTable::SqlQuery("SELECT 1 AS Id, 2 AS \"V\"".into());
+        let template = |table| TermSql {
+            value: TermSqlValue::Template {
+                table,
+                parts: vec![
+                    TemplatePart::Literal("r/".into()),
+                    TemplatePart::Column("Id".into()),
+                ],
+                iri_safe: false,
+            },
+            datatype: None,
+        };
+        let plan = SqlPlan {
+            columns: vec!["a".into(), "b".into()],
+            projection: Vec::new(),
+            branches: vec![SqlBranch {
+                from: vec![view.clone(), view.clone()],
+                select: vec![column(0, "Id"), column(1, "\"V\"")],
+                conditions: vec![
+                    Condition::SameTerm(template(0), template(1)),
+                    Condition::Eq(column(0, "ID"), SqlExpr::Param("1".into())),
+                ],
+            }],
+            distinct: false,
+        };
+        assert_eq!(
+            plan.folded_columns(),
+            [
+                (view.clone(), "Id".to_owned()),
+                (view.clone(), "ID".to_owned())
+            ]
+        );
+        let resolved = HashMap::from([
+            ((view.clone(), "Id".to_owned()), "id".to_owned()),
+            ((view, "ID".to_owned()), "id".to_owned()),
+        ]);
+        assert_eq!(
+            plan.with_resolved_columns(&resolved).to_sql().sql,
+            "SELECT t0.\"id\" AS \"a\", t1.\"V\" AS \"b\"\n\
+             FROM (SELECT 1 AS Id, 2 AS \"V\") t0\n\
+             JOIN (SELECT 1 AS Id, 2 AS \"V\") t1 ON $1 || t0.\"id\"::text = $2 || t1.\"id\"::text\n\
+             WHERE t0.\"id\" = $3"
+        );
+    }
 
     #[test]
     fn quote_identifier_plain_name_is_wrapped() {

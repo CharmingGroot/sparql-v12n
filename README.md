@@ -107,6 +107,18 @@ read-only transactions. The database URL and password are never logged. Request
 logs (stderr, level from `RUST_LOG`) carry the generated SQL and timings, not
 result values. TLS, authentication and CORS belong to a reverse proxy in front.
 
+## Column names
+
+Column names in `rr:column`, templates and join conditions are SQL
+identifiers (R2RML §5). A delimited name (`"\"Name\""`) is taken as
+written. A regular name is resolved as PostgreSQL resolves it unquoted,
+which folds it to lower case: `rr:column "StudentId"` reads the column
+that `SELECT ... AS StudentId` produces (`studentid`), and `rr:column
+"Name"` does not match a column created as `"Name"`. Before running a
+query that uses such a name, the engine prepares a probe statement in
+which PostgreSQL resolves it, and then quotes the resolved name in the
+generated SQL. Names of lower-case letters, digits and `_` need no probe.
+
 ## Lexical forms of column values
 
 Every non-string value is written in the canonical form of XML Schema 1.1

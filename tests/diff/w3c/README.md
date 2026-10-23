@@ -32,6 +32,3 @@ R2RMLTC0000, 0001a, 0001b, 0002a, 0002b, 0002d, 0002i, 0002j, 0003b, 0003c,
 | R2RMLTC0014a, 0014b, 0014c | `rr:inverseExpression`: not supported. |
 | R2RMLTC0016a, 0016b, 0016c, 0016d, 0016e | `create.sql` uses `VARBINARY`, which PostgreSQL rejects. |
 | R2RMLTC0019a | Relative IRI from a column: Ontop fails (HTTP 500) and v12n has no base IRI (#33), so neither answers. |
-
-Also left out: the `numsport` query of R2RMLTC0009d, for which Ontop does
-not start (#26) and v12n fails on the unquoted alias `SPORTCOUNT` (#31).

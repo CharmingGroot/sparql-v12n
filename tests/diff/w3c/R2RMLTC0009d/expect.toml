@@ -4,3 +4,8 @@
 expect = "ontop-error"
 issue = 26
 solutions = 2
+
+[query.numsport]
+expect = "ontop-error"
+issue = 26
+solutions = 2

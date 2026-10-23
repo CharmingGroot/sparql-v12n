@@ -742,3 +742,68 @@ async fn trim_scale_matches_the_canonical_decimal_formatter() {
         edge_cases.len() + 4000 + 1000 + 1001 + 401 + 7 + 121
     );
 }
+
+/// R2RML §5 with PostgreSQL's case folding: a regular identifier in the
+/// mapping names the column PostgreSQL would find for it unquoted, a
+/// delimited one the column with exactly that name.
+#[tokio::test]
+async fn unquoted_column_names_resolve_as_postgres_folds_them() {
+    let Some(url) = database_url() else { return };
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#A> rr:logicalTable [ rr:sqlQuery """SELECT 1 AS Id, 'x' AS "Name", 'y' AS Label""" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{ID}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "\"Name\"" ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "LABEL" ] ] .
+        <#B> rr:logicalTable [ rr:sqlQuery """SELECT '1' AS iD, 'z' AS "V" """ ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{Id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column "\"V\"" ] ] .
+    "#;
+    let rows = |variables: &str, pattern: &str| {
+        let plan = plan(
+            mapping,
+            &format!("PREFIX ex: <http://example.org/> SELECT {variables} WHERE {{ {pattern} }}"),
+        );
+        let url = url.clone();
+        async move { run(&url, Limits::default(), &plan).await.unwrap().0 }
+    };
+    assert_eq!(
+        rows("?s ?n ?l", "?s ex:name ?n ; ex:label ?l").await,
+        ["?s=<http://example.org/row/1> ?n=\"x\" ?l=\"y\""]
+    );
+    // A constant compared with a folded column is bound with its type.
+    assert_eq!(
+        rows("?l", "<http://example.org/row/1> ex:label ?l").await,
+        ["?l=\"y\""]
+    );
+    // The join compares an integer and a text column, which needs their
+    // types under the resolved names.
+    assert_eq!(
+        rows("?s ?l ?v", "?s ex:label ?l ; ex:v ?v").await,
+        ["?s=<http://example.org/row/1> ?l=\"y\" ?v=\"z\""]
+    );
+}
+
+/// R2RML §5: a delimited identifier that is not all lower case is not
+/// equivalent to any regular identifier in PostgreSQL (W3C R2RMLTC0002f).
+#[tokio::test]
+async fn unquoted_name_does_not_match_a_mixed_case_column() {
+    let Some(url) = database_url() else { return };
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#A> rr:logicalTable [ rr:sqlQuery """SELECT 1 AS id, 'x' AS "Name" """ ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "Name" ] ] .
+    "#;
+    let plan = plan(
+        mapping,
+        "SELECT ?n WHERE { ?s <http://example.org/name> ?n }",
+    );
+    let error = run(&url, Limits::default(), &plan).await.unwrap_err();
+    assert!(
+        matches!(&error, Error::Database(m) if m.contains("does not exist")),
+        "{error}"
+    );
+}

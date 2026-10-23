@@ -1,16 +1,12 @@
-# v12n quotes the unquoted sqlQuery alias as written; PostgreSQL folded it to lower case (#31).
-
+# Duplicate rows: a student with two sports repeats the name triples, which
+# v12n returns once per row and Ontop once (#32).
 [query.firstname]
 expect = "mismatch"
-issue = 31
+issue = 32
 
 [query.lastname]
 expect = "mismatch"
-issue = 31
-
-[query.plays]
-expect = "mismatch"
-issue = 31
+issue = 32
 
 # ?s comes from term maps of different shapes in the UNION branches.
 [query.id]
