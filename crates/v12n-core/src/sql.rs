@@ -37,9 +37,43 @@ pub enum SqlExpr {
     /// Column `name` of table alias `t{table}`.
     Column { table: usize, name: String },
     /// A constant, always sent as a bound parameter.
-    Param(String),
+    Param(Param),
     /// String concatenation of the parts, each cast to text.
     Concat(Vec<SqlExpr>),
+}
+
+/// A constant of the query and what it has to match.
+///
+/// A database adapter checks every parameter against the SQL type the
+/// database infers for it before binding, because the database parses
+/// text with its own input syntax, which differs from RDF lexical forms:
+/// `007` and `+7` are the integer 7 there, `7.0` is an error for an
+/// integer, and `99999999999` overflows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Param {
+    /// The lexical form a value must render as to match (R2RML §10.2,
+    /// natural RDF lexical form), or plain text for parts of a string.
+    pub value: String,
+    /// The datatype IRI of a literal constant compared with a column
+    /// whose literal datatype is the natural one of its SQL type, which
+    /// is only known from the database. The two must then be equal:
+    /// `"7"^^xsd:decimal` is not the term an integer column produces.
+    pub datatype: Option<String>,
+}
+
+impl From<String> for Param {
+    fn from(value: String) -> Self {
+        Self {
+            value,
+            datatype: None,
+        }
+    }
+}
+
+impl From<&str> for Param {
+    fn from(value: &str) -> Self {
+        value.to_owned().into()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,13 +131,35 @@ impl ResultValue {
 pub struct RenderedSql {
     pub sql: String,
     pub params: Vec<String>,
+    /// [`Param::datatype`] of each parameter.
+    pub param_datatypes: Vec<Option<String>>,
+    /// Index into [`SqlPlan::branches`] of the branch each parameter
+    /// belongs to.
+    pub param_branches: Vec<usize>,
 }
 
 impl SqlPlan {
     /// Renders the plan. Parameters are numbered in the order they appear
     /// in the text.
+    ///
+    /// Every parameter is one side of an equality in the conjunction of
+    /// its branch's `ON` and `WHERE` conditions, so binding it to `NULL`
+    /// empties that branch and leaves the others as they are.
     pub fn to_sql(&self) -> RenderedSql {
-        let mut r = Renderer::default();
+        self.to_sql_with_text_params(&[])
+    }
+
+    /// Like [`to_sql`](Self::to_sql), with the column compared with each
+    /// parameter in `text_params` (0-based) cast to text. A database
+    /// adapter uses this for column types whose values it does not format
+    /// itself: the comparison then uses the same text the result column
+    /// gets, instead of the database parsing the constant as that type.
+    /// The cast keeps an index on the column from being used.
+    pub fn to_sql_with_text_params(&self, text_params: &[usize]) -> RenderedSql {
+        let mut r = Renderer {
+            text_params,
+            ..Renderer::default()
+        };
         if self.branches.is_empty() {
             r.sql.push_str("SELECT 1 WHERE false");
         }
@@ -116,22 +172,29 @@ impl SqlPlan {
                     "\nUNION ALL\n"
                 });
             }
+            r.branch_index = i;
             r.branch(branch, &self.columns, self.distinct && single);
         }
         RenderedSql {
             sql: r.sql,
             params: r.params,
+            param_datatypes: r.param_datatypes,
+            param_branches: r.param_branches,
         }
     }
 }
 
 #[derive(Default)]
-struct Renderer {
+struct Renderer<'a> {
     sql: String,
     params: Vec<String>,
+    param_datatypes: Vec<Option<String>>,
+    param_branches: Vec<usize>,
+    branch_index: usize,
+    text_params: &'a [usize],
 }
 
-impl Renderer {
+impl Renderer<'_> {
     fn branch(&mut self, branch: &SqlBranch, columns: &[String], distinct: bool) {
         self.sql.push_str("SELECT ");
         if distinct {
@@ -189,9 +252,22 @@ impl Renderer {
             }
             match condition {
                 Condition::Eq(left, right) => {
+                    // A column side holds no parameter, so the parameter
+                    // on the other side is the next one either way.
+                    let as_text = matches!(
+                        (left, right),
+                        (SqlExpr::Column { .. }, SqlExpr::Param(_))
+                            | (SqlExpr::Param(_), SqlExpr::Column { .. })
+                    ) && self.text_params.contains(&self.params.len());
                     self.expr(left);
+                    if as_text && matches!(left, SqlExpr::Column { .. }) {
+                        self.sql.push_str("::text");
+                    }
                     self.sql.push_str(" = ");
                     self.expr(right);
+                    if as_text && matches!(right, SqlExpr::Column { .. }) {
+                        self.sql.push_str("::text");
+                    }
                 }
                 Condition::IsNotNull(expr) => {
                     self.expr(expr);
@@ -207,8 +283,10 @@ impl Renderer {
                 self.sql
                     .push_str(&format!("t{table}.{}", quote_identifier(name)));
             }
-            SqlExpr::Param(value) => {
-                self.params.push(value.clone());
+            SqlExpr::Param(param) => {
+                self.params.push(param.value.clone());
+                self.param_datatypes.push(param.datatype.clone());
+                self.param_branches.push(self.branch_index);
                 self.sql.push_str(&format!("${}", self.params.len()));
             }
             SqlExpr::Concat(parts) => {
@@ -369,6 +447,55 @@ mod tests {
              WHERE t0.\"k\" = $2 AND t2.\"v\" IS NOT NULL"
         );
         assert_eq!(rendered.params, ["p/", "one"]);
+        assert_eq!(rendered.param_branches, [0, 0]);
+    }
+
+    #[test]
+    fn to_sql_with_text_params_casts_the_compared_column() {
+        let branch = |value: &str, datatype: Option<&str>| SqlBranch {
+            from: vec![LogicalTable::TableName("t".into())],
+            select: vec![column(0, "id")],
+            conditions: vec![
+                Condition::Eq(
+                    column(0, "a"),
+                    SqlExpr::Concat(vec![SqlExpr::Param("x/".into()), column(0, "b")]),
+                ),
+                Condition::Eq(
+                    column(0, "v"),
+                    SqlExpr::Param(Param {
+                        value: value.into(),
+                        datatype: datatype.map(Into::into),
+                    }),
+                ),
+            ],
+        };
+        let plan = SqlPlan {
+            columns: vec!["x".into()],
+            projection: Vec::new(),
+            branches: vec![branch("1", None), branch("2", Some("http://ex/dt"))],
+            distinct: false,
+        };
+        let rendered = plan.to_sql_with_text_params(&[3]);
+        assert_eq!(
+            rendered.sql,
+            "SELECT t0.\"id\" AS \"x\"\n\
+             FROM \"t\" t0\n\
+             WHERE t0.\"a\" = $1 || t0.\"b\"::text AND t0.\"v\" = $2\n\
+             UNION ALL\n\
+             SELECT t0.\"id\" AS \"x\"\n\
+             FROM \"t\" t0\n\
+             WHERE t0.\"a\" = $3 || t0.\"b\"::text AND t0.\"v\"::text = $4"
+        );
+        assert_eq!(rendered.params, ["x/", "1", "x/", "2"]);
+        assert_eq!(
+            rendered.param_datatypes,
+            [None, None, None, Some("http://ex/dt".to_owned())]
+        );
+        assert_eq!(rendered.param_branches, [0, 0, 1, 1]);
+        assert_eq!(
+            plan.to_sql().sql,
+            rendered.sql.replace("::text = $4", " = $4")
+        );
     }
 
     #[test]

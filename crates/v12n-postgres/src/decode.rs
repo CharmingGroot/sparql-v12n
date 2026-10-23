@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-//! PostgreSQL binary values to [`SqlValue`], and constants to bind
-//! parameters.
+//! PostgreSQL binary values to [`SqlValue`].
 
 use std::error::Error as StdError;
 
-use bytes::BytesMut;
-use tokio_postgres::types::{Format, FromSql, IsNull, ToSql, Type, to_sql_checked};
-use v12n_core::solution::{SqlValue, canonical_decimal, canonical_double};
+use tokio_postgres::types::{FromSql, Type};
+use v12n_core::solution::SqlValue;
 
 type BoxError = Box<dyn StdError + Sync + Send>;
 
 /// Days from 1970-01-01 to 2000-01-01, the epoch of PostgreSQL dates and
 /// timestamps.
-const PG_EPOCH_DAYS: i64 = 10_957;
-const MICROS_PER_DAY: i64 = 86_400_000_000;
+pub(crate) const PG_EPOCH_DAYS: i64 = 10_957;
+pub(crate) const MICROS_PER_DAY: i64 = 86_400_000_000;
 
 /// How to read one result column, chosen from its PostgreSQL type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,52 +239,6 @@ impl<'a> FromSql<'a> for Raw<'a> {
     }
 }
 
-/// A constant bound in text format. The server parses it with the input
-/// function of the parameter's type, which the prepared statement takes
-/// from the column the parameter is compared with, so `id = $1` stays an
-/// integer comparison that can use an index on `id`.
-#[derive(Debug)]
-pub(crate) struct TextParam<'a>(pub &'a str);
-
-impl ToSql for TextParam<'_> {
-    fn to_sql(&self, _: &Type, out: &mut BytesMut) -> Result<IsNull, BoxError> {
-        out.extend_from_slice(self.0.as_bytes());
-        Ok(IsNull::No)
-    }
-
-    fn accepts(_: &Type) -> bool {
-        true
-    }
-
-    fn encode_format(&self, _: &Type) -> Format {
-        Format::Text
-    }
-
-    to_sql_checked!();
-}
-
-/// Whether a constant compared with `=` to a column of type `ty` can ever
-/// match. RDF terms are compared by lexical form, and a column value takes
-/// part through its natural lexical form (R2RML §10.2), so the constant must
-/// be exactly that form: `007` never matches the integer 7, which renders as
-/// `7`. Types without a canonical form here are left to the server.
-pub(crate) fn can_match(ty: &Type, value: &str) -> bool {
-    match *ty {
-        Type::INT2 => value.parse::<i16>().is_ok_and(|v| v.to_string() == value),
-        Type::INT4 => value.parse::<i32>().is_ok_and(|v| v.to_string() == value),
-        Type::INT8 => value.parse::<i64>().is_ok_and(|v| v.to_string() == value),
-        Type::BOOL => value == "true" || value == "false",
-        Type::FLOAT4 => value
-            .parse::<f32>()
-            .is_ok_and(|v| canonical_double(widen(v)) == value),
-        Type::FLOAT8 => value
-            .parse::<f64>()
-            .is_ok_and(|v| canonical_double(v) == value),
-        Type::NUMERIC => canonical_decimal(value).is_some_and(|c| c == value),
-        _ => true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,22 +324,5 @@ mod tests {
             SqlValue::String("abababab-abab-abab-abab-abababababab".into())
         );
         assert!(Decoder::Int8.decode(Some(&[0, 1])).is_err());
-    }
-
-    #[test]
-    fn can_match_requires_the_natural_lexical_form() {
-        assert!(can_match(&Type::INT4, "7"));
-        assert!(!can_match(&Type::INT4, "007"));
-        assert!(!can_match(&Type::INT4, "+7"));
-        assert!(!can_match(&Type::INT4, "abc"));
-        assert!(!can_match(&Type::INT2, "40000"));
-        assert!(can_match(&Type::BOOL, "true"));
-        assert!(!can_match(&Type::BOOL, "t"));
-        assert!(can_match(&Type::NUMERIC, "120.5"));
-        assert!(!can_match(&Type::NUMERIC, "120.50"));
-        assert!(can_match(&Type::FLOAT8, "1.5E0"));
-        assert!(!can_match(&Type::FLOAT8, "1.5"));
-        assert!(can_match(&Type::FLOAT4, "1.0E-1"));
-        assert!(can_match(&Type::TEXT, "anything"));
     }
 }

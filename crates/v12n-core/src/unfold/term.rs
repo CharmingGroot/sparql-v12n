@@ -6,7 +6,7 @@ use oxrdf::Term;
 
 use crate::mapping::template::{iri_safe, is_iunreserved};
 use crate::mapping::{Template, TemplatePart, TermMap, TermMapValue, TermType};
-use crate::sql::{Condition, SqlExpr};
+use crate::sql::{Condition, Param, SqlExpr};
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -75,14 +75,14 @@ impl<'a> TermExpr<'a> {
     /// The term's lexical form as one SQL string expression.
     fn to_sql_string(self) -> SqlExpr {
         match self.value {
-            TermValue::Constant(term) => SqlExpr::Param(lexical_form(term).to_owned()),
+            TermValue::Constant(term) => SqlExpr::Param(lexical_form(term).into()),
             TermValue::Column { table, name } => column(table, name),
             TermValue::Template { table, template } => SqlExpr::Concat(
                 template
                     .parts()
                     .iter()
                     .map(|part| match part {
-                        TemplatePart::Literal(text) => SqlExpr::Param(text.clone()),
+                        TemplatePart::Literal(text) => SqlExpr::Param(text.as_str().into()),
                         TemplatePart::Column(name) => column(table, name),
                     })
                     .collect(),
@@ -175,19 +175,30 @@ fn constant_eq(constant: &Term, other: &TermExpr<'_>, iri: bool) -> Equality {
                 template
                     .columns()
                     .zip(values)
-                    .map(|(name, v)| Condition::Eq(column(table, name), SqlExpr::Param(v)))
+                    .map(|(name, v)| Condition::Eq(column(table, name), SqlExpr::Param(v.into())))
                     .collect(),
             ),
             ConstantMatch::NoMatch => Equality::Never,
             ConstantMatch::Unknown => Equality::When(vec![Condition::Eq(
                 other.to_sql_string(),
-                SqlExpr::Param(value.to_owned()),
+                SqlExpr::Param(value.into()),
             )]),
         },
-        _ => Equality::When(vec![Condition::Eq(
-            other.to_sql_string(),
-            SqlExpr::Param(value.to_owned()),
-        )]),
+        _ => {
+            let datatype = match (constant, literal_type(other)) {
+                (Term::Literal(literal), LiteralType::Natural) => {
+                    Some(literal.datatype().as_str().to_owned())
+                }
+                _ => None,
+            };
+            Equality::When(vec![Condition::Eq(
+                other.to_sql_string(),
+                SqlExpr::Param(Param {
+                    value: value.to_owned(),
+                    datatype,
+                }),
+            )])
+        }
     }
 }
 
@@ -582,6 +593,8 @@ mod tests {
             Equality::Never
         );
 
+        // The natural datatype depends on the SQL type, so the constant's
+        // datatype travels with the parameter for the database adapter.
         let natural = column_map("amount", TermType::Literal);
         assert_eq!(
             term_eq(
@@ -590,7 +603,10 @@ mod tests {
             ),
             Equality::When(vec![Condition::Eq(
                 column(0, "amount"),
-                SqlExpr::Param("5".into())
+                SqlExpr::Param(Param {
+                    value: "5".into(),
+                    datatype: Some(XSD_STRING.into()),
+                })
             )])
         );
     }
