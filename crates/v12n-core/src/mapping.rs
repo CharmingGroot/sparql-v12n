@@ -5,6 +5,7 @@ mod index;
 mod parse;
 pub(crate) mod template;
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 pub use index::{MappingIndex, PropertyCandidate};
@@ -24,16 +25,44 @@ pub const BASE_IRI: &str = "http://v12n.invalid/";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mapping {
     triples_maps: Vec<TriplesMap>,
+    prefixes: BTreeMap<String, String>,
 }
 
 impl Mapping {
     /// Parses and validates an R2RML mapping written in Turtle.
     pub fn from_turtle(input: &str) -> Result<Self, Error> {
-        parse::parse(input).map(|triples_maps| Self { triples_maps })
+        parse::parse(input).map(|(triples_maps, prefixes)| Self {
+            triples_maps,
+            prefixes,
+        })
     }
 
     pub fn triples_maps(&self) -> &[TriplesMap] {
         &self.triples_maps
+    }
+
+    /// The `@prefix` declarations of the document, prefix name to
+    /// namespace IRI. A prefix declared twice keeps its last namespace.
+    pub fn prefixes(&self) -> &BTreeMap<String, String> {
+        &self.prefixes
+    }
+
+    /// `iri` as a Turtle/SPARQL prefixed name (`ex:Customer`) using the
+    /// mapping's prefixes, or `None` when no prefix fits.
+    ///
+    /// The longest matching namespace wins, then the smallest prefix name,
+    /// so the result does not depend on declaration order. Local names are
+    /// limited to a conservative subset of `PN_LOCAL` that needs no
+    /// escaping in either language.
+    pub fn compact_iri(&self, iri: &str) -> Option<String> {
+        self.prefixes
+            .iter()
+            .filter_map(|(prefix, namespace)| {
+                let local = iri.strip_prefix(namespace.as_str())?;
+                is_simple_local_name(local).then_some((namespace.len(), prefix, local))
+            })
+            .min_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)))
+            .map(|(_, prefix, local)| format!("{prefix}:{local}"))
     }
 
     pub fn triples_map(&self, id: &TriplesMapId) -> Option<&TriplesMap> {
@@ -41,20 +70,37 @@ impl Mapping {
     }
 }
 
+/// Letters, digits, `_` and `-`, with `.` allowed inside; empty is
+/// allowed too (`ex:`).
+fn is_simple_local_name(local: &str) -> bool {
+    local
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && !local.starts_with(['-', '.'])
+        && !local.ends_with('.')
+}
+
 /// The resource that identifies a triples map.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TriplesMapId {
     Iri(String),
+    /// A blank node written with a label (`_:people`).
     BlankNode(String),
+    /// A blank node written as `[ ... ]`, which has no label in the
+    /// document: its 1-based position among the triples maps, in document
+    /// order.
+    Anonymous(usize),
 }
 
 impl fmt::Display for TriplesMapId {
     /// IRIs under [`BASE_IRI`] are shown relative (`<#CustomerMap>`), as
-    /// they are usually written in the mapping file.
+    /// they are usually written in the mapping file. Anonymous triples maps
+    /// show as `[]#3` for the third triples map of the document.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Iri(iri) => write!(f, "<{}>", iri.strip_prefix(BASE_IRI).unwrap_or(iri)),
             Self::BlankNode(label) => write!(f, "_:{label}"),
+            Self::Anonymous(position) => write!(f, "[]#{position}"),
         }
     }
 }
@@ -68,10 +114,22 @@ pub struct TriplesMap {
 }
 
 /// The SQL source of a triples map (`rr:tableName` or `rr:sqlQuery`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LogicalTable {
     TableName(String),
     SqlQuery(String),
+}
+
+impl LogicalTable {
+    /// R2RML §5: `SELECT * FROM {table}` for a table or view, the query
+    /// itself for an R2RML view. Two logical tables are the same exactly
+    /// when these strings are identical (R2RML §8).
+    pub fn effective_sql_query(&self) -> String {
+        match self {
+            Self::TableName(name) => format!("SELECT * FROM {name}"),
+            Self::SqlQuery(query) => query.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

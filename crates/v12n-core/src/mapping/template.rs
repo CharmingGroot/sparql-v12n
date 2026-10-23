@@ -99,13 +99,36 @@ impl fmt::Display for Template {
     }
 }
 
+/// `ucschar` from RFC 3987: the non-ASCII part of `iunreserved`, as
+/// inclusive code point ranges.
+pub(crate) const UCSCHAR: &[(u32, u32)] = &[
+    (0xA0, 0xD7FF),
+    (0xF900, 0xFDCF),
+    (0xFDF0, 0xFFEF),
+    (0x10000, 0x1FFFD),
+    (0x20000, 0x2FFFD),
+    (0x30000, 0x3FFFD),
+    (0x40000, 0x4FFFD),
+    (0x50000, 0x5FFFD),
+    (0x60000, 0x6FFFD),
+    (0x70000, 0x7FFFD),
+    (0x80000, 0x8FFFD),
+    (0x90000, 0x9FFFD),
+    (0xA0000, 0xAFFFD),
+    (0xB0000, 0xBFFFD),
+    (0xC0000, 0xCFFFD),
+    (0xD0000, 0xDFFFD),
+    (0xE1000, 0xEFFFD),
+];
+
 /// `iunreserved` from RFC 3987, which R2RML's IRI-safe version keeps.
 pub(crate) fn is_iunreserved(c: char) -> bool {
     let code = c as u32;
     c.is_ascii_alphanumeric()
         || matches!(c, '-' | '.' | '_' | '~')
-        || matches!(code, 0xA0..=0xD7FF | 0xF900..=0xFDCF | 0xFDF0..=0xFFEF)
-        || ((0x10000..=0xEFFFD).contains(&code) && code & 0xFFFF <= 0xFFFD)
+        || UCSCHAR
+            .iter()
+            .any(|&(from, to)| (from..=to).contains(&code))
 }
 
 /// R2RML §7.3 IRI-safe version of a string: everything except
@@ -162,6 +185,18 @@ mod tests {
     fn parse_column_with_spaces_and_quotes_keeps_name_verbatim() {
         let t = Template::parse(r#"http://ex/{"Order Id"}"#).unwrap();
         assert_eq!(t.columns().collect::<Vec<_>>(), [r#""Order Id""#]);
+    }
+
+    #[test]
+    fn iri_safe_keeps_only_iunreserved() {
+        assert_eq!(iri_safe("a-b.c_d~e"), "a-b.c_d~e");
+        assert_eq!(iri_safe("a b/c%"), "a%20b%2Fc%25");
+        assert_eq!(iri_safe("한글"), "한글");
+        // Private use and the start of plane 14 are not `ucschar`.
+        assert_eq!(iri_safe("\u{E000}"), "%EE%80%80");
+        assert_eq!(iri_safe("\u{E0001}"), "%F3%A0%80%81");
+        assert_eq!(iri_safe("\u{E1000}"), "\u{E1000}");
+        assert_eq!(iri_safe("\u{1FFFE}"), "%F0%9F%BF%BE");
     }
 
     #[test]

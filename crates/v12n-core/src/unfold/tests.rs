@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::sparql;
+use crate::sql::{TermSql, TermSqlValue};
 
 const SHOP: &str = include_str!("../../../../examples/shop/mapping.ttl");
 
@@ -20,15 +21,16 @@ fn with_prefixes(body: &str) -> String {
     format!("{PREFIXES}{body}")
 }
 
-fn eq(left: SqlExpr, right: SqlExpr) -> Condition {
-    Condition::Eq(left, right)
-}
-
-fn col(table: usize, name: &str) -> SqlExpr {
-    SqlExpr::Column {
-        table,
-        name: name.to_owned(),
-    }
+/// Template columns compared pairwise.
+fn same(lt: usize, l: &str, rt: usize, r: &str) -> Condition {
+    let side = |table, name: &str| TermSql {
+        value: TermSqlValue::Column {
+            table,
+            name: name.to_owned(),
+        },
+        datatype: None,
+    };
+    Condition::SameTerm(side(lt, l), side(rt, r))
 }
 
 #[test]
@@ -45,12 +47,8 @@ fn unfold_shared_variable_emits_column_join() {
         panic!("expected one branch");
     };
     assert_eq!(branch.from.len(), 3);
-    assert!(
-        branch
-            .conditions
-            .contains(&eq(col(1, "customer_id"), col(0, "id")))
-    );
-    assert!(branch.conditions.contains(&eq(col(2, "id"), col(1, "id"))));
+    assert!(branch.conditions.contains(&same(1, "customer_id", 0, "id")));
+    assert!(branch.conditions.contains(&same(2, "id", 1, "id")));
 }
 
 #[test]
@@ -159,10 +157,7 @@ fn unfold_same_variable_in_one_pattern_compares_within_the_row() {
     rr:objectMap [ rr:template "http://ex/person/{friend}" ] ] ."#,
     );
     let plan = unfold_query(&mapping, "SELECT ?x WHERE { ?x ex:knows ?x }").unwrap();
-    assert_eq!(
-        plan.branches[0].conditions,
-        [eq(col(0, "friend"), col(0, "id"))]
-    );
+    assert_eq!(plan.branches[0].conditions, [same(0, "friend", 0, "id")]);
 }
 
 #[test]

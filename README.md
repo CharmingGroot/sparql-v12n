@@ -144,6 +144,26 @@ column, which in
 PostgreSQL turns `id = 7.0` into `id::numeric = 7.0` and stops it from
 using an index on `id`.
 
+## Variables shared across columns
+
+A variable that occurs twice is a join, and it also compares RDF terms,
+not SQL values. Before running such a query, the engine asks PostgreSQL
+for the types of the columns involved (by preparing a probe statement)
+and then:
+
+- compares columns of the same kind (integers, text, dates, ...) with
+  `=`, so indexes are used;
+- compares other pairs through the natural lexical form computed in SQL
+  (`int_col::text = text_col::text`) after checking the natural datatypes:
+  an `integer` column holding 7 joins a text column only if that column
+  has `rr:datatype xsd:integer`, and never a `numeric` 7.0;
+- percent-encodes template values as IRIs do (R2RML IRI-safe version)
+  when templates or IRI columns can only be compared as strings;
+- rejects the query as unsupported (exit code 1, HTTP 501) when the
+  lexical form cannot be computed in SQL, for example a `numeric`
+  template value against a text column, instead of failing in PostgreSQL
+  or returning wrong rows.
+
 ## Layout
 
 | Path | Contents |

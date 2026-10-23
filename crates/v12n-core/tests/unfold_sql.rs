@@ -97,3 +97,33 @@ fn column_against_template_compares_strings() {
         &format!("{PREFIXES}SELECT ?o WHERE {{ ?o ex:homepage ?c . ?c ex:name ?name }}")
     ));
 }
+
+const AMBIGUOUS: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#Pair> rr:logicalTable [ rr:tableName "pairs" ] ;
+  rr:subjectMap [ rr:template "http://example.org/pair/{a}-{b}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "label" ] ] .
+
+<#Ref> rr:logicalTable [ rr:tableName "refs" ] ;
+  rr:subjectMap [ rr:template "http://example.org/ref/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:points ;
+    rr:objectMap [ rr:template "http://example.org/pair/{code}" ] ] .
+"#;
+
+#[test]
+fn ambiguous_templates_compare_iri_safe_strings() {
+    insta::assert_snapshot!(explain(
+        AMBIGUOUS,
+        &format!("{PREFIXES}SELECT ?r ?l WHERE {{ ?r ex:points ?p . ?p ex:label ?l }}")
+    ));
+}
+
+#[test]
+fn constant_against_ambiguous_template_compares_iri_safe_strings() {
+    insta::assert_snapshot!(explain(
+        AMBIGUOUS,
+        &format!("{PREFIXES}SELECT ?l WHERE {{ <http://example.org/pair/x%20y-z> ex:label ?l }}")
+    ));
+}

@@ -5,6 +5,7 @@ use std::error::Error as StdError;
 
 use tokio_postgres::types::{FromSql, Type};
 use v12n_core::solution::SqlValue;
+use v12n_core::sql::{ColumnType, Comparison, Lexical};
 
 type BoxError = Box<dyn StdError + Sync + Send>;
 
@@ -51,6 +52,22 @@ impl Decoder {
             Type::TIMESTAMPTZ => Self::Timestamptz,
             Type::UUID => Self::Uuid,
             _ => return None,
+        })
+    }
+
+    /// IRI of the natural datatype of the values this decoder produces
+    /// (R2RML §10.2); `None` for `xsd:string`.
+    fn natural_datatype(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Bool => "http://www.w3.org/2001/XMLSchema#boolean",
+            Self::Int2 | Self::Int4 | Self::Int8 => "http://www.w3.org/2001/XMLSchema#integer",
+            Self::Float4 | Self::Float8 => "http://www.w3.org/2001/XMLSchema#double",
+            Self::Numeric => "http://www.w3.org/2001/XMLSchema#decimal",
+            Self::Bytea => "http://www.w3.org/2001/XMLSchema#hexBinary",
+            Self::Date => "http://www.w3.org/2001/XMLSchema#date",
+            Self::Time => "http://www.w3.org/2001/XMLSchema#time",
+            Self::Timestamp | Self::Timestamptz => "http://www.w3.org/2001/XMLSchema#dateTime",
+            Self::Text | Self::Uuid => return None,
         })
     }
 
@@ -115,6 +132,45 @@ impl Decoder {
                 ))
             }
         })
+    }
+}
+
+/// How terms built from a column of type `ty` compare in SQL.
+///
+/// Within a group, `=` on values agrees with equality of natural lexical
+/// forms, except for floating point (`-0 = 0`) and types without a
+/// decoder (`'1 day' = '24 hours'` for `interval`), whose text output is
+/// compared instead. Across groups only the natural lexical forms can be
+/// compared, and SQL computes them only where the text output already is
+/// that form, or for booleans and binaries. `bpchar` is left out: its
+/// cast to text drops the padding its values carry.
+pub(crate) fn column_type(ty: &Type) -> ColumnType {
+    let (group, comparison, lexical) = match (Decoder::for_type(ty), ty) {
+        (_, &Type::BPCHAR) => ("bpchar", Comparison::Value, None),
+        (Some(Decoder::Int2 | Decoder::Int4 | Decoder::Int8), _) => {
+            ("integer", Comparison::Value, Some(Lexical::Text))
+        }
+        (Some(Decoder::Text), _) => ("text", Comparison::Value, Some(Lexical::Text)),
+        (Some(Decoder::Uuid), _) => ("uuid", Comparison::Value, Some(Lexical::Text)),
+        (Some(Decoder::Bool), _) => ("boolean", Comparison::Value, Some(Lexical::Boolean)),
+        (Some(Decoder::Bytea), _) => ("bytea", Comparison::Value, Some(Lexical::Hex)),
+        (Some(Decoder::Float4 | Decoder::Float8), _) => ("double", Comparison::Text, None),
+        (Some(Decoder::Numeric), _) => ("numeric", Comparison::Value, None),
+        (Some(Decoder::Date), _) => ("date", Comparison::Value, None),
+        (Some(Decoder::Time), _) => ("time", Comparison::Value, None),
+        (Some(Decoder::Timestamp), _) => ("timestamp", Comparison::Value, None),
+        (Some(Decoder::Timestamptz), _) => ("timestamptz", Comparison::Value, None),
+        // R2RML §10.2: cast to a string, which is exactly `::text`.
+        (None, _) => (ty.name(), Comparison::Text, Some(Lexical::Text)),
+    };
+    ColumnType {
+        name: ty.name().to_owned(),
+        natural_datatype: Decoder::for_type(ty)
+            .and_then(Decoder::natural_datatype)
+            .map(str::to_owned),
+        group: group.to_owned(),
+        comparison,
+        lexical,
     }
 }
 

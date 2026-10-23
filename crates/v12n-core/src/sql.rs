@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //! SQL plan (`SqlPlan`) and PostgreSQL text rendering with bound parameters.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use oxrdf::Term;
 
+use crate::Error;
+use crate::mapping::template::UCSCHAR;
 use crate::mapping::{LogicalTable, TemplatePart, TermType};
+
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 /// An unfolded query: one `SELECT` per branch, combined with `UNION ALL`
 /// (or `UNION` under `DISTINCT`).
@@ -78,8 +82,100 @@ impl From<&str> for Param {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Condition {
+    /// SQL equality: the columns of an `rr:joinCondition` (R2RML §8 joins
+    /// with SQL `=`), or a column and a constant, which a database adapter
+    /// checks against the column's type before binding (see [`Param`]).
     Eq(SqlExpr, SqlExpr),
     IsNotNull(SqlExpr),
+    /// Both sides produce the same RDF term. Column values take part
+    /// through their natural lexical form (R2RML §10.2), which SQL `=`
+    /// matches only for some pairs of SQL types, so how this renders
+    /// depends on the column types (see [`SqlPlan::to_sql_with`]).
+    SameTerm(TermSql, TermSql),
+}
+
+/// One side of a [`Condition::SameTerm`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermSql {
+    pub value: TermSqlValue,
+    /// The datatype of a literal without language tag, when the
+    /// comparison may have to check it; `None` when it never needs to,
+    /// such as for IRIs and template columns.
+    pub datatype: Option<TermDatatype>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TermSqlValue {
+    /// The natural lexical form of a column of table alias `t{table}`.
+    Column { table: usize, name: String },
+    /// A template over table alias `t{table}`. With `iri_safe`, column
+    /// values are percent-encoded as in an IRI template (R2RML §7.3).
+    Template {
+        table: usize,
+        parts: Vec<TemplatePart>,
+        iri_safe: bool,
+    },
+    /// The lexical form of a constant.
+    Param(Param),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TermDatatype {
+    /// The natural datatype of the column's SQL type (R2RML §10.2), only
+    /// known from the database.
+    Natural,
+    /// A datatype IRI given by the mapping.
+    Iri(String),
+}
+
+/// What a database adapter knows about the SQL type of a column that a
+/// [`Condition::SameTerm`] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnType {
+    /// The SQL type name, for error messages.
+    pub name: String,
+    /// IRI of the type's natural datatype; `None` for `xsd:string`.
+    pub natural_datatype: Option<String>,
+    /// Two columns of the same group compare as `comparison` says.
+    pub group: String,
+    pub comparison: Comparison,
+    /// How SQL computes the natural lexical form, when it can.
+    pub lexical: Option<Lexical>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comparison {
+    /// `a = b`: within the group, equal values have equal natural lexical
+    /// forms and the other way round.
+    Value,
+    /// `a::text = b::text`: the text output identifies the natural
+    /// lexical form within the group, but value equality does not (for
+    /// example `-0` and `0`, or `1 day` and `24 hours`).
+    Text,
+}
+
+/// SQL for a column's natural lexical form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lexical {
+    /// The text output, `col::text`.
+    Text,
+    /// `true` or `false`.
+    Boolean,
+    /// Upper-case hexadecimal digits.
+    Hex,
+}
+
+/// Column types by logical table and column name.
+pub type ColumnTypes = HashMap<(LogicalTable, String), ColumnType>;
+
+/// What a database adapter learned before rendering, see
+/// [`SqlPlan::to_sql_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RenderOptions<'a> {
+    /// Parameters (0-based) whose compared column is cast to text.
+    pub text_params: &'a [usize],
+    /// Types of the columns that [`SqlPlan::term_columns`] lists.
+    pub column_types: Option<&'a ColumnTypes>,
 }
 
 /// A projected variable and how to rebuild its RDF term from a result row.
@@ -145,19 +241,33 @@ impl SqlPlan {
     /// Every parameter is one side of an equality in the conjunction of
     /// its branch's `ON` and `WHERE` conditions, so binding it to `NULL`
     /// empties that branch and leaves the others as they are.
+    ///
+    /// Without column types, a [`Condition::SameTerm`] compares columns
+    /// with `=` and template columns by their text output, which is what
+    /// the database sees for text and integer columns.
     pub fn to_sql(&self) -> RenderedSql {
-        self.to_sql_with_text_params(&[])
+        self.to_sql_with(&RenderOptions::default())
+            .expect("rendering without column types does not fail")
     }
 
-    /// Like [`to_sql`](Self::to_sql), with the column compared with each
-    /// parameter in `text_params` (0-based) cast to text. A database
-    /// adapter uses this for column types whose values it does not format
-    /// itself: the comparison then uses the same text the result column
-    /// gets, instead of the database parsing the constant as that type.
-    /// The cast keeps an index on the column from being used.
-    pub fn to_sql_with_text_params(&self, text_params: &[usize]) -> RenderedSql {
+    /// Like [`to_sql`](Self::to_sql), with what a database adapter knows:
+    ///
+    /// - The column compared with each parameter in `text_params` is cast
+    ///   to text. An adapter uses this for column types whose values it
+    ///   does not format itself: the comparison then uses the same text
+    ///   the result column gets, instead of the database parsing the
+    ///   constant as that type. The cast keeps an index on the column
+    ///   from being used.
+    /// - With `column_types`, a [`Condition::SameTerm`] is `false` when a
+    ///   natural datatype differs from the other side's datatype, compares
+    ///   two columns of the same group as [`Comparison`] says, and
+    ///   otherwise compares natural lexical forms computed in SQL. A
+    ///   column whose lexical form SQL cannot compute is an
+    ///   [`Error::UnsupportedFeature`], rather than a comparison that
+    ///   fails in the database or gives wrong answers.
+    pub fn to_sql_with(&self, options: &RenderOptions<'_>) -> Result<RenderedSql, Error> {
         let mut r = Renderer {
-            text_params,
+            options: *options,
             ..Renderer::default()
         };
         if self.branches.is_empty() {
@@ -173,15 +283,79 @@ impl SqlPlan {
                 });
             }
             r.branch_index = i;
-            r.branch(branch, &self.columns, self.distinct && single);
+            r.branch(branch, &self.columns, self.distinct && single)?;
         }
-        RenderedSql {
+        Ok(RenderedSql {
             sql: r.sql,
             params: r.params,
             param_datatypes: r.param_datatypes,
             param_branches: r.param_branches,
+        })
+    }
+
+    /// The columns [`Condition::SameTerm`]s read, each once, in order of
+    /// appearance. Their types go into [`RenderOptions::column_types`].
+    pub fn term_columns(&self) -> Vec<(LogicalTable, String)> {
+        let mut out: Vec<(LogicalTable, String)> = Vec::new();
+        for branch in &self.branches {
+            for condition in &branch.conditions {
+                let Condition::SameTerm(left, right) = condition else {
+                    continue;
+                };
+                for (table, name) in left.columns().into_iter().chain(right.columns()) {
+                    let key = (branch.from[table].clone(), name.to_owned());
+                    if !out.contains(&key) {
+                        out.push(key);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+impl TermSql {
+    /// `(table, column)` pairs the side reads.
+    pub fn columns(&self) -> Vec<(usize, &str)> {
+        match &self.value {
+            TermSqlValue::Column { table, name } => vec![(*table, name.as_str())],
+            TermSqlValue::Template { table, parts, .. } => parts
+                .iter()
+                .filter_map(|p| match p {
+                    TemplatePart::Column(name) => Some((*table, name.as_str())),
+                    TemplatePart::Literal(_) => None,
+                })
+                .collect(),
+            TermSqlValue::Param(_) => Vec::new(),
         }
     }
+}
+
+/// A statement whose result columns have the types of `columns`, to
+/// prepare (not run) so the database reports them. Each logical table
+/// appears once.
+pub fn column_type_probe(columns: &[(LogicalTable, String)]) -> String {
+    let mut tables: Vec<&LogicalTable> = Vec::new();
+    let select: Vec<String> = columns
+        .iter()
+        .map(|(table, name)| {
+            let position = tables.iter().position(|t| *t == table).unwrap_or_else(|| {
+                tables.push(table);
+                tables.len() - 1
+            });
+            format!("p{position}.{}", quote_identifier(name))
+        })
+        .collect();
+    let from: Vec<String> = tables
+        .iter()
+        .enumerate()
+        .map(|(i, table)| format!("{} p{i}", logical_table(table)))
+        .collect();
+    format!(
+        "SELECT {}\nFROM {}\nLIMIT 0",
+        select.join(", "),
+        from.join("\nCROSS JOIN ")
+    )
 }
 
 #[derive(Default)]
@@ -191,11 +365,19 @@ struct Renderer<'a> {
     param_datatypes: Vec<Option<String>>,
     param_branches: Vec<usize>,
     branch_index: usize,
-    text_params: &'a [usize],
+    options: RenderOptions<'a>,
+    /// Logical tables of the branch being rendered.
+    from: &'a [LogicalTable],
 }
 
-impl Renderer<'_> {
-    fn branch(&mut self, branch: &SqlBranch, columns: &[String], distinct: bool) {
+impl<'a> Renderer<'a> {
+    fn branch(
+        &mut self,
+        branch: &'a SqlBranch,
+        columns: &[String],
+        distinct: bool,
+    ) -> Result<(), Error> {
+        self.from = &branch.from;
         self.sql.push_str("SELECT ");
         if distinct {
             self.sql.push_str("DISTINCT ");
@@ -236,16 +418,17 @@ impl Renderer<'_> {
             self.sql.push_str(&format!(" t{i}"));
             if i > 0 && !on[i].is_empty() {
                 self.sql.push_str(" ON ");
-                self.conditions(&on[i]);
+                self.conditions(&on[i])?;
             }
         }
         if !filters.is_empty() {
             self.sql.push_str("\nWHERE ");
-            self.conditions(&filters);
+            self.conditions(&filters)?;
         }
+        Ok(())
     }
 
-    fn conditions(&mut self, conditions: &[&Condition]) {
+    fn conditions(&mut self, conditions: &[&Condition]) -> Result<(), Error> {
         for (i, condition) in conditions.iter().enumerate() {
             if i > 0 {
                 self.sql.push_str(" AND ");
@@ -258,7 +441,7 @@ impl Renderer<'_> {
                         (left, right),
                         (SqlExpr::Column { .. }, SqlExpr::Param(_))
                             | (SqlExpr::Param(_), SqlExpr::Column { .. })
-                    ) && self.text_params.contains(&self.params.len());
+                    ) && self.options.text_params.contains(&self.params.len());
                     self.expr(left);
                     if as_text && matches!(left, SqlExpr::Column { .. }) {
                         self.sql.push_str("::text");
@@ -273,16 +456,160 @@ impl Renderer<'_> {
                     self.expr(expr);
                     self.sql.push_str(" IS NOT NULL");
                 }
+                Condition::SameTerm(left, right) => self.same_term(left, right)?,
             }
         }
+        Ok(())
+    }
+
+    fn same_term(&mut self, left: &TermSql, right: &TermSql) -> Result<(), Error> {
+        let Some(types) = self.options.column_types else {
+            self.term_side(left, None)?;
+            self.sql.push_str(" = ");
+            return self.term_side(right, None);
+        };
+        if !self.datatypes_agree(left, right, types) {
+            self.sql.push_str("false");
+            return Ok(());
+        }
+        if let (
+            TermSqlValue::Column {
+                table: lt,
+                name: ln,
+            },
+            TermSqlValue::Column {
+                table: rt,
+                name: rn,
+            },
+        ) = (&left.value, &right.value)
+            && let (Some(a), Some(b)) = (self.column_type(*lt, ln), self.column_type(*rt, rn))
+            && a.group == b.group
+        {
+            let cast = match a.comparison {
+                Comparison::Value => "",
+                Comparison::Text => "::text",
+            };
+            self.sql.push_str(&format!(
+                "{}{cast} = {}{cast}",
+                column_sql(*lt, ln),
+                column_sql(*rt, rn)
+            ));
+            return Ok(());
+        }
+        self.term_side(left, Some(types))?;
+        self.sql.push_str(" = ");
+        self.term_side(right, Some(types))
+    }
+
+    /// R2RML §10.2: a literal from a column without `rr:datatype` has its
+    /// SQL type's natural datatype, so it can only equal a literal with
+    /// that datatype.
+    fn datatypes_agree(&self, left: &TermSql, right: &TermSql, types: &ColumnTypes) -> bool {
+        let datatype = |side: &TermSql| -> Option<String> {
+            match (&side.datatype, &side.value) {
+                (Some(TermDatatype::Iri(iri)), _) => Some(iri.clone()),
+                (Some(TermDatatype::Natural), TermSqlValue::Column { table, name }) => {
+                    let ty = types.get(&(self.from[*table].clone(), name.clone()))?;
+                    Some(
+                        ty.natural_datatype
+                            .as_deref()
+                            .unwrap_or(XSD_STRING)
+                            .to_owned(),
+                    )
+                }
+                _ => None,
+            }
+        };
+        let natural = |side: &TermSql| side.datatype == Some(TermDatatype::Natural);
+        if !natural(left) && !natural(right) {
+            return true;
+        }
+        match (datatype(left), datatype(right)) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
+
+    fn column_type(&self, table: usize, name: &str) -> Option<&'a ColumnType> {
+        self.options
+            .column_types?
+            .get(&(self.from[table].clone(), name.to_owned()))
+    }
+
+    /// One side of a term comparison as a string expression. Without
+    /// `types`, columns are rendered as they are and template columns by
+    /// their text output.
+    fn term_side(&mut self, side: &TermSql, types: Option<&ColumnTypes>) -> Result<(), Error> {
+        match &side.value {
+            TermSqlValue::Column { table, name } => match types {
+                None => self.sql.push_str(&column_sql(*table, name)),
+                Some(_) => {
+                    let lexical = self.lexical(*table, name)?;
+                    self.sql.push_str(&lexical);
+                }
+            },
+            TermSqlValue::Template {
+                table,
+                parts,
+                iri_safe,
+            } => {
+                for (i, part) in parts.iter().enumerate() {
+                    if i > 0 {
+                        self.sql.push_str(" || ");
+                    }
+                    match part {
+                        TemplatePart::Literal(text) => {
+                            self.expr(&SqlExpr::Param(text.as_str().into()))
+                        }
+                        TemplatePart::Column(name) => {
+                            let value = match types {
+                                None => format!("{}::text", column_sql(*table, name)),
+                                Some(_) => self.lexical(*table, name)?,
+                            };
+                            self.sql.push_str(&if *iri_safe {
+                                iri_safe_sql(&value)
+                            } else {
+                                value
+                            });
+                        }
+                    }
+                }
+            }
+            TermSqlValue::Param(param) => self.expr(&SqlExpr::Param(param.clone())),
+        }
+        Ok(())
+    }
+
+    /// SQL for the natural lexical form of a column.
+    fn lexical(&self, table: usize, name: &str) -> Result<String, Error> {
+        let column = column_sql(table, name);
+        let Some(ty) = self.column_type(table, name) else {
+            return Ok(format!("{column}::text"));
+        };
+        Ok(match ty.lexical {
+            Some(Lexical::Text) => format!("{column}::text"),
+            Some(Lexical::Boolean) => {
+                format!("CASE {column} WHEN true THEN 'true' WHEN false THEN 'false' END")
+            }
+            Some(Lexical::Hex) => format!("upper(encode({column}, 'hex'))"),
+            None => {
+                let source = match &self.from[table] {
+                    LogicalTable::TableName(t) => format!("table {t}"),
+                    LogicalTable::SqlQuery(_) => "an rr:sqlQuery".to_owned(),
+                };
+                return Err(Error::UnsupportedFeature(format!(
+                    "comparing terms built from column {name} of {source} ({}) with terms of \
+                     a different SQL type or shape: its natural lexical form cannot be \
+                     computed in SQL",
+                    ty.name
+                )));
+            }
+        })
     }
 
     fn expr(&mut self, expr: &SqlExpr) {
         match expr {
-            SqlExpr::Column { table, name } => {
-                self.sql
-                    .push_str(&format!("t{table}.{}", quote_identifier(name)));
-            }
+            SqlExpr::Column { table, name } => self.sql.push_str(&column_sql(*table, name)),
             SqlExpr::Param(param) => {
                 self.params.push(param.value.clone());
                 self.param_datatypes.push(param.datatype.clone());
@@ -305,6 +632,35 @@ impl Renderer<'_> {
     }
 }
 
+fn column_sql(table: usize, name: &str) -> String {
+    format!("t{table}.{}", quote_identifier(name))
+}
+
+/// R2RML §7.3 IRI-safe version of a text expression: every character
+/// outside `iunreserved` becomes `%XX` per UTF-8 byte, upper case, as the
+/// engine encodes template values when it builds IRIs. NULL stays NULL.
+pub fn iri_safe_sql(text: &str) -> String {
+    let mut class = String::from("^[-.0-9A-Z_a-z~");
+    for &(from, to) in UCSCHAR {
+        let escape = |c: u32| {
+            if c <= 0xFFFF {
+                format!("\\u{c:04X}")
+            } else {
+                format!("\\U{c:08X}")
+            }
+        };
+        class.push_str(&format!("{}-{}", escape(from), escape(to)));
+    }
+    class.push_str("]$");
+    format!(
+        "CASE WHEN {text} IS NULL THEN NULL ELSE (SELECT coalesce(string_agg(\
+         CASE WHEN c ~ '{class}' THEN c \
+         ELSE regexp_replace(upper(encode(convert_to(c, 'UTF8'), 'hex')), '(..)', '%\\1', 'g') END, \
+         '' ORDER BY n), '') \
+         FROM generate_series(1, char_length({text})) AS n, substr({text}, n, 1) AS c) END"
+    )
+}
+
 /// Table aliases a condition refers to, in ascending order.
 fn condition_tables(condition: &Condition) -> Vec<usize> {
     fn collect(expr: &SqlExpr, out: &mut BTreeSet<usize>) {
@@ -323,6 +679,11 @@ fn condition_tables(condition: &Condition) -> Vec<usize> {
             collect(right, &mut tables);
         }
         Condition::IsNotNull(expr) => collect(expr, &mut tables),
+        Condition::SameTerm(left, right) => {
+            for (table, _) in left.columns().into_iter().chain(right.columns()) {
+                tables.insert(table);
+            }
+        }
     }
     tables.into_iter().collect()
 }
@@ -475,7 +836,12 @@ mod tests {
             branches: vec![branch("1", None), branch("2", Some("http://ex/dt"))],
             distinct: false,
         };
-        let rendered = plan.to_sql_with_text_params(&[3]);
+        let rendered = plan
+            .to_sql_with(&RenderOptions {
+                text_params: &[3],
+                ..RenderOptions::default()
+            })
+            .unwrap();
         assert_eq!(
             rendered.sql,
             "SELECT t0.\"id\" AS \"x\"\n\
@@ -496,6 +862,115 @@ mod tests {
             plan.to_sql().sql,
             rendered.sql.replace("::text = $4", " = $4")
         );
+    }
+
+    fn ty(group: &str, comparison: Comparison, lexical: Option<Lexical>) -> ColumnType {
+        ColumnType {
+            name: group.to_owned(),
+            natural_datatype: (group == "integer")
+                .then(|| "http://www.w3.org/2001/XMLSchema#integer".to_owned()),
+            group: group.to_owned(),
+            comparison,
+            lexical,
+        }
+    }
+
+    fn side(table: usize, name: &str, datatype: Option<TermDatatype>) -> TermSql {
+        TermSql {
+            value: TermSqlValue::Column {
+                table,
+                name: name.to_owned(),
+            },
+            datatype,
+        }
+    }
+
+    /// `WHERE` of a two-table branch with one `SameTerm`, rendered with
+    /// the given column types for `a` (table `l`) and `b` (table `r`).
+    fn same_term_sql(
+        left: TermSql,
+        right: TermSql,
+        a: ColumnType,
+        b: ColumnType,
+    ) -> Result<String, Error> {
+        let (l, r) = (
+            LogicalTable::TableName("l".into()),
+            LogicalTable::TableName("r".into()),
+        );
+        let plan = SqlPlan {
+            columns: Vec::new(),
+            projection: Vec::new(),
+            branches: vec![SqlBranch {
+                from: vec![l.clone(), r.clone()],
+                select: Vec::new(),
+                conditions: vec![Condition::SameTerm(left, right)],
+            }],
+            distinct: false,
+        };
+        assert_eq!(plan.term_columns().len(), 2);
+        let types: ColumnTypes = [((l, "a".to_owned()), a), ((r, "b".to_owned()), b)].into();
+        let rendered = plan.to_sql_with(&RenderOptions {
+            column_types: Some(&types),
+            ..RenderOptions::default()
+        })?;
+        Ok(rendered.sql.split(" ON ").nth(1).unwrap().to_owned())
+    }
+
+    #[test]
+    fn same_term_with_column_types_compares_as_the_group_says() {
+        let int = || ty("integer", Comparison::Value, Some(Lexical::Text));
+        let text = || ty("text", Comparison::Value, Some(Lexical::Text));
+        let double = || ty("double", Comparison::Text, None);
+        let boolean = || ty("boolean", Comparison::Value, Some(Lexical::Boolean));
+        let numeric = || ty("numeric", Comparison::Value, None);
+        let plain = |t, n| side(t, n, None);
+        let natural = |t, n| side(t, n, Some(TermDatatype::Natural));
+
+        // Same group: `=` keeps indexes usable.
+        assert_eq!(
+            same_term_sql(plain(0, "a"), plain(1, "b"), int(), int()).unwrap(),
+            r#"t0."a" = t1."b""#
+        );
+        assert_eq!(
+            same_term_sql(plain(0, "a"), plain(1, "b"), double(), double()).unwrap(),
+            r#"t0."a"::text = t1."b"::text"#
+        );
+        // Across groups: natural lexical forms, never an operator error.
+        assert_eq!(
+            same_term_sql(plain(0, "a"), plain(1, "b"), int(), text()).unwrap(),
+            r#"t0."a"::text = t1."b"::text"#
+        );
+        assert_eq!(
+            same_term_sql(plain(0, "a"), plain(1, "b"), boolean(), text()).unwrap(),
+            r#"CASE t0."a" WHEN true THEN 'true' WHEN false THEN 'false' END = t1."b"::text"#
+        );
+        // Natural datatypes that differ never give the same literal.
+        assert_eq!(
+            same_term_sql(natural(0, "a"), natural(1, "b"), int(), text()).unwrap(),
+            "false"
+        );
+        let integer = TermDatatype::Iri("http://www.w3.org/2001/XMLSchema#integer".into());
+        assert_eq!(
+            same_term_sql(natural(0, "a"), side(1, "b", Some(integer)), int(), text()).unwrap(),
+            r#"t0."a"::text = t1."b"::text"#
+        );
+        // No SQL for numeric's canonical form: rejected, not guessed.
+        let err = same_term_sql(plain(0, "a"), plain(1, "b"), numeric(), int()).unwrap_err();
+        assert!(
+            matches!(&err, Error::UnsupportedFeature(m) if m.contains("column a of table l (numeric)")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn iri_safe_sql_keeps_nulls_and_uses_the_iunreserved_ranges() {
+        let sql = iri_safe_sql("x");
+        assert!(
+            sql.starts_with("CASE WHEN x IS NULL THEN NULL ELSE"),
+            "{sql}"
+        );
+        assert!(sql.contains(r"\u00A0-\uD7FF"), "{sql}");
+        assert!(sql.contains(r"\U000E1000-\U000EFFFD]$'"), "{sql}");
     }
 
     #[test]

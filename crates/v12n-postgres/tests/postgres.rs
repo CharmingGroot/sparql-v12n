@@ -385,3 +385,185 @@ async fn numeric_template_matches_the_canonical_form_of_any_scale() {
         assert_eq!(!rows.is_empty(), expected, "{iri}");
     }
 }
+
+/// One triples map per `(name, sql, predicate-object maps)`, all with the
+/// subject `http://example.org/row/{id}`: subjects of different shapes
+/// cannot share a variable across UNION branches yet.
+fn views(rows: &[(&str, &str, &str)]) -> String {
+    let maps: String = rows
+        .iter()
+        .map(|(name, sql, poms)| {
+            format!(
+                "<#{name}> rr:logicalTable [ rr:sqlQuery \"\"\"{sql}\"\"\" ] ;\n\
+                 rr:subjectMap [ rr:template \"http://example.org/row/{{id}}\" ] ;\n{poms} .\n"
+            )
+        })
+        .collect();
+    format!(
+        "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
+         @prefix ex: <http://example.org/> .\n\
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n{maps}"
+    )
+}
+
+#[tokio::test]
+async fn constant_literal_matches_only_the_natural_datatype_of_the_column() {
+    let Some(url) = database_url() else { return };
+    let v = "rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column \"v\" ] ]";
+    let mapping = views(&[
+        ("int", "SELECT 1 AS id, 7::int4 AS v", v),
+        ("text", "SELECT 2 AS id, '7'::text AS v", v),
+    ]);
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    assert_eq!(
+        subjects(&url, &mapping, "v", "7").await,
+        ["?row=<http://example.org/row/1>"]
+    );
+    assert_eq!(
+        subjects(&url, &mapping, "v", "\"7\"").await,
+        ["?row=<http://example.org/row/2>"]
+    );
+    for object in [format!("\"7\"^^<{xsd}decimal>"), "7.0".to_owned()] {
+        assert!(
+            subjects(&url, &mapping, "v", &object).await.is_empty(),
+            "{object}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn join_across_column_types_compares_terms_not_values() {
+    let Some(url) = database_url() else { return };
+    let v = |p: &str, extra: &str| {
+        format!(
+            "rr:predicateObjectMap [ rr:predicate ex:{p} ; rr:objectMap [ rr:column \"v\" {extra}] ]"
+        )
+    };
+    let mapping = views(&[
+        ("int", "SELECT 1 AS id, 7::int4 AS v", &v("left", "")),
+        ("bigint", "SELECT 2 AS id, 7::int8 AS v", &v("right", "")),
+        // "7" is not "7"^^xsd:integer, and 7.0 is "7.0"^^xsd:decimal.
+        ("text", "SELECT 3 AS id, '7'::text AS v", &v("right", "")),
+        (
+            "numeric",
+            "SELECT 4 AS id, 7.0::numeric AS v",
+            &v("right", ""),
+        ),
+        // rr:datatype makes the text "7" the term "7"^^xsd:integer.
+        (
+            "typed",
+            "SELECT 5 AS id, '7'::text AS v",
+            &v("right", "; rr:datatype xsd:integer "),
+        ),
+    ]);
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?a ?b WHERE { ?a ex:left ?x . ?b ex:right ?x }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            "?a=<http://example.org/row/1> ?b=<http://example.org/row/2>",
+            "?a=<http://example.org/row/1> ?b=<http://example.org/row/5>",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn string_comparison_applies_iri_safe_encoding() {
+    let Some(url) = database_url() else { return };
+    let mapping = views(&[
+        (
+            "link",
+            "SELECT 1 AS id, 'http://example.org/doc/a%20b%2Fc' AS target \
+             UNION ALL SELECT 2, 'http://example.org/flag/true'",
+            "rr:predicateObjectMap [ rr:predicate ex:links ;
+               rr:objectMap [ rr:column \"target\" ; rr:termType rr:IRI ] ]",
+        ),
+        (
+            "doc",
+            "SELECT 3 AS id, 'a b/c'::text AS name",
+            "rr:predicateObjectMap [ rr:predicate ex:about ;
+               rr:objectMap [ rr:template \"http://example.org/doc/{name}\" ] ]",
+        ),
+        (
+            "flag",
+            "SELECT 4 AS id, true AS b",
+            "rr:predicateObjectMap [ rr:predicate ex:about ;
+               rr:objectMap [ rr:template \"http://example.org/flag/{b}\" ] ]",
+        ),
+        (
+            "pair",
+            "SELECT 5 AS id, 'x y'::text AS a, 'z'::text AS b",
+            "rr:predicateObjectMap [ rr:predicate ex:about ;
+               rr:objectMap [ rr:template \"http://example.org/pair/{a}-{b}\" ] ]",
+        ),
+    ]);
+    // A column holding IRIs against a template.
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?l ?s WHERE { ?l ex:links ?t . ?s ex:about ?t }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            "?l=<http://example.org/row/1> ?s=<http://example.org/row/3>",
+            "?l=<http://example.org/row/2> ?s=<http://example.org/row/4>",
+        ]
+    );
+    // A constant against a template whose values cannot be read off it.
+    assert_eq!(
+        subjects(&url, &mapping, "about", "<http://example.org/pair/x%20y-z>").await,
+        ["?row=<http://example.org/row/5>"]
+    );
+    assert!(
+        subjects(
+            &url,
+            &mapping,
+            "about",
+            "<http://example.org/pair/x%2520y-z>"
+        )
+        .await
+        .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn comparison_sql_cannot_compute_is_rejected() {
+    let Some(url) = database_url() else { return };
+    let mapping = views(&[
+        (
+            "price",
+            "SELECT 1 AS id, 7.0::numeric AS p",
+            "rr:predicateObjectMap [ rr:predicate ex:item ;
+               rr:objectMap [ rr:template \"http://example.org/item/{p}\" ] ]",
+        ),
+        (
+            "item",
+            "SELECT 2 AS id, 'http://example.org/item/7.0' AS iri, 7 AS n",
+            "rr:predicateObjectMap [ rr:predicate ex:same ;
+               rr:objectMap [ rr:column \"iri\" ; rr:termType rr:IRI ] ] ;
+             rr:predicateObjectMap [ rr:predicate ex:item ;
+               rr:objectMap [ rr:template \"http://example.org/item/{n}\" ] ]",
+        ),
+    ]);
+    for query in [
+        // numeric has no SQL expression for its canonical form.
+        "SELECT ?p WHERE { ?p <http://example.org/item> ?i . ?q <http://example.org/same> ?i }",
+        // Same template shape, numeric against integer.
+        "SELECT ?p WHERE { ?p <http://example.org/item> ?i . ?q <http://example.org/item> ?i }",
+    ] {
+        let error = run(&url, Limits::default(), &plan(&mapping, query))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                Error::Core(v12n_core::Error::UnsupportedFeature(m)) if m.contains("numeric")
+            ),
+            "{query}: {error}"
+        );
+    }
+}
