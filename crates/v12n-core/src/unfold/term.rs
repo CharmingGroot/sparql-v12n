@@ -251,7 +251,8 @@ fn constant_eq(constant: &Term, other: &TermExpr<'_>, iri: bool) -> Equality {
                 TermExpr::constant(constant).to_term_sql(),
             )]),
         },
-        TermValue::Column { .. } if let Some(base) = other.base_iri => {
+        TermValue::Column { .. } if other.base_iri.is_some() => {
+            let base = other.base_iri.expect("checked by the guard");
             // R2RML §11.2: the column value is the IRI itself, or, when the
             // IRI starts with the base, the relative rest, which resolves to
             // it unless it has a scheme of its own. Two parameters keep the
