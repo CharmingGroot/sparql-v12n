@@ -163,6 +163,9 @@ pub enum Lexical {
     Boolean,
     /// Upper-case hexadecimal digits.
     Hex,
+    /// The canonical `xsd:decimal` form of a PostgreSQL `numeric`,
+    /// `trim_scale(col)::text` (PostgreSQL 13 or later).
+    Decimal,
 }
 
 /// Column types by logical table and column name.
@@ -592,6 +595,11 @@ impl<'a> Renderer<'a> {
                 format!("CASE {column} WHEN true THEN 'true' WHEN false THEN 'false' END")
             }
             Some(Lexical::Hex) => format!("upper(encode({column}, 'hex'))"),
+            // `numeric` output never uses an exponent, and trim_scale drops
+            // exactly the trailing fractional zeros, which is the XML
+            // Schema 1.1 decimalCanonicalMap (`3`, `12.5`); tested against
+            // `canonical_decimal` over many values in v12n-postgres.
+            Some(Lexical::Decimal) => format!("trim_scale({column})::text"),
             None => {
                 let source = match &self.from[table] {
                     LogicalTable::TableName(t) => format!("table {t}"),
@@ -922,7 +930,7 @@ mod tests {
         let text = || ty("text", Comparison::Value, Some(Lexical::Text));
         let double = || ty("double", Comparison::Text, None);
         let boolean = || ty("boolean", Comparison::Value, Some(Lexical::Boolean));
-        let numeric = || ty("numeric", Comparison::Value, None);
+        let numeric = || ty("numeric", Comparison::Value, Some(Lexical::Decimal));
         let plain = |t, n| side(t, n, None);
         let natural = |t, n| side(t, n, Some(TermDatatype::Natural));
 
@@ -954,10 +962,15 @@ mod tests {
             same_term_sql(natural(0, "a"), side(1, "b", Some(integer)), int(), text()).unwrap(),
             r#"t0."a"::text = t1."b"::text"#
         );
-        // No SQL for numeric's canonical form: rejected, not guessed.
-        let err = same_term_sql(plain(0, "a"), plain(1, "b"), numeric(), int()).unwrap_err();
+        // numeric: the canonical decimal, computed by trim_scale.
+        assert_eq!(
+            same_term_sql(plain(0, "a"), plain(1, "b"), numeric(), int()).unwrap(),
+            r#"trim_scale(t0."a")::text = t1."b"::text"#
+        );
+        // No SQL for double's canonical form: rejected, not guessed.
+        let err = same_term_sql(plain(0, "a"), plain(1, "b"), double(), int()).unwrap_err();
         assert!(
-            matches!(&err, Error::UnsupportedFeature(m) if m.contains("column a of table l (numeric)")),
+            matches!(&err, Error::UnsupportedFeature(m) if m.contains("column a of table l (double)")),
             "{err}"
         );
     }

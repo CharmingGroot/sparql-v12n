@@ -18,12 +18,17 @@ issue = 24
 expect = "mismatch"
 issue = 24
 
-# Ontop keeps the numeric scale (12.50); v12n writes the canonical 12.5.
+# Ontop keeps the numeric scale (12.50, 3.00); v12n writes the XSD 1.1
+# canonical forms (12.5, 3), as decided in Discussion #35.
 [query.prices]
 expect = "mismatch"
 issue = 25
 
 [query.price-constant]
+expect = "mismatch"
+issue = 25
+
+[query.price-integral-constant]
 expect = "mismatch"
 issue = 25
 

@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio_postgres::NoTls;
 use tokio_postgres::types::Type;
 use v12n_core::mapping::{Mapping, MappingIndex};
+use v12n_core::solution::canonical_decimal;
 use v12n_core::sql::SqlPlan;
 use v12n_core::{sparql, unfold};
 use v12n_postgres::{Database, Error, Limits};
@@ -162,10 +163,11 @@ fn sql_query_mapping(sql: &str, columns: &[&str]) -> String {
 async fn natural_mapping_covers_postgres_types() {
     let Some(url) = database_url() else { return };
     let columns = [
-        "d", "f", "r", "b", "dt", "tm", "ts", "tz", "bin", "s", "u", "iv",
+        "d", "di", "f", "f30", "r", "b", "dt", "tm", "ts", "tz", "bin", "s", "u", "iv",
     ];
     let mapping = sql_query_mapping(
-        r"SELECT 1 AS id, 12.50::numeric AS d, 1.5::float8 AS f, 0.1::real AS r,
+        r"SELECT 1 AS id, 12.50::numeric AS d, 3.00::numeric AS di, 1.5::float8 AS f,
+          30::float8 AS f30, 0.1::real AS r,
           true AS b, DATE '2024-02-29' AS dt, TIME '10:00:00.25' AS tm,
           TIMESTAMP '2024-01-02 03:04:05.5' AS ts,
           TIMESTAMPTZ '2024-01-02 03:04:05+09' AS tz, '\\x0a0b'::bytea AS bin,
@@ -186,7 +188,10 @@ async fn natural_mapping_covers_postgres_types() {
     };
     let expected = [
         ("d", xsd("12.5", "decimal")),
+        // XML Schema 1.1 decimalCanonicalMap: an integer has no point.
+        ("di", xsd("3", "decimal")),
         ("f", xsd("1.5E0", "double")),
+        ("f30", xsd("3.0E1", "double")),
         ("r", xsd("1.0E-1", "double")),
         ("b", xsd("true", "boolean")),
         ("dt", xsd("2024-02-29", "date")),
@@ -306,10 +311,10 @@ async fn unrepresentable_constant_drops_only_its_branch() {
 async fn constants_round_trip_through_the_result_formatting() {
     let Some(url) = database_url() else { return };
     let columns = [
-        "d", "f", "b", "dt", "ts", "tz", "bin", "u", "iv", "i2", "i8",
+        "d", "di", "f", "b", "dt", "ts", "tz", "bin", "u", "iv", "i2", "i8",
     ];
     let mapping = sql_query_mapping(
-        r"SELECT 1 AS id, 12.50::numeric AS d, 1.5::float8 AS f, true AS b,
+        r"SELECT 1 AS id, 12.50::numeric AS d, 3.00::numeric AS di, 1.5::float8 AS f, true AS b,
           DATE '2024-02-29' AS dt, TIMESTAMP '2024-01-02 03:04:05.5' AS ts,
           TIMESTAMPTZ '2024-01-02 03:04:05+09' AS tz, '\\x0a0b'::bytea AS bin,
           '00000000-0000-0000-0000-00000000000a'::uuid AS u,
@@ -324,6 +329,9 @@ async fn constants_round_trip_through_the_result_formatting() {
         ("d", "12.5".to_owned(), true),
         ("d", "12.50".to_owned(), false),
         ("d", "\"12.5\"".to_owned(), false),
+        ("di", xsd("3", "decimal"), true),
+        ("di", "3.0".to_owned(), false),
+        ("di", "3".to_owned(), false),
         ("f", "1.5E0".to_owned(), true),
         ("f", xsd("1.5", "double"), false),
         ("b", "true".to_owned(), true),
@@ -442,7 +450,7 @@ async fn join_across_column_types_compares_terms_not_values() {
     let mapping = views(&[
         ("int", "SELECT 1 AS id, 7::int4 AS v", &v("left", "")),
         ("bigint", "SELECT 2 AS id, 7::int8 AS v", &v("right", "")),
-        // "7" is not "7"^^xsd:integer, and 7.0 is "7.0"^^xsd:decimal.
+        // "7" is not "7"^^xsd:integer, and 7.0 is "7"^^xsd:decimal.
         ("text", "SELECT 3 AS id, '7'::text AS v", &v("right", "")),
         (
             "numeric",
@@ -531,29 +539,102 @@ async fn string_comparison_applies_iri_safe_encoding() {
 }
 
 #[tokio::test]
-async fn comparison_sql_cannot_compute_is_rejected() {
+async fn numeric_compares_with_other_types_by_its_canonical_form() {
     let Some(url) = database_url() else { return };
     let mapping = views(&[
         (
             "price",
-            "SELECT 1 AS id, 7.0::numeric AS p",
+            "SELECT 1 AS id, 7.00::numeric AS p UNION ALL SELECT 2, 7.50::numeric",
             "rr:predicateObjectMap [ rr:predicate ex:item ;
                rr:objectMap [ rr:template \"http://example.org/item/{p}\" ] ]",
         ),
         (
             "item",
-            "SELECT 2 AS id, 'http://example.org/item/7.0' AS iri, 7 AS n",
+            "SELECT 3 AS id, 'http://example.org/item/7' AS iri, 7 AS n \
+             UNION ALL SELECT 4, 'http://example.org/item/7.5', 8 \
+             UNION ALL SELECT 5, 'http://example.org/item/7.00', 9",
             "rr:predicateObjectMap [ rr:predicate ex:same ;
                rr:objectMap [ rr:column \"iri\" ; rr:termType rr:IRI ] ] ;
              rr:predicateObjectMap [ rr:predicate ex:item ;
                rr:objectMap [ rr:template \"http://example.org/item/{n}\" ] ]",
         ),
     ]);
-    for query in [
-        // numeric has no SQL expression for its canonical form.
-        "SELECT ?p WHERE { ?p <http://example.org/item> ?i . ?q <http://example.org/same> ?i }",
-        // Same template shape, numeric against integer.
-        "SELECT ?p WHERE { ?p <http://example.org/item> ?i . ?q <http://example.org/item> ?i }",
+    // A numeric template against a column holding IRIs; row 3's integer
+    // template matches its own IRI too.
+    let query = "SELECT ?p ?q WHERE {
+        ?p <http://example.org/item> ?i . ?q <http://example.org/same> ?i }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            "?p=<http://example.org/row/1> ?q=<http://example.org/row/3>",
+            "?p=<http://example.org/row/2> ?q=<http://example.org/row/4>",
+            "?p=<http://example.org/row/3> ?q=<http://example.org/row/3>",
+        ]
+    );
+    // Same template shape, numeric against integer: 7.00 is 7.
+    let query = "SELECT ?p ?q WHERE {
+        ?p <http://example.org/item> ?i . ?q <http://example.org/item> ?i }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    let pair =
+        |p: u8, q: u8| format!("?p=<http://example.org/row/{p}> ?q=<http://example.org/row/{q}>");
+    assert_eq!(
+        rows,
+        [
+            pair(1, 1),
+            pair(1, 3),
+            pair(2, 2),
+            pair(3, 1),
+            pair(3, 3),
+            pair(4, 4),
+            pair(5, 5)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn comparison_sql_cannot_compute_is_rejected() {
+    let Some(url) = database_url() else { return };
+    let mapping = views(&[
+        (
+            "reading",
+            "SELECT 1 AS id, 30::float8 AS f, TIME '10:00:00' AS tm",
+            "rr:predicateObjectMap [ rr:predicate ex:item ;
+               rr:objectMap [ rr:template \"http://example.org/item/{f}\" ] ] ;
+             rr:predicateObjectMap [ rr:predicate ex:at ;
+               rr:objectMap [ rr:template \"http://example.org/at/{tm}\" ] ]",
+        ),
+        (
+            "item",
+            "SELECT 2 AS id, 'http://example.org/item/3.0E1' AS iri, 7 AS n, \
+             'http://example.org/at/10:00:00' AS at",
+            "rr:predicateObjectMap [ rr:predicate ex:same ;
+               rr:objectMap [ rr:column \"iri\" ; rr:termType rr:IRI ] ] ;
+             rr:predicateObjectMap [ rr:predicate ex:same ;
+               rr:objectMap [ rr:column \"at\" ; rr:termType rr:IRI ] ] ;
+             rr:predicateObjectMap [ rr:predicate ex:item ;
+               rr:objectMap [ rr:template \"http://example.org/item/{n}\" ] ]",
+        ),
+    ]);
+    // Floating point and date/time have no SQL expression for their
+    // canonical forms (Discussion #35).
+    for (query, column) in [
+        (
+            "SELECT ?p WHERE { ?p <http://example.org/item> ?i . ?q <http://example.org/same> ?i }",
+            "float8",
+        ),
+        (
+            "SELECT ?p WHERE { ?p <http://example.org/item> ?i . ?q <http://example.org/item> ?i }",
+            "float8",
+        ),
+        (
+            "SELECT ?p WHERE { ?p <http://example.org/at> ?i . ?q <http://example.org/same> ?i }",
+            "time",
+        ),
     ] {
         let error = run(&url, Limits::default(), &plan(&mapping, query))
             .await
@@ -561,9 +642,103 @@ async fn comparison_sql_cannot_compute_is_rejected() {
         assert!(
             matches!(
                 &error,
-                Error::Core(v12n_core::Error::UnsupportedFeature(m)) if m.contains("numeric")
+                Error::Core(v12n_core::Error::UnsupportedFeature(m)) if m.contains(column)
             ),
             "{query}: {error}"
         );
     }
+}
+
+/// `trim_scale(x)::text`, which SQL uses for the natural lexical form of
+/// a `numeric` (`Lexical::Decimal`), must be exactly the form the engine
+/// writes for the value it decodes, and `canonical_decimal` of the value's
+/// text output, for every value.
+#[tokio::test]
+async fn trim_scale_matches_the_canonical_decimal_formatter() {
+    let Some(url) = database_url() else { return };
+    let edge_cases = [
+        "0",
+        "0.000",
+        "-0",
+        "-0.00",
+        "1",
+        "-1",
+        "3.00",
+        "12.50",
+        "-12.50",
+        "100",
+        "100.00",
+        "0.5",
+        "-0.5",
+        ".5",
+        "-.5",
+        "0.0001000",
+        "00012.3400",
+        "10",
+        "1000000",
+        "1e20",
+        "1e-30",
+        "-1.5e-7",
+        "120000.50",
+        "-0.0012",
+        "9999.9999",
+        "10000.0000",
+        "0.00010000",
+        "123456789012345678901234567890.123456789000000",
+        "-99999999999999999999999999999999999999.99999999999999999999",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+    ];
+    let sql = format!(
+        "SELECT id, x AS d, x::text AS s, trim_scale(x)::text AS t
+         FROM (
+           SELECT i AS id, x FROM unnest('{{{}}}'::numeric[]) WITH ORDINALITY AS u(x, i)
+           UNION ALL
+           SELECT 100000 + i,
+                  round((i * 7919 % 2000003 - 1000001)::numeric / 10::numeric ^ (i % 23), i % 31)
+           FROM generate_series(1, 4000) AS i
+           UNION ALL
+           SELECT 200000 + i, round((i * 104729 % 1000003)::numeric * 10::numeric ^ (i % 40), -(i % 5))
+           FROM generate_series(1, 1000) AS i
+           UNION ALL
+           SELECT 300000 + i, i::numeric / 7 FROM generate_series(-500, 500) AS i
+           UNION ALL
+           SELECT 400000 + i, (i::numeric / 4)::numeric(30, 10) FROM generate_series(-200, 200) AS i
+           UNION ALL
+           SELECT 500000 + i, round(1::numeric / 3, 1000) * i FROM generate_series(-3, 3) AS i
+           UNION ALL
+           SELECT 600000 + i, 10::numeric ^ i FROM generate_series(-60, 60) AS i
+         ) AS v",
+        edge_cases.join(",")
+    );
+    let mapping = sql_query_mapping(&sql, &["d", "s", "t"]);
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?d ?s ?t WHERE { ?row ex:d ?d ; ex:s ?s ; ex:t ?t }";
+    let limits = Limits {
+        row_limit: 0,
+        ..Limits::default()
+    };
+    let database = Database::connect(&url, limits).await.unwrap();
+    let mut solutions = database.execute(&plan(&mapping, query)).await.unwrap();
+    let mut checked = 0;
+    while let Some(solution) = solutions.try_next().await.unwrap() {
+        let [Some(d), Some(s), Some(t)] = solution.values() else {
+            panic!("{solution:?}")
+        };
+        let (s, t) = (s.to_string(), t.to_string());
+        let (s, t) = (s.trim_matches('"'), t.trim_matches('"'));
+        assert_eq!(
+            d.to_string(),
+            format!("\"{t}\"^^<http://www.w3.org/2001/XMLSchema#decimal>"),
+            "{s}"
+        );
+        // NaN and the infinities have no xsd:decimal form and stay as they are.
+        assert_eq!(canonical_decimal(s).as_deref().unwrap_or(s), t, "{s}");
+        checked += 1;
+    }
+    assert_eq!(
+        checked,
+        edge_cases.len() + 4000 + 1000 + 1001 + 401 + 7 + 121
+    );
 }

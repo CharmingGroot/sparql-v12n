@@ -107,6 +107,18 @@ read-only transactions. The database URL and password are never logged. Request
 logs (stderr, level from `RUST_LOG`) carry the generated SQL and timings, not
 result values. TLS, authentication and CORS belong to a reverse proxy in front.
 
+## Lexical forms of column values
+
+Every non-string value is written in the canonical form of XML Schema 1.1
+Part 2, the version R2RML references, both in literals and in template
+values: `numeric` 12.50 and 3.00 become `"12.5"^^xsd:decimal` and
+`"3"^^xsd:decimal` (an integral decimal has no decimal point), `float8` 30
+becomes `"3.0E1"^^xsd:double`, `boolean` gives `true`/`false`, and `bytea`
+upper-case hexadecimal. Results therefore do not depend on a column's
+declared scale. Ontop writes PostgreSQL's text output instead (`12.50`,
+`"30"^^xsd:double`); the differential tests record these as known
+differences (issue #25).
+
 ## Constants in a query
 
 Constants in triple patterns are matched as RDF terms, as SPARQL requires:
@@ -156,13 +168,16 @@ and then:
 - compares other pairs through the natural lexical form computed in SQL
   (`int_col::text = text_col::text`) after checking the natural datatypes:
   an `integer` column holding 7 joins a text column only if that column
-  has `rr:datatype xsd:integer`, and never a `numeric` 7.0;
+  has `rr:datatype xsd:integer`, and never a `numeric` 7.0. A `numeric`
+  value's canonical form is computed with `trim_scale(col)::text`
+  (PostgreSQL 13 or later), which is tested to equal the engine's own
+  formatting;
 - percent-encodes template values as IRIs do (R2RML IRI-safe version)
   when templates or IRI columns can only be compared as strings;
 - rejects the query as unsupported (exit code 1, HTTP 501) when the
-  lexical form cannot be computed in SQL, for example a `numeric`
-  template value against a text column, instead of failing in PostgreSQL
-  or returning wrong rows.
+  lexical form cannot be computed in SQL, for example a `float8` or
+  date/time template value against a text column, instead of failing in
+  PostgreSQL or returning wrong rows.
 
 ## Layout
 

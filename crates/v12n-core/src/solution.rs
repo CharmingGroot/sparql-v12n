@@ -67,9 +67,11 @@ impl SqlValue {
     /// The natural RDF lexical form, `None` for `NULL`.
     ///
     /// R2RML §10.2 requires one lexical form per value and recommends the
-    /// canonical one, so numbers, booleans and binaries are canonicalized
-    /// (XML Schema 1.0 Part 2). Template values and column literals both go
-    /// through here, which keeps the two consistent.
+    /// canonical one, so every value is written with the canonical mapping
+    /// of XML Schema 1.1 Part 2, the version R2RML references. Template
+    /// values and column literals both go through here, which keeps the
+    /// two consistent, and constants are checked against it before they
+    /// are bound.
     pub fn natural_lexical_form(&self) -> Option<Cow<'_, str>> {
         Some(match self {
             Self::Null => return None,
@@ -87,9 +89,12 @@ impl SqlValue {
     }
 }
 
-/// Canonical `xsd:decimal` form of a decimal string: no leading or trailing
-/// zeros, but at least one digit on each side of the point. `None` when
-/// `value` is not an `xsd:decimal` lexical form.
+/// Canonical `xsd:decimal` form of a decimal string (XML Schema 1.1
+/// Part 2, `decimalCanonicalMap`): an integer without a decimal point
+/// (`noDecimalPtCanonicalMap`, `3`), any other value with no leading zeros
+/// but one `0` before the point and no trailing zeros
+/// (`decimalPtCanonicalMap`, `0.5`). Zero has no sign. `None` when `value`
+/// is not an `xsd:decimal` lexical form.
 pub fn canonical_decimal(value: &str) -> Option<String> {
     let (negative, digits) = match value.as_bytes().first() {
         Some(b'-') => (true, &value[1..]),
@@ -106,20 +111,25 @@ pub fn canonical_decimal(value: &str) -> Option<String> {
         "" => "0",
         int => int,
     };
-    let frac = match frac.trim_end_matches('0') {
-        "" => "0",
-        frac => frac,
-    };
-    let sign = if negative && (int, frac) != ("0", "0") {
+    let frac = frac.trim_end_matches('0');
+    let sign = if negative && (int, frac) != ("0", "") {
         "-"
     } else {
         ""
     };
-    Some(format!("{sign}{int}.{frac}"))
+    Some(if frac.is_empty() {
+        format!("{sign}{int}")
+    } else {
+        format!("{sign}{int}.{frac}")
+    })
 }
 
-/// Canonical `xsd:double` form: a mantissa with one non-zero digit before
-/// the point and at least one after it, then `E` and the exponent.
+/// Canonical `xsd:double` form (XML Schema 1.1 Part 2,
+/// `doubleCanonicalMap`): the shortest decimal that rounds to the value,
+/// written by `scientificCanonicalMap` as a mantissa with one non-zero
+/// digit before the point and at least one after it (`3.0E1`), then `E`
+/// and the exponent; `INF`, `-INF`, `NaN`, `0.0E0` and `-0.0E0` for the
+/// special values.
 pub fn canonical_double(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_owned();

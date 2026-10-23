@@ -317,18 +317,22 @@ mod tests {
         assert!(bind(&Type::INT4, "7", Some(&string)).is_no_match());
         assert!(!bind(&Type::TEXT, "7", Some(&string)).is_no_match());
         assert!(bind(&Type::TEXT, "7", Some(&integer)).is_no_match());
-        assert!(!bind(&Type::NUMERIC, "7.0", Some(&decimal)).is_no_match());
-        assert!(bind(&Type::NUMERIC, "7.0", Some(&integer)).is_no_match());
+        assert!(!bind(&Type::NUMERIC, "7", Some(&decimal)).is_no_match());
+        assert!(bind(&Type::NUMERIC, "7", Some(&integer)).is_no_match());
     }
 
     #[test]
     fn numeric_uses_the_canonical_decimal_form() {
         assert_eq!(bind(&Type::NUMERIC, "1.1", None), Bound::Text("1.1".into()));
-        for value in ["1.10", "01.1", "1", "+1.1", "1e3", "abc", "nan"] {
+        // XML Schema 1.1 decimalCanonicalMap: integers have no point.
+        for value in ["1", "-12", "0", "-0.5", "NaN"] {
+            assert!(matches(&Type::NUMERIC, value), "{value}");
+        }
+        for value in [
+            "1.10", "01.1", "1.0", "-0", "0.0", "+1.1", ".5", "1e3", "abc", "nan",
+        ] {
             assert!(!matches(&Type::NUMERIC, value), "{value}");
         }
-        assert!(matches(&Type::NUMERIC, "NaN"));
-        assert!(matches(&Type::NUMERIC, "-0.5"));
     }
 
     #[test]
