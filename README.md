@@ -17,6 +17,26 @@ which tables and columns can be queried.
 | HTTP | SPARQL 1.1 Protocol endpoint at `/sparql` |
 | MCP | tools for AI agents (later) |
 
+## `v12n query`
+
+`v12n query mapping.ttl query.rq --db postgresql://reader@localhost/shop`
+prints SPARQL 1.1 Query Results JSON (or a table with `--format table`).
+SPARQL results JSON has no place to mark a partial result, so limits are
+reported outside it, on stderr and in the exit code:
+
+| Exit code | When |
+|---|---|
+| `0` | Success, including a result of exactly `--row-limit` rows |
+| `1` | Invalid input: arguments, files, query syntax, unsupported SPARQL |
+| `2` | Invalid mapping |
+| `3` | Database error, or a value that cannot become an RDF term |
+| `4` | Statement timeout (`--timeout`). Before the first row it is reported like other errors; after output has started, stdout is left unterminated |
+| `5` | Row limit reached (`--row-limit`): stdout holds the first `--row-limit` solutions as a complete result, and stderr has a warning |
+
+The stderr line names the cause and the limit, for example
+`warning: result truncated at the row limit of 10000; more rows exist ...` or
+`error: statement timeout of 30s reached after 120 rows; ...`.
+
 ## HTTP endpoint
 
 `v12n serve --config v12n.toml` serves the SPARQL 1.1 Protocol at `/sparql`
@@ -32,11 +52,11 @@ which tables and columns can be queried.
 
 | Status | When |
 |---|---|
-| `200` | Results. With a row limit, a cut-off result carries `V12N-Truncated: <row limit>` and holds exactly that many solutions |
+| `200` | Results. With a row limit, a cut-off result carries `V12N-Truncated: <row limit>` and holds exactly that many solutions (`v12n query` exits with 5 in the same case) |
 | `400` | Query syntax, a missing or repeated `query`, dataset parameters, a query that unfolds into too many SQL branches |
 | `406` / `413` / `414` / `415` | Format not offered / query over `max_query_bytes` in a `POST` / in a `GET` / other content type |
 | `501` | A SPARQL feature not supported yet |
-| `503` | Statement timeout before the first row, or `max_concurrent_requests` reached (with `Retry-After`) |
+| `503` | Statement timeout before the first row (`v12n query` exits with 4), or `max_concurrent_requests` reached (with `Retry-After`) |
 | `500` | Database or other internal errors |
 
 The status is sent before the body, so an error after the first row cannot
