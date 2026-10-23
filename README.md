@@ -119,6 +119,9 @@ declared scale. Ontop writes PostgreSQL's text output instead (`12.50`,
 `"30"^^xsd:double`); the differential tests record these as known
 differences (issue #25).
 
+One exception: a `time` value of `24:00:00` is written as is, although the
+XSD 1.1 canonical form is `00:00:00` (issue #37).
+
 ## Constants in a query
 
 Constants in triple patterns are matched as RDF terms, as SPARQL requires:
