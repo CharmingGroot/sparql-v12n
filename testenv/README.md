@@ -19,7 +19,7 @@ Run from this directory:
 ./fetch-jdbc.sh          # PostgreSQL JDBC driver for Ontop, checksum-verified, into jdbc/
 docker compose up -d     # postgres, then ontop once postgres is healthy
 ./smoke.sh               # VIP query against Ontop must return orders 1001, 1003, 1004
-./compare.sh             # every examples/shop/queries/*.rq: v12n query vs Ontop, sorted
+./compare.sh             # every examples/shop/queries/*.rq: Ontop vs v12n query vs v12n serve, sorted
 docker compose down -v   # stop and drop the database volume
 ```
 
@@ -29,9 +29,11 @@ docker compose down -v   # stop and drop the database volume
 |----------|----------------------------------|
 | postgres | `127.0.0.1:55432`, database `shop` |
 | ontop    | `http://127.0.0.1:58080/sparql`  |
+| `v12n serve --config v12n.toml` | `http://127.0.0.1:57878/sparql` |
 
-Both are bound to localhost only. The credentials in `docker-compose.yml` and
-`ontop/shop.properties` (`v12n` / `v12n-dev`) are for local development only.
+All are bound to localhost only. The credentials in `docker-compose.yml`,
+`ontop/shop.properties` and `v12n.toml` (`v12n` / `v12n-dev`) are for local
+development only.
 
 Database integration tests run against the same PostgreSQL when
 `V12N_TEST_DATABASE_URL` is set, and are skipped otherwise:
@@ -42,7 +44,8 @@ V12N_TEST_DATABASE_URL=postgresql://v12n:v12n-dev@127.0.0.1:55432/shop cargo tes
 
 ## Files
 
-- `compare.sh`: differential check of `v12n query` against Ontop
+- `compare.sh`: differential check of `v12n query` and `v12n serve` against Ontop
+- `v12n.toml`: `v12n serve` settings for this environment
 - `ontop/shop.properties`: JDBC connection to the `postgres` service
 - `ontop/shop.ttl`: vocabulary used by the shop mapping
 - `jdbc/`: downloaded driver, not committed

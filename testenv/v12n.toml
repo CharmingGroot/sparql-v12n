@@ -1,0 +1,16 @@
+# `v12n serve` against the testenv PostgreSQL. Development credentials only.
+[server]
+address = "127.0.0.1"
+port = 57878
+
+[database]
+url = "postgresql://v12n:v12n-dev@127.0.0.1:55432/shop"
+
+[mapping]
+path = "../examples/shop/mapping.ttl"
+
+[limits]
+statement_timeout = "30s"
+row_limit = 10000
+max_query_bytes = 65536
+max_concurrent_requests = 16

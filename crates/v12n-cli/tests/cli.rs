@@ -278,3 +278,64 @@ fn query_shop_vip_orders_prints_sparql_json_results() {
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("--row-limit"));
 }
+
+/// Runs `v12n serve` with only the given `V12N_*` settings; every case
+/// here fails at startup, so the process exits on its own.
+fn serve(args: &[&str], settings: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_v12n"));
+    command.arg("serve").args(args);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("V12N_") {
+            command.env_remove(key);
+        }
+    }
+    command.envs(settings.iter().copied());
+    command.output().unwrap()
+}
+
+#[test]
+fn serve_missing_config_file_exits_one() {
+    let output = serve(&["--config", "does-not-exist.toml"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("does-not-exist.toml"));
+}
+
+#[test]
+fn serve_without_database_url_exits_one() {
+    let output = serve(&[], &[("V12N_MAPPING__PATH", SHOP)]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("V12N_DATABASE__URL"));
+}
+
+#[test]
+fn serve_invalid_mapping_exits_two() {
+    let output = serve(
+        &[],
+        &[
+            ("V12N_DATABASE__URL", "postgresql://v12n@127.0.0.1:1/shop"),
+            ("V12N_MAPPING__PATH", VIP_ORDERS),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn serve_unreachable_database_exits_three_without_the_password() {
+    let output = serve(
+        &[],
+        &[
+            (
+                "V12N_DATABASE__URL",
+                "postgresql://v12n:hunter2@127.0.0.1:1/shop?connect_timeout=2",
+            ),
+            ("V12N_MAPPING__PATH", SHOP),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(3));
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!all.contains("hunter2"), "{all}");
+}
