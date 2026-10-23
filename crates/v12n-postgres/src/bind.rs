@@ -33,7 +33,8 @@ pub(crate) enum Bound {
     Binary(Vec<u8>),
     /// No value of the parameter's type can match the constant. `NULL`
     /// makes the equality it is part of unknown, which empties its branch
-    /// only (see `SqlPlan::to_sql`).
+    /// only, or drops one alternative of an `IN` list (see
+    /// `SqlPlan::to_sql`).
     NoMatch,
 }
 

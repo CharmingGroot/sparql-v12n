@@ -193,13 +193,31 @@ impl Database {
             .map(|((value, datatype), ty)| bind(ty, value, datatype.as_deref()))
             .collect();
         // Skipping the round trip when no branch can produce a row also
-        // covers the common single-branch case.
-        let empty_branches: HashSet<usize> = bound
+        // covers the common single-branch case. An alternative of an `IN`
+        // list that cannot match only drops itself.
+        let mut empty_branches: HashSet<usize> = HashSet::new();
+        let mut alternatives: HashMap<usize, (usize, bool)> = HashMap::new();
+        for ((b, &branch), alternative) in bound
             .iter()
             .zip(&rendered.param_branches)
-            .filter(|(b, _)| b.is_no_match())
-            .map(|(_, &branch)| branch)
-            .collect();
+            .zip(&rendered.param_alternatives)
+        {
+            match alternative {
+                Some(group) => {
+                    alternatives.entry(*group).or_insert((branch, false)).1 |= !b.is_no_match()
+                }
+                None if b.is_no_match() => {
+                    empty_branches.insert(branch);
+                }
+                None => {}
+            }
+        }
+        empty_branches.extend(
+            alternatives
+                .values()
+                .filter(|(_, can_match)| !can_match)
+                .map(|&(branch, _)| branch),
+        );
         if !plan.branches.is_empty() && empty_branches.len() == plan.branches.len() {
             return Ok(solutions);
         }

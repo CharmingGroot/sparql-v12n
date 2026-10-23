@@ -1,0 +1,7 @@
+# Ontop resolves relative IRIs from templates, not from columns, and fails
+# with HTTP 500 (`Not a valid (absolute) IRI: Carlos`) (#26). The W3C
+# expected output has these 2 triples.
+[query.name]
+expect = "ontop-error"
+issue = 26
+solutions = 2

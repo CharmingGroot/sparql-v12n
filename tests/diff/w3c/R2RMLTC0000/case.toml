@@ -1,3 +1,4 @@
 # W3C R2RML test R2RMLTC0000: one table, one column, zero rows
 sql = "../../../w3c/rdb2rdf/D000-1table1column0rows/create.sql"
 mapping = "../../../w3c/rdb2rdf/D000-1table1column0rows/r2rml.ttl"
+base_iri = "http://example.com/base/"

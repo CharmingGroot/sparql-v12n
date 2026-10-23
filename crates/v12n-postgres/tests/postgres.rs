@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tokio_postgres::NoTls;
 use tokio_postgres::types::Type;
-use v12n_core::mapping::{Mapping, MappingIndex};
+use v12n_core::mapping::{BaseIri, Mapping, MappingIndex};
 use v12n_core::solution::canonical_decimal;
 use v12n_core::sql::{RenderOptions, SqlPlan};
 use v12n_core::{sparql, unfold};
@@ -545,6 +545,94 @@ async fn string_comparison_applies_iri_safe_encoding() {
         .await
         .is_empty()
     );
+}
+
+#[tokio::test]
+async fn base_iri_resolves_relative_iris_in_results_constants_and_joins() {
+    let Some(url) = database_url() else { return };
+    let mapping = views(&[
+        (
+            "page",
+            "SELECT 1 AS id, 'a.html'::text AS iri \
+             UNION ALL SELECT 2, 'http://example.com/base/a.html' \
+             UNION ALL SELECT 3, 'http://other.example/b' \
+             UNION ALL SELECT 4, 'urn:x'",
+            "rr:predicateObjectMap [ rr:predicate ex:links ;
+               rr:objectMap [ rr:column \"iri\" ; rr:termType rr:IRI ] ]",
+        ),
+        (
+            "number",
+            "SELECT 6 AS id, 7::int4 AS n",
+            "rr:predicateObjectMap [ rr:predicate ex:links ;
+               rr:objectMap [ rr:column \"n\" ; rr:termType rr:IRI ] ]",
+        ),
+        (
+            "person",
+            "SELECT 5 AS id, 'a.html'::text AS name",
+            "rr:predicateObjectMap [ rr:predicate ex:about ;
+               rr:objectMap [ rr:template \"{name}\" ; rr:termType rr:IRI ] ]",
+        ),
+    ]);
+    let base = BaseIri::new("http://example.com/base/").unwrap();
+    let plan_with_base = |query: &str| {
+        let mapping = Mapping::from_turtle(&mapping)
+            .unwrap()
+            .with_base_iri(base.clone());
+        let query = sparql::parse(&format!("PREFIX ex: <http://example.org/>\n{query}")).unwrap();
+        unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping)).unwrap()
+    };
+    let rows = |query: &'static str| {
+        let plan = plan_with_base(query);
+        let url = url.clone();
+        async move { run(&url, Limits::default(), &plan).await.unwrap().0 }
+    };
+    let row = |n: u32, iri: &str| format!("?r=<http://example.org/row/{n}> ?t=<{iri}>");
+    assert_eq!(
+        rows("SELECT ?r ?t WHERE { ?r ex:links ?t }").await,
+        [
+            row(1, "http://example.com/base/a.html"),
+            row(2, "http://example.com/base/a.html"),
+            row(3, "http://other.example/b"),
+            row(4, "urn:x"),
+            row(6, "http://example.com/base/7"),
+        ]
+    );
+    // The relative and the absolute value both produce the constant. The
+    // integer column can hold neither form, so its branch is empty.
+    assert_eq!(
+        rows("SELECT ?r WHERE { ?r ex:links <http://example.com/base/a.html> }").await,
+        [
+            "?r=<http://example.org/row/1>",
+            "?r=<http://example.org/row/2>"
+        ]
+    );
+    // Only the relative form fits the integer column.
+    assert_eq!(
+        rows("SELECT ?r WHERE { ?r ex:links <http://example.com/base/7> }").await,
+        ["?r=<http://example.org/row/6>"]
+    );
+    assert!(
+        rows("SELECT ?r WHERE { ?r ex:links <http://example.com/base/urn:x> }")
+            .await
+            .is_empty()
+    );
+    // A relative template value joins both forms of the column.
+    assert_eq!(
+        rows("SELECT ?r ?s WHERE { ?r ex:links ?t . ?s ex:about ?t }").await,
+        [
+            "?r=<http://example.org/row/1> ?s=<http://example.org/row/5>",
+            "?r=<http://example.org/row/2> ?s=<http://example.org/row/5>",
+        ]
+    );
+
+    // Without a base IRI the relative value is a data error naming the setting.
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?t WHERE { ?r ex:links ?t }";
+    let error = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("V12N_BASE_IRI"), "{error}");
 }
 
 #[tokio::test]

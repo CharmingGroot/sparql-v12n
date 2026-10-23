@@ -1,0 +1,10 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_with_base(\"SELECT ?p WHERE { <http://example.com/base/Bob%2FCharles> ex:homepage ?p }\")"
+---
+SELECT DISTINCT t0."page" AS "p"
+FROM "people" t0
+WHERE t0."name" = $1 AND t0."page" IS NOT NULL
+
+-- params
+$1 = "Bob/Charles"

@@ -1,3 +1,4 @@
 # W3C R2RML test R2RMLTC0008c: Generation of triples by using multiple predicateMaps within a rr:predicateObjectMap
 sql = "../../../w3c/rdb2rdf/D008-1table1compositeprimarykey3columns1row/create.sql"
 mapping = "../../../w3c/rdb2rdf/D008-1table1compositeprimarykey3columns1row/r2rmlc.ttl"
+base_iri = "http://example.com/base/"

@@ -1,0 +1,11 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_with_base(\"SELECT ?t WHERE { <http://example.com/base/a.html> ex:title ?t }\")"
+---
+SELECT DISTINCT t0."title" AS "t"
+FROM "pages" t0
+WHERE t0."iri" IN ($1, $2) AND t0."title" IS NOT NULL
+
+-- params
+$1 = "http://example.com/base/a.html"
+$2 = "a.html"

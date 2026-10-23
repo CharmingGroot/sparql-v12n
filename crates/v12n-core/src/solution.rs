@@ -10,7 +10,7 @@ use oxrdf::{BlankNode, Literal, NamedNode, Term};
 
 use crate::Error;
 use crate::mapping::template::iri_safe;
-use crate::mapping::{TemplatePart, TermType};
+use crate::mapping::{BaseIri, TemplatePart, TermType, generated_iri};
 use crate::sql::{ResultValue, SqlPlan};
 
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -179,6 +179,7 @@ impl Solution {
 pub struct SolutionBuilder {
     variables: Vec<String>,
     terms: Vec<Option<TermBuilder>>,
+    base_iri: Option<BaseIri>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +277,7 @@ impl SolutionBuilder {
         Self {
             variables: plan.projection.iter().map(|p| p.variable.clone()).collect(),
             terms,
+            base_iri: plan.base_iri.clone(),
         }
     }
 
@@ -291,7 +293,7 @@ impl SolutionBuilder {
             .terms
             .iter()
             .map(|term| match term {
-                Some(term) => term.build(row),
+                Some(term) => term.build(row, self.base_iri.as_ref()),
                 None => Ok(None),
             })
             .collect::<Result<_, _>>()?;
@@ -301,7 +303,7 @@ impl SolutionBuilder {
 
 impl TermBuilder {
     /// R2RML §11: `None` when a column it reads is `NULL`.
-    fn build(&self, row: &[SqlValue]) -> Result<Option<Term>, Error> {
+    fn build(&self, row: &[SqlValue], base: Option<&BaseIri>) -> Result<Option<Term>, Error> {
         let (lexical, natural) = match &self.value {
             ValueBuilder::Constant(term) => return Ok(Some(term.clone())),
             ValueBuilder::Column(columns) => {
@@ -334,13 +336,7 @@ impl TermBuilder {
             }
         };
         let term: Term = match self.term_type {
-            TermType::Iri => NamedNode::new(&lexical)
-                .map_err(|_| {
-                    Error::InvalidTerm(format!(
-                        "{lexical:?} is not an absolute IRI (R2RML data error)"
-                    ))
-                })?
-                .into(),
+            TermType::Iri => generated_iri(&lexical, base)?.into(),
             // Labels are derived from the value, so the same value is the
             // same blank node throughout the result (R2RML §11). Hex keeps
             // every value a valid label without collisions.

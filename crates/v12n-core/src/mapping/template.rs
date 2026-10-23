@@ -91,6 +91,75 @@ impl Template {
             TemplatePart::Literal(_) => None,
         })
     }
+
+    /// Whether the strings this template renders as an IRI template start
+    /// with a scheme ([`has_scheme`](super::base_iri::has_scheme)).
+    ///
+    /// Column values are IRI-safe encoded (R2RML §7.3), so they never
+    /// contain `:`; whether a scheme exists is decided by the literal text
+    /// before the first `:`, unless a column comes before it.
+    pub(crate) fn iri_kind(&self) -> IriKind {
+        let mut column_seen = false;
+        let mut first = true;
+        for part in &self.parts {
+            let text = match part {
+                TemplatePart::Column(_) => {
+                    column_seen = true;
+                    continue;
+                }
+                TemplatePart::Literal(text) => text,
+            };
+            for c in text.chars() {
+                if c == ':' {
+                    return match (first, column_seen) {
+                        (_, true) => IriKind::Mixed,
+                        (true, false) => IriKind::Relative,
+                        (false, false) => IriKind::Absolute,
+                    };
+                }
+                let scheme_char = if first && !column_seen {
+                    c.is_ascii_alphabetic()
+                } else {
+                    c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
+                };
+                if !scheme_char {
+                    return IriKind::Relative;
+                }
+                first = false;
+            }
+        }
+        IriKind::Relative
+    }
+
+    /// The template with `prefix` in front of everything it renders.
+    pub(crate) fn with_prefix(&self, prefix: &str) -> Self {
+        let mut parts = self.parts.clone();
+        match parts.first_mut() {
+            Some(TemplatePart::Literal(text)) => text.insert_str(0, prefix),
+            _ => parts.insert(0, TemplatePart::Literal(prefix.to_owned())),
+        }
+        let mut source = String::with_capacity(prefix.len() + self.source.len());
+        for c in prefix.chars() {
+            if matches!(c, '{' | '}' | '\\') {
+                source.push('\\');
+            }
+            source.push(c);
+        }
+        source.push_str(&self.source);
+        Self { source, parts }
+    }
+}
+
+/// Whether the strings of an IRI template have a scheme, which tells an
+/// absolute IRI from a relative one (R2RML §11.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IriKind {
+    /// Every string has a scheme.
+    Absolute,
+    /// No string has one: every string is relative.
+    Relative,
+    /// It depends on the column values, as in `{scheme}:{rest}`.
+    Mixed,
 }
 
 impl fmt::Display for Template {
@@ -197,6 +266,48 @@ mod tests {
         assert_eq!(iri_safe("\u{E0001}"), "%F3%A0%80%81");
         assert_eq!(iri_safe("\u{E1000}"), "\u{E1000}");
         assert_eq!(iri_safe("\u{1FFFE}"), "%F0%9F%BF%BE");
+    }
+
+    #[test]
+    fn iri_kind_reads_the_scheme_off_the_literal_text() {
+        let kind = |source: &str| Template::parse(source).unwrap().iri_kind();
+        for absolute in ["http://ex/{id}", "urn:x:{id}", "a+b.c-d:{id}", "x:"] {
+            assert_eq!(kind(absolute), IriKind::Absolute, "{absolute}");
+        }
+        for relative in [
+            "{id}",
+            "{\"Name\"}",
+            "person/{id}",
+            "{a}/{b}:{c}",
+            "{a}_x:{b}",
+            ":{id}",
+            "1x:{id}",
+            "a b:{id}",
+            "",
+        ] {
+            assert_eq!(kind(relative), IriKind::Relative, "{relative}");
+        }
+        for mixed in ["{a}:{b}", "x{a}:y", "{a}1+b.c-d:{e}"] {
+            assert_eq!(kind(mixed), IriKind::Mixed, "{mixed}");
+        }
+    }
+
+    #[test]
+    fn with_prefix_prepends_to_parts_and_source() {
+        let t = Template::parse("{\"Name\"}").unwrap();
+        let prefixed = t.with_prefix("http://example.com/base/");
+        assert_eq!(
+            prefixed.parts(),
+            [lit("http://example.com/base/"), col("\"Name\"")]
+        );
+        assert_eq!(prefixed.as_str(), "http://example.com/base/{\"Name\"}");
+        let t = Template::parse("person/{id}").unwrap();
+        let prefixed = t.with_prefix("http://ex/");
+        assert_eq!(prefixed.parts(), [lit("http://ex/person/"), col("id")]);
+        assert_eq!(Template::parse(prefixed.as_str()).unwrap(), prefixed);
+        // Braces cannot be in an IRI, but the source stays a valid template.
+        let odd = Template::parse("{id}").unwrap().with_prefix("x{\\}");
+        assert_eq!(Template::parse(odd.as_str()).unwrap(), odd);
     }
 
     #[test]

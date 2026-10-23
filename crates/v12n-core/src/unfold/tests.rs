@@ -29,6 +29,7 @@ fn same(lt: usize, l: &str, rt: usize, r: &str) -> Condition {
             name: name.to_owned(),
         },
         datatype: None,
+        base_iri: None,
     };
     Condition::SameTerm(side(lt, l), side(rt, r))
 }
@@ -330,4 +331,102 @@ fn unfold_hidden_variable_of_different_shapes_is_unsupported() {
         "{err}"
     );
     assert!(unfold_query(&mapping, "SELECT DISTINCT ?v WHERE { ?s ex:p ?v }").is_ok());
+}
+
+const RELATIVE: &str = r#"
+<#Person> rr:logicalTable [ rr:tableName "people" ] ;
+  rr:subjectMap [ rr:template "{name}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:homepage ;
+    rr:objectMap [ rr:column "page" ; rr:termType rr:IRI ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:alias ;
+    rr:objectMap [ rr:template "{scheme}:{rest}" ; rr:termType rr:IRI ] ] .
+"#;
+
+fn unfold_with_base(query: &str) -> Result<SqlPlan, Error> {
+    let mapping = Mapping::from_turtle(&with_prefixes(RELATIVE))
+        .unwrap()
+        .with_base_iri(BaseIri::new("http://example.com/base/").unwrap());
+    let index = MappingIndex::new(&mapping);
+    let query = sparql::parse(&format!("PREFIX ex: <http://example.org/>\n{query}"))?;
+    unfold(&query, &mapping, &index)
+}
+
+fn param(value: &str) -> SqlExpr {
+    SqlExpr::Param(value.into())
+}
+
+fn page() -> SqlExpr {
+    SqlExpr::Column {
+        table: 0,
+        name: "page".into(),
+    }
+}
+
+#[test]
+fn unfold_base_iri_prefixes_relative_templates_and_keeps_the_plan_base() {
+    let plan = unfold_with_base("SELECT ?s WHERE { ?s ex:homepage ?p }").unwrap();
+    assert_eq!(
+        plan.base_iri.as_ref().map(BaseIri::as_str),
+        Some("http://example.com/base/")
+    );
+    let Some(ResultTerm {
+        value: ResultValue::Template(parts),
+        ..
+    }) = &plan.projection[0].term
+    else {
+        panic!("{:?}", plan.projection);
+    };
+    assert_eq!(
+        parts,
+        &[
+            TemplatePart::Literal("http://example.com/base/".into()),
+            TemplatePart::Column("s".into()),
+        ]
+    );
+}
+
+#[test]
+fn unfold_base_iri_constant_matches_the_column_value_or_its_relative_rest() {
+    let conditions = |iri: &str| {
+        unfold_with_base(&format!("SELECT ?s WHERE {{ ?s ex:homepage <{iri}> }}"))
+            .unwrap()
+            .branches[0]
+            .conditions
+            .clone()
+    };
+    assert!(
+        conditions("http://example.com/base/a.html").contains(&Condition::EqAny(
+            page(),
+            vec![param("http://example.com/base/a.html"), param("a.html")]
+        ))
+    );
+    // Outside the base, or a rest with a scheme of its own, which a column
+    // value would keep as it is: only the IRI itself.
+    for iri in ["http://other.example/a", "http://example.com/base/urn:x"] {
+        assert!(
+            conditions(iri).contains(&Condition::Eq(page(), param(iri))),
+            "{iri}"
+        );
+    }
+}
+
+#[test]
+fn unfold_base_iri_compares_mixed_templates_as_generated_strings() {
+    let plan = unfold_with_base("SELECT ?s WHERE { ?s ex:alias <http://example.com/base/x%3Ay> }")
+        .unwrap();
+    let [Condition::SameTerm(left, _), ..] = plan.branches[0].conditions.as_slice() else {
+        panic!("{:?}", plan.branches[0].conditions);
+    };
+    assert_eq!(left.base_iri.as_deref(), Some("http://example.com/base/"));
+}
+
+#[test]
+fn unfold_base_iri_distinct_over_resolved_column_is_unsupported() {
+    let err = unfold_with_base("SELECT DISTINCT ?p WHERE { ?s ex:homepage ?p }").unwrap_err();
+    assert!(matches!(err, Error::UnsupportedFeature(_)), "{err}");
+    // A prefixed template renders distinct strings for distinct values.
+    assert!(unfold_with_base("SELECT DISTINCT ?s WHERE { ?s ex:homepage ?p }").is_ok());
+    // Without a base IRI nothing is resolved, so DISTINCT stays exact.
+    let mapping = with_prefixes(RELATIVE);
+    assert!(unfold_query(&mapping, "SELECT DISTINCT ?p WHERE { ?s ex:homepage ?p }").is_ok());
 }

@@ -1,3 +1,4 @@
 # W3C R2RML test R2RMLTC0001b: One column mapping, generation of a BlankNode subject by using rr:termType
 sql = "../../../w3c/rdb2rdf/D001-1table1column1row/create.sql"
 mapping = "../../../w3c/rdb2rdf/D001-1table1column1row/r2rmlb.ttl"
+base_iri = "http://example.com/base/"

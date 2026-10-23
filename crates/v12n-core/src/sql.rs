@@ -7,7 +7,7 @@ use oxrdf::Term;
 
 use crate::Error;
 use crate::mapping::template::UCSCHAR;
-use crate::mapping::{LogicalTable, TemplatePart, TermType};
+use crate::mapping::{BaseIri, LogicalTable, SCHEME_REGEX, TemplatePart, TermType};
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -51,6 +51,9 @@ pub struct SqlPlan {
     /// No branches means the query has no answers.
     pub branches: Vec<SqlBranch>,
     pub distinct: bool,
+    /// The base IRI that relative IRIs of the results resolve against
+    /// (R2RML §11.2), from the mapping.
+    pub base_iri: Option<BaseIri>,
 }
 
 /// One `SELECT ... FROM ... WHERE ...` of the plan.
@@ -130,6 +133,11 @@ pub enum Condition {
     /// with SQL `=`), or a column and a constant, which a database adapter
     /// checks against the column's type before binding (see [`Param`]).
     Eq(SqlExpr, SqlExpr),
+    /// SQL equality with one of several expressions, rendered as `IN`: a
+    /// column and the constants that each make it produce the same term,
+    /// such as an absolute IRI and the relative IRI that resolves to it
+    /// (R2RML §11.2). Each constant is checked like one of [`Eq`](Self::Eq).
+    EqAny(SqlExpr, Vec<SqlExpr>),
     IsNotNull(SqlExpr),
     /// Both sides produce the same RDF term. Column values take part
     /// through their natural lexical form (R2RML §10.2), which SQL `=`
@@ -146,6 +154,11 @@ pub struct TermSql {
     /// comparison may have to check it; `None` when it never needs to,
     /// such as for IRIs and template columns.
     pub datatype: Option<TermDatatype>,
+    /// For an IRI whose strings may be relative: the base IRI they resolve
+    /// against (R2RML §11.2). The side then compares as the generated IRI,
+    /// the string itself when it has a scheme and the base followed by it
+    /// otherwise, which no index on the columns serves.
+    pub base_iri: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +304,9 @@ pub struct RenderedSql {
     /// Index into [`SqlPlan::branches`] of the branch each parameter
     /// belongs to.
     pub param_branches: Vec<usize>,
+    /// For a parameter that is one of the alternatives of a
+    /// [`Condition::EqAny`], an id it shares with the other alternatives.
+    pub param_alternatives: Vec<Option<usize>>,
 }
 
 impl SqlPlan {
@@ -299,7 +315,9 @@ impl SqlPlan {
     ///
     /// Every parameter is one side of an equality in the conjunction of
     /// its branch's `ON` and `WHERE` conditions, so binding it to `NULL`
-    /// empties that branch and leaves the others as they are.
+    /// empties that branch and leaves the others as they are. An
+    /// alternative of an `IN` list ([`RenderedSql::param_alternatives`])
+    /// only drops itself; binding all of them to `NULL` empties the branch.
     ///
     /// Without column types, a [`Condition::SameTerm`] compares columns
     /// with `=` and template columns by their text output, which is what
@@ -393,6 +411,7 @@ impl SqlPlan {
             params: r.params,
             param_datatypes: r.param_datatypes,
             param_branches: r.param_branches,
+            param_alternatives: r.param_alternatives,
         })
     }
 
@@ -790,6 +809,10 @@ impl SqlPlan {
                         expr(left, from, &mut f);
                         expr(right, from, &mut f);
                     }
+                    Condition::EqAny(left, right) => {
+                        expr(left, from, &mut f);
+                        right.iter_mut().for_each(|e| expr(e, from, &mut f));
+                    }
                     Condition::IsNotNull(e) => expr(e, from, &mut f),
                     Condition::SameTerm(left, right) => {
                         term(left, from, &mut f);
@@ -888,6 +911,8 @@ struct Renderer<'a> {
     params: Vec<String>,
     param_datatypes: Vec<Option<String>>,
     param_branches: Vec<usize>,
+    param_alternatives: Vec<Option<usize>>,
+    alternatives: usize,
     branch_index: usize,
     options: RenderOptions<'a>,
     /// Logical tables of the branch being rendered.
@@ -991,6 +1016,28 @@ impl<'a> Renderer<'a> {
                         self.sql.push_str("::text");
                     }
                 }
+                Condition::EqAny(left, right) => {
+                    let as_text = matches!(left, SqlExpr::Column { .. })
+                        && self.options.text_params.contains(&self.params.len());
+                    self.expr(left);
+                    if as_text {
+                        self.sql.push_str("::text");
+                    }
+                    self.sql.push_str(" IN (");
+                    let group = self.alternatives;
+                    self.alternatives += 1;
+                    for (i, alternative) in right.iter().enumerate() {
+                        if i > 0 {
+                            self.sql.push_str(", ");
+                        }
+                        let before = self.params.len();
+                        self.expr(alternative);
+                        for slot in &mut self.param_alternatives[before..] {
+                            *slot = Some(group);
+                        }
+                    }
+                    self.sql.push(')');
+                }
                 Condition::IsNotNull(expr) => {
                     self.expr(expr);
                     self.sql.push_str(" IS NOT NULL");
@@ -1021,6 +1068,8 @@ impl<'a> Renderer<'a> {
                 name: rn,
             },
         ) = (&left.value, &right.value)
+            && left.base_iri.is_none()
+            && right.base_iri.is_none()
             && let (Some(a), Some(b)) = (self.column_type(*lt, ln), self.column_type(*rt, rn))
             && a.group == b.group
         {
@@ -1078,9 +1127,40 @@ impl<'a> Renderer<'a> {
     /// One side of a term comparison as a string expression. Without
     /// `types`, columns are rendered as they are and template columns by
     /// their text output.
+    ///
+    /// With a base IRI, the side is the IRI R2RML §11.2 generates: `CASE
+    /// WHEN s ~ '^scheme:' THEN s ELSE $base || s END`, the same test as
+    /// [`has_scheme`](crate::mapping::has_scheme), with `s` rendered three
+    /// times, since a column is the common case and costs nothing to repeat.
     fn term_side(&mut self, side: &TermSql, types: Option<&ColumnTypes>) -> Result<(), Error> {
+        let Some(base) = &side.base_iri else {
+            return self.term_string(side, types, false);
+        };
+        self.sql.push_str("CASE WHEN (");
+        self.term_string(side, types, true)?;
+        self.sql.push_str(&format!(") ~ '{SCHEME_REGEX}' THEN ("));
+        self.term_string(side, types, true)?;
+        self.sql.push_str(") ELSE ");
+        self.expr(&SqlExpr::Param(base.as_str().into()));
+        self.sql.push_str(" || (");
+        self.term_string(side, types, true)?;
+        self.sql.push_str(") END");
+        Ok(())
+    }
+
+    /// The string of one side; `text` casts a column without `types` to
+    /// text, which comparing it with a pattern needs.
+    fn term_string(
+        &mut self,
+        side: &TermSql,
+        types: Option<&ColumnTypes>,
+        text: bool,
+    ) -> Result<(), Error> {
         match &side.value {
             TermSqlValue::Column { table, name } => match types {
+                None if text => self
+                    .sql
+                    .push_str(&format!("{}::text", column_sql(*table, name))),
                 None => self.sql.push_str(&column_sql(*table, name)),
                 Some(_) => {
                     let lexical = self.lexical(*table, name)?;
@@ -1143,6 +1223,7 @@ impl<'a> Renderer<'a> {
                 self.params.push(param.value.clone());
                 self.param_datatypes.push(param.datatype.clone());
                 self.param_branches.push(self.branch_index);
+                self.param_alternatives.push(None);
                 self.sql.push_str(&format!("${}", self.params.len()));
             }
             SqlExpr::Concat(parts) => {
@@ -1240,6 +1321,10 @@ fn condition_tables(condition: &Condition) -> Vec<usize> {
         Condition::Eq(left, right) => {
             collect(left, &mut tables);
             collect(right, &mut tables);
+        }
+        Condition::EqAny(left, right) => {
+            collect(left, &mut tables);
+            right.iter().for_each(|e| collect(e, &mut tables));
         }
         Condition::IsNotNull(expr) => collect(expr, &mut tables),
         Condition::SameTerm(left, right) => {
@@ -1402,6 +1487,7 @@ mod tests {
                 iri_safe: false,
             },
             datatype: None,
+            base_iri: None,
         };
         let plan = SqlPlan {
             columns: vec!["a".into(), "b".into()],
@@ -1420,6 +1506,7 @@ mod tests {
                 fixed_columns: Vec::new(),
             }],
             distinct: false,
+            base_iri: None,
         };
         assert_eq!(
             plan.folded_columns(),
@@ -1458,6 +1545,7 @@ mod tests {
                 fixed_columns: vec![["ID".to_owned()].into()],
             }],
             distinct: false,
+            base_iri: None,
         };
         let resolved = HashMap::from([((table.clone(), "ID".to_owned()), "id".to_owned())]);
         let plan = plan.with_resolved_columns(&resolved);
@@ -1530,6 +1618,7 @@ mod tests {
                 fixed_columns: Vec::new(),
             }],
             distinct: true,
+            base_iri: None,
         };
         let rendered = plan.to_sql();
         assert_eq!(
@@ -1573,6 +1662,7 @@ mod tests {
             projection: Vec::new(),
             branches: vec![branch("1", None), branch("2", Some("http://ex/dt"))],
             distinct: false,
+            base_iri: None,
         };
         let rendered = plan
             .to_sql_with(&RenderOptions {
@@ -1622,6 +1712,7 @@ mod tests {
                 name: name.to_owned(),
             },
             datatype,
+            base_iri: None,
         }
     }
 
@@ -1651,6 +1742,7 @@ mod tests {
                 fixed_columns: Vec::new(),
             }],
             distinct: false,
+            base_iri: None,
         };
         assert_eq!(plan.term_columns().len(), 2);
         let types: ColumnTypes = [((l, "a".to_owned()), a), ((r, "b".to_owned()), b)].into();
@@ -1763,6 +1855,7 @@ mod tests {
             lexical_hidden_columns: Default::default(),
             branches: vec![branch("a"), branch("b")],
             distinct: false,
+            base_iri: None,
         }
     }
 
@@ -1940,6 +2033,7 @@ mod tests {
                 fixed_columns: vec![fixed.iter().map(|c| c.to_string()).collect()],
             }],
             distinct: false,
+            base_iri: None,
         }
     }
 
@@ -2032,6 +2126,7 @@ mod tests {
             projection: Vec::new(),
             branches: Vec::new(),
             distinct: false,
+            base_iri: None,
         };
         assert_eq!(plan.to_sql().sql, "SELECT 1 WHERE false");
     }

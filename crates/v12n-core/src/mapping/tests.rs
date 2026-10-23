@@ -16,7 +16,7 @@ fn parse(body: &str) -> Result<Mapping, Error> {
 }
 
 fn id(local: &str) -> TriplesMapId {
-    TriplesMapId::Iri(format!("{BASE_IRI}#{local}"))
+    TriplesMapId::Iri(format!("{DOCUMENT_BASE_IRI}#{local}"))
 }
 
 fn ex(local: &str) -> String {

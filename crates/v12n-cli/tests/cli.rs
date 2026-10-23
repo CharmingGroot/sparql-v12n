@@ -216,6 +216,54 @@ fn explain_invalid_mapping_exits_two() {
     assert_eq!(stdout_json(&output)["error"]["kind"], json!("mapping"));
 }
 
+const RELATIVE_TEMPLATE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/w3c/rdb2rdf/D020-1table1column5rows/r2rmla.ttl"
+);
+const BOB: &str =
+    "SELECT ?t WHERE { <http://example.com/base/Bob> a <http://xmlns.com/foaf/0.1/Person> }";
+
+#[test]
+fn explain_base_iri_from_option_or_environment_resolves_relative_templates() {
+    let from_option = v12n(
+        &[
+            "explain",
+            "--base-iri",
+            "http://example.com/base/",
+            RELATIVE_TEMPLATE,
+            "-",
+        ],
+        BOB,
+    );
+    assert_eq!(from_option.status.code(), Some(0));
+    assert_eq!(stdout_json(&from_option)["params"], json!(["Bob"]));
+
+    let from_env = Command::new(env!("CARGO_BIN_EXE_v12n"))
+        .args(["explain", RELATIVE_TEMPLATE, "-"])
+        .env("V12N_BASE_IRI", "http://example.com/base/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all(BOB.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert_eq!(stdout_json(&from_env)["params"], json!(["Bob"]));
+
+    // Without a base IRI the template only renders relative IRIs, which
+    // never equal the constant.
+    let without = v12n(&["explain", RELATIVE_TEMPLATE, "-"], BOB);
+    assert_eq!(stdout_json(&without)["params"], json!([]));
+}
+
+#[test]
+fn explain_relative_base_iri_exits_one() {
+    let output = v12n(&["explain", "--base-iri", "base/", SHOP, VIP_ORDERS], "");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("base IRI"));
+}
+
 #[test]
 fn explain_missing_query_file_exits_one() {
     let output = v12n(&["explain", SHOP, "does-not-exist.rq"], "");
@@ -550,6 +598,23 @@ fn serve_warns_about_unrecognized_v12n_variables() {
         stderr.contains("WARN") && stderr.contains("V12N_DATABASE__URL"),
         "{stderr}"
     );
+}
+
+#[test]
+fn serve_invalid_base_iri_exits_one_and_names_the_setting() {
+    let output = serve(
+        &[],
+        &[
+            ("V12N_DATABASE_URL", "postgresql://v12n@127.0.0.1:1/shop"),
+            ("V12N_MAPPING", SHOP),
+            ("V12N_BASE_IRI", "not an iri"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("V12N_BASE_IRI"));
+    // The option overrides the environment, and is checked as it is read.
+    let output = serve(&["--base-iri", "base/"], &[("V12N_MAPPING", SHOP)]);
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]

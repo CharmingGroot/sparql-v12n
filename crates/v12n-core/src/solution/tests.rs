@@ -80,6 +80,7 @@ fn plan(columns: &[&str], projection: Vec<(&str, Option<ResultTerm>)>) -> SqlPla
             .collect(),
         branches: Vec::new(),
         distinct: false,
+        base_iri: None,
     }
 }
 
@@ -290,6 +291,49 @@ fn build_relative_iri_from_column_is_a_data_error() {
         .build(&[SqlValue::String("not an iri".into())])
         .unwrap_err();
     assert!(matches!(err, Error::InvalidTerm(_)), "{err}");
+}
+
+#[test]
+fn build_relative_iri_resolves_against_the_plan_base_iri() {
+    let mut plan = plan(
+        &["i", "t"],
+        vec![
+            ("i", term(TermType::Iri, ResultValue::Column("i".into()))),
+            (
+                "t",
+                term(TermType::Iri, template(&[("x", false), ("t", true)])),
+            ),
+        ],
+    );
+    plan.base_iri = Some(crate::mapping::BaseIri::new("http://example.com/base/").unwrap());
+    let builder = SolutionBuilder::new(&plan);
+    let build = |i: &str, t: &str| {
+        builder
+            .build(&[SqlValue::String(i.into()), SqlValue::String(t.into())])
+            .map(|s| s.values().to_vec())
+    };
+    // R2RMLTC0019a: a column value with a scheme is kept, fragment and all.
+    assert_eq!(
+        build("http://example.com/ns#Jhon", "1").unwrap(),
+        [
+            iri("http://example.com/ns#Jhon"),
+            iri("http://example.com/base/x1")
+        ]
+    );
+    assert_eq!(
+        build("Carlos", "a b").unwrap(),
+        [
+            iri("http://example.com/base/Carlos"),
+            iri("http://example.com/base/xa%20b")
+        ]
+    );
+    // R2RMLTC0019b: still a data error once the base is in front.
+    let err = build("Juan Daniel", "1").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("http://example.com/base/Juan Daniel"),
+        "{err}"
+    );
 }
 
 #[test]
