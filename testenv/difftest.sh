@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # Differential tests against Ontop. Every case (a directory with
-# mapping.ttl under examples/ or tests/diff/) is loaded into its own
-# PostgreSQL database and served by its own Ontop container, then
-# `cargo nextest run -p v12n-difftest` compares the two engines.
+# mapping.ttl or case.toml under examples/, tests/diff/ or tests/diff/w3c/)
+# is loaded into its own PostgreSQL database and served by its own Ontop
+# container, then `cargo nextest run -p v12n-difftest` compares the two
+# engines.
 #
-#   ./difftest.sh [args]  up, test, down; args go to the test runner
-#   ./difftest.sh up      start and load, leave running
-#   ./difftest.sh test    run the tests against a running environment
+#   ./difftest.sh [args]  run every case in batches, then remove everything;
+#                         args go to the test runner
+#   ./difftest.sh up      start the selected cases at once and leave them running
+#   ./difftest.sh test    run the tests of the selected cases against `up`
 #   ./difftest.sh down    stop and remove containers and volumes
+#
+# Environment:
+#   DIFF_CASES   space-separated case names to run (default: all)
+#   DIFF_SHARD   i/N: run every Nth case starting at the ith (default: 1/1)
+#   DIFF_BATCH   Ontop containers running at once (default: 8); each is a JVM
 #
 # Needs Docker with Compose v2 and testenv/jdbc/ (./fetch-jdbc.sh).
 # Development credentials only; every port is bound to localhost.
@@ -20,24 +27,58 @@ endpoints="$out/endpoints"
 project="${DIFF_PROJECT:-v12n-difftest}"
 pg_port="${DIFF_PG_PORT:-55433}"
 ontop_port="${DIFF_ONTOP_PORT:-58100}"
+batch_size="${DIFF_BATCH:-8}"
+shard="${DIFF_SHARD:-1/1}"
+profile="${DIFF_NEXTEST_PROFILE:-default}"
 # Pinned by digest: the tag is for people, the digest is what runs.
 postgres_image="postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe"
 ontop_image="ontop/ontop:5.5.0@sha256:d19a2055b02812c8ecc0a00cca1733c1669c4143dfeb728acbfdff92b45e94d7"
 
 compose() { docker compose -p "$project" -f "$compose_file" "$@"; }
 log() { printf '[difftest %3ss] %s\n' "$SECONDS" "$*" >&2; }
+has_nextest() { cargo nextest --version >/dev/null 2>&1; }
 
-# Same discovery and database naming as crates/v12n-difftest.
-cases() {
+# Same discovery, naming and case.toml reading as crates/v12n-difftest.
+all_cases() {
   local dir
-  for dir in "$root"/examples/*/ "$root"/tests/diff/*/; do
-    [ -f "$dir/mapping.ttl" ] && printf '%s\n' "${dir%/}"
+  for dir in "$root"/examples/*/ "$root"/tests/diff/*/ "$root"/tests/diff/w3c/*/; do
+    if [ -f "$dir/mapping.ttl" ] || [ -f "$dir/case.toml" ]; then
+      printf '%s\n' "${dir%/}"
+    fi
   done
 }
-case_name() { basename "$1"; }
-database() { local name; name="$(case_name "$1" | tr '[:upper:]-' '[:lower:]_')"; echo "diff_$name"; }
-service() { echo "ontop-$(case_name "$1" | tr '[:upper:]' '[:lower:]')"; }
 
+cases() {
+  local index=0 dir name
+  while read -r dir; do
+    name="$(basename "$dir")"
+    if [ -n "${DIFF_CASES:-}" ] && [[ " $DIFF_CASES " != *" $name "* ]]; then
+      continue
+    fi
+    if [ $((index % ${shard#*/})) -eq $((${shard%/*} - 1)) ]; then
+      printf '%s\n' "$dir"
+    fi
+    index=$((index + 1))
+  done < <(all_cases)
+}
+
+name() { basename "$1"; }
+lower() { tr '[:upper:]' '[:lower:]'; }
+database() { echo "diff_$(name "$1" | lower | tr -- - _)"; }
+service() { echo "ontop-$(name "$1" | lower)"; }
+module() { echo "case_$(name "$1" | lower | tr -c 'a-z0-9\n' _)::"; }
+
+# case.toml holds `sql = "..."` and `mapping = "..."`, relative to the case.
+toml_path() { sed -n "s/^$2 = \"\(.*\)\"\$/\1/p" "$1/case.toml"; }
+mapping_file() {
+  if [ -f "$1/case.toml" ]; then echo "$1/$(toml_path "$1" mapping)"; else echo "$1/mapping.ttl"; fi
+}
+sql_files() {
+  if [ -f "$1/case.toml" ]; then echo "$1/$(toml_path "$1" sql)"; else echo "$1/schema.sql" "$1/data.sql"; fi
+}
+
+# A Compose file with PostgreSQL and one Ontop service per case given on
+# stdin, and the endpoints file the tests read.
 generate() {
   mkdir -p "$out"
   local i=0 dir
@@ -65,78 +106,100 @@ generate() {
       echo "      ONTOP_DB_USER: v12n"
       echo "      ONTOP_DB_PASSWORD: v12n-dev"
       echo "      ONTOP_DB_DRIVER: org.postgresql.Driver"
-      echo "      ONTOP_JAVA_ARGS: -Xmx384m"
+      echo "      ONTOP_JAVA_ARGS: -Xmx256m"
       # Healthy once a probe query runs, not when the port opens.
       echo "      ONTOP_HEALTHCHECK: query"
       echo "      ONTOP_HEALTHCHECK_QUERY_INTERVAL: \"0\""
       echo "    healthcheck: { interval: 2s, timeout: 5s, retries: 150 }"
       echo "    ports: [\"127.0.0.1:$((ontop_port + i)):8080\"]"
       echo "    volumes:"
-      echo "      - \"$dir:/case:ro\""
+      echo "      - \"$(mapping_file "$dir"):/case/mapping.ttl:ro\""
       echo "      - \"$root/testenv/jdbc:/opt/ontop/jdbc:ro\""
-      echo "$(case_name "$dir") http://127.0.0.1:$((ontop_port + i))/sparql" >>"$endpoints.tmp"
+      echo "$(name "$dir") http://127.0.0.1:$((ontop_port + i))/sparql" >>"$endpoints.tmp"
       i=$((i + 1))
-    done < <(cases)
+    done
   } >"$compose_file"
   mv "$endpoints.tmp" "$endpoints"
 }
 
+start_postgres() {
+  if ! ls "$root"/testenv/jdbc/postgresql-*.jar >/dev/null 2>&1; then
+    echo "no JDBC driver in testenv/jdbc/: run testenv/fetch-jdbc.sh first" >&2
+    exit 1
+  fi
+  generate </dev/null
+  compose down -v --remove-orphans >/dev/null 2>&1 || true
+  compose up -d --wait postgres
+  log "postgres ready"
+}
+
 load() {
-  local dir db
+  local dir db count=0
   # Every psql reads stdin, so the case list comes in on another descriptor.
   while read -r dir <&3; do
     db="$(database "$dir")"
     compose exec -T postgres psql -q -v ON_ERROR_STOP=1 -U v12n -d v12n -c "CREATE DATABASE $db"
-    cat "$dir/schema.sql" "$dir/data.sql" |
-      compose exec -T postgres psql -q -v ON_ERROR_STOP=1 -U v12n -d "$db" >/dev/null
-    log "loaded $(case_name "$dir") into $db"
+    # Ontop labels blank nodes with pgcrypto's digest() on PostgreSQL.
+    compose exec -T postgres psql -q -v ON_ERROR_STOP=1 -U v12n -d "$db" -c "CREATE EXTENSION pgcrypto"
+    # shellcheck disable=SC2046 # one or two file names without spaces
+    cat $(sql_files "$dir") | compose exec -T postgres psql -q -v ON_ERROR_STOP=1 -U v12n -d "$db" >/dev/null
+    count=$((count + 1))
   done 3< <(cases)
+  log "loaded $count cases"
 }
 
-runner() {
-  if cargo nextest --version >/dev/null 2>&1; then
-    cargo nextest run -p v12n-difftest --locked --profile "${DIFF_NEXTEST_PROFILE:-default}" "$@"
-  else
-    cargo test -p v12n-difftest --locked "$@"
-  fi
+# Starts the Ontop services of the cases on stdin, replacing earlier ones.
+start_ontop() {
+  generate
+  compose up -d --remove-orphans
+  log "ontop starting: $(grep -c . "$endpoints") containers"
+}
+
+# Waits until every Ontop service is healthy or has stopped. Ontop refuses
+# some mappings at startup; their endpoint becomes "-", which the tests
+# report as an Ontop error for every query of the case.
+wait_ontop() {
+  local deadline=$((SECONDS + 300)) states service state
+  while :; do
+    states="$(compose ps -a --format '{{.Service}} {{.State}}/{{.Health}}' | grep '^ontop-' || true)"
+    if ! grep -qE ' (created|restarting|running/starting)' <<<"$states"; then break; fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "Ontop not ready after 300s:" >&2
+      echo "$states" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+  while read -r service state; do
+    [ "$state" = "running/healthy" ] && continue
+    log "$service did not start ($state):"
+    compose logs --no-log-prefix "$service" 2>&1 | grep -E 'Caused by|ERROR' | tail -2 >&2 || true
+    local case_name
+    case_name="$(awk -v s="$service" '{ n = tolower($1); if ("ontop-" n == s) print $1 }' "$endpoints")"
+    sed -i.bak "s|^$case_name .*|$case_name -|" "$endpoints" && rm -f "$endpoints.bak"
+  done <<<"$states"
+  log "ontop ready"
 }
 
 build() {
-  if cargo nextest --version >/dev/null 2>&1; then
+  if has_nextest; then
     cargo nextest run -p v12n-difftest --locked --no-run
   else
     cargo test -p v12n-difftest --locked --no-run
   fi
 }
 
+# Runs the tests of the cases whose Ontop endpoints are up.
 run_tests() {
-  V12N_DIFF_DATABASE_URL="postgresql://v12n:v12n-dev@127.0.0.1:$pg_port/v12n" \
-    V12N_DIFF_ENDPOINTS="$endpoints" runner "$@"
-}
-
-up() {
-  if ! ls "$root"/testenv/jdbc/postgresql-*.jar >/dev/null 2>&1; then
-    echo "no JDBC driver in testenv/jdbc/: run testenv/fetch-jdbc.sh first" >&2
-    exit 1
+  local filters=() name _url
+  while read -r name _url; do filters+=("$(module "$name")"); done <"$endpoints"
+  export V12N_DIFF_DATABASE_URL="postgresql://v12n:v12n-dev@127.0.0.1:$pg_port/v12n"
+  export V12N_DIFF_ENDPOINTS="$endpoints"
+  if has_nextest; then
+    cargo nextest run -p v12n-difftest --locked --profile "$profile" "$@" "${filters[@]}"
+  else
+    cargo test -p v12n-difftest --locked --test differential -- "$@" "${filters[@]}"
   fi
-  generate
-  compose down -v --remove-orphans >/dev/null 2>&1 || true
-  compose up -d --wait postgres
-  log "postgres ready"
-  load
-  # Ontop starts its JVM and reads the database schema while the tests
-  # compile.
-  compose up -d
-  log "ontop starting: $(cases | wc -l | tr -d ' ') containers"
-}
-
-wait_ontop() {
-  if ! compose up -d --wait --wait-timeout 300; then
-    compose ps >&2
-    compose logs --tail 50 >&2
-    exit 1
-  fi
-  log "ontop ready"
 }
 
 # Keeps the exit status of the run while removing the environment.
@@ -147,13 +210,42 @@ cleanup() {
 }
 
 down() {
-  [ -f "$compose_file" ] || generate
+  [ -f "$compose_file" ] || generate </dev/null
   compose down -v --remove-orphans
 }
 
+run_all() {
+  local selected batch=1 status=0 junit="$root/target/nextest/$profile/junit.xml"
+  selected="$(cases)"
+  [ -n "$selected" ] || { echo "no cases selected" >&2; exit 1; }
+  rm -f "$root/target/nextest/$profile"/junit-*.xml
+  start_postgres
+  load
+  # The first batch of Ontop JVMs starts while the tests compile.
+  local batches
+  batches="$(printf '%s\n' "$selected" | split_batches)"
+  printf '%s\n' "$batches" | sed -n 1p | tr ' ' '\n' | start_ontop
+  build
+  log "tests built"
+  while read -r line; do
+    if [ "$batch" -gt 1 ]; then printf '%s\n' "$line" | tr ' ' '\n' | start_ontop; fi
+    wait_ontop
+    run_tests "$@" || status=1
+    if [ -f "$junit" ]; then mv "$junit" "${junit%.xml}-$batch.xml"; fi
+    log "batch $batch done"
+    batch=$((batch + 1))
+  done < <(printf '%s\n' "$batches")
+  return "$status"
+}
+
+# Groups the case directories on stdin into lines of at most $batch_size.
+split_batches() { xargs -n "$batch_size" echo; }
+
 case "${1:-}" in
   up)
-    up
+    start_postgres
+    load
+    cases | start_ontop
     build
     wait_ontop
     ;;
@@ -166,11 +258,7 @@ case "${1:-}" in
     ;;
   *)
     trap cleanup EXIT
-    up
-    build
-    log "tests built"
-    wait_ontop
-    run_tests "$@"
+    run_all "$@"
     log "done"
     ;;
 esac

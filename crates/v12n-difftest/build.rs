@@ -2,15 +2,15 @@
 //! Generates one test per query of every differential case, so that test
 //! filters, `nextest --partition` and JUnit reports work per query.
 //!
-//! A case is a directory under `examples/` or `tests/diff/` with a
-//! `mapping.ttl`; its queries are `queries/*.rq`.
+//! A case is a directory under one of [`CASE_ROOTS`] with a `mapping.ttl`
+//! or a `case.toml`; its queries are `queries/*.rq`.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-const CASE_ROOTS: [&str; 2] = ["examples", "tests/diff"];
+const CASE_ROOTS: [&str; 3] = ["examples", "tests/diff", "tests/diff/w3c"];
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("set by cargo"));
@@ -24,7 +24,7 @@ fn main() {
     for root in CASE_ROOTS {
         let root = workspace.join(root);
         rerun_if_changed(&root);
-        for case in sorted_entries(&root).filter(|p| p.join("mapping.ttl").is_file()) {
+        for case in sorted_entries(&root).filter(|p| is_case(p)) {
             let name = file_name(&case);
             let module = format!("case_{}", ident(&name));
             assert!(modules.insert(module.clone()), "two cases are named {name}");
@@ -51,6 +51,10 @@ fn main() {
     }
     let path = PathBuf::from(env::var("OUT_DIR").expect("set by cargo")).join("cases.rs");
     fs::write(path, out).expect("write generated tests");
+}
+
+fn is_case(dir: &Path) -> bool {
+    dir.join("mapping.ttl").is_file() || dir.join("case.toml").is_file()
 }
 
 fn rerun_if_changed(path: &Path) {

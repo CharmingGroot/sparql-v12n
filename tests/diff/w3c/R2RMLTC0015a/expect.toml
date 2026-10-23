@@ -1,0 +1,3 @@
+# ?o comes from term maps of different shapes (language tags) in the UNION branches.
+[query.label]
+expect = "rejected"

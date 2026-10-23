@@ -5,8 +5,9 @@ over the same mapping and data, and the results must be the same bag of
 solutions. `crates/v12n-difftest` turns every query into one test, and
 `testenv/difftest.sh` starts PostgreSQL and one Ontop endpoint per case.
 
-Every directory with a `mapping.ttl` under `examples/` or `tests/diff/` is a
-case. Cases here are named `<number>-<description>`.
+Every directory with a `mapping.ttl` or a `case.toml` under `examples/`,
+`tests/diff/` or `tests/diff/w3c/` is a case. Cases here are named
+`<number>-<description>`; W3C cases are named by their test id.
 
 ```text
 0001-mdr/
@@ -37,7 +38,8 @@ that differ in some terms side by side.
 
 ```toml
 # Outside the supported subset: v12n must fail with UnsupportedFeature
-# (CLI exit code 1, HTTP 501). Ontop is not asked. Runs without a database.
+# (CLI exit code 1, HTTP 501), at planning or, for checks that need column
+# types, at execution. Ontop is not asked.
 [query.optional-criticality]
 expect = "rejected"
 
@@ -47,8 +49,9 @@ expect = "rejected"
 expect = "mismatch"
 issue = 25
 
-# Ontop fails on the query. v12n must return `solutions` solutions. Fails
-# once Ontop answers, so the results get compared.
+# Ontop fails on the query, or does not start with the mapping. v12n must
+# return `solutions` solutions. Fails once Ontop answers, so the results
+# get compared.
 [query.date-invalid]
 expect = "ontop-error"
 issue = 26
@@ -62,22 +65,25 @@ testenv/fetch-jdbc.sh    # once
 testenv/difftest.sh      # up, test, down
 ```
 
-`testenv/difftest.sh up`, `test` and `down` run the steps separately, for
-example to rerun the tests while editing a case. Arguments after `test`
-go to the test runner, such as a filter (`case_0001_mdr`) or
-`--partition count:2/1` to shard.
+Every case needs its own Ontop JVM, so the script starts at most
+`DIFF_BATCH` (8) at a time and `DIFF_SHARD=i/N` runs every Nth case, which
+CI uses to split the cases over four jobs. `DIFF_CASES="0001-mdr shop"`
+picks cases by name. `testenv/difftest.sh up`, `test` and `down` run the
+steps separately for the selected cases, for example to rerun the tests
+while editing a case.
 
 Without `V12N_DIFF_DATABASE_URL` and `V12N_DIFF_ENDPOINTS`, `cargo test`
 still runs the `rejected` checks and skips the comparisons.
 
 ## W3C RDB2RDF test cases
 
-Not included yet. The [R2RML test cases](https://www.w3.org/TR/rdb2rdf-test-cases/)
-fit this layout as one case per test: the test database's `create.sql`
-holds both tables and rows (use it as `schema.sql` with an empty
-`data.sql`), the test's mapping becomes `mapping.ttl`, and the queries
-are one `SELECT` per predicate and class of the mapping, since the engine
-does not support variable predicates yet. They are to be vendored with
-their licence notice once the download is approved, as a subset covering
-basic graph patterns on PostgreSQL; tests outside that scope are listed
-with the reason they are skipped.
+`tests/diff/w3c/` has one case per included R2RML test. A `case.toml`
+replaces `schema.sql`, `data.sql` and `mapping.ttl` there, because the W3C
+files are vendored unmodified in `tests/w3c/rdb2rdf/`:
+
+```toml
+sql = "../../../w3c/rdb2rdf/D001-1table1column1row/create.sql"
+mapping = "../../../w3c/rdb2rdf/D001-1table1column1row/r2rmla.ttl"
+```
+
+`tests/diff/w3c/README.md` lists the included and skipped tests.

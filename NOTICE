@@ -2,3 +2,9 @@ sparql-v12n
 Copyright 2026 CharmingGroot
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+tests/w3c/rdb2rdf/ contains unmodified files from the W3C RDB2RDF test
+cases (https://www.w3.org/2001/sw/rdb2rdf/test-cases/),
+Copyright (c) 2012 W3C (MIT, ERCIM, Keio), All Rights Reserved, used under
+the W3C Document License (https://www.w3.org/copyright/document-license/).
+They are not covered by the Apache License. See tests/w3c/rdb2rdf/README.md.

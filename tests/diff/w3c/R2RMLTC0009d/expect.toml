@@ -1,0 +1,6 @@
+# Ontop does not start: it cannot infer the datatype of a computed sqlQuery
+# column with ontop.inferDefaultDatatype off (#26).
+[query.name]
+expect = "ontop-error"
+issue = 26
+solutions = 2

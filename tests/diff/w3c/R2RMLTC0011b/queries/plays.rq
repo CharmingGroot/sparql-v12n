@@ -1,0 +1,3 @@
+SELECT ?s ?o WHERE {
+  ?s <http://example.com/plays> ?o .
+}

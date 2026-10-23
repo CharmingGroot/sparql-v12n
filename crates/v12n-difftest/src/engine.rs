@@ -17,36 +17,52 @@ fn unfold_query(mapping: &str, query: &str) -> Result<Result<SqlPlan, v12n_core:
         .and_then(|query| unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping))))
 }
 
-/// The unsupported feature the engine names when it rejects the query,
-/// or why the query was not rejected that way. The CLI turns this error
-/// into exit code 1 and the HTTP endpoint into status 501.
-pub fn check_rejected(mapping: &str, query: &str) -> Result<String, String> {
+/// Why the engine did not answer.
+#[derive(Debug)]
+pub enum Failure {
+    /// `UnsupportedFeature`, at planning or, for checks that need the
+    /// column types, at execution. The CLI turns it into exit code 1 and
+    /// the HTTP endpoint into status 501.
+    Unsupported(String),
+    Other(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(feature) => write!(
+                f,
+                "unsupported feature: {feature}; if this is intended, mark the query \
+                 `expect = \"rejected\"` in expect.toml"
+            ),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+/// `Some(feature)` when planning rejects the query as unsupported, `None`
+/// when it plans, and an error for any other failure.
+pub fn rejected_at_planning(mapping: &str, query: &str) -> Result<Option<String>, String> {
     match unfold_query(mapping, query)? {
-        Err(v12n_core::Error::UnsupportedFeature(feature)) => Ok(feature),
+        Err(v12n_core::Error::UnsupportedFeature(feature)) => Ok(Some(feature)),
         Err(e) => Err(format!("expected an unsupported-feature error, got: {e}")),
-        Ok(_) => Err(
-            "expected an unsupported-feature error, but the engine accepts the query; \
-             remove `expect = \"rejected\"` from expect.toml so it is compared with Ontop"
-                .to_owned(),
-        ),
+        Ok(_) => Ok(None),
     }
 }
 
 /// All solutions, with no row limit so that a cut-off result cannot pass
 /// for a complete one.
-pub fn run(database_url: &str, mapping: &str, query: &str) -> Result<Results, String> {
-    let plan = unfold_query(mapping, query)?.map_err(|e| match e {
-        v12n_core::Error::UnsupportedFeature(_) => {
-            format!(
-                "{e}; if this is intended, mark the query `expect = \"rejected\"` in expect.toml"
-            )
-        }
-        e => e.to_string(),
-    })?;
+pub fn run(database_url: &str, mapping: &str, query: &str) -> Result<Results, Failure> {
+    let plan = unfold_query(mapping, query)
+        .map_err(Failure::Other)?
+        .map_err(|e| match e {
+            v12n_core::Error::UnsupportedFeature(feature) => Failure::Unsupported(feature),
+            e => Failure::Other(e.to_string()),
+        })?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Failure::Other(e.to_string()))?;
     runtime
         .block_on(async {
             let limits = Limits {
@@ -67,5 +83,10 @@ pub fn run(database_url: &str, mapping: &str, query: &str) -> Result<Results, St
             }
             Ok::<_, v12n_postgres::Error>(Results { variables, rows })
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| match e {
+            v12n_postgres::Error::Core(v12n_core::Error::UnsupportedFeature(feature)) => {
+                Failure::Unsupported(feature)
+            }
+            e => Failure::Other(e.to_string()),
+        })
 }
