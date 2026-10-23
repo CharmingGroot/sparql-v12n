@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Both triples maps: an xsd:integer and a plain literal.
+SELECT ?s ?v WHERE { ?s ex:value ?v }

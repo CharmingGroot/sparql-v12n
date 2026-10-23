@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# Assets 7, 8 and 9 have findings; 7 has two but appears once.
+SELECT DISTINCT ?asset WHERE {
+  ?finding ex:onAsset ?asset .
+}

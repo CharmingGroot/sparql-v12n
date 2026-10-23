@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# Referencing object map: dev-02 -> web-01 and web-01 -> db-01.
+SELECT ?from ?to WHERE {
+  ?from ex:connectsTo ?to .
+}

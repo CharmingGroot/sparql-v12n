@@ -1,0 +1,11 @@
+# Queries outside the supported subset must be rejected with an
+# unsupported-feature error. Ontop's answer to them is not compared.
+
+[query.optional-criticality]
+expect = "rejected"
+
+[query.filter-severity]
+expect = "rejected"
+
+[query.ordered-findings]
+expect = "rejected"

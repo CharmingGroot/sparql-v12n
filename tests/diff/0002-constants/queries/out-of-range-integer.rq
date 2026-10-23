@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Out of range for an integer column: no match and no error, and the text branch is unaffected.
+SELECT ?s WHERE { ?s ex:value 99999999999 }

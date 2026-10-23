@@ -1354,6 +1354,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "v12n-difftest"
+version = "0.0.0"
+dependencies = [
+ "form_urlencoded",
+ "oxrdf",
+ "serde",
+ "serde_json",
+ "spargebra",
+ "thiserror",
+ "tokio",
+ "toml",
+ "v12n-core",
+ "v12n-postgres",
+]
+
+[[package]]
 name = "v12n-postgres"
 version = "0.0.0"
 dependencies = [

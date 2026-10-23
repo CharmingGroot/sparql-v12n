@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Only the label branch can match a plain literal.
+SELECT ?s WHERE { ?s ex:value "abc" }

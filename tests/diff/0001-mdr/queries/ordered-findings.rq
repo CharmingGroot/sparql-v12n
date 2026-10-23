@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# ORDER BY is not supported yet.
+SELECT ?finding ?severity WHERE {
+  ?finding ex:severityId ?severity .
+}
+ORDER BY DESC(?severity) ?finding

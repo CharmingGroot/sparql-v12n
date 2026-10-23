@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Findings on assets reachable from a Low-criticality asset in one hop.
+SELECT ?from ?finding ?title WHERE {
+  ?from ex:criticality "Low" ; ex:connectsTo ?to .
+  ?finding ex:onAsset ?to ; ex:title ?title .
+}

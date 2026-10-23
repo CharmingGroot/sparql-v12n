@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# An xsd:integer constant against the integer severity_id column.
+SELECT ?finding ?title WHERE {
+  ?finding ex:severityId 4 ; ex:title ?title .
+}

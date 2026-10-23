@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# uuid has no natural datatype: plain literals.
+SELECT ?s ?u WHERE { ?s ex:device ?u }

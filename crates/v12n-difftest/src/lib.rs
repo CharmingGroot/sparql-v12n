@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Differential tests: every query of a case runs through this engine and
+//! through Ontop over the same mapping and data, and the two results must
+//! be the same bag of solutions.
+
+mod case;
+mod compare;
+mod engine;
+mod error;
+mod ontop;
+
+use std::path::Path;
+
+pub use case::{Case, Expectation, QueryCase};
+pub use compare::{Diff, Results, Row, compare, has_order_by};
+pub use error::Error;
+
+/// Base PostgreSQL URL. Each case is loaded into its own database, named
+/// by [`Case::database`], which replaces the database in this URL.
+pub const DATABASE_URL_VAR: &str = "V12N_DIFF_DATABASE_URL";
+/// Path of a file with one `<case> <Ontop SPARQL endpoint URL>` per line.
+pub const ENDPOINTS_VAR: &str = "V12N_DIFF_ENDPOINTS";
+
+/// What a passing check did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Both engines returned the same solutions.
+    Matched { solutions: usize },
+    /// The engine rejected a query outside the supported subset.
+    Rejected { feature: String },
+    /// The results differ as recorded in the case's expectations.
+    KnownMismatch { issue: u32, diff: String },
+    /// Ontop failed as recorded, and the engine returned the expected
+    /// number of solutions.
+    KnownOntopError { issue: u32, error: String },
+    /// No database or Ontop endpoint is configured.
+    Skipped,
+}
+
+/// Runs one query of the case in `case_dir` and panics with a report if
+/// the check fails. Used by the generated tests.
+pub fn check(case_dir: &str, query: &str) {
+    match run(Path::new(case_dir), query) {
+        Ok(Outcome::Matched { solutions }) => eprintln!("same as Ontop: {solutions} solutions"),
+        Ok(Outcome::Rejected { feature }) => eprintln!("rejected: unsupported feature: {feature}"),
+        Ok(Outcome::KnownMismatch { issue, diff }) => {
+            eprintln!("known mismatch, tracked in #{issue}:\n{diff}");
+        }
+        Ok(Outcome::KnownOntopError { issue, error }) => {
+            eprintln!("known Ontop error, tracked in #{issue}: {error}");
+        }
+        Ok(Outcome::Skipped) => {
+            eprintln!("skipped: {DATABASE_URL_VAR} and {ENDPOINTS_VAR} are not set");
+        }
+        Err(error) => panic!("{error}"),
+    }
+}
+
+/// Runs one query of the case in `case_dir`. Queries expected to be
+/// rejected need neither a database nor Ontop.
+pub fn run(case_dir: &Path, query: &str) -> Result<Outcome, Error> {
+    let case = Case::load(case_dir)?;
+    let query = case.query(query)?;
+    let label = format!("{}/{}", case.name, query.name);
+
+    if query.expect == Expectation::Rejected {
+        return engine::check_rejected(&case.mapping, &query.text)
+            .map(|feature| Outcome::Rejected { feature })
+            .map_err(|message| Error::Failed(format!("{label}: {message}")));
+    }
+
+    let Some(environment) = Environment::from_env()? else {
+        return Ok(Outcome::Skipped);
+    };
+    let endpoint = environment.endpoint(&case.name)?;
+    let expected = ontop::query(&endpoint, &query.text);
+    let database_url = with_database(&environment.database_url, &case.database())?;
+    let actual = engine::run(&database_url, &case.mapping, &query.text);
+
+    match query.expect {
+        Expectation::OntopError { issue, solutions } => {
+            let actual = actual.map_err(|e| Error::Engine(format!("{label}: {e}")))?;
+            match expected {
+                Ok(_) => Err(Error::Failed(format!(
+                    "{label}: Ontop answers now; remove its expectation from expect.toml \
+                     so the results are compared, and update #{issue}"
+                ))),
+                Err(_) if actual.rows.len() != solutions => Err(Error::Failed(format!(
+                    "{label}: v12n returned {} solutions, expected {solutions}",
+                    actual.rows.len()
+                ))),
+                Err(error) => Ok(Outcome::KnownOntopError { issue, error }),
+            }
+        }
+        Expectation::Mismatch { issue } => {
+            let expected = expected.map_err(|e| Error::Ontop(format!("{label}: {e}")))?;
+            // A known mismatch may also be v12n failing where Ontop answers.
+            let diff = match actual {
+                Ok(actual) => diff(&label, &query.text, &expected, &actual)?.map(|d| d.to_string()),
+                Err(error) => Some(format!("  v12n fails: {error}\n")),
+            };
+            match diff {
+                Some(diff) => Ok(Outcome::KnownMismatch { issue, diff }),
+                None => Err(Error::Failed(format!(
+                    "{label}: matches Ontop now; remove its expectation from expect.toml \
+                     and close #{issue}"
+                ))),
+            }
+        }
+        Expectation::Match => {
+            let expected = expected.map_err(|e| Error::Ontop(format!("{label}: {e}")))?;
+            let actual = actual.map_err(|e| Error::Engine(format!("{label}: {e}")))?;
+            match diff(&label, &query.text, &expected, &actual)? {
+                None => Ok(Outcome::Matched {
+                    solutions: actual.rows.len(),
+                }),
+                Some(diff) => Err(Error::Failed(format!(
+                    "{label}: results differ from Ontop\n{diff}query:\n{}",
+                    query.text
+                ))),
+            }
+        }
+        Expectation::Rejected => unreachable!("handled above"),
+    }
+}
+
+fn diff(
+    label: &str,
+    query: &str,
+    expected: &Results,
+    actual: &Results,
+) -> Result<Option<Diff>, Error> {
+    let failed = |e: String| Error::Failed(format!("{label}: {e}"));
+    let ordered = has_order_by(query).map_err(failed)?;
+    compare(expected, actual, ordered).map_err(failed)
+}
+
+struct Environment {
+    database_url: String,
+    endpoints: String,
+    endpoints_path: String,
+}
+
+impl Environment {
+    /// `None` when neither variable is set, so that plain `cargo test`
+    /// skips the comparisons. Setting only one of them is an error, since
+    /// that is a broken setup rather than an opt-out.
+    fn from_env() -> Result<Option<Self>, Error> {
+        let database_url = std::env::var(DATABASE_URL_VAR).ok();
+        let endpoints_path = std::env::var(ENDPOINTS_VAR).ok();
+        let (database_url, endpoints_path) = match (database_url, endpoints_path) {
+            (None, None) => return Ok(None),
+            (Some(d), Some(e)) => (d, e),
+            _ => {
+                return Err(Error::Environment(format!(
+                    "set both {DATABASE_URL_VAR} and {ENDPOINTS_VAR}, or neither"
+                )));
+            }
+        };
+        let endpoints = std::fs::read_to_string(&endpoints_path)
+            .map_err(|e| Error::Environment(format!("{ENDPOINTS_VAR}={endpoints_path}: {e}")))?;
+        Ok(Some(Self {
+            database_url,
+            endpoints,
+            endpoints_path,
+        }))
+    }
+
+    fn endpoint(&self, case: &str) -> Result<String, Error> {
+        self.endpoints
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .find(|(name, _)| *name == case)
+            .map(|(_, url)| url.trim().to_owned())
+            .ok_or_else(|| {
+                Error::Environment(format!(
+                    "no Ontop endpoint for case {case} in {}",
+                    self.endpoints_path
+                ))
+            })
+    }
+}
+
+/// Replaces the database of a `postgresql://` URL, keeping user, host,
+/// port and query parameters.
+fn with_database(url: &str, database: &str) -> Result<String, Error> {
+    let invalid = || Error::Environment(format!("{DATABASE_URL_VAR} must be a postgresql:// URL"));
+    let rest = url
+        .strip_prefix("postgresql://")
+        .or_else(|| url.strip_prefix("postgres://"))
+        .ok_or_else(invalid)?;
+    let scheme = &url[..url.len() - rest.len()];
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let query = tail.find('?').map_or("", |i| &tail[i..]);
+    Ok(format!("{scheme}{authority}/{database}{query}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_database_replaces_only_the_database() {
+        let cases = [
+            ("postgresql://u:p@h:1/shop", "postgresql://u:p@h:1/diff_x"),
+            ("postgresql://u:p@h:1", "postgresql://u:p@h:1/diff_x"),
+            (
+                "postgres://u@h/shop?connect_timeout=5",
+                "postgres://u@h/diff_x?connect_timeout=5",
+            ),
+            (
+                "postgresql://h?sslmode=disable",
+                "postgresql://h/diff_x?sslmode=disable",
+            ),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(with_database(url, "diff_x").unwrap(), expected, "{url}");
+        }
+        assert!(with_database("host=h dbname=shop", "diff_x").is_err());
+    }
+}

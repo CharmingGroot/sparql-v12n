@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Asset 10 has a NULL criticality, so it produces no ex:criticality triple
+# and no solution.
+SELECT ?asset ?hostname ?criticality WHERE {
+  ?asset ex:hostname ?hostname ; ex:criticality ?criticality .
+}

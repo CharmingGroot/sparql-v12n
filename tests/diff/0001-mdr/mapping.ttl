@@ -1,0 +1,31 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#AssetMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "assets" ] ;
+  rr:subjectMap [ rr:template "http://example.org/asset/{id}" ; rr:class ex:Asset ] ;
+  rr:predicateObjectMap [ rr:predicate ex:hostname ; rr:objectMap [ rr:column "hostname" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:criticality ; rr:objectMap [ rr:column "criticality" ] ] .
+
+<#FindingMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "alerts" ] ;
+  rr:subjectMap [ rr:template "http://example.org/alert/{id}" ; rr:class ex:DetectionFinding ] ;
+  rr:predicateObjectMap [ rr:predicate ex:title ; rr:objectMap [ rr:column "title" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:severityId ; rr:objectMap [ rr:column "severity_id" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:onAsset ;
+    rr:objectMap [ rr:template "http://example.org/asset/{asset_id}" ]
+  ] .
+
+# A referencing object map: the object comes from the parent triples map
+# through a join, not from a template on the child table.
+<#LinkMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "links" ] ;
+  rr:subjectMap [ rr:template "http://example.org/asset/{src_id}" ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:connectsTo ;
+    rr:objectMap [
+      rr:parentTriplesMap <#AssetMap> ;
+      rr:joinCondition [ rr:child "dst_id" ; rr:parent "id" ]
+    ]
+  ] .

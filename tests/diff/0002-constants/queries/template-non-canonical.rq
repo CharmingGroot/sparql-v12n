@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# 007 is never produced by the template over an integer id.
+SELECT ?v WHERE { <http://example.org/item/007> ex:value ?v }
