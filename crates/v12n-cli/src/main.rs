@@ -19,7 +19,10 @@ use v12n_server::config::{Config, env, parse_duration};
 const EXIT_INPUT: u8 = 1;
 const EXIT_MAPPING: u8 = 2;
 const EXIT_DATABASE: u8 = 3;
-const EXIT_LIMIT: u8 = 4;
+const EXIT_TIMEOUT: u8 = 4;
+/// Separate from [`EXIT_TIMEOUT`] because the fix differs: a higher limit
+/// or paging with LIMIT/OFFSET, not a faster query or a longer timeout.
+const EXIT_ROW_LIMIT: u8 = 5;
 
 /// Shared by the top-level and `query` help, which `concat!` needs as a literal.
 macro_rules! exit_codes_help {
@@ -29,7 +32,8 @@ macro_rules! exit_codes_help {
   1  invalid input: arguments, files, query syntax, unsupported SPARQL
   2  invalid mapping
   3  database error, or a value that cannot become an RDF term
-  4  limit reached: statement timeout, or more rows than --row-limit"
+  4  statement timeout (--timeout) reached
+  5  row limit reached: more rows exist than --row-limit"
     };
 }
 
@@ -43,8 +47,14 @@ JSON output is SPARQL 1.1 Query Results JSON, written as rows arrive.
 The session is read-only; still, connect as a user that can only read.
 
 When more rows exist than --row-limit, the first --row-limit solutions are
-printed as a complete result and the command exits with 4. An error after
-output has started is reported on stderr and leaves stdout incomplete.
+printed as a complete result, a warning naming the limit goes to stderr,
+and the command exits with 5. A result of exactly --row-limit rows is not
+truncated and exits with 0.
+
+When the statement timeout cancels the query, stderr names the timeout and
+the command exits with 4. Before the first row, the error is reported in
+--format like other errors; after output has started, stdout is left
+incomplete so that it cannot pass for a complete result.
 
 ",
     exit_codes_help!()
@@ -157,6 +167,9 @@ struct Failure {
     /// Results were already written to stdout, so the error goes to stderr
     /// even in JSON format.
     after_output: bool,
+    /// The output on stdout is a complete, valid result, only shorter than
+    /// the full answer.
+    warning: bool,
 }
 
 impl Failure {
@@ -166,6 +179,7 @@ impl Failure {
             kind,
             message: message.into(),
             after_output: false,
+            warning: false,
         }
     }
 }
@@ -210,6 +224,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
             match format {
+                _ if failure.warning => eprintln!("warning: {}", failure.message),
                 _ if failure.after_output => eprintln!("error: {}", failure.message),
                 Format::Json => println!(
                     "{}",
@@ -395,26 +410,20 @@ fn query(
         .build()
         .map_err(|e| Failure::new(EXIT_DATABASE, "database", e.to_string()))?;
     runtime.block_on(async {
+        let before_output = |e| query_failure(e, 0);
         let database = Database::connect(url, limits)
             .await
-            .map_err(database_failure)?;
-        let mut solutions = database.execute(&plan).await.map_err(database_failure)?;
+            .map_err(before_output)?;
+        let mut solutions = database.execute(&plan).await.map_err(before_output)?;
         // Waiting for the first row before printing anything means an error
         // in planning or early execution is still reported in `format`.
-        let first = solutions.try_next().await.map_err(database_failure)?;
-        let printed = match format {
+        let first = solutions.try_next().await.map_err(before_output)?;
+        match format {
             Format::Json => print_json(&mut solutions, first).await?,
             Format::Table => print_solutions_table(&mut solutions, first).await?,
         };
         if solutions.is_truncated() {
-            return Err(Failure {
-                after_output: true,
-                ..Failure::new(
-                    EXIT_LIMIT,
-                    "row_limit",
-                    format!("stopped after {printed} rows (--row-limit); more rows exist"),
-                )
-            });
+            return Err(row_limit_warning(limits.row_limit));
         }
         Ok(())
     })
@@ -464,18 +473,56 @@ fn database_failure(error: v12n_postgres::Error) -> Failure {
     let (code, kind) = match &error {
         Error::Config(_) => (EXIT_INPUT, "input"),
         Error::Database(_) => (EXIT_DATABASE, "database"),
-        Error::Timeout(_) => (EXIT_LIMIT, "timeout"),
+        Error::Timeout(_) => (EXIT_TIMEOUT, "timeout"),
         Error::Core(_) => (EXIT_DATABASE, "data"),
     };
     Failure::new(code, kind, error.to_string())
 }
 
-/// Streams the solutions as SPARQL 1.1 Query Results JSON and returns how
-/// many were written.
+/// Like [`database_failure`], with a timeout message that names the limit,
+/// how far the result got, and the options that change it.
+fn query_failure(error: v12n_postgres::Error, rows: u64) -> Failure {
+    match error {
+        v12n_postgres::Error::Timeout(timeout) => {
+            let progress = match rows {
+                0 => "before the first row".to_owned(),
+                n => format!("after {n} rows"),
+            };
+            Failure::new(
+                EXIT_TIMEOUT,
+                "timeout",
+                format!(
+                    "statement timeout of {timeout:?} reached {progress}; the query was cancelled \
+                     (raise --timeout or {}, 0 disables it)",
+                    env::STATEMENT_TIMEOUT
+                ),
+            )
+        }
+        error => database_failure(error),
+    }
+}
+
+fn row_limit_warning(row_limit: u64) -> Failure {
+    Failure {
+        after_output: true,
+        warning: true,
+        ..Failure::new(
+            EXIT_ROW_LIMIT,
+            "row_limit",
+            format!(
+                "result truncated at the row limit of {row_limit}; more rows exist \
+                 (raise --row-limit or {}, 0 disables it, or page with LIMIT/OFFSET)",
+                env::ROW_LIMIT
+            ),
+        )
+    }
+}
+
+/// Streams the solutions as SPARQL 1.1 Query Results JSON.
 async fn print_json(
     solutions: &mut Solutions,
     first: Option<v12n_core::solution::Solution>,
-) -> Result<u64, Failure> {
+) -> Result<(), Failure> {
     let output_failure = |e: io::Error| Failure {
         after_output: true,
         ..Failure::new(EXIT_INPUT, "output", format!("cannot write output: {e}"))
@@ -483,13 +530,13 @@ async fn print_json(
     let stdout = BufWriter::new(io::stdout().lock());
     let mut writer =
         JsonResultsWriter::start(stdout, solutions.variables()).map_err(output_failure)?;
-    let mut count = 0;
+    let mut count: u64 = 0;
     let mut next = first;
     while let Some(solution) = next {
         match writer.write(&solution) {
             Ok(()) => count += 1,
             // The reader went away, e.g. `| head`; nothing left to report to.
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(count),
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
             Err(e) => return Err(output_failure(e)),
         }
         next = match solutions.try_next().await {
@@ -500,14 +547,14 @@ async fn print_json(
                 let _ = io::stdout().flush();
                 return Err(Failure {
                     after_output: true,
-                    ..database_failure(e)
+                    ..query_failure(e, count)
                 });
             }
         };
     }
     match writer.finish().and_then(|mut out| out.flush()) {
         Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(output_failure(e)),
-        _ => Ok(count),
+        _ => Ok(()),
     }
 }
 
@@ -517,7 +564,7 @@ async fn print_json(
 async fn print_solutions_table(
     solutions: &mut Solutions,
     first: Option<v12n_core::solution::Solution>,
-) -> Result<u64, Failure> {
+) -> Result<(), Failure> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut next = first;
     while let Some(solution) = next {
@@ -528,7 +575,10 @@ async fn print_solutions_table(
                 .map(|v| v.as_ref().map(ToString::to_string).unwrap_or_default())
                 .collect(),
         );
-        next = solutions.try_next().await.map_err(database_failure)?;
+        next = solutions
+            .try_next()
+            .await
+            .map_err(|e| query_failure(e, rows.len() as u64))?;
     }
     let header: Vec<String> = solutions
         .variables()
@@ -560,7 +610,7 @@ async fn print_solutions_table(
             "output",
             format!("cannot write output: {e}"),
         )),
-        _ => Ok(rows.len() as u64),
+        _ => Ok(()),
     }
 }
 

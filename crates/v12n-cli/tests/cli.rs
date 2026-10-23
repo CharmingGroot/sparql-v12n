@@ -222,6 +222,15 @@ fn query_unreachable_database_exits_three() {
 }
 
 #[test]
+fn query_help_documents_timeout_and_row_limit_exit_codes() {
+    let output = v12n(&["query", "--help"], "");
+    assert_eq!(output.status.code(), Some(0));
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("  4  statement timeout"), "{help}");
+    assert!(help.contains("  5  row limit reached"), "{help}");
+}
+
+#[test]
 fn query_invalid_timeout_exits_one() {
     let output = v12n(&["query", SHOP, VIP_ORDERS, "--timeout", "soon"], "");
     assert_eq!(output.status.code(), Some(1));
@@ -265,20 +274,6 @@ fn query_shop_vip_orders_prints_sparql_json_results() {
         ]
     );
 
-    let output = v12n(
-        &["query", SHOP, VIP_ORDERS, "--db", &url, "--row-limit", "1"],
-        "",
-    );
-    assert_eq!(output.status.code(), Some(4));
-    assert_eq!(
-        stdout_json(&output)["results"]["bindings"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--row-limit"));
-
     // The same settings from the environment, as `serve` reads them.
     let output = Command::new(env!("CARGO_BIN_EXE_v12n"))
         .args(["query", SHOP, VIP_ORDERS])
@@ -287,7 +282,156 @@ fn query_shop_vip_orders_prints_sparql_json_results() {
         .env("V12N_ROW_LIMIT", "1")
         .output()
         .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+}
+
+fn bindings(output: &Output) -> usize {
+    stdout_json(output)["results"]["bindings"]
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn query_over_the_row_limit_exits_five_with_a_complete_result_and_a_warning() {
+    let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
+        eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let output = v12n(
+        &["query", SHOP, VIP_ORDERS, "--db", &url, "--row-limit", "1"],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(5));
+    // stdout parses as a whole, so it is terminated JSON.
+    assert_eq!(bindings(&output), 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with("warning: result truncated at the row limit of 1;")
+            && stderr.contains("--row-limit")
+            && stderr.contains("V12N_ROW_LIMIT"),
+        "{stderr}"
+    );
+
+    let output = v12n(
+        &[
+            "query",
+            "--format",
+            "table",
+            SHOP,
+            VIP_ORDERS,
+            "--db",
+            &url,
+            "--row-limit",
+            "2",
+        ],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(5));
+    // Header and two rows.
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 3);
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("warning: "));
+}
+
+#[test]
+fn query_with_exactly_row_limit_rows_is_not_truncated() {
+    let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
+        eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
+        return;
+    };
+    // vip-orders has three solutions.
+    let output = v12n(
+        &["query", SHOP, VIP_ORDERS, "--db", &url, "--row-limit", "3"],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(bindings(&output), 3);
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+}
+
+/// A mapping over `rr:sqlQuery` rows of `id` and `pad`, plus a query file
+/// for `?s <http://example.org/pad> ?p`.
+fn slow_rows(sql: &str) -> (String, String) {
+    let mapping = format!(
+        "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
+         <#Slow> rr:logicalTable [ rr:sqlQuery \"\"\"{sql}\"\"\" ] ;\n\
+         rr:subjectMap [ rr:template \"http://example.org/row/{{id}}\" ] ;\n\
+         rr:predicateObjectMap [ rr:predicate <http://example.org/pad> ; rr:objectMap [ rr:column \"pad\" ] ] .\n"
+    );
+    let query = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("slow-rows.rq");
+    std::fs::write(
+        &query,
+        "SELECT ?s ?p WHERE { ?s <http://example.org/pad> ?p }",
+    )
+    .unwrap();
+    (mapping, query.to_str().unwrap().to_owned())
+}
+
+#[test]
+fn query_timeout_before_the_first_row_exits_four_and_names_the_timeout() {
+    let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
+        eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let (mapping, query) = slow_rows("SELECT 1 AS id, 'x' AS pad FROM pg_sleep(2)");
+    let output = v12n(
+        &["query", "-", &query, "--db", &url, "--timeout", "200ms"],
+        &mapping,
+    );
     assert_eq!(output.status.code(), Some(4));
+    let error = stdout_json(&output);
+    assert_eq!(error["error"]["kind"], json!("timeout"));
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("statement timeout of 200ms reached before the first row")
+            && message.contains("V12N_STATEMENT_TIMEOUT"),
+        "{message}"
+    );
+}
+
+#[test]
+fn query_timeout_after_output_started_exits_four_with_one_stderr_line() {
+    let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
+        eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
+        return;
+    };
+    // Rows larger than PostgreSQL's 8 kB send buffer reach the client one by
+    // one, so output starts well before the timeout. Without a row limit
+    // no window function holds them back.
+    let (mapping, query) = slow_rows(
+        "SELECT g AS id, repeat('x', 20000) AS pad FROM generate_series(1, 1000) g \
+         WHERE pg_sleep(0.02) IS NOT NULL",
+    );
+    let output = v12n(
+        &[
+            "query",
+            "-",
+            &query,
+            "--db",
+            &url,
+            "--timeout",
+            "500ms",
+            "--row-limit",
+            "0",
+        ],
+        &mapping,
+    );
+    assert_eq!(output.status.code(), Some(4));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("{\"head\""),
+        "{}",
+        &stdout[..stdout.len().min(80)]
+    );
+    assert!(serde_json::from_slice::<Value>(&output.stdout).is_err());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with("error: statement timeout of 500ms reached after ")
+            && stderr.contains(" rows;"),
+        "{stderr}"
+    );
 }
 
 /// Runs `v12n serve` with only the given `V12N_*` settings; every case

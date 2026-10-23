@@ -360,12 +360,13 @@ impl ResultStream {
             match self.solutions.try_next().await {
                 Ok(next) => self.next = next,
                 Err(e) => {
-                    let kind = match e {
-                        v12n_postgres::Error::Timeout(_) => "timeout",
-                        v12n_postgres::Error::Core(_) => "data",
-                        _ => "database",
+                    // Only the timeout message is free of stored values.
+                    let (kind, message) = match e {
+                        v12n_postgres::Error::Timeout(_) => ("timeout", e.to_string()),
+                        v12n_postgres::Error::Core(_) => ("data", String::new()),
+                        _ => ("database", String::new()),
                     };
-                    return Some(Err(self.abort(kind, String::new())));
+                    return Some(Err(self.abort(kind, message)));
                 }
             }
             if writer.get_mut().len() >= CHUNK_BYTES {
