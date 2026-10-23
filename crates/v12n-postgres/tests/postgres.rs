@@ -1175,3 +1175,92 @@ async fn table_keys_come_from_unique_indexes_that_always_hold() {
         ]
     );
 }
+
+/// OPTIONAL keeps every customer; a constant the column type cannot hold
+/// makes only the optional part fail, not the whole query.
+#[tokio::test]
+async fn optional_keeps_the_rows_its_part_does_not_match() {
+    let Some(url) = database_url() else { return };
+    let query = |amount: &str| {
+        format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?c ?o WHERE {{ ?c a ex:Customer OPTIONAL {{ ?o ex:placedBy ?c ; ex:amount {amount} }} }}"
+        )
+    };
+    let customer = |id: u32| format!("?c=<http://example.org/customer/{id}>");
+    let (rows, _) = run(&url, Limits::default(), &plan(SHOP, &query("30000")))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            customer(7),
+            format!("{} ?o=<http://example.org/order/1002>", customer(8)),
+            customer(9),
+        ]
+    );
+    for unmatchable in ["99999999999", "7.5", "\"30000\""] {
+        let (rows, _) = run(&url, Limits::default(), &plan(SHOP, &query(unmatchable)))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            [customer(7), customer(8), customer(9)],
+            "{unmatchable}"
+        );
+    }
+}
+
+/// The link between the two sides of OPTIONAL compares RDF terms across
+/// column types, like a join, and a UNION branch where the optional part
+/// cannot match selects NULLs of the other branches' types.
+#[tokio::test]
+async fn optional_compares_terms_across_column_types_and_union_branches() {
+    let Some(url) = database_url() else { return };
+    let v = "rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column \"v\" ] ]";
+    let w = "rr:predicateObjectMap [ rr:predicate ex:w ; rr:objectMap [ rr:column \"w\" ] ]";
+    let mapping = views(&[
+        ("int", "SELECT 1 AS id, 'x'::text AS v", v),
+        ("text", "SELECT '2'::text AS id, 'y'::text AS v", v),
+        ("w", "SELECT 2 AS id, 7::int4 AS w", w),
+    ]);
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?row ?v ?w WHERE { ?row ex:v ?v OPTIONAL { ?row ex:w ?w } }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            "?row=<http://example.org/row/1> ?v=\"x\"".to_owned(),
+            "?row=<http://example.org/row/2> ?v=\"y\" \
+             ?w=\"7\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+                .to_owned(),
+        ]
+    );
+
+    let class = |name: &str, sql: &str, extra: &str| {
+        format!(
+            "<#{name}> rr:logicalTable [ rr:sqlQuery \"\"\"{sql}\"\"\" ] ;
+               rr:subjectMap [ rr:template \"http://example.org/{name}/{{id}}\" ; rr:class ex:C ] {extra} .\n"
+        )
+    };
+    let mapping = format!(
+        "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n@prefix ex: <http://example.org/> .\n{}{}{}",
+        class("a", "SELECT 1 AS id", ""),
+        class("b", "SELECT 1 AS id", ""),
+        class("c", "SELECT 1 AS id, 7::int4 AS w", &format!("; {w}")),
+    );
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT DISTINCT ?w WHERE { ?row a ex:C OPTIONAL { ?row ex:w ?w } }";
+    let plan = plan(&mapping, query);
+    assert_eq!(plan.branches.len(), 3);
+    let (rows, _) = run(&url, Limits::default(), &plan).await.unwrap();
+    assert_eq!(
+        rows,
+        [
+            String::new(),
+            "?w=\"7\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_owned()
+        ]
+    );
+}

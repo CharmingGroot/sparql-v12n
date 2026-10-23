@@ -260,3 +260,68 @@ fn base_iri_join_on_iri_column_compares_generated_iris() {
         "SELECT ?s ?t WHERE { ?s ex:homepage ?p . ?p ex:title ?t }"
     ));
 }
+
+fn shop_keys() -> TableKeys {
+    ["customers", "orders"]
+        .into_iter()
+        .map(|t| {
+            (
+                LogicalTable::TableName(t.into()),
+                vec![vec!["id".to_owned()]],
+            )
+        })
+        .collect()
+}
+
+/// The optional part is a `LEFT JOIN` whose `ON` holds the link to the
+/// left side and its own conditions. Its key fixes its row too, so no
+/// duplicates need removing.
+#[test]
+fn optional_left_joins_the_optional_part() {
+    insta::assert_snapshot!(explain_with_keys(
+        SHOP,
+        &format!(
+            "{PREFIXES}SELECT ?c ?n ?o ?a WHERE {{ ?c ex:name ?n \
+             OPTIONAL {{ ?o ex:placedBy ?c ; ex:amount ?a }} }}"
+        ),
+        Some(&shop_keys())
+    ));
+}
+
+#[test]
+fn optional_nested_inside_optional() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?c ?o ?a WHERE { ?c a ex:Customer \
+         OPTIONAL { ?o ex:placedBy ?c OPTIONAL { ?o ex:amount ?a } } }"
+    ));
+}
+
+/// ?c is unbound where the first OPTIONAL does not match, and then any
+/// customer is compatible with it.
+#[test]
+fn optional_variable_unbound_on_the_left_compares_with_or() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?o ?c ?n WHERE { ?o ex:amount ?a OPTIONAL { ?o ex:placedBy ?c } \
+         OPTIONAL { ?c ex:name ?n } }"
+    ));
+}
+
+#[test]
+fn optional_followed_by_a_required_pattern() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?o ?c ?n WHERE { ?o ex:amount ?a OPTIONAL { ?o ex:placedBy ?c } ?c ex:name ?n }"
+    ));
+}
+
+#[test]
+fn optional_with_an_empty_left_side() {
+    insta::assert_snapshot!(shop("SELECT ?c ?t WHERE { OPTIONAL { ?c ex:tier ?t } }"));
+}
+
+/// Each UNION branch of the required part has its own `LEFT JOIN`.
+#[test]
+fn optional_in_each_union_branch() {
+    insta::assert_snapshot!(explain_with_union_types(
+        "SELECT ?s ?v ?d WHERE { ?s ex:value ?v OPTIONAL { ?s ex:measuredOn ?d } }"
+    ));
+}

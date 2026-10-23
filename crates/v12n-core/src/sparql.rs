@@ -12,13 +12,72 @@ use crate::Error;
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 /// A `SELECT` query in the supported subset: a projection, optionally
-/// `DISTINCT`, over one basic graph pattern.
+/// `DISTINCT`, over a graph pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectQuery {
     /// Projected variable names, without `?`, in `SELECT` order.
     pub variables: Vec<String>,
     pub distinct: bool,
-    pub patterns: Vec<TriplePattern>,
+    pub pattern: Pattern,
+}
+
+/// A graph pattern in the supported subset, as the SPARQL algebra builds
+/// it (SPARQL 1.1 §18.2, Translation to the SPARQL Algebra).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pattern {
+    /// A basic graph pattern. Joins of basic graph patterns are merged
+    /// into one.
+    Bgp(Vec<TriplePattern>),
+    /// `Join(left, right)`: a group with an `OPTIONAL` before other
+    /// patterns, such as `{ A OPTIONAL { B } C }`.
+    Join(Box<Pattern>, Box<Pattern>),
+    /// `LeftJoin(left, right, true)` from `OPTIONAL` (SPARQL 1.1 §18.5).
+    /// The algebra's filter expression is always `true` here: a `FILTER`
+    /// inside `OPTIONAL` would become it (§18.2.2.6, Translate Graph
+    /// Patterns), and is not supported yet.
+    LeftJoin(Box<Pattern>, Box<Pattern>),
+}
+
+impl Pattern {
+    /// Every triple pattern, in the order the pattern is written.
+    pub fn triple_patterns(&self) -> Vec<&TriplePattern> {
+        let mut out = Vec::new();
+        self.collect_triple_patterns(&mut out, true);
+        out
+    }
+
+    /// The triple patterns outside the right side of every `LeftJoin`,
+    /// which every solution matches, in the order they are written.
+    pub fn required_triple_patterns(&self) -> Vec<&TriplePattern> {
+        let mut out = Vec::new();
+        self.collect_triple_patterns(&mut out, false);
+        out
+    }
+
+    fn collect_triple_patterns<'p>(&'p self, out: &mut Vec<&'p TriplePattern>, optional: bool) {
+        match self {
+            Self::Bgp(patterns) => out.extend(patterns),
+            Self::Join(left, right) => {
+                left.collect_triple_patterns(out, optional);
+                right.collect_triple_patterns(out, optional);
+            }
+            Self::LeftJoin(left, right) => {
+                left.collect_triple_patterns(out, optional);
+                if optional {
+                    right.collect_triple_patterns(out, optional);
+                }
+            }
+        }
+    }
+
+    /// Number of `LeftJoin` nodes in the pattern.
+    pub fn left_joins(&self) -> usize {
+        match self {
+            Self::Bgp(_) => 0,
+            Self::Join(left, right) => left.left_joins() + right.left_joins(),
+            Self::LeftJoin(left, right) => left.left_joins() + 1 + right.left_joins(),
+        }
+    }
 }
 
 /// A triple pattern whose predicate is a constant IRI.
@@ -62,24 +121,21 @@ pub fn parse(query: &str) -> Result<SelectQuery, Error> {
     let GraphPattern::Project { inner, variables } = projected else {
         return Err(unsupported(describe(&projected)));
     };
-    let mut patterns = Vec::new();
-    collect_bgp(&inner, &mut patterns)?;
-    if patterns.is_empty() {
+    let pattern = group(&inner)?;
+    if pattern.triple_patterns().is_empty() {
         return Err(unsupported("empty graph patterns"));
     }
     Ok(SelectQuery {
         variables: variables.iter().map(|v| v.as_str().to_owned()).collect(),
         distinct,
-        patterns,
+        pattern,
     })
 }
 
-/// A join of basic graph patterns is the basic graph pattern of all their
-/// triples: blank node labels cannot be shared across them (SPARQL 1.1
-/// §4.1.4), so nothing is captured by merging.
-fn collect_bgp(pattern: &GraphPattern, out: &mut Vec<TriplePattern>) -> Result<(), Error> {
+fn group(pattern: &GraphPattern) -> Result<Pattern, Error> {
     match pattern {
         GraphPattern::Bgp { patterns } => {
+            let mut out = Vec::with_capacity(patterns.len());
             for p in patterns {
                 let NamedNodePattern::NamedNode(predicate) = &p.predicate else {
                     return Err(unsupported("variable predicates"));
@@ -90,11 +146,39 @@ fn collect_bgp(pattern: &GraphPattern, out: &mut Vec<TriplePattern>) -> Result<(
                     object: pattern_term(&p.object)?,
                 });
             }
-            Ok(())
+            Ok(Pattern::Bgp(out))
         }
-        GraphPattern::Join { left, right } => {
-            collect_bgp(left, out)?;
-            collect_bgp(right, out)
+        // A join of basic graph patterns is the basic graph pattern of all
+        // their triples: blank node labels cannot be shared across them
+        // (SPARQL 1.1 §4.1.4), so nothing is captured by merging.
+        GraphPattern::Join { left, right } => Ok(match (group(left)?, group(right)?) {
+            (Pattern::Bgp(mut left), Pattern::Bgp(right)) => {
+                left.extend(right);
+                Pattern::Bgp(left)
+            }
+            (left, right) => Pattern::Join(Box::new(left), Box::new(right)),
+        }),
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            if expression.is_some() {
+                return Err(unsupported("FILTER inside OPTIONAL"));
+            }
+            let left = group(left)?;
+            Ok(match group(right)? {
+                // `{ }` has one solution that binds nothing, which extends
+                // every solution unchanged.
+                Pattern::Bgp(right) if right.is_empty() => left,
+                // LeftJoin(Z, P), with Z the empty pattern, is P when P
+                // has solutions and Z otherwise. As the right side of
+                // another LeftJoin, both cases give LeftJoin(left, P).
+                Pattern::LeftJoin(inner_left, inner_right) if matches!(&*inner_left, Pattern::Bgp(p) if p.is_empty()) => {
+                    Pattern::LeftJoin(Box::new(left), inner_right)
+                }
+                right => Pattern::LeftJoin(Box::new(left), Box::new(right)),
+            })
         }
         other => Err(unsupported(describe(other))),
     }
@@ -176,8 +260,8 @@ mod tests {
         assert_eq!(q.variables, ["c", "n"]);
         assert!(!q.distinct);
         assert_eq!(
-            q.patterns,
-            [
+            q.pattern,
+            Pattern::Bgp(vec![
                 TriplePattern {
                     subject: var("c"),
                     predicate: RDF_TYPE.to_owned(),
@@ -195,7 +279,7 @@ mod tests {
                     predicate: "http://example.org/tier".to_owned(),
                     object: PatternTerm::Constant(Literal::new_simple_literal("VIP").into()),
                 },
-            ]
+            ])
         );
     }
 
@@ -209,15 +293,107 @@ mod tests {
     #[test]
     fn parse_blank_node_becomes_a_variable() {
         let q = parse_ok("SELECT ?o WHERE { ?o ex:placedBy [] }");
-        assert!(matches!(&q.patterns[0].object, PatternTerm::Variable(v) if v.starts_with("_:")));
+        assert!(
+            matches!(&q.pattern.triple_patterns()[0].object, PatternTerm::Variable(v) if v.starts_with("_:"))
+        );
+    }
+
+    fn bgp(triples: &[(&str, &str, &str)]) -> Pattern {
+        Pattern::Bgp(
+            triples
+                .iter()
+                .map(|&(s, p, o)| TriplePattern {
+                    subject: var(s),
+                    predicate: format!("http://example.org/{p}"),
+                    object: var(o),
+                })
+                .collect(),
+        )
+    }
+
+    fn left_join(left: Pattern, right: Pattern) -> Pattern {
+        Pattern::LeftJoin(Box::new(left), Box::new(right))
+    }
+
+    #[test]
+    fn parse_optional_is_a_left_join_in_written_order() {
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t } OPTIONAL { ?c ex:city ?y } }",
+        );
+        assert_eq!(
+            q.pattern,
+            left_join(
+                left_join(bgp(&[("c", "name", "n")]), bgp(&[("c", "tier", "t")])),
+                bgp(&[("c", "city", "y")])
+            )
+        );
+        assert_eq!(q.pattern.left_joins(), 2);
+        assert_eq!(q.pattern.required_triple_patterns().len(), 1);
+        assert_eq!(q.pattern.triple_patterns().len(), 3);
+    }
+
+    #[test]
+    fn parse_patterns_after_optional_join_the_left_join() {
+        let q =
+            parse_ok("SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t } ?c ex:city ?y }");
+        assert_eq!(
+            q.pattern,
+            Pattern::Join(
+                Box::new(left_join(
+                    bgp(&[("c", "name", "n")]),
+                    bgp(&[("c", "tier", "t")])
+                )),
+                Box::new(bgp(&[("c", "city", "y")]))
+            )
+        );
+        let required: Vec<&str> = q
+            .pattern
+            .required_triple_patterns()
+            .iter()
+            .map(|p| p.predicate.as_str())
+            .collect();
+        assert_eq!(
+            required,
+            ["http://example.org/name", "http://example.org/city"]
+        );
+    }
+
+    #[test]
+    fn parse_nested_optional_and_empty_left_sides() {
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:placed ?o OPTIONAL { ?o ex:amount ?a } } }",
+        );
+        assert_eq!(
+            q.pattern,
+            left_join(
+                bgp(&[("c", "name", "n")]),
+                left_join(bgp(&[("c", "placed", "o")]), bgp(&[("o", "amount", "a")]))
+            )
+        );
+        // `{ OPTIONAL { P } }` keeps its empty left side.
+        let q = parse_ok("SELECT * WHERE { OPTIONAL { ?c ex:name ?n } }");
+        assert_eq!(
+            q.pattern,
+            left_join(Pattern::Bgp(Vec::new()), bgp(&[("c", "name", "n")]))
+        );
+        // As the right side of another OPTIONAL it is the same as P.
+        let q =
+            parse_ok("SELECT * WHERE { ?c ex:name ?n OPTIONAL { OPTIONAL { ?c ex:tier ?t } } }");
+        assert_eq!(
+            q.pattern,
+            left_join(bgp(&[("c", "name", "n")]), bgp(&[("c", "tier", "t")]))
+        );
+        // An empty OPTIONAL changes nothing.
+        let q = parse_ok("SELECT * WHERE { ?c ex:name ?n OPTIONAL { } }");
+        assert_eq!(q.pattern, bgp(&[("c", "name", "n")]));
     }
 
     #[test]
     fn parse_unsupported_features_are_rejected_by_name() {
         let cases = [
             (
-                "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t } }",
-                "OPTIONAL",
+                "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t FILTER(?t = \"VIP\") } }",
+                "FILTER inside OPTIONAL",
             ),
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(?t = \"VIP\") }",

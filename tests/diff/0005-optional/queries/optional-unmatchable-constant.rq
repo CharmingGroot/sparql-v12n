@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/>
+
+# 7.5 is never the integer amount: the optional part never matches, and
+# every order stays.
+SELECT ?o ?note WHERE {
+  ?o a ex:Order .
+  OPTIONAL { ?o ex:note ?note ; ex:amount 7.5 }
+}

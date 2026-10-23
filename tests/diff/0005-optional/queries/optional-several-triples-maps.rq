@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# ex:name comes from three triples maps, two of which can match here.
+SELECT ?o ?x ?n WHERE {
+  ?o ex:amount 40 .
+  OPTIONAL { ?x ex:name ?n }
+}

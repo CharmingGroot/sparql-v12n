@@ -75,7 +75,7 @@ fn plan(columns: &[&str], projection: Vec<(&str, Option<ResultTerm>)>) -> SqlPla
             .into_iter()
             .map(|(variable, term)| ProjectedTerm {
                 variable: variable.to_owned(),
-                term,
+                terms: term.into_iter().collect(),
             })
             .collect(),
         branches: Vec::new(),
@@ -90,6 +90,7 @@ fn term(term_type: TermType, value: ResultValue) -> Option<ResultTerm> {
         value,
         datatype: None,
         language: None,
+        guard: None,
     })
 }
 
@@ -359,4 +360,51 @@ fn build_from_unfolded_shop_plan() {
             )
         ]
     );
+}
+
+#[test]
+fn build_takes_the_first_bound_term_of_several_optional_parts() {
+    let mut plan = plan(&["c", "c_1"], Vec::new());
+    plan.projection = vec![ProjectedTerm {
+        variable: "c".into(),
+        terms: ["c", "c_1"]
+            .into_iter()
+            .map(|alias| ResultTerm {
+                term_type: TermType::Iri,
+                value: template(&[("http://ex/", false), (alias, true)]),
+                datatype: None,
+                language: None,
+                guard: None,
+            })
+            .collect(),
+    }];
+    let builder = SolutionBuilder::new(&plan);
+    let build = |row: &[SqlValue]| builder.build(row).unwrap().values().to_vec();
+    assert_eq!(
+        build(&[SqlValue::Integer(1), SqlValue::Integer(1)]),
+        [iri("http://ex/1")]
+    );
+    assert_eq!(
+        build(&[SqlValue::Null, SqlValue::Integer(2)]),
+        [iri("http://ex/2")]
+    );
+    assert_eq!(build(&[SqlValue::Null, SqlValue::Null]), [None]);
+}
+
+#[test]
+fn build_constant_with_a_guard_is_unbound_where_the_guard_is_null() {
+    let mut constant = term(
+        TermType::Literal,
+        ResultValue::Constant(Literal::new_simple_literal("staff").into()),
+    )
+    .unwrap();
+    constant.guard = Some("k".into());
+    let plan = plan(&["k"], vec![("k", Some(constant))]);
+    let builder = SolutionBuilder::new(&plan);
+    let build = |row: &[SqlValue]| builder.build(row).unwrap().values().to_vec();
+    assert_eq!(
+        build(&[SqlValue::Boolean(true)]),
+        [Some(Literal::new_simple_literal("staff").into())]
+    );
+    assert_eq!(build(&[SqlValue::Null]), [None]);
 }

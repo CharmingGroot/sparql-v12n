@@ -1,0 +1,14 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "shop(\"SELECT ?o ?c ?n WHERE { ?o ex:amount ?a OPTIONAL { ?o ex:placedBy ?c } \\\n         OPTIONAL { ?c ex:name ?n } }\")"
+---
+SELECT q."o", q."c", q."c_1", q."n"
+FROM (
+SELECT DISTINCT t0."id" AS "o", t0."amount" AS "a", t1."customer_id" AS "c", t2."id" AS "c_1", t2."name" AS "n"
+FROM "orders" t0
+LEFT JOIN "orders" t1 ON t1."id" = t0."id" AND t1."customer_id" IS NOT NULL
+LEFT JOIN "customers" t2 ON (t1."customer_id" IS NULL OR t2."id" = t1."customer_id") AND t2."id" IS NOT NULL AND t2."name" IS NOT NULL
+WHERE t0."id" IS NOT NULL AND t0."amount" IS NOT NULL
+) q
+
+-- params

@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# The left side is the empty pattern, whose one solution every email extends.
+SELECT ?p ?email WHERE {
+  OPTIONAL { ?p ex:email ?email }
+}

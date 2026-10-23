@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/>
+
+# ?m is bound by the nested OPTIONAL only, and also on the left side of
+# the outer one: the inner part is evaluated on its own first.
+SELECT ?p ?m ?o WHERE {
+  ?p ex:manager ?m .
+  OPTIONAL { ?o ex:placedBy ?p OPTIONAL { ?o ex:placedBy ?m } }
+}

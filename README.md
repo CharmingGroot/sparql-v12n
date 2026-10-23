@@ -201,8 +201,9 @@ parameter type PostgreSQL infers from the column: it reads the constant
 as that type and formats it back with the same code that builds result
 terms, and only an identical round trip is sent, in binary where the type
 allows. A constant that cannot match empties its own `UNION` branch
-instead of making PostgreSQL fail on input it cannot parse; the query
-skips the database when no branch is left. The comparison stays on the
+instead of making PostgreSQL fail on input it cannot parse (inside an
+`OPTIONAL`, only that part does not match); the query skips the database
+when no branch is left. The comparison stays on the
 column's own type, so its indexes are used. For column types without a
 natural datatype (such as `interval`), results carry the column cast to
 text, and constants are compared with that same text (`col::text = $1`),
@@ -291,6 +292,41 @@ its columns' type and text output, so equal terms from columns of
 different types also count twice where SQL cannot compute their lexical
 form, or when the types combine (`varchar` and `text`) or the text differs
 (`numeric` 1.0 and 1.00).
+
+## OPTIONAL
+
+`OPTIONAL` follows the SPARQL algebra's LeftJoin: every solution of the
+left side is kept, and extended by each compatible solution of the
+optional part where there are some. The SQL is a `LEFT JOIN` per optional
+part:
+
+- The part's tables are joined among themselves (in parentheses when
+  there are several), and the `ON` clause holds both the part's own
+  conditions and the link to the left side. A nested `OPTIONAL` is a
+  `LEFT JOIN` inside the outer one, and patterns written after an
+  `OPTIONAL` are joined after it.
+- Shared variables are compared as RDF terms, as in joins, so typed
+  columns and template decomposition work the same way and indexes are
+  used where both sides are plain columns.
+- An unbound variable is `NULL` in SQL and left out of the JSON binding.
+  Where a shared variable may be unbound on one side (bound only by an
+  earlier `OPTIONAL`, or by one nested in the part), it is compatible with
+  any value: the condition is `(left IS NULL OR left = right)`, which no
+  index on the column serves.
+- Each part is translated on its own first, as the algebra evaluates it,
+  so a condition that links a nested part to the outer left side is
+  checked in the outer part's `ON` clause, never inside the nested one.
+- A variable that only `OPTIONAL` parts bind gets columns from each of
+  them, and its value is the first one bound in the row. A constant term
+  of an optional part comes with a flag column that tells whether the
+  part matched.
+- Duplicate triples count once inside each part, as in any basic graph
+  pattern.
+
+Not supported yet, and rejected as unsupported: `FILTER` inside
+`OPTIONAL`; an optional part that more than one combination of triples
+maps can match (it needs a `UNION` inside the `LEFT JOIN`); `SELECT
+DISTINCT` over a variable that only several `OPTIONAL` parts bind.
 
 ## Layout
 

@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# A vendor can never have ex:email, so its UNION branch has no left join.
+SELECT DISTINCT ?name ?email WHERE {
+  ?p a ex:Party ; ex:name ?name .
+  OPTIONAL { ?p ex:email ?email }
+}

@@ -83,7 +83,7 @@ fn unfold_projection_records_how_to_rebuild_terms() {
         [
             ProjectedTerm {
                 variable: "order".into(),
-                term: Some(ResultTerm {
+                terms: vec![ResultTerm {
                     term_type: TermType::Iri,
                     value: ResultValue::Template(vec![
                         TemplatePart::Literal("http://example.org/order/".into()),
@@ -91,20 +91,22 @@ fn unfold_projection_records_how_to_rebuild_terms() {
                     ]),
                     datatype: None,
                     language: None,
-                }),
+                    guard: None,
+                }],
             },
             ProjectedTerm {
                 variable: "amount".into(),
-                term: Some(ResultTerm {
+                terms: vec![ResultTerm {
                     term_type: TermType::Literal,
                     value: ResultValue::Column("amount".into()),
                     datatype: None,
                     language: None,
-                }),
+                    guard: None,
+                }],
             },
             ProjectedTerm {
                 variable: "missing".into(),
-                term: None,
+                terms: Vec::new(),
             },
         ]
     );
@@ -119,10 +121,7 @@ fn unfold_multi_column_template_gets_one_alias_per_column() {
     );
     let plan = unfold_query(&mapping, "SELECT ?s ?s_1 WHERE { ?s ex:p ?s_1 }").unwrap();
     assert_eq!(plan.columns, ["s", "s_2", "s_1"]);
-    assert_eq!(
-        plan.projection[0].term.as_ref().unwrap().value.columns(),
-        ["s", "s_2"]
-    );
+    assert_eq!(plan.projection[0].terms[0].value.columns(), ["s", "s_2"]);
 }
 
 #[test]
@@ -140,7 +139,7 @@ fn unfold_constant_iri_outside_template_has_no_rows() {
 fn unfold_unknown_property_has_no_rows() {
     let plan = unfold_query(SHOP, "SELECT ?c WHERE { ?c ex:nope ?x }").unwrap();
     assert!(plan.branches.is_empty());
-    assert_eq!(plan.projection[0].term, None);
+    assert_eq!(plan.projection[0].terms, []);
 }
 
 #[test]
@@ -369,10 +368,12 @@ fn unfold_base_iri_prefixes_relative_templates_and_keeps_the_plan_base() {
         plan.base_iri.as_ref().map(BaseIri::as_str),
         Some("http://example.com/base/")
     );
-    let Some(ResultTerm {
-        value: ResultValue::Template(parts),
-        ..
-    }) = &plan.projection[0].term
+    let [
+        ResultTerm {
+            value: ResultValue::Template(parts),
+            ..
+        },
+    ] = plan.projection[0].terms.as_slice()
     else {
         panic!("{:?}", plan.projection);
     };
@@ -429,4 +430,272 @@ fn unfold_base_iri_distinct_over_resolved_column_is_unsupported() {
     // Without a base IRI nothing is resolved, so DISTINCT stays exact.
     let mapping = with_prefixes(RELATIVE);
     assert!(unfold_query(&mapping, "SELECT DISTINCT ?p WHERE { ?s ex:homepage ?p }").is_ok());
+}
+
+fn is_null(table: usize, name: &str) -> Condition {
+    Condition::IsNull(SqlExpr::Column {
+        table,
+        name: name.to_owned(),
+    })
+}
+
+#[test]
+fn unfold_optional_left_joins_its_tables_with_the_link_in_on() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c ?o WHERE { ?c ex:name ?n OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a } }",
+    )
+    .unwrap();
+    let [branch] = plan.branches.as_slice() else {
+        panic!("expected one branch");
+    };
+    assert_eq!(
+        branch.from,
+        ["customers", "orders", "orders"].map(|t| LogicalTable::TableName(t.into()))
+    );
+    let [join] = branch.left_joins.as_slice() else {
+        panic!("{:?}", branch.left_joins);
+    };
+    assert_eq!(join.tables, 1..3);
+    assert_eq!(join.parent, None);
+    // The link to ?c and the conditions within the part decide whether it
+    // matches; none of them filters the customers.
+    assert!(join.conditions.contains(&same(1, "customer_id", 0, "id")));
+    assert!(join.conditions.contains(&same(2, "id", 1, "id")));
+    assert!(
+        join.conditions
+            .contains(&Condition::IsNotNull(SqlExpr::Column {
+                table: 2,
+                name: "amount".into()
+            }))
+    );
+    assert!(
+        branch
+            .conditions
+            .iter()
+            .all(|c| matches!(c, Condition::IsNotNull(SqlExpr::Column { table: 0, .. })))
+    );
+}
+
+#[test]
+fn unfold_optional_that_cannot_match_is_left_out() {
+    // No triples map produces ex:missing, and orders are never customers.
+    for optional in ["?c ex:missing ?x", "?c ex:amount ?x"] {
+        let plan = unfold_query(
+            SHOP,
+            &format!("SELECT ?c ?x WHERE {{ ?c ex:name ?n OPTIONAL {{ {optional} }} }}"),
+        )
+        .unwrap();
+        let [branch] = plan.branches.as_slice() else {
+            panic!("expected one branch");
+        };
+        assert!(branch.left_joins.is_empty(), "{optional}");
+        assert_eq!(branch.from.len(), 1);
+        assert_eq!(plan.projection[1].terms, [], "{optional}");
+    }
+}
+
+#[test]
+fn unfold_nested_optional_is_a_left_join_inside_the_outer_one() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?o ex:placedBy ?c OPTIONAL { ?o ex:amount ?a } } }",
+    )
+    .unwrap();
+    let joins = &plan.branches[0].left_joins;
+    assert_eq!(joins.len(), 2);
+    assert_eq!((joins[0].tables.clone(), joins[0].parent), (1..3, None));
+    assert_eq!((joins[1].tables.clone(), joins[1].parent), (2..3, Some(0)));
+    assert!(joins[1].conditions.contains(&same(2, "id", 1, "id")));
+    // ?o is bound by the outer part wherever the inner one binds it, so
+    // it has one column.
+    assert_eq!(plan.columns, ["a", "c", "n", "o"]);
+}
+
+/// SPARQL 1.1 §18.6: the inner LeftJoin is evaluated on its own, so a
+/// variable it binds and the left side of the outer one also binds is only
+/// compared after it, in the outer part's conditions, where unbound is
+/// compatible.
+#[test]
+fn unfold_variable_bound_by_a_nested_optional_and_the_left_side_compares_in_the_outer_part() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT * WHERE { ?o ex:placedBy ?c OPTIONAL { ?o ex:amount ?a OPTIONAL { ?c ex:name ?n } } }",
+    )
+    .unwrap();
+    let joins = &plan.branches[0].left_joins;
+    assert_eq!(joins.len(), 2);
+    assert!(
+        !joins[1]
+            .conditions
+            .iter()
+            .any(|c| condition_reads_table(c, 0)),
+        "{:?}",
+        joins[1].conditions
+    );
+    assert!(joins[0].conditions.contains(&Condition::Or(vec![
+        vec![is_null(2, "id")],
+        vec![same(2, "id", 0, "customer_id")],
+    ])));
+}
+
+fn condition_reads_table(condition: &Condition, table: usize) -> bool {
+    let reads = |e: &SqlExpr| matches!(e, SqlExpr::Column { table: t, .. } if *t == table);
+    match condition {
+        Condition::Eq(l, r) => reads(l) || reads(r),
+        Condition::EqAny(l, r) => reads(l) || r.iter().any(reads),
+        Condition::IsNotNull(e) | Condition::IsNull(e) => reads(e),
+        Condition::Or(alternatives) => alternatives
+            .iter()
+            .flatten()
+            .any(|c| condition_reads_table(c, table)),
+        Condition::SameTerm(l, r) => l
+            .columns()
+            .into_iter()
+            .chain(r.columns())
+            .any(|(t, _)| t == table),
+    }
+}
+
+#[test]
+fn unfold_variable_unbound_on_the_left_is_compatible_with_any_value() {
+    // ?c is bound by the first OPTIONAL only.
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?o ?c WHERE { ?o ex:amount ?a OPTIONAL { ?o ex:placedBy ?c } \
+         OPTIONAL { ?c ex:name ?n } }",
+    )
+    .unwrap();
+    let joins = &plan.branches[0].left_joins;
+    assert_eq!(joins.len(), 2);
+    assert!(joins[1].conditions.contains(&Condition::Or(vec![
+        vec![is_null(1, "customer_id")],
+        vec![same(2, "id", 1, "customer_id")],
+    ])));
+    // Either part can bind ?c: the first one bound in a row is its value.
+    assert_eq!(plan.columns, ["o", "c", "c_1"]);
+    assert_eq!(plan.projection[1].terms.len(), 2);
+}
+
+#[test]
+fn unfold_pattern_after_optional_joins_where_unbound_or_equal() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?o ?c WHERE { ?o ex:amount ?a OPTIONAL { ?o ex:placedBy ?c } ?c ex:name ?n }",
+    )
+    .unwrap();
+    let branch = &plan.branches[0];
+    assert!(branch.conditions.contains(&Condition::Or(vec![
+        vec![is_null(1, "customer_id")],
+        vec![same(2, "id", 1, "customer_id")],
+    ])));
+    // The required pattern binds ?c in every row.
+    assert_eq!(plan.columns, ["o", "c"]);
+    assert_eq!(plan.projection[1].terms.len(), 1);
+}
+
+#[test]
+fn unfold_optional_over_several_matching_triples_maps_is_unsupported() {
+    let mapping = with_prefixes(
+        r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "v" ] ] .
+<#B> rr:logicalTable [ rr:tableName "b" ] ;
+  rr:subjectMap [ rr:template "http://ex/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "w" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:q ; rr:objectMap [ rr:column "x" ] ] ."#,
+    );
+    let err = unfold_query(
+        &mapping,
+        "SELECT * WHERE { ?s ex:q ?x OPTIONAL { ?s ex:p ?v } }",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::UnsupportedFeature(f) if f.contains("OPTIONAL")),
+        "{err}"
+    );
+}
+
+#[test]
+fn unfold_optional_absent_from_a_branch_selects_unbound_there() {
+    let mapping = with_prefixes(
+        r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/a/{id}" ; rr:class ex:C ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "v" ] ] .
+<#B> rr:logicalTable [ rr:tableName "b" ] ;
+  rr:subjectMap [ rr:template "http://ex/b/{id}" ; rr:class ex:C ] ."#,
+    );
+    let plan = unfold_query(
+        &mapping,
+        "SELECT DISTINCT ?v WHERE { ?s a ex:C OPTIONAL { ?s ex:p ?v } }",
+    )
+    .unwrap();
+    assert_eq!(plan.branches.len(), 2);
+    assert_eq!(plan.branches[0].left_joins.len(), 1);
+    assert!(plan.branches[1].left_joins.is_empty());
+    assert_eq!(plan.branches[1].select, [SqlExpr::Unbound]);
+}
+
+#[test]
+fn unfold_constant_of_an_optional_part_is_selected_as_a_flag() {
+    let mapping = with_prefixes(
+        r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "v" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:kind ; rr:object "staff" ] ."#,
+    );
+    let plan = unfold_query(
+        &mapping,
+        "SELECT ?s ?k WHERE { ?s ex:p ?v OPTIONAL { ?s ex:kind ?k } }",
+    )
+    .unwrap();
+    assert_eq!(plan.columns, ["s", "k"]);
+    assert_eq!(
+        plan.branches[0].select[1],
+        SqlExpr::Matched(Box::new(SqlExpr::Column {
+            table: 1,
+            name: "id".into()
+        }))
+    );
+    let [term] = plan.projection[1].terms.as_slice() else {
+        panic!("{:?}", plan.projection);
+    };
+    assert_eq!(term.guard.as_deref(), Some("k"));
+    assert!(matches!(term.value, ResultValue::Constant(_)));
+}
+
+#[test]
+fn unfold_distinct_over_a_variable_of_two_optional_parts_is_unsupported() {
+    let err = unfold_query(
+        SHOP,
+        "SELECT DISTINCT ?c WHERE { ?o ex:amount ?a OPTIONAL { ?o ex:placedBy ?c } \
+         OPTIONAL { ?c ex:name ?n } }",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::UnsupportedFeature(f) if f.contains("DISTINCT")),
+        "{err}"
+    );
+}
+
+#[test]
+fn unfold_class_implied_only_within_the_same_part() {
+    // `?c a ex:Customer` is implied by `?c ex:name ?n` from the same
+    // triples map only when both are required: an OPTIONAL part may not
+    // match.
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c a ex:Customer OPTIONAL { ?c ex:name ?n } }",
+    )
+    .unwrap();
+    assert_eq!(plan.branches[0].from.len(), 2);
+    assert_eq!(plan.branches[0].left_joins[0].tables, 1..2);
+}
+
+#[test]
+fn unfold_optional_with_empty_left_side_has_only_the_left_join() {
+    let plan = unfold_query(SHOP, "SELECT ?c WHERE { OPTIONAL { ?c ex:tier ?t } }").unwrap();
+    let branch = &plan.branches[0];
+    assert!(branch.conditions.is_empty());
+    assert_eq!(branch.left_joins[0].tables, 0..1);
 }

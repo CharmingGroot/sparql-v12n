@@ -440,8 +440,8 @@ fn explain(
                 .map(|p| {
                     json!({
                         "name": p.variable,
-                        "term_type": p.term.as_ref().map(|t| term_type(t.term_type)),
-                        "columns": p.term.as_ref().map(|t| t.value.columns()).unwrap_or_default(),
+                        "term_type": p.terms.first().map(|t| term_type(t.term_type)),
+                        "columns": p.terms.iter().flat_map(|t| t.value.columns()).collect::<Vec<_>>(),
                     })
                 })
                 .collect();

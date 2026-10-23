@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/>
+
+# ex:Person comes from two triples maps. Only people have ex:email: the
+# contractors keep ?email unbound, and so do people without one (NULL).
+SELECT ?p ?name ?email WHERE {
+  ?p a ex:Person ; ex:name ?name .
+  OPTIONAL { ?p ex:email ?email }
+}

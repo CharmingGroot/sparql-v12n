@@ -2,6 +2,7 @@
 //! SQL plan (`SqlPlan`) and PostgreSQL text rendering with bound parameters.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 
 use oxrdf::Term;
 
@@ -64,14 +65,39 @@ pub struct SqlBranch {
     /// One expression per entry of [`SqlPlan::columns`], then one per
     /// entry of [`SqlPlan::hidden_columns`].
     pub select: Vec<SqlExpr>,
-    /// Conjunction of conditions. Rendering puts a condition that links
-    /// two tables in the `ON` clause of the later one, the rest in `WHERE`.
+    /// Conjunction of conditions on every row of the branch. Rendering
+    /// puts a condition that links two tables in the `ON` clause of the
+    /// later one, the rest in `WHERE`.
     pub conditions: Vec<Condition>,
+    /// The `OPTIONAL` parts, as `LEFT JOIN`s, in the order they are
+    /// written; one comes before those nested in it.
+    pub left_joins: Vec<LeftJoin>,
     /// For each entry of `from`, the columns whose values a solution
     /// fixes: those of terms that distinct column values always render as
     /// distinct terms. When they include a unique key of the table, the
     /// table contributes at most one row to each solution.
     pub fixed_columns: Vec<BTreeSet<String>>,
+}
+
+/// An `OPTIONAL` part of a branch: `LEFT JOIN (tables) ON conditions`, so
+/// the rows of the left side are kept, and extended by the matching rows
+/// where there are some (SPARQL 1.1 §18.5, LeftJoin).
+///
+/// Every column of its tables is `NULL` in a row it does not extend, and
+/// a variable bound only by it is then unbound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftJoin {
+    /// The tables of the part, those nested in it included: aliases
+    /// `t{tables.start}` and up, all after the tables before it.
+    pub tables: Range<usize>,
+    /// The index in [`SqlBranch::left_joins`] of the part this one is
+    /// nested in; `None` at the top level.
+    pub parent: Option<usize>,
+    /// Conjunction of the conditions of the part: within it, and with the
+    /// left side, whose solutions it must be compatible with (SPARQL 1.1
+    /// §18.3). The left side is the tables before it, those of the parent
+    /// part on, or all of them at the top level.
+    pub conditions: Vec<Condition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +117,13 @@ pub enum SqlExpr {
     },
     /// `NULL` of an SQL type, written as [`ColumnType::sql_type`].
     Null(String),
+    /// `NULL` for a column of an `OPTIONAL` part that cannot match in
+    /// this branch. Its type comes from the other branches (see
+    /// [`SqlPlan::with_union_types`]).
+    Unbound,
+    /// `true` where the expression is not `NULL`, `NULL` where it is:
+    /// whether the `OPTIONAL` part of a column matched.
+    Matched(Box<SqlExpr>),
 }
 
 /// A constant of the query and what it has to match.
@@ -139,6 +172,12 @@ pub enum Condition {
     /// (R2RML §11.2). Each constant is checked like one of [`Eq`](Self::Eq).
     EqAny(SqlExpr, Vec<SqlExpr>),
     IsNotNull(SqlExpr),
+    IsNull(SqlExpr),
+    /// Disjunction of conjunctions: a variable bound by an `OPTIONAL`
+    /// part on one side of a join is compatible with any value where it is
+    /// unbound, and equal to the other side's term where it is bound
+    /// (SPARQL 1.1 §18.3, compatible mappings).
+    Or(Vec<Vec<Condition>>),
     /// Both sides produce the same RDF term. Column values take part
     /// through their natural lexical form (R2RML §10.2), which SQL `=`
     /// matches only for some pairs of SQL types, so how this renders
@@ -254,9 +293,12 @@ pub struct RenderOptions<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectedTerm {
     pub variable: String,
-    /// `None` when the variable never occurs in the pattern, so it is
-    /// unbound in every solution.
-    pub term: Option<ResultTerm>,
+    /// The terms the variable can take its value from, tried in order: the
+    /// first that is bound in a row is the value. Bound terms of one row
+    /// are the same RDF term. Several only when the variable is bound by
+    /// more than one `OPTIONAL` part and by nothing else. Empty when the
+    /// variable is unbound in every solution.
+    pub terms: Vec<ResultTerm>,
 }
 
 /// The term map a projected variable takes its values from, with column
@@ -267,6 +309,9 @@ pub struct ResultTerm {
     pub value: ResultValue,
     pub datatype: Option<String>,
     pub language: Option<String>,
+    /// For a constant of an `OPTIONAL` part, the result column that is
+    /// `NULL` when the part did not match and the term is unbound.
+    pub guard: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +349,10 @@ pub struct RenderedSql {
     /// Index into [`SqlPlan::branches`] of the branch each parameter
     /// belongs to.
     pub param_branches: Vec<usize>,
+    /// Whether each parameter is one side of an equality that every row
+    /// of its branch satisfies, so that binding it to `NULL` empties the
+    /// branch. Not for one of an `OPTIONAL` part or of a disjunction.
+    pub param_required: Vec<bool>,
     /// For a parameter that is one of the alternatives of a
     /// [`Condition::EqAny`], an id it shares with the other alternatives.
     pub param_alternatives: Vec<Option<usize>>,
@@ -313,11 +362,13 @@ impl SqlPlan {
     /// Renders the plan. Parameters are numbered in the order they appear
     /// in the text.
     ///
-    /// Every parameter is one side of an equality in the conjunction of
-    /// its branch's `ON` and `WHERE` conditions, so binding it to `NULL`
-    /// empties that branch and leaves the others as they are. An
-    /// alternative of an `IN` list ([`RenderedSql::param_alternatives`])
-    /// only drops itself; binding all of them to `NULL` empties the branch.
+    /// Every parameter is one side of an equality, so binding it to `NULL`
+    /// makes the equality fail. For a [required](RenderedSql::param_required)
+    /// one, that empties its branch and leaves the others as they are; in
+    /// an `OPTIONAL` part or a disjunction, the part or the alternative
+    /// does not match. An alternative of an `IN` list
+    /// ([`RenderedSql::param_alternatives`]) only drops itself; binding all
+    /// of them to `NULL` fails the `IN`.
     ///
     /// Without column types, a [`Condition::SameTerm`] compares columns
     /// with `=` and template columns by their text output, which is what
@@ -411,6 +462,7 @@ impl SqlPlan {
             params: r.params,
             param_datatypes: r.param_datatypes,
             param_branches: r.param_branches,
+            param_required: r.param_required,
             param_alternatives: r.param_alternatives,
         })
     }
@@ -468,18 +520,31 @@ impl SqlPlan {
     /// The columns [`Condition::SameTerm`]s read, each once, in order of
     /// appearance. Their types go into [`RenderOptions::column_types`].
     pub fn term_columns(&self) -> Vec<(LogicalTable, String)> {
-        let mut out: Vec<(LogicalTable, String)> = Vec::new();
-        for branch in &self.branches {
-            for condition in &branch.conditions {
-                let Condition::SameTerm(left, right) = condition else {
-                    continue;
-                };
-                for (table, name) in left.columns().into_iter().chain(right.columns()) {
-                    let key = (branch.from[table].clone(), name.to_owned());
-                    if !out.contains(&key) {
-                        out.push(key);
+        fn collect(
+            condition: &Condition,
+            from: &[LogicalTable],
+            out: &mut Vec<(LogicalTable, String)>,
+        ) {
+            match condition {
+                Condition::SameTerm(left, right) => {
+                    for (table, name) in left.columns().into_iter().chain(right.columns()) {
+                        let key = (from[table].clone(), name.to_owned());
+                        if !out.contains(&key) {
+                            out.push(key);
+                        }
                     }
                 }
+                Condition::Or(alternatives) => alternatives
+                    .iter()
+                    .flatten()
+                    .for_each(|c| collect(c, from, out)),
+                _ => {}
+            }
+        }
+        let mut out: Vec<(LogicalTable, String)> = Vec::new();
+        for branch in &self.branches {
+            for condition in branch.all_conditions() {
+                collect(condition, &branch.from, &mut out);
             }
         }
         out
@@ -526,6 +591,10 @@ impl SqlPlan {
     ///   terms compare equal. A type without such SQL is an
     ///   [`Error::UnsupportedFeature`] instead of a guessed form.
     ///
+    /// A branch where an `OPTIONAL` part cannot match selects
+    /// [`SqlExpr::Unbound`] for its columns, which becomes a `NULL` of the
+    /// type of the other branches' columns.
+    ///
     /// Hidden columns are compared, never read, by their type and text
     /// output (see [`to_sql_with`](Self::to_sql_with)), which keeps terms
     /// of different types apart; there the lexical forms only replace
@@ -536,15 +605,14 @@ impl SqlPlan {
         }
         let mut owners: HashMap<&str, (&str, bool)> = HashMap::new();
         for projected in &self.projection {
-            let Some(term) = &projected.term else {
-                continue;
-            };
-            let natural = term.term_type == TermType::Literal
-                && matches!(term.value, ResultValue::Column(_))
-                && term.datatype.is_none()
-                && term.language.is_none();
-            for alias in term.value.columns() {
-                owners.insert(alias, (&projected.variable, natural));
+            for term in &projected.terms {
+                let natural = term.term_type == TermType::Literal
+                    && matches!(term.value, ResultValue::Column(_))
+                    && term.datatype.is_none()
+                    && term.language.is_none();
+                for alias in term.value.columns() {
+                    owners.insert(alias, (&projected.variable, natural));
+                }
             }
         }
         let mut used: HashSet<String> = self
@@ -610,34 +678,57 @@ impl SqlPlan {
         let Some((variable, natural)) = owner else {
             return Ok(unchanged());
         };
-        let mut columns = Vec::new();
+        // `None` for a branch that selects `Unbound`.
+        let mut columns: Vec<Option<(usize, &str, &ColumnType)>> = Vec::new();
         for (branch, expr) in self.branches.iter().zip(&exprs) {
-            let SqlExpr::Column { table, name } = expr else {
+            let (table, name) = match expr {
+                SqlExpr::Column { table, name } => (*table, name),
+                SqlExpr::Unbound => {
+                    columns.push(None);
+                    continue;
+                }
+                _ => return Ok(unchanged()),
+            };
+            let Some(ty) = types.get(&(branch.from[table].clone(), name.clone())) else {
                 return Ok(unchanged());
             };
-            let Some(ty) = types.get(&(branch.from[*table].clone(), name.clone())) else {
-                return Ok(unchanged());
-            };
-            columns.push((*table, name.as_str(), ty));
+            columns.push(Some((table, name.as_str(), ty)));
         }
+        let column = |b: usize| columns[b].expect("only branches with a column are members");
         let classes = |members: &[usize]| {
             let mut out: Vec<&str> = Vec::new();
             for &b in members {
-                let class = columns[b].2.union_class.as_str();
+                let class = column(b).2.union_class.as_str();
                 if !out.contains(&class) {
                     out.push(class);
                 }
             }
             out
         };
-        let all: Vec<usize> = (0..columns.len()).collect();
-        if classes(&all).len() < 2 {
+        let present: Vec<usize> = (0..columns.len())
+            .filter(|&b| columns[b].is_some())
+            .collect();
+        let Some(&first) = present.first() else {
             return Ok(unchanged());
+        };
+        if classes(&present).len() < 2 {
+            // `UNION` resolves the `NULL`s of two leading branches to text
+            // before it sees a third, so they get the type of the others.
+            let null = SqlExpr::Null(column(first).2.sql_type.clone());
+            let exprs = exprs
+                .iter()
+                .map(|&e| match e {
+                    SqlExpr::Unbound if !hidden => null.clone(),
+                    other => other.clone(),
+                })
+                .collect();
+            return Ok(vec![(alias.to_owned(), exprs)]);
         }
 
         // Branches whose terms can be the same, in order of first branch.
         let mut buckets: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
-        for (b, (_, _, ty)) in columns.iter().enumerate() {
+        for &b in &present {
+            let ty = column(b).2;
             let key = if natural {
                 Some(ty.natural_datatype.as_deref().unwrap_or(XSD_STRING))
             } else {
@@ -661,13 +752,13 @@ impl SqlPlan {
                 // are, which can only keep a duplicate.
                 let Some(lexical) = members
                     .iter()
-                    .map(|&b| columns[b].2.lexical)
+                    .map(|&b| column(b).2.lexical)
                     .collect::<Option<Vec<Lexical>>>()
                 else {
                     continue;
                 };
                 for (&b, lexical) in members.iter().zip(lexical) {
-                    let (table, name, _) = columns[b];
+                    let (table, name, _) = column(b);
                     out[b] = SqlExpr::Lexical {
                         table,
                         name: name.to_owned(),
@@ -682,17 +773,18 @@ impl SqlPlan {
             let typed = classes(members).len() == 1;
             let lexical_ok = lexical_ok(*key);
             let null = if typed {
-                SqlExpr::Null(columns[members[0]].2.sql_type.clone())
+                SqlExpr::Null(column(members[0]).2.sql_type.clone())
             } else {
                 SqlExpr::Null("\"pg_catalog\".\"text\"".to_owned())
             };
             let mut exprs_k = Vec::with_capacity(columns.len());
-            for (b, &(table, name, ty)) in columns.iter().enumerate() {
+            for (b, &expr) in exprs.iter().enumerate() {
                 exprs_k.push(if !members.contains(&b) {
                     null.clone()
                 } else if typed {
-                    exprs[b].clone()
+                    expr.clone()
                 } else {
+                    let (table, name, ty) = column(b);
                     match ty.lexical.filter(|_| lexical_ok) {
                         Some(lexical) => SqlExpr::Lexical {
                             table,
@@ -700,10 +792,8 @@ impl SqlPlan {
                             lexical,
                         },
                         None => {
-                            let names: Vec<&str> = members
-                                .iter()
-                                .map(|&m| columns[m].2.name.as_str())
-                                .collect();
+                            let names: Vec<&str> =
+                                members.iter().map(|&m| column(m).2.name.as_str()).collect();
                             return Err(Error::UnsupportedFeature(format!(
                                 "?{variable} reads columns of SQL types {} in different UNION \
                                  branches, whose terms can be the same: comparing them needs the \
@@ -777,8 +867,9 @@ impl SqlPlan {
                 SqlExpr::Column { table, name } | SqlExpr::Lexical { table, name, .. } => {
                     f(&from[*table], name);
                 }
-                SqlExpr::Param(_) | SqlExpr::Null(_) => {}
+                SqlExpr::Param(_) | SqlExpr::Null(_) | SqlExpr::Unbound => {}
                 SqlExpr::Concat(parts) => parts.iter_mut().for_each(|p| expr(p, from, f)),
+                SqlExpr::Matched(inner) => expr(inner, from, f),
             }
         }
         fn term(
@@ -803,22 +894,37 @@ impl SqlPlan {
             for e in &mut branch.select {
                 expr(e, from, &mut f);
             }
-            for condition in &mut branch.conditions {
-                match condition {
+            fn condition(
+                c: &mut Condition,
+                from: &[LogicalTable],
+                f: &mut impl FnMut(&LogicalTable, &mut String),
+            ) {
+                match c {
                     Condition::Eq(left, right) => {
-                        expr(left, from, &mut f);
-                        expr(right, from, &mut f);
+                        expr(left, from, f);
+                        expr(right, from, f);
                     }
                     Condition::EqAny(left, right) => {
-                        expr(left, from, &mut f);
-                        right.iter_mut().for_each(|e| expr(e, from, &mut f));
+                        expr(left, from, f);
+                        right.iter_mut().for_each(|e| expr(e, from, f));
                     }
-                    Condition::IsNotNull(e) => expr(e, from, &mut f),
+                    Condition::IsNotNull(e) | Condition::IsNull(e) => expr(e, from, f),
+                    Condition::Or(alternatives) => alternatives
+                        .iter_mut()
+                        .flatten()
+                        .for_each(|c| condition(c, from, f)),
                     Condition::SameTerm(left, right) => {
-                        term(left, from, &mut f);
-                        term(right, from, &mut f);
+                        term(left, from, f);
+                        term(right, from, f);
                     }
                 }
+            }
+            let conditions = branch
+                .conditions
+                .iter_mut()
+                .chain(branch.left_joins.iter_mut().flat_map(|j| &mut j.conditions));
+            for c in conditions {
+                condition(c, from, &mut f);
             }
             for (table, fixed) in from.iter().zip(&mut branch.fixed_columns) {
                 *fixed = std::mem::take(fixed)
@@ -830,6 +936,15 @@ impl SqlPlan {
                     .collect();
             }
         }
+    }
+}
+
+impl SqlBranch {
+    /// The conditions of the branch and of its `OPTIONAL` parts.
+    pub fn all_conditions(&self) -> impl Iterator<Item = &Condition> {
+        self.conditions
+            .iter()
+            .chain(self.left_joins.iter().flat_map(|j| &j.conditions))
     }
 }
 
@@ -894,6 +1009,13 @@ fn probe(columns: &[(LogicalTable, String)], name_sql: impl Fn(&str) -> String) 
     )
 }
 
+/// A table or a nested `OPTIONAL` part of a join tree.
+#[derive(Debug, Clone, Copy)]
+enum Member {
+    Table(usize),
+    Part(usize),
+}
+
 /// The select list of every branch.
 struct Select {
     /// Alias of each entry of [`SqlBranch::select`] that is rendered.
@@ -911,9 +1033,15 @@ struct Renderer<'a> {
     params: Vec<String>,
     param_datatypes: Vec<Option<String>>,
     param_branches: Vec<usize>,
+    param_required: Vec<bool>,
     param_alternatives: Vec<Option<usize>>,
     alternatives: usize,
     branch_index: usize,
+    /// Whether the conditions being rendered hold for every row of the
+    /// branch, rather than in an `OPTIONAL` part or a disjunction.
+    required: bool,
+    /// Units rendered so far, for their aliases.
+    units: usize,
     options: RenderOptions<'a>,
     /// Logical tables of the branch being rendered.
     from: &'a [LogicalTable],
@@ -958,38 +1086,136 @@ impl<'a> Renderer<'a> {
             self.sql.push_str(&quote_identifier(&select.aliases[entry]));
         }
 
-        let mut on: Vec<Vec<&Condition>> = vec![Vec::new(); branch.from.len()];
-        let mut filters = Vec::new();
-        for condition in &branch.conditions {
-            let tables = condition_tables(condition);
-            match tables.last() {
-                Some(&last) if tables.len() > 1 => on[last].push(condition),
-                _ => filters.push(condition),
+        self.required = true;
+        if branch.from.is_empty() {
+            // Every `OPTIONAL` part was left out: one row, of unbound values.
+            if !branch.conditions.is_empty() {
+                self.sql.push_str("\nWHERE ");
+                let conditions: Vec<&Condition> = branch.conditions.iter().collect();
+                self.conditions(&conditions)?;
             }
+            return Ok(());
         }
-        for (i, table) in branch.from.iter().enumerate() {
-            self.sql.push('\n');
-            if i > 0 {
-                self.sql.push_str(if on[i].is_empty() {
-                    "CROSS JOIN "
-                } else {
-                    "JOIN "
-                });
-            } else {
-                self.sql.push_str("FROM ");
-            }
-            self.sql.push_str(&logical_table(table));
-            self.sql.push_str(&format!(" t{i}"));
-            if i > 0 && !on[i].is_empty() {
-                self.sql.push_str(" ON ");
-                self.conditions(&on[i])?;
-            }
-        }
+        self.sql.push_str("\nFROM ");
+        let filters = self.join_tree(branch, None)?;
         if !filters.is_empty() {
             self.sql.push_str("\nWHERE ");
             self.conditions(&filters)?;
         }
         Ok(())
+    }
+
+    /// The tables of `scope`, the whole branch or one of its `OPTIONAL`
+    /// parts, joined: its own tables with `JOIN`, the parts nested in it
+    /// with `LEFT JOIN`, in the order they are written. Returns the
+    /// conditions of `scope` that are left for its `WHERE` or `ON` clause.
+    ///
+    /// A condition that links two tables of the scope goes to the `ON`
+    /// clause of the later one, as long as that is a table of the scope
+    /// rather than a nested part: a condition on a nested part's columns
+    /// (its variables being unbound, or compatible) filters the rows of
+    /// `scope` after the left join and must not decide whether the part
+    /// matches.
+    fn join_tree(
+        &mut self,
+        branch: &'a SqlBranch,
+        scope: Option<usize>,
+    ) -> Result<Vec<&'a Condition>, Error> {
+        let (range, conditions) = match scope {
+            None => (0..branch.from.len(), &branch.conditions),
+            Some(j) => (
+                branch.left_joins[j].tables.clone(),
+                &branch.left_joins[j].conditions,
+            ),
+        };
+        // The members of the scope: its own tables and its nested parts.
+        let mut members: Vec<Member> = Vec::new();
+        let mut member_of = vec![None; branch.from.len()];
+        let mut t = range.start;
+        while t < range.end {
+            let nested =
+                branch.left_joins.iter().enumerate().find(|(_, j)| {
+                    j.parent == scope && j.tables.start == t && !j.tables.is_empty()
+                });
+            let end = match nested {
+                Some((j, join)) => {
+                    members.push(Member::Part(j));
+                    join.tables.end
+                }
+                None => {
+                    members.push(Member::Table(t));
+                    t + 1
+                }
+            };
+            for slot in &mut member_of[t..end] {
+                *slot = Some(members.len() - 1);
+            }
+            t = end;
+        }
+
+        let mut on: Vec<Vec<&Condition>> = vec![Vec::new(); members.len()];
+        let mut rest = Vec::new();
+        for condition in conditions {
+            let tables = condition_tables(condition);
+            let owners: Option<BTreeSet<usize>> =
+                tables.iter().map(|&table| member_of[table]).collect();
+            match owners
+                .as_ref()
+                .and_then(|o| o.last().map(|&m| (o.len(), m)))
+            {
+                Some((n, last)) if n > 1 && matches!(members[last], Member::Table(_)) => {
+                    on[last].push(condition)
+                }
+                _ => rest.push(condition),
+            }
+        }
+
+        for (k, member) in members.iter().enumerate() {
+            if k == 0 && matches!(member, Member::Part(_)) {
+                // `{ OPTIONAL { ... } }`: the left side is the empty
+                // pattern, whose one solution binds nothing.
+                self.sql.push_str(&format!("(SELECT) u{}", self.units));
+                self.units += 1;
+            }
+            match *member {
+                Member::Table(i) => {
+                    if k > 0 {
+                        self.sql.push_str(if on[k].is_empty() {
+                            "\nCROSS JOIN "
+                        } else {
+                            "\nJOIN "
+                        });
+                    }
+                    self.sql.push_str(&logical_table(&branch.from[i]));
+                    self.sql.push_str(&format!(" t{i}"));
+                    if k > 0 && !on[k].is_empty() {
+                        self.sql.push_str(" ON ");
+                        self.conditions(&on[k])?;
+                    }
+                }
+                Member::Part(part) => {
+                    self.sql.push_str("\nLEFT JOIN ");
+                    let required = std::mem::replace(&mut self.required, false);
+                    let single = branch.left_joins[part].tables.len() == 1
+                        && !branch.left_joins.iter().any(|j| j.parent == Some(part));
+                    if !single {
+                        self.sql.push('(');
+                    }
+                    let rest = self.join_tree(branch, Some(part))?;
+                    if !single {
+                        self.sql.push(')');
+                    }
+                    self.sql.push_str(" ON ");
+                    if rest.is_empty() {
+                        self.sql.push_str("true");
+                    } else {
+                        self.conditions(&rest)?;
+                    }
+                    self.required = required;
+                }
+            }
+        }
+        Ok(rest)
     }
 
     fn conditions(&mut self, conditions: &[&Condition]) -> Result<(), Error> {
@@ -1041,6 +1267,29 @@ impl<'a> Renderer<'a> {
                 Condition::IsNotNull(expr) => {
                     self.expr(expr);
                     self.sql.push_str(" IS NOT NULL");
+                }
+                Condition::IsNull(expr) => {
+                    self.expr(expr);
+                    self.sql.push_str(" IS NULL");
+                }
+                Condition::Or(alternatives) => {
+                    let required = std::mem::replace(&mut self.required, false);
+                    self.sql.push('(');
+                    for (i, alternative) in alternatives.iter().enumerate() {
+                        if i > 0 {
+                            self.sql.push_str(" OR ");
+                        }
+                        let conjunction: Vec<&Condition> = alternative.iter().collect();
+                        if conjunction.len() > 1 {
+                            self.sql.push('(');
+                        }
+                        self.conditions(&conjunction)?;
+                        if conjunction.len() > 1 {
+                            self.sql.push(')');
+                        }
+                    }
+                    self.sql.push(')');
+                    self.required = required;
                 }
                 Condition::SameTerm(left, right) => self.same_term(left, right)?,
             }
@@ -1223,6 +1472,7 @@ impl<'a> Renderer<'a> {
                 self.params.push(param.value.clone());
                 self.param_datatypes.push(param.datatype.clone());
                 self.param_branches.push(self.branch_index);
+                self.param_required.push(self.required);
                 self.param_alternatives.push(None);
                 self.sql.push_str(&format!("${}", self.params.len()));
             }
@@ -1248,6 +1498,12 @@ impl<'a> Renderer<'a> {
             // Typed, since `UNION` resolves an untyped NULL of two branches
             // to text before it sees the third.
             SqlExpr::Null(ty) => self.sql.push_str(&format!("NULL::{ty}")),
+            SqlExpr::Unbound => self.sql.push_str("NULL"),
+            SqlExpr::Matched(inner) => {
+                self.sql.push_str("CASE WHEN ");
+                self.expr(inner);
+                self.sql.push_str(" IS NOT NULL THEN true END");
+            }
         }
     }
 }
@@ -1312,28 +1568,35 @@ fn condition_tables(condition: &Condition) -> Vec<usize> {
             SqlExpr::Column { table, .. } | SqlExpr::Lexical { table, .. } => {
                 out.insert(*table);
             }
-            SqlExpr::Param(_) | SqlExpr::Null(_) => {}
+            SqlExpr::Param(_) | SqlExpr::Null(_) | SqlExpr::Unbound => {}
             SqlExpr::Concat(parts) => parts.iter().for_each(|p| collect(p, out)),
+            SqlExpr::Matched(inner) => collect(inner, out),
         }
     }
-    let mut tables = BTreeSet::new();
-    match condition {
-        Condition::Eq(left, right) => {
-            collect(left, &mut tables);
-            collect(right, &mut tables);
-        }
-        Condition::EqAny(left, right) => {
-            collect(left, &mut tables);
-            right.iter().for_each(|e| collect(e, &mut tables));
-        }
-        Condition::IsNotNull(expr) => collect(expr, &mut tables),
-        Condition::SameTerm(left, right) => {
-            for (table, _) in left.columns().into_iter().chain(right.columns()) {
-                tables.insert(table);
+    fn tables(condition: &Condition, out: &mut BTreeSet<usize>) {
+        match condition {
+            Condition::Eq(left, right) => {
+                collect(left, out);
+                collect(right, out);
+            }
+            Condition::EqAny(left, right) => {
+                collect(left, out);
+                right.iter().for_each(|e| collect(e, out));
+            }
+            Condition::IsNotNull(expr) | Condition::IsNull(expr) => collect(expr, out),
+            Condition::Or(alternatives) => {
+                alternatives.iter().flatten().for_each(|c| tables(c, out))
+            }
+            Condition::SameTerm(left, right) => {
+                for (table, _) in left.columns().into_iter().chain(right.columns()) {
+                    out.insert(table);
+                }
             }
         }
     }
-    tables.into_iter().collect()
+    let mut out = BTreeSet::new();
+    tables(condition, &mut out);
+    out.into_iter().collect()
 }
 
 fn logical_table(table: &LogicalTable) -> String {
@@ -1503,6 +1766,7 @@ mod tests {
                     Condition::SameTerm(template(0), template(1)),
                     Condition::Eq(column(0, "ID"), SqlExpr::Param("1".into())),
                 ],
+                left_joins: Vec::new(),
                 fixed_columns: Vec::new(),
             }],
             distinct: false,
@@ -1542,6 +1806,7 @@ mod tests {
                 from: vec![table.clone()],
                 select: vec![column(0, "ID")],
                 conditions: Vec::new(),
+                left_joins: Vec::new(),
                 fixed_columns: vec![["ID".to_owned()].into()],
             }],
             distinct: false,
@@ -1555,6 +1820,81 @@ mod tests {
         );
         let keys: TableKeys = [(table, vec![vec!["id".to_owned()]])].into();
         assert!(!plan.has_duplicates(Some(&keys)));
+    }
+
+    fn optional_plan(query: &str) -> SqlPlan {
+        let mapping = crate::mapping::Mapping::from_turtle(include_str!(
+            "../../../examples/shop/mapping.ttl"
+        ))
+        .unwrap();
+        let index = crate::mapping::MappingIndex::new(&mapping);
+        let query =
+            crate::sparql::parse(&format!("PREFIX ex: <http://example.org/>\n{query}")).unwrap();
+        crate::unfold::unfold(&query, &mapping, &index).unwrap()
+    }
+
+    #[test]
+    fn to_sql_nests_optional_parts_and_keeps_their_conditions_in_on() {
+        let plan = optional_plan(
+            "SELECT ?c ?o ?a WHERE { ?c ex:tier \"VIP\" \
+             OPTIONAL { ?o ex:placedBy ?c OPTIONAL { ?o ex:amount ?a } } }",
+        );
+        let rendered = plan.to_sql();
+        assert_eq!(
+            rendered.sql,
+            "SELECT DISTINCT t0.\"id\" AS \"c\", t1.\"id\" AS \"o\", t2.\"amount\" AS \"a\"\n\
+             FROM \"customers\" t0\n\
+             LEFT JOIN (\"orders\" t1\n\
+             LEFT JOIN \"orders\" t2 ON t2.\"id\" = t1.\"id\" AND t2.\"amount\" IS NOT NULL) \
+             ON t1.\"customer_id\" = t0.\"id\" AND t1.\"id\" IS NOT NULL\n\
+             WHERE t0.\"tier\" = $1 AND t0.\"id\" IS NOT NULL"
+        );
+        assert_eq!(rendered.param_required, [true]);
+    }
+
+    /// A constant that cannot match fails its own condition: in an
+    /// `OPTIONAL` part, the part does not match, and the branch stays.
+    #[test]
+    fn to_sql_marks_parameters_of_optional_parts_as_not_required() {
+        let plan = optional_plan(
+            "SELECT ?c ?o WHERE { ?c ex:tier \"VIP\" OPTIONAL { ?o ex:placedBy ?c ; ex:amount 100 } }",
+        );
+        let rendered = plan.to_sql();
+        assert_eq!(rendered.params, ["100", "VIP"]);
+        assert_eq!(rendered.param_required, [false, true]);
+    }
+
+    #[test]
+    fn to_sql_puts_conditions_on_an_optional_part_after_the_left_join() {
+        // ?c may be unbound after the OPTIONAL: the last pattern must not
+        // decide whether the part matches.
+        let plan = optional_plan(
+            "SELECT ?o ?n WHERE { ?o ex:amount ?a OPTIONAL { ?o ex:placedBy ?c } ?c ex:name ?n }",
+        );
+        assert_eq!(
+            plan.to_sql().sql,
+            "SELECT q.\"o\", q.\"n\"\nFROM (\n\
+             SELECT DISTINCT t0.\"id\" AS \"o\", t0.\"amount\" AS \"a\", t2.\"id\" AS \"c\", \
+             t2.\"name\" AS \"n\"\n\
+             FROM \"orders\" t0\n\
+             LEFT JOIN \"orders\" t1 ON t1.\"id\" = t0.\"id\" AND t1.\"customer_id\" IS NOT NULL\n\
+             JOIN \"customers\" t2 ON (t1.\"customer_id\" IS NULL OR t2.\"id\" = t1.\"customer_id\")\n\
+             WHERE t0.\"id\" IS NOT NULL AND t0.\"amount\" IS NOT NULL AND t2.\"id\" IS NOT NULL \
+             AND t2.\"name\" IS NOT NULL\n\
+             ) q"
+        );
+    }
+
+    #[test]
+    fn to_sql_starts_from_one_row_when_the_left_side_is_empty() {
+        let plan = optional_plan("SELECT ?c WHERE { OPTIONAL { ?c ex:tier ?t } }");
+        assert!(
+            plan.to_sql()
+                .sql
+                .contains("FROM (SELECT) u0\nLEFT JOIN \"customers\" t0 ON "),
+            "{}",
+            plan.to_sql().sql
+        );
     }
 
     #[test]
@@ -1615,6 +1955,7 @@ mod tests {
                     ),
                     Condition::IsNotNull(column(2, "v")),
                 ],
+                left_joins: Vec::new(),
                 fixed_columns: Vec::new(),
             }],
             distinct: true,
@@ -1651,6 +1992,7 @@ mod tests {
                     }),
                 ),
             ],
+            left_joins: Vec::new(),
             fixed_columns: Vec::new(),
         };
         let plan = SqlPlan {
@@ -1739,6 +2081,7 @@ mod tests {
                 from: vec![l.clone(), r.clone()],
                 select: Vec::new(),
                 conditions: vec![Condition::SameTerm(left, right)],
+                left_joins: Vec::new(),
                 fixed_columns: Vec::new(),
             }],
             distinct: false,
@@ -1825,6 +2168,7 @@ mod tests {
             from: vec![LogicalTable::TableName(t.into())],
             select: vec![column(0, "v"), column(0, "h")],
             conditions: Vec::new(),
+            left_joins: Vec::new(),
             fixed_columns: vec![BTreeSet::new()],
         };
         let (term_type, value) = if natural {
@@ -1844,12 +2188,13 @@ mod tests {
             distinct_order: vec![1, 0],
             projection: vec![ProjectedTerm {
                 variable: "v".into(),
-                term: Some(ResultTerm {
+                terms: vec![ResultTerm {
                     term_type,
                     value,
                     datatype: None,
                     language: None,
-                }),
+                    guard: None,
+                }],
             }],
             split_columns: Vec::new(),
             lexical_hidden_columns: Default::default(),
@@ -1893,6 +2238,45 @@ mod tests {
             let plan = union_plan(natural);
             assert_eq!(with_union_types(&plan, int(), int()).unwrap(), plan);
         }
+    }
+
+    /// Branches where an `OPTIONAL` part cannot match select `Unbound`;
+    /// two of them before a typed column would make `UNION` resolve the
+    /// column to text first.
+    #[test]
+    fn union_gives_unbound_columns_the_type_of_the_others() {
+        let mut plan = union_plan(true);
+        let mut third = plan.branches[0].clone();
+        third.from = vec![LogicalTable::TableName("c".into())];
+        plan.branches.insert(0, third);
+        plan.branches[0].select[0] = SqlExpr::Unbound;
+        plan.branches[1].select[0] = SqlExpr::Unbound;
+        plan.branches[0].select[1] = SqlExpr::Unbound;
+        let int = || union_type("integer", Some("integer"), Some(Lexical::Text));
+        let typed = with_union_types(&plan, int(), int()).unwrap();
+        let selects: Vec<&[SqlExpr]> = typed.branches.iter().map(|b| &b.select[..]).collect();
+        let null = SqlExpr::Null("pg_catalog.integer".into());
+        assert_eq!(
+            selects,
+            [
+                &[null.clone(), SqlExpr::Unbound][..],
+                &[null, column(0, "h")][..],
+                &[column(0, "v"), column(0, "h")][..],
+            ]
+        );
+        // Different classes split as before; a branch without the column
+        // leaves every split column NULL.
+        plan.branches[1].select[0] = column(0, "v");
+        let text = union_type("text", None, Some(Lexical::Text));
+        let split = with_union_types(&plan, int(), text).unwrap();
+        assert_eq!(split.columns, ["v", "v_1"]);
+        assert_eq!(
+            split.branches[0].select[..2],
+            [
+                SqlExpr::Null("pg_catalog.integer".into()),
+                SqlExpr::Null("pg_catalog.text".into())
+            ]
+        );
     }
 
     #[test]
@@ -2030,6 +2414,7 @@ mod tests {
                 from: vec![LogicalTable::TableName("\"T\"".into())],
                 select: vec![column(0, "\"Id\""), column(0, "v")],
                 conditions: Vec::new(),
+                left_joins: Vec::new(),
                 fixed_columns: vec![fixed.iter().map(|c| c.to_string()).collect()],
             }],
             distinct: false,
