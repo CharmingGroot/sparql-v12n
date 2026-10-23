@@ -1,3 +1,4 @@
 # W3C R2RML test R2RMLTC0009a: Generation of triples from foreign key relations
 sql = "../../../w3c/rdb2rdf/D009-2tables1primarykey1foreignkey/create.sql"
 mapping = "../../../w3c/rdb2rdf/D009-2tables1primarykey1foreignkey/r2rmla.ttl"
+base_iri = "http://example.com/base/"

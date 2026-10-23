@@ -67,7 +67,8 @@ pub fn run(case_dir: &Path, query: &str) -> Result<Outcome, Error> {
     let failed = |message: String| Error::Failed(format!("{label}: {message}"));
     if query.expect == Expectation::Rejected
         && let Some(feature) =
-            engine::rejected_at_planning(&case.mapping, &query.text).map_err(failed)?
+            engine::rejected_at_planning(&case.mapping, case.base_iri.as_deref(), &query.text)
+                .map_err(failed)?
     {
         return Ok(Outcome::Rejected { feature });
     }
@@ -79,7 +80,12 @@ pub fn run(case_dir: &Path, query: &str) -> Result<Outcome, Error> {
 
     if query.expect == Expectation::Rejected {
         // Some checks need the column types, so they reject at execution.
-        return match engine::run(&database_url, &case.mapping, &query.text) {
+        return match engine::run(
+            &database_url,
+            &case.mapping,
+            case.base_iri.as_deref(),
+            &query.text,
+        ) {
             Err(engine::Failure::Unsupported(feature)) => Ok(Outcome::Rejected { feature }),
             Err(engine::Failure::Other(e)) => Err(failed(format!(
                 "expected an unsupported-feature error, got: {e}"
@@ -99,7 +105,12 @@ pub fn run(case_dir: &Path, query: &str) -> Result<Outcome, Error> {
     } else {
         ontop::query(&endpoint, &query.text)
     };
-    let actual = engine::run(&database_url, &case.mapping, &query.text);
+    let actual = engine::run(
+        &database_url,
+        &case.mapping,
+        case.base_iri.as_deref(),
+        &query.text,
+    );
 
     match query.expect {
         Expectation::OntopError { issue, solutions } => {

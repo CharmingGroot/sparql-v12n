@@ -61,10 +61,13 @@ pub async fn serve(config: Config) -> Result<(), Error> {
         path: config.mapping.clone(),
         message: e.to_string(),
     })?;
-    let mapping = Mapping::from_turtle(&text).map_err(|e| Error::Mapping {
+    let mut mapping = Mapping::from_turtle(&text).map_err(|e| Error::Mapping {
         path: config.mapping.clone(),
         message: e.to_string(),
     })?;
+    if let Some(base) = config.base_iri.clone() {
+        mapping = mapping.with_base_iri(base);
+    }
     let app = App::new(mapping, config.database, config.limits);
     app.pool.get().await?.release();
 
@@ -72,6 +75,7 @@ pub async fn serve(config: Config) -> Result<(), Error> {
     tracing::info!(
         listen = %listener.local_addr()?,
         mapping = %config.mapping.display(),
+        base_iri = config.base_iri.as_ref().map_or("", |b| b.as_str()),
         statement_timeout_ms = config.limits.query.statement_timeout.as_millis() as u64,
         row_limit = config.limits.query.row_limit,
         max_query_bytes = config.limits.max_query_bytes,

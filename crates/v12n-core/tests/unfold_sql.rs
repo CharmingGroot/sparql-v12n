@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Snapshots of the SQL generated for example queries.
 
-use v12n_core::mapping::{LogicalTable, Mapping, MappingIndex};
+use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
 use v12n_core::sql::{ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, TableKeys};
 use v12n_core::{sparql, unfold};
 
@@ -15,7 +15,10 @@ fn explain(mapping: &str, query: &str) -> String {
 }
 
 fn explain_with_keys(mapping: &str, query: &str, keys: Option<&TableKeys>) -> String {
-    let mapping = Mapping::from_turtle(mapping).unwrap();
+    render(Mapping::from_turtle(mapping).unwrap(), query, keys)
+}
+
+fn render(mapping: Mapping, query: &str, keys: Option<&TableKeys>) -> String {
     let index = MappingIndex::new(&mapping);
     let query = sparql::parse(query).unwrap();
     let plan = unfold::unfold(&query, &mapping, &index).unwrap();
@@ -206,5 +209,54 @@ fn union_splits_a_literal_over_columns_of_different_types() {
 fn union_keeps_the_index_on_a_constant_subject() {
     insta::assert_snapshot!(explain_with_union_types(
         "SELECT ?v WHERE { <http://example.org/item/1> ex:value ?v }"
+    ));
+}
+
+/// IRIs from a relative template, a relative template with a path, and
+/// columns, in the style of the W3C tests R2RMLTC0019a and R2RMLTC0020a.
+const RELATIVE: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#Person> rr:logicalTable [ rr:tableName "people" ] ;
+  rr:subjectMap [ rr:template "{name}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:homepage ;
+    rr:objectMap [ rr:column "page" ; rr:termType rr:IRI ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:knows ;
+    rr:objectMap [ rr:template "person/{friend}" ; rr:termType rr:IRI ] ] .
+
+<#Page> rr:logicalTable [ rr:tableName "pages" ] ;
+  rr:subjectMap [ rr:column "iri" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:title ; rr:objectMap [ rr:column "title" ] ] .
+"#;
+
+fn explain_with_base(query: &str) -> String {
+    let mapping = Mapping::from_turtle(RELATIVE)
+        .unwrap()
+        .with_base_iri(BaseIri::new("http://example.com/base/").unwrap());
+    render(mapping, &format!("{PREFIXES}{query}"), None)
+}
+
+/// The template gets the base in front, so the constant still decomposes
+/// into a comparison on the column.
+#[test]
+fn base_iri_constant_against_relative_template_decomposes() {
+    insta::assert_snapshot!(explain_with_base(
+        "SELECT ?p WHERE { <http://example.com/base/Bob%2FCharles> ex:homepage ?p }"
+    ));
+}
+
+/// A column holding the IRI or the relative rest both produce it.
+#[test]
+fn base_iri_constant_against_iri_column_matches_both_forms() {
+    insta::assert_snapshot!(explain_with_base(
+        "SELECT ?t WHERE { <http://example.com/base/a.html> ex:title ?t }"
+    ));
+}
+
+#[test]
+fn base_iri_join_on_iri_column_compares_generated_iris() {
+    insta::assert_snapshot!(explain_with_base(
+        "SELECT ?s ?t WHERE { ?s ex:homepage ?p . ?p ex:title ?t }"
     ));
 }

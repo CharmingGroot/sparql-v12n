@@ -84,6 +84,7 @@ files are vendored unmodified in `tests/w3c/rdb2rdf/`:
 ```toml
 sql = "../../../w3c/rdb2rdf/D001-1table1column1row/create.sql"
 mapping = "../../../w3c/rdb2rdf/D001-1table1column1row/r2rmla.ttl"
+base_iri = "http://example.com/base/"   # optional: v12n's base IRI (--base-iri)
 ```
 
 `tests/diff/w3c/README.md` lists the included and skipped tests.

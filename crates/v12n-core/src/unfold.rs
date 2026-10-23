@@ -9,7 +9,7 @@ use oxrdf::Term;
 
 use crate::Error;
 use crate::mapping::{
-    LogicalTable, Mapping, MappingIndex, ObjectMap, TemplatePart, TermType, TriplesMap,
+    BaseIri, LogicalTable, Mapping, MappingIndex, ObjectMap, TemplatePart, TermType, TriplesMap,
 };
 use crate::sparql::{PatternTerm, RDF_TYPE, SelectQuery, TriplePattern};
 use crate::sql::{Condition, ProjectedTerm, ResultTerm, ResultValue, SqlBranch, SqlExpr, SqlPlan};
@@ -44,7 +44,7 @@ pub fn unfold(
             branches.push(branch);
         }
     }
-    plan(query, branches)
+    plan(query, branches, mapping.base_iri())
 }
 
 /// One way a triple pattern can be produced.
@@ -175,13 +175,14 @@ impl<'a> Branch<'a> {
     fn add(&mut self, pattern: &'a TriplePattern, candidate: Candidate<'a>, mapping: &'a Mapping) {
         let tm = candidate.triples_map();
         let table = self.push_table(&tm.logical_table);
-        let subject = TermExpr::from_term_map(&tm.subject_map.term_map, table);
+        let base = mapping.base_iri();
+        let subject = TermExpr::from_term_map(&tm.subject_map.term_map, table, base);
         let object = match candidate {
             Candidate::Class(_) => None,
             Candidate::Property {
                 object_map: ObjectMap::Term(term_map),
                 ..
-            } => Some(TermExpr::from_term_map(term_map, table)),
+            } => Some(TermExpr::from_term_map(term_map, table, base)),
             Candidate::Property {
                 object_map: ObjectMap::Reference(reference),
                 ..
@@ -212,6 +213,7 @@ impl<'a> Branch<'a> {
                 Some(TermExpr::from_term_map(
                     &parent.subject_map.term_map,
                     parent_table,
+                    base,
                 ))
             }
         };
@@ -254,6 +256,10 @@ impl<'a> Branch<'a> {
                 Condition::Eq(left, right) => {
                     collect_columns(left, &mut covered);
                     collect_columns(right, &mut covered);
+                }
+                Condition::EqAny(left, right) => {
+                    collect_columns(left, &mut covered);
+                    right.iter().for_each(|e| collect_columns(e, &mut covered));
                 }
                 // Every rendering maps NULL to NULL, so `=` is not true.
                 Condition::SameTerm(left, right) => {
@@ -385,7 +391,11 @@ fn hidden_variables(query: &SelectQuery) -> Vec<&str> {
     out
 }
 
-fn plan(query: &SelectQuery, branches: Vec<Branch<'_>>) -> Result<SqlPlan, Error> {
+fn plan(
+    query: &SelectQuery,
+    branches: Vec<Branch<'_>>,
+    base_iri: Option<&BaseIri>,
+) -> Result<SqlPlan, Error> {
     let Some(first) = branches.first() else {
         return Ok(SqlPlan {
             columns: Vec::new(),
@@ -403,6 +413,7 @@ fn plan(query: &SelectQuery, branches: Vec<Branch<'_>>) -> Result<SqlPlan, Error
                 .collect(),
             branches: Vec::new(),
             distinct: query.distinct,
+            base_iri: base_iri.cloned(),
         });
     };
 
@@ -441,6 +452,18 @@ fn plan(query: &SelectQuery, branches: Vec<Branch<'_>>) -> Result<SqlPlan, Error
             return Err(Error::UnsupportedFeature(format!(
                 "DISTINCT over ?{variable}, whose template {template} can render the same \
                  string for different column values"
+            )));
+        }
+        // Duplicates are removed by column value, and a relative value and
+        // the absolute IRI it resolves to are different values of one term.
+        if let Some(term) = first.bindings.get(variable)
+            && query.distinct
+            && term.base_iri.is_some()
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "DISTINCT over ?{variable}, whose IRIs are resolved against the base IRI per \
+                 value: a relative value and the absolute IRI it resolves to would count as \
+                 two solutions"
             )));
         }
     }
@@ -581,6 +604,7 @@ fn plan(query: &SelectQuery, branches: Vec<Branch<'_>>) -> Result<SqlPlan, Error
         split_columns: Vec::new(),
         branches,
         distinct: query.distinct,
+        base_iri: base_iri.cloned(),
     })
 }
 

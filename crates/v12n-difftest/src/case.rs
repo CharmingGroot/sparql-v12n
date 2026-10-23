@@ -19,6 +19,10 @@ pub struct Case {
     pub name: String,
     pub dir: PathBuf,
     pub mapping: String,
+    /// The base IRI the engine resolves relative IRIs against, from
+    /// `case.toml`. Ontop 5.5.0 always uses `http://example.com/base/`, the
+    /// base IRI of the W3C test cases, for templates; it has no setting.
+    pub base_iri: Option<String>,
     expectations: BTreeMap<String, Expectation>,
 }
 
@@ -48,13 +52,14 @@ pub struct QueryCase {
     pub expect: Expectation,
 }
 
-/// `case.toml`: paths relative to the case directory. One string per key,
-/// since `testenv/difftest.sh` reads them with `sed`.
+/// `case.toml`: paths relative to the case directory, and the base IRI.
+/// One string per key, since `testenv/difftest.sh` reads them with `sed`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CaseFile {
     sql: String,
     mapping: String,
+    base_iri: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -89,6 +94,7 @@ impl Case {
             .ok_or_else(|| Error::case(dir, "case directory has no UTF-8 name"))?
             .to_owned();
         let case_path = dir.join("case.toml");
+        let mut base_iri = None;
         let mapping = if case_path.is_file() {
             let file: CaseFile =
                 toml::from_str(&read(&case_path)?).map_err(|e| Error::case(&case_path, e))?;
@@ -99,6 +105,7 @@ impl Case {
                     format!("no SQL file {}", sql.display()),
                 ));
             }
+            base_iri = file.base_iri;
             read(&dir.join(&file.mapping))?
         } else {
             read(&dir.join("mapping.ttl"))?
@@ -143,6 +150,7 @@ impl Case {
             name,
             dir: dir.to_owned(),
             mapping,
+            base_iri,
             expectations,
         })
     }

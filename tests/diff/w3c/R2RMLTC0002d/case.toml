@@ -1,3 +1,4 @@
 # W3C R2RML test R2RMLTC0002d: Two columns mapping, generation of a BlankNode subject by using a SQL Query that concatenates two columns
 sql = "../../../w3c/rdb2rdf/D002-1table2columns1row/create.sql"
 mapping = "../../../w3c/rdb2rdf/D002-1table2columns1row/r2rmld.ttl"
+base_iri = "http://example.com/base/"

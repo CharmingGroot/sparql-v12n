@@ -4,8 +4,10 @@
 
 use oxrdf::Term;
 
-use crate::mapping::template::{iri_safe, is_iunreserved};
-use crate::mapping::{Template, TemplatePart, TermMap, TermMapValue, TermType};
+use crate::mapping::template::{IriKind, iri_safe, is_iunreserved};
+use crate::mapping::{
+    BaseIri, Template, TemplatePart, TermMap, TermMapValue, TermType, has_scheme,
+};
 use crate::sql::{Condition, Param, SqlExpr, TermDatatype, TermSql, TermSqlValue};
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
@@ -17,6 +19,12 @@ pub(crate) struct TermExpr<'a> {
     pub term_type: TermType,
     pub datatype: Option<&'a str>,
     pub language: Option<&'a str>,
+    /// Set when the term is an IRI whose strings may be relative, which
+    /// resolve against this base (R2RML §11.2): a column, or a template
+    /// whose strings have a scheme for some values only. Templates whose
+    /// strings never have one already start with the base
+    /// ([`Mapping::with_base_iri`](crate::mapping::Mapping::with_base_iri)).
+    pub base_iri: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -33,17 +41,25 @@ pub(crate) enum TermValue<'a> {
 }
 
 impl<'a> TermExpr<'a> {
-    pub fn from_term_map(term_map: &'a TermMap, table: usize) -> Self {
+    pub fn from_term_map(term_map: &'a TermMap, table: usize, base: Option<&'a BaseIri>) -> Self {
         let value = match &term_map.value {
             TermMapValue::Constant(term) => TermValue::Constant(term),
             TermMapValue::Column(name) => TermValue::Column { table, name },
             TermMapValue::Template(template) => TermValue::Template { table, template },
+        };
+        let resolved_per_value = match value {
+            TermValue::Constant(_) => false,
+            TermValue::Column { .. } => true,
+            TermValue::Template { template, .. } => template.iri_kind() == IriKind::Mixed,
         };
         Self {
             value,
             term_type: term_map.term_type,
             datatype: term_map.datatype.as_deref(),
             language: term_map.language.as_deref(),
+            base_iri: base
+                .filter(|_| term_map.term_type == TermType::Iri && resolved_per_value)
+                .map(BaseIri::as_str),
         }
     }
 
@@ -58,6 +74,7 @@ impl<'a> TermExpr<'a> {
             term_type,
             datatype: None,
             language: None,
+            base_iri: None,
         }
     }
 
@@ -98,7 +115,11 @@ impl<'a> TermExpr<'a> {
             (TermType::Literal, None, None) => datatype,
             _ => None,
         };
-        TermSql { value, datatype }
+        TermSql {
+            value,
+            datatype,
+            base_iri: self.base_iri.map(str::to_owned),
+        }
     }
 }
 
@@ -111,6 +132,7 @@ fn template_column(table: usize, name: &str) -> TermSql {
             name: name.to_owned(),
         },
         datatype: None,
+        base_iri: None,
     }
 }
 
@@ -177,18 +199,20 @@ pub(crate) fn term_eq(left: &TermExpr<'_>, right: &TermExpr<'_>) -> Equality {
                 table: rt,
                 template: r,
             },
-        ) => match decompose_template(l, r, left.term_type) {
-            Decomposition::Columns(pairs) => Equality::When(
-                pairs
-                    .into_iter()
-                    .map(|(lc, rc)| {
-                        Condition::SameTerm(template_column(lt, lc), template_column(rt, rc))
-                    })
-                    .collect(),
-            ),
-            Decomposition::Disjoint => Equality::Never,
-            Decomposition::Unknown => string_eq(left, right),
-        },
+        ) if left.base_iri.is_none() && right.base_iri.is_none() => {
+            match decompose_template(l, r, left.term_type) {
+                Decomposition::Columns(pairs) => Equality::When(
+                    pairs
+                        .into_iter()
+                        .map(|(lc, rc)| {
+                            Condition::SameTerm(template_column(lt, lc), template_column(rt, rc))
+                        })
+                        .collect(),
+                ),
+                Decomposition::Disjoint => Equality::Never,
+                Decomposition::Unknown => string_eq(left, right),
+            }
+        }
         _ => string_eq(left, right),
     }
 }
@@ -205,6 +229,14 @@ fn string_eq(left: &TermExpr<'_>, right: &TermExpr<'_>) -> Equality {
 fn constant_eq(constant: &Term, other: &TermExpr<'_>, iri: bool) -> Equality {
     let value = lexical_form(constant);
     match other.value {
+        // Values with and without a scheme render the constant through
+        // different template text, so compare the generated strings.
+        TermValue::Template { .. } if other.base_iri.is_some() => {
+            Equality::When(vec![Condition::SameTerm(
+                other.to_term_sql(),
+                TermExpr::constant(constant).to_term_sql(),
+            )])
+        }
         TermValue::Template { table, template } => match decompose_constant(value, template, iri) {
             ConstantMatch::Values(values) => Equality::When(
                 template
@@ -219,6 +251,20 @@ fn constant_eq(constant: &Term, other: &TermExpr<'_>, iri: bool) -> Equality {
                 TermExpr::constant(constant).to_term_sql(),
             )]),
         },
+        TermValue::Column { .. } if let Some(base) = other.base_iri => {
+            // R2RML §11.2: the column value is the IRI itself, or, when the
+            // IRI starts with the base, the relative rest, which resolves to
+            // it unless it has a scheme of its own. Two parameters keep the
+            // comparison on the column, and so its index.
+            let column = column_or_constant(other);
+            let iri = SqlExpr::Param(value.into());
+            Equality::When(vec![
+                match value.strip_prefix(base).filter(|rest| !has_scheme(rest)) {
+                    Some(rest) => Condition::EqAny(column, vec![iri, SqlExpr::Param(rest.into())]),
+                    None => Condition::Eq(column, iri),
+                },
+            ])
+        }
         _ => {
             let datatype = match (constant, literal_type(other)) {
                 (Term::Literal(literal), LiteralType::Natural) => {
@@ -605,8 +651,8 @@ mod tests {
         let literal = column_map("b", TermType::Literal);
         assert_eq!(
             term_eq(
-                &TermExpr::from_term_map(&iri, 0),
-                &TermExpr::from_term_map(&literal, 1)
+                &TermExpr::from_term_map(&iri, 0, None),
+                &TermExpr::from_term_map(&literal, 1, None)
             ),
             Equality::Never
         );
@@ -618,7 +664,7 @@ mod tests {
         typed.datatype = Some("http://www.w3.org/2001/XMLSchema#integer".into());
         let plain: Term = Literal::new_simple_literal("5").into();
         let tagged: Term = Literal::new_language_tagged_literal_unchecked("5", "en").into();
-        let typed = TermExpr::from_term_map(&typed, 0);
+        let typed = TermExpr::from_term_map(&typed, 0, None);
         assert_eq!(
             term_eq(&typed, &TermExpr::constant(&plain)),
             Equality::Never
@@ -633,7 +679,7 @@ mod tests {
         let natural = column_map("amount", TermType::Literal);
         assert_eq!(
             term_eq(
-                &TermExpr::from_term_map(&natural, 0),
+                &TermExpr::from_term_map(&natural, 0, None),
                 &TermExpr::constant(&plain)
             ),
             Equality::When(vec![Condition::Eq(
@@ -657,8 +703,8 @@ mod tests {
         };
         assert_eq!(
             term_eq(
-                &TermExpr::from_term_map(&iri_column, 1),
-                &TermExpr::from_term_map(&t, 0)
+                &TermExpr::from_term_map(&iri_column, 1, None),
+                &TermExpr::from_term_map(&t, 0, None)
             ),
             Equality::When(vec![Condition::SameTerm(
                 TermSql {
@@ -667,6 +713,7 @@ mod tests {
                         name: "home".into()
                     },
                     datatype: None,
+                    base_iri: None,
                 },
                 TermSql {
                     value: TermSqlValue::Template {
@@ -675,6 +722,7 @@ mod tests {
                         iri_safe: true,
                     },
                     datatype: None,
+                    base_iri: None,
                 }
             )])
         );
@@ -692,8 +740,8 @@ mod tests {
             language: None,
         };
         let datatypes = |l: &TermMap, r: &TermMap| match term_eq(
-            &TermExpr::from_term_map(l, 0),
-            &TermExpr::from_term_map(r, 1),
+            &TermExpr::from_term_map(l, 0, None),
+            &TermExpr::from_term_map(r, 1, None),
         ) {
             Equality::When(c) => match &c[..] {
                 [Condition::SameTerm(l, r)] => (l.datatype.clone(), r.datatype.clone()),
@@ -733,8 +781,8 @@ mod tests {
         };
         assert_eq!(
             term_eq(
-                &TermExpr::from_term_map(&a, 1),
-                &TermExpr::from_term_map(&b, 0)
+                &TermExpr::from_term_map(&a, 1, None),
+                &TermExpr::from_term_map(&b, 0, None)
             ),
             Equality::When(vec![eq(1, "x", 0, "y")])
         );
@@ -742,7 +790,7 @@ mod tests {
         assert_eq!(
             term_eq(
                 &TermExpr::constant(&constant),
-                &TermExpr::from_term_map(&a, 0)
+                &TermExpr::from_term_map(&a, 0, None)
             ),
             Equality::When(vec![Condition::Eq(
                 column(0, "x"),

@@ -22,14 +22,17 @@ pub enum Error {
     /// An `rr:template` string is malformed.
     #[error("invalid template {template:?}: {reason}")]
     InvalidTemplate { template: String, reason: String },
+    /// The base IRI is not an absolute IRI.
+    #[error("invalid base IRI {0}")]
+    InvalidBaseIri(String),
     /// The query is not valid SPARQL.
     #[error("query syntax error: {0}")]
     QuerySyntax(String),
     /// The query would unfold into more UNION branches than the limit.
     #[error("query unfolds into more than {limit} UNION branches")]
     TooManyBranches { limit: usize },
-    /// A result row cannot be turned into an RDF term, such as a column
-    /// value that is not an absolute IRI.
+    /// A result row cannot be turned into an RDF term, such as a relative
+    /// IRI without a base IRI (an R2RML data error).
     #[error("invalid term: {0}")]
     InvalidTerm(String),
     /// A valid construct this engine does not support yet.

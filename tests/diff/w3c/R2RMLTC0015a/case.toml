@@ -1,3 +1,4 @@
 # W3C R2RML test R2RMLTC0015a: Generation of language tags from a table with language information
 sql = "../../../w3c/rdb2rdf/D015-1table3columns1composityeprimarykey3rows2languages/create.sql"
 mapping = "../../../w3c/rdb2rdf/D015-1table3columns1composityeprimarykey3rows2languages/r2rmla.ttl"
+base_iri = "http://example.com/base/"

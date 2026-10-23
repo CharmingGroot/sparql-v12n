@@ -77,6 +77,7 @@ password_env = "SHOP_DB_PASSWORD"   # optional: read the password from this vari
 
 [mapping]
 path = "mapping.ttl"                # relative to this file
+base_iri = "http://data.example.com/"   # optional: for relative IRIs (see below)
 
 [limits]
 statement_timeout = "30s"           # 0 disables
@@ -92,13 +93,16 @@ max_concurrent_requests = 16        # more are refused with 503, not queued
 | `[database] url` | `V12N_DATABASE_URL` | required |
 | `[database] password_env` | (file only) | none |
 | `[mapping] path` | `V12N_MAPPING` | required |
+| `[mapping] base_iri` | `V12N_BASE_IRI` | none: relative IRIs are data errors |
 | `[limits] statement_timeout` | `V12N_STATEMENT_TIMEOUT` | `30s` |
 | `[limits] row_limit` | `V12N_ROW_LIMIT` | `10000` |
 | `[limits] max_query_bytes` | `V12N_MAX_QUERY_BYTES` | `65536` |
 | `[limits] max_concurrent_requests` | `V12N_MAX_CONCURRENT_REQUESTS` | `16` |
 
-`v12n query` reads the same `V12N_DATABASE_URL`, `V12N_ROW_LIMIT` and
-`V12N_STATEMENT_TIMEOUT`, below its command-line options. `serve` ignores other
+`v12n query` reads the same `V12N_DATABASE_URL`, `V12N_ROW_LIMIT`,
+`V12N_STATEMENT_TIMEOUT` and `V12N_BASE_IRI`, below its command-line options;
+`v12n explain` reads `V12N_BASE_IRI`, and `--base-iri` also overrides the
+setting for `serve`. `serve` ignores other
 `V12N_*` variables and logs a warning for each, so a misspelled name is
 visible.
 
@@ -118,6 +122,48 @@ that `SELECT ... AS StudentId` produces (`studentid`), and `rr:column
 query that uses such a name, the engine prepares a probe statement in
 which PostgreSQL resolves it, and then quotes the resolved name in the
 generated SQL. Names of lower-case letters, digits and `_` need no probe.
+
+## Relative IRIs
+
+A column or template with `rr:termType rr:IRI` can produce a relative IRI,
+such as `Carlos` or `person/7`. R2RML resolves it against a base IRI given
+to the processor (R2RML §4, §11.2), by plain string concatenation, not RFC
+3986 resolution: with the base `http://data.example.com/`, `Carlos` becomes
+`<http://data.example.com/Carlos>` and `../x` becomes
+`<http://data.example.com/../x>`. Template values are percent-encoded
+first (`Bob/Charles` gives `Bob%2FCharles`).
+
+There is no default base IRI. Without `base_iri` (`--base-iri`,
+`V12N_BASE_IRI`), a relative IRI is an R2RML data error that names the
+setting, so the engine never invents IRIs for the data. Set it to the
+namespace the data belongs to; it must be an absolute IRI.
+
+A string counts as absolute when it starts with a scheme (`http:`,
+`urn:`, ...); a fragment does not make it relative. A string with a
+scheme that is not a valid IRI is a data error, where R2RML would first try
+the base IRI in front of it; this only differs for values such as
+`http://host:port/` with a non-numeric port, and it lets the SQL
+comparisons below use the same rule as the results.
+
+- A template whose text never yields a scheme, such as `{name}` or
+  `person/{id}`, gets the base IRI in front of it when the mapping is
+  loaded. A constant like `<http://data.example.com/person/7>` is then
+  matched on the column as before (`id = $1`), with its index.
+- A column can hold either form, so a constant matches both:
+  `iri IN ($1, $2)` with `http://data.example.com/a` and `a`, which still
+  uses an index on the column.
+- A join on such a column, or on a template like `{scheme}:{rest}` whose
+  scheme depends on the values, compares the generated IRIs in SQL
+  (`CASE WHEN iri ~ '^scheme:' THEN iri ELSE $base || iri END`), which an
+  index on the column does not serve.
+- Duplicates are removed by column value, so a relative value and the
+  absolute IRI it resolves to (`a` and `http://data.example.com/a`) still
+  count twice, and `SELECT DISTINCT` over such a column is rejected as
+  unsupported when a base IRI is set.
+
+Ontop 5.5.0 puts `http://example.com/base/` (the base IRI of the W3C test
+cases) in front of every template that does not start with an absolute
+IRI, with no setting to change it, and fails on relative IRIs from columns.
 
 ## Lexical forms of column values
 

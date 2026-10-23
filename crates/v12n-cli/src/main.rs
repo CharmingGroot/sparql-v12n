@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use v12n_core::mapping::{Mapping, MappingIndex, TermType, TriplesMapId};
+use v12n_core::mapping::{BaseIri, Mapping, MappingIndex, TermType, TriplesMapId};
 use v12n_core::results::JsonResultsWriter;
 use v12n_core::sql::SqlPlan;
 use v12n_core::{sparql, unfold};
@@ -71,6 +71,7 @@ Settings (file key, environment variable, default):
   [database] url                    V12N_DATABASE_URL             required
   [database] password_env           (file only)                   none
   [mapping] path                    V12N_MAPPING                  required
+  [mapping] base_iri                V12N_BASE_IRI                 none (--base-iri)
   [limits] statement_timeout        V12N_STATEMENT_TIMEOUT        30s (0: none)
   [limits] row_limit                V12N_ROW_LIMIT                10000 (0: none)
   [limits] max_query_bytes          V12N_MAX_QUERY_BYTES          65536
@@ -79,6 +80,7 @@ Settings (file key, environment variable, default):
 Environment variables override the file. Other V12N_* variables are
 ignored with a warning in the log.
 
+Without a base IRI, a relative IRI from a column or template is a data error.
 A relative mapping path in the file is relative to the file. Connect as a
 database user that can only read; sessions are also set read-only.
 Logs go to stderr; RUST_LOG sets the level (default info).
@@ -132,6 +134,8 @@ enum Command {
         mapping: PathBuf,
         /// SPARQL SELECT query, or `-` for stdin
         query: PathBuf,
+        #[command(flatten)]
+        base_iri: BaseIriArg,
     },
     /// Run a SPARQL query on PostgreSQL and print the solutions
     #[command(after_help = QUERY_HELP)]
@@ -149,6 +153,8 @@ enum Command {
         /// Statement timeout such as 500ms, 30s or 2m; 0 disables it
         #[arg(long, env = env::STATEMENT_TIMEOUT, default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
+        #[command(flatten)]
+        base_iri: BaseIriArg,
     },
     /// Serve the SPARQL 1.1 Protocol endpoint at /sparql
     #[command(after_help = SERVE_HELP)]
@@ -156,7 +162,23 @@ enum Command {
         /// TOML settings file; the environment variables below override it
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Base IRI for relative IRIs from columns and templates; overrides
+        /// [mapping] base_iri and V12N_BASE_IRI
+        #[arg(long, value_parser = parse_base_iri)]
+        base_iri: Option<BaseIri>,
     },
+}
+
+#[derive(clap::Args)]
+struct BaseIriArg {
+    /// Base IRI that relative IRIs from columns and templates resolve
+    /// against, by prepending it (R2RML); without it they are data errors
+    #[arg(long = "base-iri", env = env::BASE_IRI, value_parser = parse_base_iri)]
+    base_iri: Option<BaseIri>,
+}
+
+fn parse_base_iri(value: &str) -> Result<BaseIri, String> {
+    BaseIri::new(value).map_err(|e| e.to_string())
 }
 
 /// A failure to report: exit code, error kind for JSON output, message.
@@ -201,16 +223,22 @@ fn main() -> ExitCode {
     let result = match &cli.command {
         Command::Check { mapping } => check(mapping, format),
         Command::Terms { mapping } => terms(mapping, format),
-        Command::Explain { mapping, query } => explain(mapping, query, format),
+        Command::Explain {
+            mapping,
+            query,
+            base_iri,
+        } => explain(mapping, query, base_iri.base_iri.as_ref(), format),
         Command::Query {
             mapping,
             query: query_path,
             db,
             row_limit,
             timeout,
+            base_iri,
         } => query(
             mapping,
             query_path,
+            base_iri.base_iri.as_ref(),
             db.as_deref(),
             Limits {
                 statement_timeout: *timeout,
@@ -218,7 +246,7 @@ fn main() -> ExitCode {
             },
             format,
         ),
-        Command::Serve { config } => serve(config.as_deref()),
+        Command::Serve { config, base_iri } => serve(config.as_deref(), base_iri.clone()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -365,7 +393,11 @@ fn terms(path: &Path, format: Format) -> Result<(), Failure> {
 }
 
 /// Reads the mapping and the query and unfolds the query.
-fn load_plan(mapping_path: &Path, query_path: &Path) -> Result<SqlPlan, Failure> {
+fn load_plan(
+    mapping_path: &Path,
+    query_path: &Path,
+    base_iri: Option<&BaseIri>,
+) -> Result<SqlPlan, Failure> {
     let stdin = Path::new("-");
     if mapping_path == stdin && query_path == stdin {
         return Err(Failure::new(
@@ -374,7 +406,10 @@ fn load_plan(mapping_path: &Path, query_path: &Path) -> Result<SqlPlan, Failure>
             "only one of the mapping and the query can be read from stdin",
         ));
     }
-    let mapping = load_mapping(mapping_path)?;
+    let mut mapping = load_mapping(mapping_path)?;
+    if let Some(base) = base_iri {
+        mapping = mapping.with_base_iri(base.clone());
+    }
     let query = read_input(query_path)?;
     // Errors past this point are about the query, not the mapping.
     sparql::parse(&query)
@@ -388,8 +423,13 @@ fn load_plan(mapping_path: &Path, query_path: &Path) -> Result<SqlPlan, Failure>
         })
 }
 
-fn explain(mapping_path: &Path, query_path: &Path, format: Format) -> Result<(), Failure> {
-    let plan = load_plan(mapping_path, query_path)?;
+fn explain(
+    mapping_path: &Path,
+    query_path: &Path,
+    base_iri: Option<&BaseIri>,
+    format: Format,
+) -> Result<(), Failure> {
+    let plan = load_plan(mapping_path, query_path, base_iri)?;
     let rendered = plan.to_sql();
 
     match format {
@@ -426,11 +466,12 @@ fn explain(mapping_path: &Path, query_path: &Path, format: Format) -> Result<(),
 fn query(
     mapping_path: &Path,
     query_path: &Path,
+    base_iri: Option<&BaseIri>,
     db: Option<&str>,
     limits: Limits,
     format: Format,
 ) -> Result<(), Failure> {
-    let plan = load_plan(mapping_path, query_path)?;
+    let plan = load_plan(mapping_path, query_path, base_iri)?;
     let url = db.ok_or_else(|| {
         Failure::new(
             EXIT_INPUT,
@@ -462,9 +503,12 @@ fn query(
     })
 }
 
-fn serve(config_path: Option<&Path>) -> Result<(), Failure> {
+fn serve(config_path: Option<&Path>, base_iri: Option<BaseIri>) -> Result<(), Failure> {
     init_logging();
-    let config = Config::load(config_path).map_err(server_failure)?;
+    let mut config = Config::load(config_path).map_err(server_failure)?;
+    if base_iri.is_some() {
+        config.base_iri = base_iri;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

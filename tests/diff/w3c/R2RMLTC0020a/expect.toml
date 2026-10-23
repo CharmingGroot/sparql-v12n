@@ -1,4 +1,0 @@
-# Relative IRIs: v12n has no base IRI; Ontop answers (#33).
-[query.type-person]
-expect = "mismatch"
-issue = 33

@@ -1,0 +1,15 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_with_base(\"SELECT ?s ?t WHERE { ?s ex:homepage ?p . ?p ex:title ?t }\")"
+---
+SELECT q."s", q."t"
+FROM (
+SELECT DISTINCT t0."name" AS "s", t0."page" AS "p", t1."title" AS "t"
+FROM "people" t0
+JOIN "pages" t1 ON CASE WHEN (t1."iri"::text) ~ '^[A-Za-z][-+.0-9A-Za-z]*:' THEN (t1."iri"::text) ELSE $1 || (t1."iri"::text) END = CASE WHEN (t0."page"::text) ~ '^[A-Za-z][-+.0-9A-Za-z]*:' THEN (t0."page"::text) ELSE $2 || (t0."page"::text) END
+WHERE t0."name" IS NOT NULL AND t1."title" IS NOT NULL
+) q
+
+-- params
+$1 = "http://example.com/base/"
+$2 = "http://example.com/base/"

@@ -7,8 +7,8 @@ use oxrdf::{BlankNode, NamedOrBlankNode, Term, Triple};
 use oxttl::TurtleParser;
 
 use super::{
-    BASE_IRI, JoinCondition, LogicalTable, ObjectMap, PredicateObjectMap, RefObjectMap, SubjectMap,
-    Template, TermMap, TermMapValue, TermType, TriplesMap, TriplesMapId,
+    DOCUMENT_BASE_IRI, JoinCondition, LogicalTable, ObjectMap, PredicateObjectMap, RefObjectMap,
+    SubjectMap, Template, TermMap, TermMapValue, TermType, TriplesMap, TriplesMapId,
 };
 use crate::Error;
 
@@ -95,8 +95,8 @@ struct Graph<'i> {
 impl<'i> Graph<'i> {
     fn from_turtle(input: &'i str) -> Result<Self, Error> {
         let parser = TurtleParser::new()
-            .with_base_iri(BASE_IRI)
-            .expect("BASE_IRI is a valid IRI");
+            .with_base_iri(DOCUMENT_BASE_IRI)
+            .expect("DOCUMENT_BASE_IRI is a valid IRI");
         let mut seen = HashSet::new();
         let mut triples = Vec::new();
         let mut by_subject: HashMap<_, Vec<usize>> = HashMap::new();
