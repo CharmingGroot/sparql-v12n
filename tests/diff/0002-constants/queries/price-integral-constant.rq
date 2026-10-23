@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# The canonical xsd:decimal form of 3.00: XSD 1.1 writes an integer without a decimal point.
+SELECT ?s WHERE { ?s ex:price "3"^^xsd:decimal }

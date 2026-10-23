@@ -142,8 +142,10 @@ impl Decoder {
 /// decoder (`'1 day' = '24 hours'` for `interval`), whose text output is
 /// compared instead. Across groups only the natural lexical forms can be
 /// compared, and SQL computes them only where the text output already is
-/// that form, or for booleans and binaries. `bpchar` is left out: its
-/// cast to text drops the padding its values carry.
+/// that form, or for booleans, binaries and `numeric` (`trim_scale`).
+/// Floating point and date/time types are left out until an SQL
+/// expression is shown to match their canonical forms, and `bpchar`
+/// because its cast to text drops the padding its values carry.
 pub(crate) fn column_type(ty: &Type) -> ColumnType {
     let (group, comparison, lexical) = match (Decoder::for_type(ty), ty) {
         (_, &Type::BPCHAR) => ("bpchar", Comparison::Value, None),
@@ -155,7 +157,7 @@ pub(crate) fn column_type(ty: &Type) -> ColumnType {
         (Some(Decoder::Bool), _) => ("boolean", Comparison::Value, Some(Lexical::Boolean)),
         (Some(Decoder::Bytea), _) => ("bytea", Comparison::Value, Some(Lexical::Hex)),
         (Some(Decoder::Float4 | Decoder::Float8), _) => ("double", Comparison::Text, None),
-        (Some(Decoder::Numeric), _) => ("numeric", Comparison::Value, None),
+        (Some(Decoder::Numeric), _) => ("numeric", Comparison::Value, Some(Lexical::Decimal)),
         (Some(Decoder::Date), _) => ("date", Comparison::Value, None),
         (Some(Decoder::Time), _) => ("time", Comparison::Value, None),
         (Some(Decoder::Timestamp), _) => ("timestamp", Comparison::Value, None),

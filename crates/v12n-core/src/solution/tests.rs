@@ -36,11 +36,18 @@ fn natural_lexical_form_is_canonical() {
         "5232524D4C"
     );
     assert_eq!(lexical(SqlValue::Decimal("0120.50".into())), "120.5");
-    assert_eq!(lexical(SqlValue::Decimal("-0.000".into())), "0.0");
-    assert_eq!(lexical(SqlValue::Decimal("7".into())), "7.0");
+    // XML Schema 1.1 decimalCanonicalMap: integers have no decimal point.
+    assert_eq!(lexical(SqlValue::Decimal("-0.000".into())), "0");
+    assert_eq!(lexical(SqlValue::Decimal("7".into())), "7");
+    assert_eq!(lexical(SqlValue::Decimal("3.00".into())), "3");
+    assert_eq!(lexical(SqlValue::Decimal("-12.50".into())), "-12.5");
+    assert_eq!(lexical(SqlValue::Decimal("-0.0010".into())), "-0.001");
+    assert_eq!(lexical(SqlValue::Decimal("100".into())), "100");
     assert_eq!(lexical(SqlValue::Decimal("NaN".into())), "NaN");
     assert_eq!(lexical(SqlValue::Double(120.5)), "1.205E2");
     assert_eq!(lexical(SqlValue::Double(100.0)), "1.0E2");
+    // The W3C R2RML test D005 expects 30 as "3.0E1"^^xsd:double.
+    assert_eq!(lexical(SqlValue::Double(30.0)), "3.0E1");
     assert_eq!(lexical(SqlValue::Double(-1.5e-7)), "-1.5E-7");
     assert_eq!(lexical(SqlValue::Double(0.0)), "0.0E0");
     assert_eq!(lexical(SqlValue::Double(f64::NEG_INFINITY)), "-INF");
@@ -49,7 +56,9 @@ fn natural_lexical_form_is_canonical() {
 #[test]
 fn canonical_decimal_rejects_non_decimals() {
     assert_eq!(canonical_decimal("+.5"), Some("0.5".into()));
-    assert_eq!(canonical_decimal("3."), Some("3.0".into()));
+    assert_eq!(canonical_decimal("3."), Some("3".into()));
+    assert_eq!(canonical_decimal("-.0"), Some("0".into()));
+    assert_eq!(canonical_decimal("+0010.0100"), Some("10.01".into()));
     for bad in ["", ".", "-", "1e3", "1.2.3", " 1", "Infinity"] {
         assert_eq!(canonical_decimal(bad), None, "{bad:?}");
     }
