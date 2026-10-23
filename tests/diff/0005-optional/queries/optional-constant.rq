@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# A constant object (rr:object) is unbound where the part does not match.
+SELECT ?p ?kind WHERE {
+  ?p a ex:Person .
+  OPTIONAL { ?p ex:kind ?kind }
+}

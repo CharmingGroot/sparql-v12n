@@ -1,0 +1,9 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "shop(\"SELECT ?c ?t WHERE { OPTIONAL { ?c ex:tier ?t } }\")"
+---
+SELECT DISTINCT t0."id" AS "c", t0."tier" AS "t"
+FROM (SELECT) u0
+LEFT JOIN "customers" t0 ON t0."id" IS NOT NULL AND t0."tier" IS NOT NULL
+
+-- params

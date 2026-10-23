@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# The projection keeps the bag: person 1 once per distinct phone.
+SELECT ?p WHERE {
+  ?p a ex:Person .
+  OPTIONAL { ?p ex:phone ?phone }
+}

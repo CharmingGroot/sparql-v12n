@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/>
+
+# Order 13 has no person and order 14 refers to one that does not exist:
+# the optional part does not match, and ?p stays unbound.
+SELECT ?o ?p WHERE {
+  ?o a ex:Order .
+  OPTIONAL { ?o ex:placedBy ?p . ?p a ex:Party }
+}

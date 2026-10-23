@@ -1,0 +1,9 @@
+PREFIX ex: <http://example.org/>
+
+# Join(LeftJoin(...), ...): where the OPTIONAL left ?p unbound, the last
+# pattern binds it freely.
+SELECT ?o ?p ?email WHERE {
+  ?o a ex:Order .
+  OPTIONAL { ?o ex:placedBy ?p . ?p a ex:Party }
+  ?p ex:email ?email
+}

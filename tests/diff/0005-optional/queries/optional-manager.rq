@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/>
+
+# A manager template over a nullable column, and a manager that does not
+# exist (99).
+SELECT ?p ?m ?memail WHERE {
+  ?p ex:manager ?m .
+  OPTIONAL { ?m ex:email ?memail }
+}

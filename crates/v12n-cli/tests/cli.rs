@@ -189,7 +189,7 @@ fn explain_query_from_stdin_table_format_prints_sql() {
 fn explain_unsupported_feature_exits_one() {
     let output = v12n(
         &["explain", SHOP, "-"],
-        "SELECT * WHERE { ?c <http://example.org/name> ?n OPTIONAL { ?c <http://example.org/tier> ?t } }",
+        "SELECT * WHERE { ?c <http://example.org/knows>+ ?d }",
     );
     assert_eq!(output.status.code(), Some(1));
     let error = stdout_json(&output);
@@ -198,7 +198,7 @@ fn explain_unsupported_feature_exits_one() {
         error["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("OPTIONAL")
+            .contains("property paths")
     );
 }
 

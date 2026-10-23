@@ -1,0 +1,13 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_with_union_types(\"SELECT ?s ?v ?d WHERE { ?s ex:value ?v OPTIONAL { ?s ex:measuredOn ?d } }\")"
+---
+SELECT t0."id" AS "s", t0."value" AS "v", NULL::"pg_catalog"."text" AS "v_1", t1."measured_on" AS "d"
+FROM "readings" t0
+LEFT JOIN "readings" t1 ON t1."id" = t0."id" AND t1."measured_on" IS NOT NULL
+WHERE t0."id" IS NOT NULL AND t0."value" IS NOT NULL
+UNION
+SELECT t0."id" AS "s", NULL::"pg_catalog"."int4" AS "v", t0."value" AS "v_1", t1."measured_on" AS "d"
+FROM "labels" t0
+LEFT JOIN "readings" t1 ON t1."id" = t0."id" AND t1."measured_on" IS NOT NULL
+WHERE t0."id" IS NOT NULL AND t0."value" IS NOT NULL

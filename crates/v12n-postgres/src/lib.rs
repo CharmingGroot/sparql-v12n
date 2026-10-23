@@ -194,13 +194,16 @@ impl Database {
             .collect();
         // Skipping the round trip when no branch can produce a row also
         // covers the common single-branch case. An alternative of an `IN`
-        // list that cannot match only drops itself.
+        // list that cannot match only drops itself, and a constant of an
+        // `OPTIONAL` part or a disjunction only fails its own condition.
         let mut empty_branches: HashSet<usize> = HashSet::new();
         let mut alternatives: HashMap<usize, (usize, bool)> = HashMap::new();
-        for ((b, &branch), alternative) in bound
+        for (((b, &branch), alternative), _) in bound
             .iter()
             .zip(&rendered.param_branches)
             .zip(&rendered.param_alternatives)
+            .zip(&rendered.param_required)
+            .filter(|(_, required)| **required)
         {
             match alternative {
                 Some(group) => {

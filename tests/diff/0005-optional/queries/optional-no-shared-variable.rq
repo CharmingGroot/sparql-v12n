@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Nothing links the two sides: every order extends every person.
+SELECT ?p ?o WHERE {
+  ?p ex:email ?e .
+  OPTIONAL { ?o ex:note ?note }
+}

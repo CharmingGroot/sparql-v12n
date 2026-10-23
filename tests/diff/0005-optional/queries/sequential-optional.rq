@@ -1,0 +1,10 @@
+PREFIX ex: <http://example.org/>
+
+# Order 13 has no ex:placedBy, so ?p is unbound after the first OPTIONAL
+# and the second one binds it to every person with an email. Order 14
+# refers to person 99, who has none.
+SELECT ?o ?p ?email WHERE {
+  ?o a ex:Order .
+  OPTIONAL { ?o ex:placedBy ?p }
+  OPTIONAL { ?p ex:email ?email }
+}

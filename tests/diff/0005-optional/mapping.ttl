@@ -1,0 +1,45 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#PersonMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "people" ] ;
+  rr:subjectMap [
+    rr:template "http://example.org/person/{id}" ;
+    rr:class ex:Person , ex:Party
+  ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:email ; rr:objectMap [ rr:column "email" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:manager ;
+    rr:objectMap [ rr:template "http://example.org/person/{manager_id}" ]
+  ] ;
+  rr:predicateObjectMap [ rr:predicate ex:kind ; rr:object "staff" ] .
+
+# ex:Person again, with the same subject template over a text key: an
+# OPTIONAL part on ?p compares a text column with an integer one.
+<#ContractorMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "contractors" ] ;
+  rr:subjectMap [ rr:template "http://example.org/person/{code}" ; rr:class ex:Person ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:agency ; rr:objectMap [ rr:column "agency" ] ] .
+
+# ex:Party again, with subjects that are never a person's.
+<#VendorMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "vendors" ] ;
+  rr:subjectMap [ rr:template "http://example.org/vendor/{id}" ; rr:class ex:Party ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+
+<#OrderMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "orders" ] ;
+  rr:subjectMap [ rr:template "http://example.org/order/{id}" ; rr:class ex:Order ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:placedBy ;
+    rr:objectMap [ rr:template "http://example.org/person/{person_id}" ]
+  ] ;
+  rr:predicateObjectMap [ rr:predicate ex:amount ; rr:objectMap [ rr:column "amount" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:note ; rr:objectMap [ rr:column "note" ] ] .
+
+<#PhoneMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "phones" ] ;
+  rr:subjectMap [ rr:template "http://example.org/person/{person_id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:phone ; rr:objectMap [ rr:column "phone" ] ] .

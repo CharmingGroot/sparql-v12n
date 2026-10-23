@@ -178,7 +178,9 @@ impl Solution {
 #[derive(Debug, Clone)]
 pub struct SolutionBuilder {
     variables: Vec<String>,
-    terms: Vec<Option<TermBuilder>>,
+    /// For each variable, the terms tried in order (see
+    /// [`ProjectedTerm::terms`](crate::sql::ProjectedTerm::terms)).
+    terms: Vec<Vec<TermBuilder>>,
     base_iri: Option<BaseIri>,
 }
 
@@ -188,6 +190,8 @@ struct TermBuilder {
     value: ValueBuilder,
     datatype: Option<NamedNode>,
     language: Option<String>,
+    /// Unbound when this column is `NULL`.
+    guard: Option<Columns>,
 }
 
 #[derive(Debug, Clone)]
@@ -252,26 +256,32 @@ impl SolutionBuilder {
             .projection
             .iter()
             .map(|projected| {
-                let term = projected.term.as_ref()?;
-                let value = match &term.value {
-                    ResultValue::Constant(c) => ValueBuilder::Constant(c.clone()),
-                    ResultValue::Column(alias) => ValueBuilder::Column(column(alias)),
-                    ResultValue::Template(parts) => ValueBuilder::Template(
-                        parts
-                            .iter()
-                            .map(|p| match p {
-                                TemplatePart::Literal(text) => Part::Literal(text.clone()),
-                                TemplatePart::Column(alias) => Part::Column(column(alias)),
-                            })
-                            .collect(),
-                    ),
-                };
-                Some(TermBuilder {
-                    term_type: term.term_type,
-                    value,
-                    datatype: term.datatype.as_deref().map(NamedNode::new_unchecked),
-                    language: term.language.clone(),
-                })
+                projected
+                    .terms
+                    .iter()
+                    .map(|term| {
+                        let value = match &term.value {
+                            ResultValue::Constant(c) => ValueBuilder::Constant(c.clone()),
+                            ResultValue::Column(alias) => ValueBuilder::Column(column(alias)),
+                            ResultValue::Template(parts) => ValueBuilder::Template(
+                                parts
+                                    .iter()
+                                    .map(|p| match p {
+                                        TemplatePart::Literal(text) => Part::Literal(text.clone()),
+                                        TemplatePart::Column(alias) => Part::Column(column(alias)),
+                                    })
+                                    .collect(),
+                            ),
+                        };
+                        TermBuilder {
+                            term_type: term.term_type,
+                            value,
+                            datatype: term.datatype.as_deref().map(NamedNode::new_unchecked),
+                            language: term.language.clone(),
+                            guard: term.guard.as_deref().map(column),
+                        }
+                    })
+                    .collect()
             })
             .collect();
         Self {
@@ -289,14 +299,17 @@ impl SolutionBuilder {
     /// Builds the solution for one row, which holds a value per entry of
     /// [`SqlPlan::columns`].
     pub fn build(&self, row: &[SqlValue]) -> Result<Solution, Error> {
-        let values = self
-            .terms
-            .iter()
-            .map(|term| match term {
-                Some(term) => term.build(row, self.base_iri.as_ref()),
-                None => Ok(None),
-            })
-            .collect::<Result<_, _>>()?;
+        let mut values = Vec::with_capacity(self.terms.len());
+        for terms in &self.terms {
+            let mut value = None;
+            for term in terms {
+                value = term.build(row, self.base_iri.as_ref())?;
+                if value.is_some() {
+                    break;
+                }
+            }
+            values.push(value);
+        }
         Ok(Solution { values })
     }
 }
@@ -304,6 +317,13 @@ impl SolutionBuilder {
 impl TermBuilder {
     /// R2RML §11: `None` when a column it reads is `NULL`.
     fn build(&self, row: &[SqlValue], base: Option<&BaseIri>) -> Result<Option<Term>, Error> {
+        if self
+            .guard
+            .as_ref()
+            .is_some_and(|guard| matches!(guard.value(row), SqlValue::Null))
+        {
+            return Ok(None);
+        }
         let (lexical, natural) = match &self.value {
             ValueBuilder::Constant(term) => return Ok(Some(term.clone())),
             ValueBuilder::Column(columns) => {
