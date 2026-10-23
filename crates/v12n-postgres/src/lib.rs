@@ -6,7 +6,8 @@ mod bind;
 mod decode;
 mod error;
 
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -16,8 +17,8 @@ use tokio_postgres::{Client, Config, NoTls, RowStream, Statement};
 use v12n_core::mapping::LogicalTable;
 use v12n_core::solution::{Solution, SolutionBuilder, SqlValue};
 use v12n_core::sql::{
-    ColumnTypes, RenderOptions, SqlPlan, TableKeys, column_type_probe, quote_identifier,
-    quote_table_name,
+    ColumnTypes, RenderOptions, SqlPlan, TableKeys, column_name_probe, column_type_probe,
+    quote_identifier, quote_table_name,
 };
 
 use bind::{Bound, bind};
@@ -111,6 +112,8 @@ impl Database {
     pub async fn execute(&self, plan: &SqlPlan) -> Result<Solutions, Error> {
         let timeout = self.limits.statement_timeout;
         let pg = |e| Error::from_postgres(e, timeout);
+        let plan = self.resolve_columns(plan).await.map_err(pg)?;
+        let plan = plan.as_ref();
         let column_types = self.column_types(plan).await.map_err(pg)?;
         let keys = self.load_table_keys(plan).await.map_err(pg)?;
         let options = RenderOptions {
@@ -260,6 +263,29 @@ impl Database {
             keys.entry(tables[table].clone()).or_default().push(columns);
         }
         Ok(Some(keys))
+    }
+
+    /// The plan with every column name that PostgreSQL may fold
+    /// (`folded_identifier`) replaced by the name PostgreSQL resolves it
+    /// to, read from the result columns of a prepared probe statement.
+    /// The database applies its own folding rules, which depend on the
+    /// encoding, and an `rr:sqlQuery` names its columns as PostgreSQL
+    /// does (`AS StudentId` is `studentid`, `count(*)` is `count`).
+    async fn resolve_columns<'p>(
+        &self,
+        plan: &'p SqlPlan,
+    ) -> Result<Cow<'p, SqlPlan>, tokio_postgres::Error> {
+        let columns = plan.folded_columns();
+        if columns.is_empty() {
+            return Ok(Cow::Borrowed(plan));
+        }
+        let probe = self.client.prepare(&column_name_probe(&columns)).await?;
+        let resolved: HashMap<_, _> = columns
+            .into_iter()
+            .zip(probe.columns())
+            .map(|(column, c)| (column, c.name().to_owned()))
+            .collect();
+        Ok(Cow::Owned(plan.with_resolved_columns(&resolved)))
     }
 
     /// Types of the columns the plan compares as RDF terms, read by
