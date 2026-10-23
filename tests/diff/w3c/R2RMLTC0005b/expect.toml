@@ -1,0 +1,18 @@
+# Duplicate rows: v12n returns the triple once per row, Ontop once (#32).
+
+[query.amount]
+expect = "mismatch"
+issue = 32
+
+[query.fname]
+expect = "mismatch"
+issue = 32
+
+[query.lname]
+expect = "mismatch"
+issue = 32
+
+[query.type-ious]
+expect = "mismatch"
+issue = 32
+

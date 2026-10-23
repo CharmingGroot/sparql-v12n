@@ -1,0 +1,25 @@
+# Duplicate rows: v12n returns the triple once per row, Ontop once (#32).
+
+[query.amount]
+expect = "mismatch"
+issue = 32
+
+[query.city]
+expect = "mismatch"
+issue = 32
+
+[query.fname]
+expect = "mismatch"
+issue = 32
+
+[query.lname]
+expect = "mismatch"
+issue = 32
+
+[query.type-lives]
+expect = "mismatch"
+issue = 32
+
+# The join on ?s compares blank nodes built from a float8 column.
+[query.type-ious]
+expect = "rejected"

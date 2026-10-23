@@ -18,7 +18,8 @@ pub use error::Error;
 /// Base PostgreSQL URL. Each case is loaded into its own database, named
 /// by [`Case::database`], which replaces the database in this URL.
 pub const DATABASE_URL_VAR: &str = "V12N_DIFF_DATABASE_URL";
-/// Path of a file with one `<case> <Ontop SPARQL endpoint URL>` per line.
+/// Path of a file with one `<case> <Ontop SPARQL endpoint URL>` per line;
+/// the URL is `-` when Ontop did not start with the case's mapping.
 pub const ENDPOINTS_VAR: &str = "V12N_DIFF_ENDPOINTS";
 
 /// What a passing check did.
@@ -56,25 +57,48 @@ pub fn check(case_dir: &str, query: &str) {
     }
 }
 
-/// Runs one query of the case in `case_dir`. Queries expected to be
-/// rejected need neither a database nor Ontop.
+/// Runs one query of the case in `case_dir`. Queries that planning
+/// rejects need neither a database nor Ontop.
 pub fn run(case_dir: &Path, query: &str) -> Result<Outcome, Error> {
     let case = Case::load(case_dir)?;
     let query = case.query(query)?;
     let label = format!("{}/{}", case.name, query.name);
 
-    if query.expect == Expectation::Rejected {
-        return engine::check_rejected(&case.mapping, &query.text)
-            .map(|feature| Outcome::Rejected { feature })
-            .map_err(|message| Error::Failed(format!("{label}: {message}")));
+    let failed = |message: String| Error::Failed(format!("{label}: {message}"));
+    if query.expect == Expectation::Rejected
+        && let Some(feature) =
+            engine::rejected_at_planning(&case.mapping, &query.text).map_err(failed)?
+    {
+        return Ok(Outcome::Rejected { feature });
     }
 
     let Some(environment) = Environment::from_env()? else {
         return Ok(Outcome::Skipped);
     };
-    let endpoint = environment.endpoint(&case.name)?;
-    let expected = ontop::query(&endpoint, &query.text);
     let database_url = with_database(&environment.database_url, &case.database())?;
+
+    if query.expect == Expectation::Rejected {
+        // Some checks need the column types, so they reject at execution.
+        return match engine::run(&database_url, &case.mapping, &query.text) {
+            Err(engine::Failure::Unsupported(feature)) => Ok(Outcome::Rejected { feature }),
+            Err(engine::Failure::Other(e)) => Err(failed(format!(
+                "expected an unsupported-feature error, got: {e}"
+            ))),
+            Ok(_) => Err(failed(
+                "expected an unsupported-feature error, but the engine answers; remove \
+                 `expect = \"rejected\"` from expect.toml so it is compared with Ontop"
+                    .to_owned(),
+            )),
+        };
+    }
+
+    let endpoint = environment.endpoint(&case.name)?;
+    // "-": Ontop refused the mapping at startup (see testenv/difftest.sh).
+    let expected = if endpoint == "-" {
+        Err("Ontop did not start with this mapping; its container log has the cause".to_owned())
+    } else {
+        ontop::query(&endpoint, &query.text)
+    };
     let actual = engine::run(&database_url, &case.mapping, &query.text);
 
     match query.expect {

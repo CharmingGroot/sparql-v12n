@@ -1,0 +1,3 @@
+# W3C R2RML test R2RMLTC0020a: Generation of triples by using IRI value in columns
+sql = "../../../w3c/rdb2rdf/D020-1table1column5rows/create.sql"
+mapping = "../../../w3c/rdb2rdf/D020-1table1column5rows/r2rmla.ttl"

@@ -175,7 +175,8 @@ and then:
 | `crates/v12n-difftest` | Differential tests against Ontop, one test per case query |
 | `examples/shop` | Example schema, data, mapping and queries |
 | `testenv` | Local PostgreSQL and the Ontop reference endpoint for tests |
-| `tests/diff` | Differential test cases (`examples/` are cases too) |
+| `tests/diff` | Differential test cases (`examples/` are cases too), W3C R2RML cases in `tests/diff/w3c` |
+| `tests/w3c/rdb2rdf` | W3C RDB2RDF test files, unmodified subset (W3C Document License) |
 
 ## License
 

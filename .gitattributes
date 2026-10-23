@@ -1,0 +1,2 @@
+# Vendored W3C test files: keep them byte for byte (some use CRLF).
+tests/w3c/** -text

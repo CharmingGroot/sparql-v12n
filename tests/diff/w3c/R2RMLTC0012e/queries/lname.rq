@@ -1,0 +1,4 @@
+# Subjects are blank nodes, so only the objects are compared.
+SELECT ?o WHERE {
+  ?s <http://example.com/base/IOUs#lname> ?o .
+}

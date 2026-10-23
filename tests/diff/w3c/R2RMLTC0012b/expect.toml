@@ -1,0 +1,10 @@
+# Duplicate rows: v12n returns the triple once per row, Ontop once (#32).
+
+[query.city]
+expect = "mismatch"
+issue = 32
+
+[query.name]
+expect = "mismatch"
+issue = 32
+

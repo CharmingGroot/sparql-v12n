@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Case directories: `schema.sql`, `data.sql`, `mapping.ttl`,
+//! Case directories: `schema.sql`, `data.sql` and `mapping.ttl`, or a
+//! `case.toml` that points at SQL and mapping files kept elsewhere (the
+//! vendored W3C test cases, which must stay unmodified); then
 //! `queries/*.rq` and an optional `expect.toml`.
 
 use std::collections::BTreeMap;
@@ -46,6 +48,15 @@ pub struct QueryCase {
     pub expect: Expectation,
 }
 
+/// `case.toml`: paths relative to the case directory. One string per key,
+/// since `testenv/difftest.sh` reads them with `sed`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaseFile {
+    sql: String,
+    mapping: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExpectFile {
@@ -77,7 +88,21 @@ impl Case {
             .and_then(|n| n.to_str())
             .ok_or_else(|| Error::case(dir, "case directory has no UTF-8 name"))?
             .to_owned();
-        let mapping = read(&dir.join("mapping.ttl"))?;
+        let case_path = dir.join("case.toml");
+        let mapping = if case_path.is_file() {
+            let file: CaseFile =
+                toml::from_str(&read(&case_path)?).map_err(|e| Error::case(&case_path, e))?;
+            let sql = dir.join(&file.sql);
+            if !sql.is_file() {
+                return Err(Error::case(
+                    &case_path,
+                    format!("no SQL file {}", sql.display()),
+                ));
+            }
+            read(&dir.join(&file.mapping))?
+        } else {
+            read(&dir.join("mapping.ttl"))?
+        };
         let queries = query_names(dir)?;
 
         let expect_path = dir.join("expect.toml");

@@ -1,0 +1,4 @@
+# The table has no rows, so both engines must return no solutions.
+SELECT ?s ?o WHERE {
+  ?s <http://xmlns.com/foaf/0.1/name> ?o .
+}

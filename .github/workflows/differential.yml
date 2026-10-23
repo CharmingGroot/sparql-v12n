@@ -11,6 +11,7 @@ on:
       - "crates/v12n-difftest/**"
       - "examples/**"
       - "tests/diff/**"
+      - "tests/w3c/**"
       - "testenv/difftest.sh"
       - "testenv/fetch-jdbc.sh"
       - "Cargo.lock"
@@ -36,6 +37,12 @@ jobs:
   ontop:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # Cases are split across jobs because every case needs its own Ontop
+    # JVM; a shard runs its cases in batches of DIFF_BATCH containers.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -59,9 +66,11 @@ jobs:
       - run: testenv/difftest.sh
         env:
           DIFF_NEXTEST_PROFILE: ci
+          DIFF_SHARD: ${{ matrix.shard }}/4
+          DIFF_BATCH: 10
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: junit-differential
-          path: target/nextest/ci/junit.xml
+          name: junit-differential-${{ matrix.shard }}
+          path: target/nextest/ci/junit-*.xml
           if-no-files-found: warn

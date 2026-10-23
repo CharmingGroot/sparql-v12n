@@ -1,0 +1,3 @@
+SELECT ?s WHERE {
+  ?s a <http://xmlns.com/foaf/0.1/Person> .
+}

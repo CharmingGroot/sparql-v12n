@@ -1,0 +1,3 @@
+# W3C R2RML test R2RMLTC0012b: Duplicate tuples generate same blank node
+sql = "../../../w3c/rdb2rdf/D012-2tables2duplicates0nulls/create.sql"
+mapping = "../../../w3c/rdb2rdf/D012-2tables2duplicates0nulls/r2rmlb.ttl"

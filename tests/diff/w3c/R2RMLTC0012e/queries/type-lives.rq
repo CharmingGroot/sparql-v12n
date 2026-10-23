@@ -1,0 +1,6 @@
+# Members of the class, through their <http://example.com/base/IOUs#city> values: the
+# subjects are blank nodes, which are not compared.
+SELECT ?o WHERE {
+  ?s a <http://example.com/base/Lives> ;
+    <http://example.com/base/IOUs#city> ?o .
+}
