@@ -165,7 +165,9 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           missing=0
-          for c in $(git rev-list "$BASE..$HEAD"); do
+          # Merge commits from GitHub's "Update branch" carry no sign-off and
+          # are dropped by the squash merge, so only authored commits count.
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
             author=$(git log -1 --format='%an <%ae>' "$c")
             case "$author" in *"[bot]"*) continue ;; esac
             if ! git log -1 --format=%B "$c" | grep -qF "Signed-off-by: $author"; then
