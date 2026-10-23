@@ -152,9 +152,10 @@ using an index on `id`.
 | `crates/v12n-postgres` | Execution on PostgreSQL and key metadata introspection |
 | `crates/v12n-server` | SPARQL 1.1 Protocol HTTP endpoint |
 | `crates/v12n-cli` | The `v12n` command |
+| `crates/v12n-difftest` | Differential tests against Ontop, one test per case query |
 | `examples/shop` | Example schema, data, mapping and queries |
-| `testenv` | Local PostgreSQL (and later the reference endpoint) for tests |
-| `tests/diff` | Differential test cases |
+| `testenv` | Local PostgreSQL and the Ontop reference endpoint for tests |
+| `tests/diff` | Differential test cases (`examples/` are cases too) |
 
 ## License
 

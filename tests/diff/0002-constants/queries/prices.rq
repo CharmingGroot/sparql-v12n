@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# numeric(10,2) values as xsd:decimal literals.
+SELECT ?s ?p WHERE { ?s ex:price ?p }

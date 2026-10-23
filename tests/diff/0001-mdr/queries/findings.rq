@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# Every finding with its title and integer severity.
+SELECT ?finding ?title ?severity WHERE {
+  ?finding a ex:DetectionFinding ; ex:title ?title ; ex:severityId ?severity .
+}

@@ -1,0 +1,44 @@
+# Known differences from Ontop. Each check fails once the difference is
+# gone, so these entries are removed together with the issue.
+
+# v12n fails in PostgreSQL: UNION types integer and text cannot be matched.
+[query.all-values]
+expect = "mismatch"
+issue = 24
+
+[query.template-constant]
+expect = "mismatch"
+issue = 24
+
+[query.template-non-canonical]
+expect = "mismatch"
+issue = 24
+
+[query.template-out-of-range]
+expect = "mismatch"
+issue = 24
+
+# Ontop keeps the numeric scale (12.50); v12n writes the canonical 12.5.
+[query.prices]
+expect = "mismatch"
+issue = 25
+
+[query.price-constant]
+expect = "mismatch"
+issue = 25
+
+# Ontop matches the uppercase uuid by value; the RDF terms differ.
+[query.uuid-uppercase]
+expect = "mismatch"
+issue = 26
+
+# Ontop rejects ill-typed xsd:date constants; they match nothing.
+[query.date-non-canonical]
+expect = "ontop-error"
+issue = 26
+solutions = 0
+
+[query.date-invalid]
+expect = "ontop-error"
+issue = 26
+solutions = 0

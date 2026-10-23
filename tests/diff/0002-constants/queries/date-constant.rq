@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# An xsd:date constant in canonical form.
+SELECT ?s WHERE { ?s ex:measuredOn "2024-02-29"^^xsd:date }

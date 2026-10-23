@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# The lowercase text form PostgreSQL prints.
+SELECT ?s WHERE { ?s ex:device "00000000-0000-0000-0000-00000000000a" }

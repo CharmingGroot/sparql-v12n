@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Matches reading 1 only; the text '120' is a different term.
+SELECT ?s WHERE { ?s ex:value 120 }

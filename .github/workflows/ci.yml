@@ -66,6 +66,49 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: warn
 
+  # L3: tests that need PostgreSQL run against a service container with
+  # the shop example loaded. They skip themselves in the test job above.
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        # Same image as testenv/difftest.sh, pinned by digest.
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_USER: v12n
+          POSTGRES_PASSWORD: v12n-dev
+          POSTGRES_DB: shop
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U v12n -d shop"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      V12N_TEST_DATABASE_URL: postgresql://v12n:v12n-dev@127.0.0.1:55432/shop
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Load the shop example
+        env:
+          CONTAINER: ${{ job.services.postgres.id }}
+        run: cat examples/shop/schema.sql examples/shop/data.sql | docker exec -i "$CONTAINER" psql -q -v ON_ERROR_STOP=1 -U v12n -d shop
+      # Integration test binaries only; the differential tests have their
+      # own workflow.
+      - run: cargo nextest run --workspace --locked --profile ci -E 'kind(test) - package(v12n-difftest)'
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: junit-postgres
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 10

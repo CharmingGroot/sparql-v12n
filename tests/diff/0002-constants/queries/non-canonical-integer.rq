@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Not the canonical lexical form of 120: no match.
+SELECT ?s WHERE { ?s ex:value "0120"^^xsd:integer }

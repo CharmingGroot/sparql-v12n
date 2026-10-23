@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Findings on High-criticality assets: 1001 (4), 1003 (5), 1004 (3).
+SELECT ?finding ?severity WHERE {
+  ?asset a ex:Asset ; ex:criticality "High" .
+  ?finding ex:onAsset ?asset ; ex:severityId ?severity .
+}

@@ -23,6 +23,19 @@ docker compose up -d     # postgres, then ontop once postgres is healthy
 docker compose down -v   # stop and drop the database volume
 ```
 
+## Differential tests
+
+`difftest.sh` runs every case in `examples/` and `tests/diff/` through
+v12n and Ontop and compares the results (see `tests/diff/README.md`). It
+starts its own PostgreSQL and one Ontop container per case from a
+generated Compose file in `target/difftest/`, under the Compose project
+`v12n-difftest`, so it does not touch the environment above.
+
+```sh
+./fetch-jdbc.sh
+./difftest.sh            # up, test, down -v
+```
+
 ## Ports
 
 | Service  | Address                          |
@@ -30,6 +43,8 @@ docker compose down -v   # stop and drop the database volume
 | postgres | `127.0.0.1:55432`, database `shop` |
 | ontop    | `http://127.0.0.1:58080/sparql`  |
 | `v12n serve --config v12n.toml` | `http://127.0.0.1:57878/sparql` |
+| `difftest.sh` postgres | `127.0.0.1:55433` (`DIFF_PG_PORT`), one database `diff_<case>` per case |
+| `difftest.sh` ontop | `http://127.0.0.1:58100/sparql` and up, one per case (`DIFF_ONTOP_PORT`) |
 
 All are bound to localhost only. The credentials in `docker-compose.yml`,
 `ontop/shop.properties` and `v12n.toml` (`v12n` / `v12n-dev`) are for local
@@ -44,6 +59,7 @@ V12N_TEST_DATABASE_URL=postgresql://v12n:v12n-dev@127.0.0.1:55432/shop cargo tes
 
 ## Files
 
+- `difftest.sh`: differential tests of every case against Ontop
 - `compare.sh`: differential check of `v12n query` and `v12n serve` against Ontop
 - `v12n.toml`: `v12n serve` settings for this environment
 - `ontop/shop.properties`: JDBC connection to the `postgres` service

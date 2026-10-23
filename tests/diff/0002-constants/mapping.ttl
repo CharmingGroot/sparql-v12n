@@ -1,0 +1,17 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#ReadingMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "readings" ] ;
+  rr:subjectMap [ rr:template "http://example.org/item/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:value ; rr:objectMap [ rr:column "value" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:measuredOn ; rr:objectMap [ rr:column "measured_on" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:device ; rr:objectMap [ rr:column "device" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:price ; rr:objectMap [ rr:column "price" ] ] .
+
+# ex:value again, from a text column, with the same subject template: a
+# constant object can match only one of the two UNION branches.
+<#LabelMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "labels" ] ;
+  rr:subjectMap [ rr:template "http://example.org/item/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:value ; rr:objectMap [ rr:column "value" ] ] .

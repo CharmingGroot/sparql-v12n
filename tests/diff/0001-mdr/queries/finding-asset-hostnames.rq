@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Template object joined with the asset subject template.
+SELECT ?finding ?hostname WHERE {
+  ?finding ex:onAsset ?asset .
+  ?asset ex:hostname ?hostname .
+}

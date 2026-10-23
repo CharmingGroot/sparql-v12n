@@ -1,0 +1,67 @@
+name: Differential
+
+# L4: the same queries through this engine and Ontop (testenv/difftest.sh).
+# Pull requests run it only when they change what produces or checks the
+# results; the nightly run covers everything else.
+on:
+  pull_request:
+    paths:
+      - "crates/v12n-core/**"
+      - "crates/v12n-postgres/**"
+      - "crates/v12n-difftest/**"
+      - "examples/**"
+      - "tests/diff/**"
+      - "testenv/difftest.sh"
+      - "testenv/fetch-jdbc.sh"
+      - "Cargo.lock"
+      - ".config/nextest.toml"
+      - ".github/workflows/differential.yml"
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: differential-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+permissions:
+  contents: read
+
+jobs:
+  ontop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - uses: actions/cache@v6
+        with:
+          path: testenv/jdbc
+          key: jdbc-${{ hashFiles('testenv/fetch-jdbc.sh') }}
+      # Checks the checksum of a cached driver too.
+      - run: testenv/fetch-jdbc.sh
+      # A separate step, so the log shows pull time apart from the tests.
+      - name: Pull pinned images
+        run: |
+          grep -oE '"(postgres|ontop/ontop):[^"]+"' testenv/difftest.sh | tr -d '"' |
+            xargs -n1 -P2 docker pull -q
+      - run: testenv/difftest.sh
+        env:
+          DIFF_NEXTEST_PROFILE: ci
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: junit-differential
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn

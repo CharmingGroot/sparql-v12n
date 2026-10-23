@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Dates as xsd:date literals.
+SELECT ?s ?d WHERE { ?s ex:measuredOn ?d }

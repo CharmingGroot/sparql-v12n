@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A subject IRI whose id is out of range for the integer column.
+SELECT ?v WHERE { <http://example.org/item/99999999999> ex:value ?v }

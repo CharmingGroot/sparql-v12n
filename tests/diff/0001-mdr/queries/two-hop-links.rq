@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# The only two-hop path is dev-02 -> web-01 -> db-01.
+SELECT ?first ?second ?third WHERE {
+  ?first ex:connectsTo ?second .
+  ?second ex:connectsTo ?third .
+}
