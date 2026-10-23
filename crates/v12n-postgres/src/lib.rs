@@ -55,7 +55,23 @@ impl Database {
     ///
     /// Must be called inside a Tokio runtime, which drives the connection.
     pub async fn connect(url: &str, limits: Limits) -> Result<Self, Error> {
+        let config: Config = url.parse().map_err(Error::config)?;
+        Self::connect_config(config, limits).await
+    }
+
+    /// Like [`connect`](Self::connect), with a password kept out of the
+    /// URL, for example one read from a separate environment variable.
+    pub async fn connect_with_password(
+        url: &str,
+        password: &str,
+        limits: Limits,
+    ) -> Result<Self, Error> {
         let mut config: Config = url.parse().map_err(Error::config)?;
+        config.password(password);
+        Self::connect_config(config, limits).await
+    }
+
+    async fn connect_config(mut config: Config, limits: Limits) -> Result<Self, Error> {
         if config.get_connect_timeout().is_none() {
             config.connect_timeout(DEFAULT_CONNECT_TIMEOUT);
         }
@@ -79,6 +95,11 @@ impl Database {
         Ok(Self { client, limits })
     }
 
+    /// Whether the connection is gone, e.g. after a server restart.
+    pub fn is_closed(&self) -> bool {
+        self.client.is_closed()
+    }
+
     /// Runs a plan. Rows are fetched as the returned [`Solutions`] are read.
     pub async fn execute(&self, plan: &SqlPlan) -> Result<Solutions, Error> {
         let timeout = self.limits.statement_timeout;
@@ -88,31 +109,26 @@ impl Database {
         // happens to have exactly `row_limit` rows.
         let fetch = (self.limits.row_limit > 0)
             .then(|| i64::try_from(self.limits.row_limit.saturating_add(1)).unwrap_or(i64::MAX));
-        let limit_clause = match fetch {
-            Some(_) => format!("\nLIMIT ${}", rendered.params.len() + 1),
-            None => String::new(),
+        let limited = |sql: &str| match fetch {
+            Some(_) => count_rows(sql, rendered.params.len() + 1),
+            None => sql.to_owned(),
         };
 
         let mut statement = self
             .client
-            .prepare(&format!("{}{limit_clause}", rendered.sql))
+            .prepare(&limited(&rendered.sql))
             .await
             .map_err(pg)?;
-        let decoders: Vec<Option<Decoder>> = statement
-            .columns()
+        let data_columns = statement.columns().len() - usize::from(fetch.is_some());
+        let decoders: Vec<Option<Decoder>> = statement.columns()[..data_columns]
             .iter()
             .map(|c| Decoder::for_type(c.type_()))
             .collect();
         if decoders.iter().any(Option::is_none) && decoders.len() == plan.columns.len() {
             let sql = cast_to_text(&rendered.sql, &plan.columns, &decoders);
-            statement = self
-                .client
-                .prepare(&format!("{sql}{limit_clause}"))
-                .await
-                .map_err(pg)?;
+            statement = self.client.prepare(&limited(&sql)).await.map_err(pg)?;
         }
-        let decoders = statement
-            .columns()
+        let decoders = statement.columns()[..data_columns]
             .iter()
             .map(|c| Decoder::for_type(c.type_()).unwrap_or(Decoder::Text))
             .collect();
@@ -157,6 +173,16 @@ impl Database {
         }
         self.client.query_raw(statement, bound).await
     }
+}
+
+/// Wraps `sql` so that every row also carries the number of rows, at most
+/// `$limit`, in an extra last column. The first row then tells whether
+/// the result exceeds the row limit, before any solution is handed out,
+/// so an HTTP response can mark the truncation in a header. PostgreSQL
+/// buffers the limited rows for the window; the client still streams.
+/// An empty `OVER ()` adds no sort, so the order of `sql` is kept.
+fn count_rows(sql: &str, limit_param: usize) -> String {
+    format!("SELECT q.*, count(*) OVER ()\nFROM (\n{sql}\nLIMIT ${limit_param}\n) q")
 }
 
 /// R2RML §10.2: a value whose type has no natural datatype becomes a plain
@@ -212,10 +238,17 @@ impl Solutions {
                 return Err(Error::from_postgres(e, self.timeout));
             }
         };
-        if self.row_limit > 0 && self.returned == self.row_limit {
-            self.truncated = true;
-            self.rows = None;
-            return Ok(None);
+        if self.row_limit > 0 {
+            if self.returned == 0 {
+                let total: i64 = row
+                    .try_get(self.decoders.len())
+                    .map_err(|e| Error::Database(e.to_string()))?;
+                self.truncated = u64::try_from(total).unwrap_or(0) > self.row_limit;
+            }
+            if self.returned == self.row_limit {
+                self.rows = None;
+                return Ok(None);
+            }
         }
         self.returned += 1;
         let values = self
@@ -235,7 +268,8 @@ impl Solutions {
         Ok(Some(self.builder.build(&values)?))
     }
 
-    /// Whether the result had more rows than the row limit.
+    /// Whether the result has more rows than the row limit. Known once
+    /// the first solution has been read.
     pub fn is_truncated(&self) -> bool {
         self.truncated
     }

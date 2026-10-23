@@ -58,6 +58,11 @@ impl<W: Write> JsonResultsWriter<W> {
         Ok(())
     }
 
+    /// The underlying writer, e.g. to drain a buffer between solutions.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.out
+    }
+
     /// Closes the document and returns the writer, unflushed.
     pub fn finish(mut self) -> io::Result<W> {
         self.out.write_all(b"\n]}}\n")?;

@@ -13,6 +13,7 @@ use v12n_core::results::JsonResultsWriter;
 use v12n_core::sql::SqlPlan;
 use v12n_core::{sparql, unfold};
 use v12n_postgres::{DEFAULT_ROW_LIMIT, Database, Limits, Solutions};
+use v12n_server::config::{Config, env, parse_duration};
 
 /// Exit codes are part of the CLI contract; scripts and agents rely on them.
 const EXIT_INPUT: u8 = 1;
@@ -48,6 +49,32 @@ output has started is reported on stderr and leaves stdout incomplete.
 ",
     exit_codes_help!()
 );
+
+const SERVE_HELP: &str = "Examples:
+  v12n serve --config v12n.toml
+  V12N_DATABASE_URL=postgresql://reader@localhost/shop V12N_MAPPING=mapping.ttl v12n serve
+  curl -H 'Accept: application/sparql-results+json' --data-urlencode query@query.rq http://127.0.0.1:7878/sparql
+
+Settings (file key, environment variable, default):
+  [server] address                  V12N_ADDRESS                  127.0.0.1
+  [server] port                     V12N_PORT                     7878
+  [database] url                    V12N_DATABASE_URL             required
+  [database] password_env           (file only)                   none
+  [mapping] path                    V12N_MAPPING                  required
+  [limits] statement_timeout        V12N_STATEMENT_TIMEOUT        30s (0: none)
+  [limits] row_limit                V12N_ROW_LIMIT                10000 (0: none)
+  [limits] max_query_bytes          V12N_MAX_QUERY_BYTES          65536
+  [limits] max_concurrent_requests  V12N_MAX_CONCURRENT_REQUESTS  16
+
+Environment variables override the file. Other V12N_* variables are
+ignored with a warning in the log.
+
+A relative mapping path in the file is relative to the file. Connect as a
+database user that can only read; sessions are also set read-only.
+Logs go to stderr; RUST_LOG sets the level (default info).
+
+Exit codes: 1 invalid settings or address in use, 2 invalid mapping,
+3 database unreachable at startup.";
 
 #[derive(Parser)]
 #[command(
@@ -104,17 +131,22 @@ enum Command {
         /// SPARQL SELECT query, or `-` for stdin
         query: PathBuf,
         /// PostgreSQL connection URL, e.g. postgresql://reader@localhost/shop
-        #[arg(long, env = "V12N_DATABASE_URL", hide_env_values = true)]
+        #[arg(long, env = env::DATABASE_URL, hide_env_values = true)]
         db: Option<String>,
         /// Most solutions to return; 0 means no limit
-        #[arg(long, default_value_t = DEFAULT_ROW_LIMIT)]
+        #[arg(long, env = env::ROW_LIMIT, default_value_t = DEFAULT_ROW_LIMIT)]
         row_limit: u64,
         /// Statement timeout such as 500ms, 30s or 2m; 0 disables it
-        #[arg(long, default_value = "30s", value_parser = parse_duration)]
+        #[arg(long, env = env::STATEMENT_TIMEOUT, default_value = "30s", value_parser = parse_duration)]
         timeout: Duration,
     },
-    /// Serve the SPARQL 1.1 Protocol endpoint
-    Serve,
+    /// Serve the SPARQL 1.1 Protocol endpoint at /sparql
+    #[command(after_help = SERVE_HELP)]
+    Serve {
+        /// TOML settings file; the environment variables below override it
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 /// A failure to report: exit code, error kind for JSON output, message.
@@ -172,7 +204,7 @@ fn main() -> ExitCode {
             },
             format,
         ),
-        Command::Serve => not_implemented("serve"),
+        Command::Serve { config } => serve(config.as_deref()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -190,31 +222,6 @@ fn main() -> ExitCode {
             }
             ExitCode::from(failure.code)
         }
-    }
-}
-
-fn not_implemented(command: &str) -> Result<(), Failure> {
-    Err(Failure::new(
-        EXIT_INPUT,
-        "not_implemented",
-        format!("v12n {command}: not implemented yet"),
-    ))
-}
-
-/// `500ms`, `30s`, `2m`, or a bare number of seconds.
-fn parse_duration(text: &str) -> Result<Duration, String> {
-    let (number, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
-        Some(at) => text.split_at(at),
-        None => (text, "s"),
-    };
-    let number: u64 = number
-        .parse()
-        .map_err(|_| format!("{text:?} is not a duration such as 500ms, 30s or 2m"))?;
-    match unit {
-        "ms" => Ok(Duration::from_millis(number)),
-        "s" => Ok(Duration::from_secs(number)),
-        "m" => Ok(Duration::from_secs(number.saturating_mul(60))),
-        _ => Err(format!("unknown unit {unit:?}; use ms, s or m")),
     }
 }
 
@@ -411,6 +418,45 @@ fn query(
         }
         Ok(())
     })
+}
+
+fn serve(config_path: Option<&Path>) -> Result<(), Failure> {
+    init_logging();
+    let config = Config::load(config_path).map_err(server_failure)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Failure::new(EXIT_INPUT, "runtime", e.to_string()))?;
+    runtime
+        .block_on(v12n_server::serve(config))
+        .map_err(server_failure)
+}
+
+/// `RUST_LOG` takes `info`, `v12n_server=debug,warn` and the like.
+fn init_logging() {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::prelude::*;
+    let filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|value| value.parse::<Targets>().ok())
+        .unwrap_or_else(|| Targets::new().with_default(LevelFilter::INFO));
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::stderr)
+                .with_ansi(false),
+        )
+        .with(filter)
+        .init();
+}
+
+fn server_failure(error: v12n_server::Error) -> Failure {
+    use v12n_server::Error;
+    match error {
+        Error::Config(_) | Error::Io(_) => Failure::new(EXIT_INPUT, "input", error.to_string()),
+        Error::Mapping { .. } => Failure::new(EXIT_MAPPING, "mapping", error.to_string()),
+        Error::Database(e) => database_failure(e),
+    }
 }
 
 fn database_failure(error: v12n_postgres::Error) -> Failure {

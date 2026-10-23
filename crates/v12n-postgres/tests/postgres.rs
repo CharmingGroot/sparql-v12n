@@ -126,6 +126,25 @@ async fn row_limit_cuts_off_and_reports_truncation() {
     assert_eq!((rows.len(), truncated), (3, false));
 }
 
+#[tokio::test]
+async fn truncation_is_known_after_the_first_solution() {
+    let Some(url) = database_url() else { return };
+    let plan = plan(
+        SHOP,
+        "SELECT ?c WHERE { ?c a <http://example.org/Customer> }",
+    );
+    for (row_limit, truncated) in [(1, true), (2, true), (3, false), (0, false)] {
+        let limits = Limits {
+            row_limit,
+            ..Limits::default()
+        };
+        let database = Database::connect(&url, limits).await.unwrap();
+        let mut solutions = database.execute(&plan).await.unwrap();
+        assert!(solutions.try_next().await.unwrap().is_some());
+        assert_eq!(solutions.is_truncated(), truncated, "row limit {row_limit}");
+    }
+}
+
 fn sql_query_mapping(sql: &str, columns: &[&str]) -> String {
     let objects: String = columns
         .iter()

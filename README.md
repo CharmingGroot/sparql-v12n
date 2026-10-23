@@ -17,6 +17,76 @@ which tables and columns can be queried.
 | HTTP | SPARQL 1.1 Protocol endpoint at `/sparql` |
 | MCP | tools for AI agents (later) |
 
+## HTTP endpoint
+
+`v12n serve --config v12n.toml` serves the SPARQL 1.1 Protocol at `/sparql`
+(and `/healthz` for liveness):
+
+- `GET /sparql?query=...`, `POST` with `application/x-www-form-urlencoded`
+  (`query=...`), or `POST` with `application/sparql-query` and the query as
+  the body.
+- Results are SPARQL 1.1 Query Results JSON (`application/sparql-results+json`),
+  streamed as rows arrive from PostgreSQL. Other formats get `406`.
+- `default-graph-uri` and `named-graph-uri` get `400`: the dataset is the one
+  the mapping defines.
+
+| Status | When |
+|---|---|
+| `200` | Results. With a row limit, a cut-off result carries `V12N-Truncated: <row limit>` and holds exactly that many solutions |
+| `400` | Query syntax, a missing or repeated `query`, dataset parameters, a query that unfolds into too many SQL branches |
+| `406` / `413` / `414` / `415` | Format not offered / query over `max_query_bytes` in a `POST` / in a `GET` / other content type |
+| `501` | A SPARQL feature not supported yet |
+| `503` | Statement timeout before the first row, or `max_concurrent_requests` reached (with `Retry-After`) |
+| `500` | Database or other internal errors |
+
+The status is sent before the body, so an error after the first row cannot
+change it: the server aborts the response (the JSON stays unterminated) and
+logs the error. Whether a result is truncated is known before the first row,
+because PostgreSQL counts the rows up to the limit before sending them.
+
+Settings come from a TOML file (`--config`); environment variables override it:
+
+```toml
+[server]
+address = "127.0.0.1"
+port = 7878
+
+[database]
+url = "postgresql://reader@localhost/shop"
+password_env = "SHOP_DB_PASSWORD"   # optional: read the password from this variable
+
+[mapping]
+path = "mapping.ttl"                # relative to this file
+
+[limits]
+statement_timeout = "30s"           # 0 disables
+row_limit = 10000                   # 0 disables
+max_query_bytes = 65536
+max_concurrent_requests = 16        # more are refused with 503, not queued
+```
+
+| Setting | Environment variable | Default |
+|---|---|---|
+| `[server] address` | `V12N_ADDRESS` | `127.0.0.1` |
+| `[server] port` | `V12N_PORT` | `7878` |
+| `[database] url` | `V12N_DATABASE_URL` | required |
+| `[database] password_env` | (file only) | none |
+| `[mapping] path` | `V12N_MAPPING` | required |
+| `[limits] statement_timeout` | `V12N_STATEMENT_TIMEOUT` | `30s` |
+| `[limits] row_limit` | `V12N_ROW_LIMIT` | `10000` |
+| `[limits] max_query_bytes` | `V12N_MAX_QUERY_BYTES` | `65536` |
+| `[limits] max_concurrent_requests` | `V12N_MAX_CONCURRENT_REQUESTS` | `16` |
+
+`v12n query` reads the same `V12N_DATABASE_URL`, `V12N_ROW_LIMIT` and
+`V12N_STATEMENT_TIMEOUT`, below its command-line options. `serve` ignores other
+`V12N_*` variables and logs a warning for each, so a misspelled name is
+visible.
+
+Connect as a database user that can only read; sessions are also set to
+read-only transactions. The database URL and password are never logged. Request
+logs (stderr, level from `RUST_LOG`) carry the generated SQL and timings, not
+result values. TLS, authentication and CORS belong to a reverse proxy in front.
+
 ## Layout
 
 | Path | Contents |

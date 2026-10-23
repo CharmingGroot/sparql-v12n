@@ -1,0 +1,530 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Server settings: built-in defaults, then a TOML file, then `V12N_*`
+//! environment variables.
+
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Deserialize;
+use v12n_postgres::{DEFAULT_ROW_LIMIT, DEFAULT_STATEMENT_TIMEOUT, Limits};
+
+use crate::Error;
+
+/// Prefix of the environment variables that override the file.
+pub const ENV_PREFIX: &str = "V12N_";
+/// The environment variables `serve` reads, one per setting, in the order
+/// of the file. `v12n query` reads the ones it shares with `serve`.
+pub mod env {
+    pub const ADDRESS: &str = "V12N_ADDRESS";
+    pub const PORT: &str = "V12N_PORT";
+    pub const DATABASE_URL: &str = "V12N_DATABASE_URL";
+    pub const MAPPING: &str = "V12N_MAPPING";
+    pub const STATEMENT_TIMEOUT: &str = "V12N_STATEMENT_TIMEOUT";
+    pub const ROW_LIMIT: &str = "V12N_ROW_LIMIT";
+    pub const MAX_QUERY_BYTES: &str = "V12N_MAX_QUERY_BYTES";
+    pub const MAX_CONCURRENT_REQUESTS: &str = "V12N_MAX_CONCURRENT_REQUESTS";
+
+    pub const ALL: [&str; 8] = [
+        ADDRESS,
+        PORT,
+        DATABASE_URL,
+        MAPPING,
+        STATEMENT_TIMEOUT,
+        ROW_LIMIT,
+        MAX_QUERY_BYTES,
+        MAX_CONCURRENT_REQUESTS,
+    ];
+}
+/// Default listen address: loopback, so that exposing the endpoint is a
+/// deliberate choice.
+pub const DEFAULT_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+pub const DEFAULT_PORT: u16 = 7878;
+/// Default for [`ServerLimits::max_query_bytes`].
+pub const DEFAULT_MAX_QUERY_BYTES: usize = 64 * 1024;
+/// Default for [`ServerLimits::max_concurrent_requests`].
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 16;
+
+/// Everything `v12n serve` needs.
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub listen: SocketAddr,
+    pub database: DatabaseConfig,
+    /// R2RML mapping in Turtle.
+    pub mapping: PathBuf,
+    pub limits: ServerLimits,
+}
+
+/// How to reach PostgreSQL. `Debug` never shows the URL or the password.
+#[derive(Clone)]
+pub struct DatabaseConfig {
+    pub url: String,
+    /// Read from the variable named by `password_env`, if set.
+    pub password: Option<String>,
+}
+
+impl fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("url", &"<redacted>")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Resource limits of the endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerLimits {
+    /// Statement timeout and row limit of every query.
+    pub query: Limits,
+    /// Longest query text accepted, in bytes after URL decoding.
+    pub max_query_bytes: usize,
+    /// Requests served at once; more are refused with 503, not queued.
+    pub max_concurrent_requests: usize,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            query: Limits::default(),
+            max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+        }
+    }
+}
+
+/// The file as written; every field is optional so that defaults and
+/// environment variables can fill the rest.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawConfig {
+    server: RawServer,
+    database: RawDatabase,
+    mapping: RawMapping,
+    limits: RawLimits,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawServer {
+    address: Option<IpAddr>,
+    port: Option<u16>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawDatabase {
+    url: Option<String>,
+    password_env: Option<String>,
+}
+
+impl fmt::Debug for RawDatabase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawDatabase")
+            .field("password_env", &self.password_env)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawMapping {
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawLimits {
+    statement_timeout: Option<RawDuration>,
+    row_limit: Option<u64>,
+    max_query_bytes: Option<usize>,
+    max_concurrent_requests: Option<usize>,
+}
+
+/// `"30s"` or a number of seconds.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawDuration {
+    Seconds(u64),
+    Text(String),
+}
+
+impl Config {
+    /// Reads the file at `path`, if any, then applies the process
+    /// environment. Unrecognized `V12N_*` variables are logged as warnings.
+    pub fn load(path: Option<&Path>) -> Result<Self, Error> {
+        let file = match path {
+            Some(path) => Some((
+                std::fs::read_to_string(path)
+                    .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?,
+                path,
+            )),
+            None => None,
+        };
+        let vars: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        // Before parsing, so that the warning also explains a missing
+        // setting that was given under a misspelled name.
+        for name in unrecognized_env(vars.iter().map(|(k, _)| k.as_str())) {
+            tracing::warn!(
+                "ignoring environment variable {name}: not a setting; known: {}",
+                env::ALL.join(", ")
+            );
+        }
+        Self::from_sources(
+            file.as_ref().map(|(text, path)| (text.as_str(), *path)),
+            vars,
+            |name| std::env::var(name).ok(),
+        )
+    }
+
+    /// Builds the configuration from file text and its path (relative
+    /// mapping paths are resolved against the file's directory), the
+    /// environment variables, and a lookup for `password_env`. Variables
+    /// that name no setting are ignored; see [`unrecognized_env`].
+    pub fn from_sources(
+        file: Option<(&str, &Path)>,
+        vars: impl IntoIterator<Item = (String, String)>,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, Error> {
+        let mut raw = match file {
+            Some((text, path)) => {
+                // Only the message and line: the default rendering quotes
+                // the source line, which may hold the database password.
+                let mut raw: RawConfig = toml::from_str(text).map_err(|e| {
+                    let line = e
+                        .span()
+                        .map(|span| text[..span.start].matches('\n').count() + 1)
+                        .map(|n| format!(" (line {n})"))
+                        .unwrap_or_default();
+                    Error::Config(format!("{}{line}: {}", path.display(), e.message()))
+                })?;
+                if let Some(mapping) = &mut raw.mapping.path
+                    && mapping.is_relative()
+                {
+                    let dir = path.parent().unwrap_or(Path::new(""));
+                    *mapping = dir.join(&*mapping);
+                }
+                raw
+            }
+            None => RawConfig::default(),
+        };
+        let mut vars: Vec<(String, String)> = vars
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(ENV_PREFIX))
+            .collect();
+        vars.sort();
+        for (key, value) in vars {
+            raw.apply_env(&key, &value)?;
+        }
+        raw.resolve(lookup)
+    }
+}
+
+/// The `V12N_*` names among `names` that are not settings. They are
+/// ignored, as unknown variables usually are, but worth a warning: a
+/// misspelled name, or one in an older style such as
+/// `V12N_DATABASE__URL`, would otherwise silently do nothing.
+pub fn unrecognized_env<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut out: Vec<&str> = names
+        .into_iter()
+        .filter(|name| name.starts_with(ENV_PREFIX) && !env::ALL.contains(name))
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+impl RawConfig {
+    fn apply_env(&mut self, key: &str, value: &str) -> Result<(), Error> {
+        let invalid = |reason: String| Error::Config(format!("{key}: {reason}"));
+        let number = |value: &str| {
+            value
+                .parse::<u64>()
+                .map_err(|_| invalid(format!("{value:?} is not a non-negative integer")))
+        };
+        let size = |value: &str| {
+            number(value).and_then(|n| usize::try_from(n).map_err(|e| invalid(e.to_string())))
+        };
+        match key {
+            env::ADDRESS => {
+                self.server.address = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid(format!("{value:?} is not an IP address")))?,
+                );
+            }
+            env::PORT => {
+                self.server.port = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid(format!("{value:?} is not a port number")))?,
+                );
+            }
+            env::DATABASE_URL => self.database.url = Some(value.to_owned()),
+            env::MAPPING => self.mapping.path = Some(PathBuf::from(value)),
+            env::STATEMENT_TIMEOUT => {
+                self.limits.statement_timeout = Some(RawDuration::Text(value.to_owned()));
+            }
+            env::ROW_LIMIT => self.limits.row_limit = Some(number(value)?),
+            env::MAX_QUERY_BYTES => self.limits.max_query_bytes = Some(size(value)?),
+            env::MAX_CONCURRENT_REQUESTS => {
+                self.limits.max_concurrent_requests = Some(size(value)?);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn resolve(self, lookup: impl Fn(&str) -> Option<String>) -> Result<Config, Error> {
+        let url = self.database.url.ok_or_else(|| {
+            Error::Config("no database URL: set [database] url or V12N_DATABASE_URL".to_owned())
+        })?;
+        let password = match self.database.password_env {
+            Some(name) => Some(lookup(&name).ok_or_else(|| {
+                Error::Config(format!(
+                    "[database] password_env names {name}, which is not set"
+                ))
+            })?),
+            None => None,
+        };
+        let mapping = self.mapping.path.ok_or_else(|| {
+            Error::Config("no mapping: set [mapping] path or V12N_MAPPING".to_owned())
+        })?;
+        let statement_timeout = match self.limits.statement_timeout {
+            None => DEFAULT_STATEMENT_TIMEOUT,
+            Some(RawDuration::Seconds(seconds)) => Duration::from_secs(seconds),
+            Some(RawDuration::Text(text)) => parse_duration(&text)
+                .map_err(|e| Error::Config(format!("[limits] statement_timeout: {e}")))?,
+        };
+        let positive = |value: Option<usize>, default: usize, key: &str| match value {
+            Some(0) => Err(Error::Config(format!("[limits] {key} must be at least 1"))),
+            Some(value) => Ok(value),
+            None => Ok(default),
+        };
+        Ok(Config {
+            listen: SocketAddr::new(
+                self.server.address.unwrap_or(DEFAULT_ADDRESS),
+                self.server.port.unwrap_or(DEFAULT_PORT),
+            ),
+            database: DatabaseConfig { url, password },
+            mapping,
+            limits: ServerLimits {
+                query: Limits {
+                    statement_timeout,
+                    row_limit: self.limits.row_limit.unwrap_or(DEFAULT_ROW_LIMIT),
+                },
+                max_query_bytes: positive(
+                    self.limits.max_query_bytes,
+                    DEFAULT_MAX_QUERY_BYTES,
+                    "max_query_bytes",
+                )?,
+                max_concurrent_requests: positive(
+                    self.limits.max_concurrent_requests,
+                    DEFAULT_MAX_CONCURRENT_REQUESTS,
+                    "max_concurrent_requests",
+                )?,
+            },
+        })
+    }
+}
+
+/// `500ms`, `30s`, `2m`, or a bare number of seconds.
+pub fn parse_duration(text: &str) -> Result<Duration, String> {
+    let (number, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => text.split_at(at),
+        None => (text, "s"),
+    };
+    let number: u64 = number
+        .parse()
+        .map_err(|_| format!("{text:?} is not a duration such as 500ms, 30s or 2m"))?;
+    match unit {
+        "ms" => Ok(Duration::from_millis(number)),
+        "s" => Ok(Duration::from_secs(number)),
+        "m" => Ok(Duration::from_secs(number.saturating_mul(60))),
+        _ => Err(format!("unknown unit {unit:?}; use ms, s or m")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FILE: &str = r#"
+[server]
+address = "0.0.0.0"
+port = 8080
+
+[database]
+url = "postgresql://reader:secret@db/shop"
+
+[mapping]
+path = "mapping.ttl"
+
+[limits]
+statement_timeout = "5s"
+row_limit = 100
+max_query_bytes = 1000
+max_concurrent_requests = 4
+"#;
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    fn load(file: Option<&str>, vars: &[(&str, &str)]) -> Result<Config, Error> {
+        Config::from_sources(
+            file.map(|text| (text, Path::new("/etc/v12n/v12n.toml"))),
+            env(vars),
+            |name| (name == "SHOP_PASSWORD").then(|| "from-env".to_owned()),
+        )
+    }
+
+    #[test]
+    fn config_file_sets_every_field_and_resolves_mapping_next_to_it() {
+        let config = load(Some(FILE), &[]).unwrap();
+        assert_eq!(config.listen, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(config.database.url, "postgresql://reader:secret@db/shop");
+        assert_eq!(config.mapping, Path::new("/etc/v12n/mapping.ttl"));
+        assert_eq!(
+            config.limits,
+            ServerLimits {
+                query: Limits {
+                    statement_timeout: Duration::from_secs(5),
+                    row_limit: 100,
+                },
+                max_query_bytes: 1000,
+                max_concurrent_requests: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn config_environment_overrides_every_setting_of_the_file() {
+        let config = load(
+            Some(FILE),
+            &[
+                ("V12N_ADDRESS", "::1"),
+                ("V12N_PORT", "9000"),
+                ("V12N_DATABASE_URL", "postgresql://other/shop"),
+                ("V12N_MAPPING", "m.ttl"),
+                ("V12N_STATEMENT_TIMEOUT", "250ms"),
+                ("V12N_ROW_LIMIT", "0"),
+                ("V12N_MAX_QUERY_BYTES", "10"),
+                ("V12N_MAX_CONCURRENT_REQUESTS", "2"),
+                ("HOME", "/home/x"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(config.listen, "[::1]:9000".parse().unwrap());
+        assert_eq!(config.database.url, "postgresql://other/shop");
+        assert_eq!(config.mapping, Path::new("m.ttl"));
+        assert_eq!(
+            config.limits,
+            ServerLimits {
+                query: Limits {
+                    statement_timeout: Duration::from_millis(250),
+                    row_limit: 0,
+                },
+                max_query_bytes: 10,
+                max_concurrent_requests: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn config_ignores_unrecognized_v12n_variables_and_names_them() {
+        let vars = [
+            ("V12N_DATABASE__URL", "postgresql://old-style/shop"),
+            ("V12N_ROWLIMIT", "1"),
+            ("V12N_PORT", "9000"),
+            ("OTHER_PORT", "1"),
+        ];
+        let config = load(Some(FILE), &vars).unwrap();
+        assert_eq!(config.database.url, "postgresql://reader:secret@db/shop");
+        assert_eq!(config.limits.query.row_limit, 100);
+        assert_eq!(config.listen.port(), 9000);
+        assert_eq!(
+            unrecognized_env(vars.iter().map(|(k, _)| *k)),
+            ["V12N_DATABASE__URL", "V12N_ROWLIMIT"]
+        );
+    }
+
+    #[test]
+    fn config_without_file_uses_defaults_and_environment() {
+        let config = load(
+            None,
+            &[
+                ("V12N_DATABASE_URL", "postgresql://db/shop"),
+                ("V12N_MAPPING", "mapping.ttl"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            config.listen,
+            SocketAddr::new(DEFAULT_ADDRESS, DEFAULT_PORT)
+        );
+        assert_eq!(config.limits, ServerLimits::default());
+        assert_eq!(config.database.password, None);
+    }
+
+    #[test]
+    fn config_statement_timeout_accepts_seconds_as_a_number() {
+        let file =
+            "[database]\nurl = \"u\"\n[mapping]\npath = \"m\"\n[limits]\nstatement_timeout = 7\n";
+        let config = load(Some(file), &[]).unwrap();
+        assert_eq!(
+            config.limits.query.statement_timeout,
+            Duration::from_secs(7)
+        );
+    }
+
+    fn with_password_env(name: &str) -> String {
+        FILE.replace(
+            "[mapping]",
+            &format!("password_env = \"{name}\"\n\n[mapping]"),
+        )
+    }
+
+    #[test]
+    fn config_password_env_reads_the_named_variable() {
+        let config = load(Some(&with_password_env("SHOP_PASSWORD")), &[]).unwrap();
+        assert_eq!(config.database.password.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn config_errors_name_the_setting() {
+        let error =
+            |file: Option<&str>, vars: &[(&str, &str)]| load(file, vars).unwrap_err().to_string();
+        assert!(error(None, &[]).contains("V12N_DATABASE_URL"));
+        assert!(error(Some("[database]\nurl = \"u\"\n"), &[]).contains("V12N_MAPPING"));
+        assert!(error(Some("[limits]\nrow_limt = 1\n"), &[]).contains("row_limt"));
+        assert!(error(Some(FILE), &[("V12N_ROW_LIMIT", "-1")]).contains("V12N_ROW_LIMIT"));
+        assert!(error(Some(FILE), &[("V12N_PORT", "70000")]).contains("V12N_PORT"));
+        assert!(error(Some(FILE), &[("V12N_MAX_CONCURRENT_REQUESTS", "0")]).contains("at least 1"));
+        assert!(error(Some(&with_password_env("UNSET")), &[]).contains("UNSET"));
+    }
+
+    #[test]
+    fn config_debug_hides_the_database_url_and_password() {
+        let config = load(Some(&with_password_env("SHOP_PASSWORD")), &[]).unwrap();
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("secret"), "{debug}");
+        assert!(!debug.contains("from-env"), "{debug}");
+        assert!(!debug.contains("reader"), "{debug}");
+    }
+
+    #[test]
+    fn parse_duration_accepts_units_and_bare_seconds() {
+        assert_eq!(parse_duration("500ms"), Ok(Duration::from_millis(500)));
+        assert_eq!(parse_duration("30s"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_duration("2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(parse_duration("15"), Ok(Duration::from_secs(15)));
+        assert!(parse_duration("1h").is_err());
+        assert!(parse_duration("s").is_err());
+    }
+}

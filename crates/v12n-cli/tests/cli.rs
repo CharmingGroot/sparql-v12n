@@ -13,7 +13,8 @@ const SHOP: &str = concat!(
 fn v12n(args: &[&str], stdin: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_v12n"))
         .args(args)
-        .env_remove("V12N_DATABASE_URL")
+        .env_clear()
+        .envs(std::env::vars().filter(|(k, _)| !k.starts_with("V12N_")))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -277,4 +278,106 @@ fn query_shop_vip_orders_prints_sparql_json_results() {
         1
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("--row-limit"));
+
+    // The same settings from the environment, as `serve` reads them.
+    let output = Command::new(env!("CARGO_BIN_EXE_v12n"))
+        .args(["query", SHOP, VIP_ORDERS])
+        .env_clear()
+        .env("V12N_DATABASE_URL", &url)
+        .env("V12N_ROW_LIMIT", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+}
+
+/// Runs `v12n serve` with only the given `V12N_*` settings; every case
+/// here fails at startup, so the process exits on its own.
+fn serve(args: &[&str], settings: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_v12n"));
+    command.arg("serve").args(args);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("V12N_") {
+            command.env_remove(key);
+        }
+    }
+    command.envs(settings.iter().copied());
+    command.output().unwrap()
+}
+
+#[test]
+fn serve_missing_config_file_exits_one() {
+    let output = serve(&["--config", "does-not-exist.toml"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("does-not-exist.toml"));
+}
+
+#[test]
+fn serve_without_database_url_exits_one() {
+    let output = serve(&[], &[("V12N_MAPPING", SHOP)]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("V12N_DATABASE_URL"));
+}
+
+#[test]
+fn serve_invalid_mapping_exits_two() {
+    let output = serve(
+        &[],
+        &[
+            ("V12N_DATABASE_URL", "postgresql://v12n@127.0.0.1:1/shop"),
+            ("V12N_MAPPING", VIP_ORDERS),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn serve_unreachable_database_exits_three_without_the_password() {
+    let output = serve(
+        &[],
+        &[
+            (
+                "V12N_DATABASE_URL",
+                "postgresql://v12n:hunter2@127.0.0.1:1/shop?connect_timeout=2",
+            ),
+            ("V12N_MAPPING", SHOP),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(3));
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!all.contains("hunter2"), "{all}");
+}
+
+#[test]
+fn serve_warns_about_unrecognized_v12n_variables() {
+    let output = serve(
+        &[],
+        &[
+            ("V12N_DATABASE__URL", "postgresql://v12n@127.0.0.1:1/shop"),
+            ("V12N_MAPPING", SHOP),
+        ],
+    );
+    // The old-style name is not read, so there is no database URL.
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("WARN") && stderr.contains("V12N_DATABASE__URL"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn query_reads_the_statement_timeout_from_the_environment() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_v12n"));
+    command
+        .args(["query", SHOP, VIP_ORDERS])
+        .env_clear()
+        .env("V12N_DATABASE_URL", "postgresql://v12n@127.0.0.1:1/shop")
+        .env("V12N_STATEMENT_TIMEOUT", "soon");
+    let output = command.output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("soon"));
 }
