@@ -27,7 +27,9 @@ verify() {
   [ "$(digest 256 "$file")" = "$sha256" ] && [ "$(digest 1 "$file")" = "$sha1" ]
 }
 
+# Ontop runs as its own user in the container; mktemp creates files 0600.
 if [ -f "$dir/$jar" ] && verify "$dir/$jar"; then
+  chmod 0644 "$dir/$jar"
   echo "$jar already present and verified"
   exit 0
 fi
@@ -44,6 +46,7 @@ if ! verify "$tmp"; then
   exit 1
 fi
 
+chmod 0644 "$tmp"
 mv "$tmp" "$dir/$jar"
 trap - EXIT
 echo "fetched and verified $dir/$jar"
