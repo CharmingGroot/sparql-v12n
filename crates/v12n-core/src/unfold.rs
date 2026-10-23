@@ -301,10 +301,10 @@ impl Branch<'_> {
 
 fn collect_columns(expr: &SqlExpr, out: &mut HashSet<(usize, String)>) {
     match expr {
-        SqlExpr::Column { table, name } => {
+        SqlExpr::Column { table, name } | SqlExpr::Lexical { table, name, .. } => {
             out.insert((*table, name.clone()));
         }
-        SqlExpr::Param(_) => {}
+        SqlExpr::Param(_) | SqlExpr::Null(_) => {}
         SqlExpr::Concat(parts) => parts.iter().for_each(|p| collect_columns(p, out)),
     }
 }
@@ -391,6 +391,8 @@ fn plan(query: &SelectQuery, branches: Vec<Branch<'_>>) -> Result<SqlPlan, Error
             columns: Vec::new(),
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),
+            split_columns: Vec::new(),
+            lexical_hidden_columns: Default::default(),
             projection: query
                 .variables
                 .iter()
@@ -497,14 +499,22 @@ fn plan(query: &SelectQuery, branches: Vec<Branch<'_>>) -> Result<SqlPlan, Error
     }
 
     let mut hidden_columns = Vec::new();
+    let mut lexical_hidden_columns = BTreeSet::new();
     for variable in &hidden {
         let term = first
             .bindings
             .get(variable)
             .expect("every variable of the pattern is bound in every branch");
+        let natural = term.term_type == TermType::Literal
+            && matches!(term.value, TermValue::Column { .. })
+            && term.datatype.is_none()
+            && term.language.is_none();
         for slot in 0..term.columns().len() {
             let alias = column_alias(variable, slot, &reserved, &used);
             used.insert(alias.clone());
+            if !natural {
+                lexical_hidden_columns.insert(alias.clone());
+            }
             hidden_columns.push(alias);
         }
     }
@@ -565,8 +575,10 @@ fn plan(query: &SelectQuery, branches: Vec<Branch<'_>>) -> Result<SqlPlan, Error
     Ok(SqlPlan {
         columns,
         hidden_columns,
+        lexical_hidden_columns,
         distinct_order,
         projection,
+        split_columns: Vec::new(),
         branches,
         distinct: query.distinct,
     })

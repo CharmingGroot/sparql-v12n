@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# xsd:decimal from a numeric column, xsd:integer from an integer column.
+SELECT ?s ?p WHERE { ?s ex:price ?p }

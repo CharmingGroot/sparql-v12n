@@ -2,7 +2,7 @@
 //! Snapshots of the SQL generated for example queries.
 
 use v12n_core::mapping::{LogicalTable, Mapping, MappingIndex};
-use v12n_core::sql::{RenderOptions, TableKeys};
+use v12n_core::sql::{ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, TableKeys};
 use v12n_core::{sparql, unfold};
 
 const SHOP: &str = include_str!("../../../examples/shop/mapping.ttl");
@@ -151,5 +151,60 @@ fn constant_against_ambiguous_template_compares_iri_safe_strings() {
     insta::assert_snapshot!(explain(
         AMBIGUOUS,
         &format!("{PREFIXES}SELECT ?l WHERE {{ <http://example.org/pair/x%20y-z> ex:label ?l }}")
+    ));
+}
+
+const CONSTANTS: &str = include_str!("../../../tests/diff/0002-constants/mapping.ttl");
+
+fn column_type(name: &str, natural: Option<&str>) -> ColumnType {
+    let group = if name == "int4" { "integer" } else { "text" };
+    ColumnType {
+        name: name.to_owned(),
+        sql_type: format!("\"pg_catalog\".\"{name}\""),
+        union_class: group.to_owned(),
+        natural_datatype: natural.map(|n| format!("http://www.w3.org/2001/XMLSchema#{n}")),
+        group: group.to_owned(),
+        comparison: Comparison::Value,
+        lexical: Some(Lexical::Text),
+    }
+}
+
+/// `ex:value` reads an integer column of `readings` and a text column of
+/// `labels` (#24), with the types a database reports for them.
+fn explain_with_union_types(query: &str) -> String {
+    let mapping = Mapping::from_turtle(CONSTANTS).unwrap();
+    let index = MappingIndex::new(&mapping);
+    let query = sparql::parse(&format!("{PREFIXES}{query}")).unwrap();
+    let plan = unfold::unfold(&query, &mapping, &index).unwrap();
+    let int = || column_type("int4", Some("integer"));
+    let types: ColumnTypes = [
+        (("readings", "id"), int()),
+        (("readings", "value"), int()),
+        (("labels", "id"), int()),
+        (("labels", "value"), column_type("text", None)),
+    ]
+    .into_iter()
+    .map(|((table, column), ty)| ((LogicalTable::TableName(table.into()), column.into()), ty))
+    .collect();
+    let plan = plan.with_union_types(&types).unwrap();
+    plan.to_sql_with(&RenderOptions {
+        column_types: Some(&types),
+        ..RenderOptions::default()
+    })
+    .unwrap()
+    .sql
+}
+
+#[test]
+fn union_splits_a_literal_over_columns_of_different_types() {
+    insta::assert_snapshot!(explain_with_union_types(
+        "SELECT ?s ?v WHERE { ?s ex:value ?v }"
+    ));
+}
+
+#[test]
+fn union_keeps_the_index_on_a_constant_subject() {
+    insta::assert_snapshot!(explain_with_union_types(
+        "SELECT ?v WHERE { <http://example.org/item/1> ex:value ?v }"
     ));
 }

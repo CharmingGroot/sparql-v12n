@@ -194,6 +194,29 @@ and then:
   date/time template value against a text column, instead of failing in
   PostgreSQL or returning wrong rows.
 
+## Variables over columns of different types
+
+The term maps of one pattern can read a variable from columns of
+different SQL types, such as an `integer` column in one triples map and a
+`text` column in another. `UNION` needs one type per result column, so
+for queries over several term maps the engine also asks PostgreSQL for
+the types of the selected columns and:
+
+- keeps one result column where the types combine without changing any
+  value (`int4` and `int8`, `text` and `varchar`);
+- splits a literal of natural datatype into one result column per
+  datatype; each branch fills its own and leaves the others `NULL`, so the
+  integer 120 stays `"120"^^xsd:integer` and the text `'120'` stays
+  `"120"`;
+- selects the natural lexical form, computed in SQL as for joins, where
+  two types can give the same term: template values (`item/{id}` over an
+  `integer` key and a `text` key both give `item/1`), IRI columns,
+  literals with `rr:datatype` or a language tag, and plain literals from
+  `text` and `uuid` columns. The same triple from two term maps then
+  still counts once;
+- rejects the query as unsupported when that form cannot be computed in
+  SQL (`float8`, `real` with `double precision`, date/time, `char(n)`).
+
 ## Duplicate triples
 
 An RDF graph is a set of triples, so a triple counts once however many
@@ -217,8 +240,11 @@ first one is returned. `v12n explain` has no database and always shows the
 
 Duplicates are compared by column values, so two different values that a
 template renders as the same string (`{a}-{b}` with `x-`, `y` and `x`,
-`-y`), or columns of different types that give the same term in two term
-maps, still count twice.
+`-y`) still count twice. A variable that is not selected is compared by
+its columns' type and text output, so equal terms from columns of
+different types also count twice where SQL cannot compute their lexical
+form, or when the types combine (`varchar` and `text`) or the text differs
+(`numeric` 1.0 and 1.00).
 
 ## Layout
 

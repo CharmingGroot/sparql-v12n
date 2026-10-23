@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Item 1 once, from an integer and a text key.
+SELECT DISTINCT ?s WHERE { ?s ex:weight ?w }

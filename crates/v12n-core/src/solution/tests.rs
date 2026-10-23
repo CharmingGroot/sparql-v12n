@@ -69,6 +69,8 @@ fn plan(columns: &[&str], projection: Vec<(&str, Option<ResultTerm>)>) -> SqlPla
         columns: columns.iter().map(|c| (*c).to_owned()).collect(),
         hidden_columns: Vec::new(),
         distinct_order: Vec::new(),
+        split_columns: Vec::new(),
+        lexical_hidden_columns: Default::default(),
         projection: projection
             .into_iter()
             .map(|(variable, term)| ProjectedTerm {
@@ -132,6 +134,39 @@ fn build_iri_template_percent_encodes_column_values() {
         .build(&[SqlValue::String("a b/c".into()), SqlValue::Integer(7)])
         .unwrap();
     assert_eq!(solution.values(), [iri("http://ex/a%20b%2Fc/7")]);
+}
+
+#[test]
+fn build_split_column_reads_the_entry_the_row_fills() {
+    let mut plan = plan(
+        &["v", "w", "v_1"],
+        vec![
+            (
+                "v",
+                term(TermType::Literal, ResultValue::Column("v".into())),
+            ),
+            (
+                "w",
+                term(TermType::Literal, ResultValue::Column("w".into())),
+            ),
+        ],
+    );
+    plan.split_columns = vec![vec!["v".into(), "v_1".into()]];
+    let builder = SolutionBuilder::new(&plan);
+    let integer = NamedNode::new_unchecked(XSD_INTEGER);
+    let build = |row: &[SqlValue]| builder.build(row).unwrap().values().to_vec();
+    assert_eq!(
+        build(&[SqlValue::Integer(7), SqlValue::Null, SqlValue::Null]),
+        [Some(Literal::new_typed_literal("7", integer).into()), None]
+    );
+    assert_eq!(
+        build(&[SqlValue::Null, SqlValue::Null, SqlValue::String("7".into())]),
+        [Some(Literal::new_simple_literal("7").into()), None]
+    );
+    assert_eq!(
+        build(&[SqlValue::Null, SqlValue::Null, SqlValue::Null]),
+        [None, None]
+    );
 }
 
 #[test]

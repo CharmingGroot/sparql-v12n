@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! SQL plan (`SqlPlan`) and PostgreSQL text rendering with bound parameters.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use oxrdf::Term;
 
@@ -29,6 +29,11 @@ pub struct SqlPlan {
     /// Aliases of the columns of variables that occur in the pattern but
     /// are not selected. They take part in removing duplicates only.
     pub hidden_columns: Vec<String>,
+    /// The entries of `hidden_columns` whose terms depend on the columns'
+    /// natural lexical forms only: all but literals of natural datatype
+    /// (R2RML §10.2), whose datatype comes from the SQL type. Leaving an
+    /// entry out is safe: it can only keep a duplicate.
+    pub lexical_hidden_columns: BTreeSet<String>,
     /// The entries of [`SqlBranch::select`] in the order duplicates are
     /// removed over: by first occurrence of their variable in the pattern,
     /// so that an index on the first subject can deliver the rows sorted
@@ -37,6 +42,12 @@ pub struct SqlPlan {
     pub distinct_order: Vec<usize>,
     /// How to rebuild each projected variable from the result columns.
     pub projection: Vec<ProjectedTerm>,
+    /// Groups of entries of `columns` that together hold the values of
+    /// one projected column, one SQL type per entry (see
+    /// [`with_union_types`](Self::with_union_types)). Each branch fills
+    /// one entry of a group and leaves the others `NULL`. The projection
+    /// refers to the first entry.
+    pub split_columns: Vec<Vec<String>>,
     /// No branches means the query has no answers.
     pub branches: Vec<SqlBranch>,
     pub distinct: bool,
@@ -68,6 +79,15 @@ pub enum SqlExpr {
     Param(Param),
     /// String concatenation of the parts, each cast to text.
     Concat(Vec<SqlExpr>),
+    /// The natural lexical form of column `name` of table alias
+    /// `t{table}`, computed in SQL.
+    Lexical {
+        table: usize,
+        name: String,
+        lexical: Lexical,
+    },
+    /// `NULL` of an SQL type, written as [`ColumnType::sql_type`].
+    Null(String),
 }
 
 /// A constant of the query and what it has to match.
@@ -158,6 +178,12 @@ pub enum TermDatatype {
 pub struct ColumnType {
     /// The SQL type name, for error messages.
     pub name: String,
+    /// The type as SQL text for a cast, schema-qualified and quoted.
+    pub sql_type: String,
+    /// Columns of one class can share a `UNION` result column: the type
+    /// the database resolves for them keeps the natural RDF term of every
+    /// value (integer widths do, `real` and `double precision` do not).
+    pub union_class: String,
     /// IRI of the type's natural datatype; `None` for `xsd:string`.
     pub natural_datatype: Option<String>,
     /// Two columns of the same group compare as `comparison` says.
@@ -439,6 +465,253 @@ impl SqlPlan {
         }
         out
     }
+
+    /// The columns that branches select, each once, in order of
+    /// appearance; empty with fewer than two branches. Their types go into
+    /// [`with_union_types`](Self::with_union_types).
+    pub fn union_columns(&self) -> Vec<(LogicalTable, String)> {
+        let mut out: Vec<(LogicalTable, String)> = Vec::new();
+        if self.branches.len() < 2 {
+            return out;
+        }
+        for branch in &self.branches {
+            for expr in &branch.select {
+                if let SqlExpr::Column { table, name } = expr {
+                    let key = (branch.from[*table].clone(), name.clone());
+                    if !out.contains(&key) {
+                        out.push(key);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The plan with result columns that `UNION` can combine, given the
+    /// types of [`union_columns`](Self::union_columns).
+    ///
+    /// `UNION` matches columns by position and needs one type per result
+    /// column, while a projected column may read columns of different SQL
+    /// types in different branches. Where it does, and the types are not
+    /// of one [`ColumnType::union_class`], each branch keeps its own type
+    /// as long as no two of them can produce the same RDF term:
+    ///
+    /// - A literal of natural datatype (R2RML §10.2) is split into one
+    ///   result column per natural datatype ([`SqlPlan::split_columns`]).
+    ///   Terms of different datatypes differ, so removing duplicates stays
+    ///   exact, and each value is read with its own type.
+    /// - Columns whose terms can be the same, any other term or template
+    ///   value, or a natural datatype shared by different classes (`text`
+    ///   and `uuid` both give plain literals), are selected as their
+    ///   natural lexical form, computed in SQL ([`Lexical`]), so equal
+    ///   terms compare equal. A type without such SQL is an
+    ///   [`Error::UnsupportedFeature`] instead of a guessed form.
+    ///
+    /// Hidden columns are compared, never read, by their type and text
+    /// output (see [`to_sql_with`](Self::to_sql_with)), which keeps terms
+    /// of different types apart; there the lexical forms only replace
+    /// columns whose terms can be the same, where SQL computes them.
+    pub fn with_union_types(&self, types: &ColumnTypes) -> Result<Self, Error> {
+        if self.branches.len() < 2 {
+            return Ok(self.clone());
+        }
+        let mut owners: HashMap<&str, (&str, bool)> = HashMap::new();
+        for projected in &self.projection {
+            let Some(term) = &projected.term else {
+                continue;
+            };
+            let natural = term.term_type == TermType::Literal
+                && matches!(term.value, ResultValue::Column(_))
+                && term.datatype.is_none()
+                && term.language.is_none();
+            for alias in term.value.columns() {
+                owners.insert(alias, (&projected.variable, natural));
+            }
+        }
+        let mut used: HashSet<String> = self
+            .columns
+            .iter()
+            .chain(&self.hidden_columns)
+            .cloned()
+            .collect();
+        let mut plan = self.clone();
+        plan.columns.clear();
+        for branch in &mut plan.branches {
+            branch.select.clear();
+        }
+        // Entries of the new select lists for each old one.
+        let mut entries: Vec<Vec<usize>> = Vec::new();
+        for (i, alias) in self.columns.iter().enumerate() {
+            let start = plan.columns.len();
+            let owner = owners.get(alias.as_str()).copied();
+            for (alias, exprs) in self.union_column(i, alias, owner, false, types, &mut used)? {
+                plan.columns.push(alias);
+                for (branch, expr) in plan.branches.iter_mut().zip(exprs) {
+                    branch.select.push(expr);
+                }
+            }
+            if plan.columns.len() - start > 1 {
+                plan.split_columns.push(plan.columns[start..].to_vec());
+            }
+            entries.push((start..plan.columns.len()).collect());
+        }
+        let width = plan.columns.len();
+        for (h, alias) in self.hidden_columns.iter().enumerate() {
+            let natural = !self.lexical_hidden_columns.contains(alias);
+            let owner = Some((alias.as_str(), natural));
+            let i = self.columns.len() + h;
+            for (_, exprs) in self.union_column(i, alias, owner, true, types, &mut used)? {
+                for (branch, expr) in plan.branches.iter_mut().zip(exprs) {
+                    branch.select.push(expr);
+                }
+            }
+        }
+        entries.extend((0..self.hidden_columns.len()).map(|h| vec![width + h]));
+        plan.distinct_order = self
+            .distinct_order
+            .iter()
+            .flat_map(|&e| entries[e].iter().copied())
+            .collect();
+        Ok(plan)
+    }
+
+    /// The result columns for entry `i` of the select lists, each with
+    /// one expression per branch; one column for a `hidden` entry.
+    fn union_column(
+        &self,
+        i: usize,
+        alias: &str,
+        owner: Option<(&str, bool)>,
+        hidden: bool,
+        types: &ColumnTypes,
+        used: &mut HashSet<String>,
+    ) -> Result<Vec<(String, Vec<SqlExpr>)>, Error> {
+        let exprs: Vec<&SqlExpr> = self.branches.iter().map(|b| &b.select[i]).collect();
+        let unchanged = || vec![(alias.to_owned(), exprs.iter().map(|&e| e.clone()).collect())];
+        let Some((variable, natural)) = owner else {
+            return Ok(unchanged());
+        };
+        let mut columns = Vec::new();
+        for (branch, expr) in self.branches.iter().zip(&exprs) {
+            let SqlExpr::Column { table, name } = expr else {
+                return Ok(unchanged());
+            };
+            let Some(ty) = types.get(&(branch.from[*table].clone(), name.clone())) else {
+                return Ok(unchanged());
+            };
+            columns.push((*table, name.as_str(), ty));
+        }
+        let classes = |members: &[usize]| {
+            let mut out: Vec<&str> = Vec::new();
+            for &b in members {
+                let class = columns[b].2.union_class.as_str();
+                if !out.contains(&class) {
+                    out.push(class);
+                }
+            }
+            out
+        };
+        let all: Vec<usize> = (0..columns.len()).collect();
+        if classes(&all).len() < 2 {
+            return Ok(unchanged());
+        }
+
+        // Branches whose terms can be the same, in order of first branch.
+        let mut buckets: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
+        for (b, (_, _, ty)) in columns.iter().enumerate() {
+            let key = if natural {
+                Some(ty.natural_datatype.as_deref().unwrap_or(XSD_STRING))
+            } else {
+                None
+            };
+            match buckets.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, members)) => members.push(b),
+                None => buckets.push((key, vec![b])),
+            }
+        }
+        // A lexical form read back as a string makes a plain literal, which
+        // is only right for natural datatype xsd:string.
+        let lexical_ok = |key: Option<&str>| key.is_none_or(|datatype| datatype == XSD_STRING);
+        if hidden {
+            let mut out: Vec<SqlExpr> = exprs.iter().map(|&e| e.clone()).collect();
+            for (key, members) in &buckets {
+                if classes(members).len() < 2 || !lexical_ok(*key) {
+                    continue;
+                }
+                // Without SQL for one of the forms the columns stay as they
+                // are, which can only keep a duplicate.
+                let Some(lexical) = members
+                    .iter()
+                    .map(|&b| columns[b].2.lexical)
+                    .collect::<Option<Vec<Lexical>>>()
+                else {
+                    continue;
+                };
+                for (&b, lexical) in members.iter().zip(lexical) {
+                    let (table, name, _) = columns[b];
+                    out[b] = SqlExpr::Lexical {
+                        table,
+                        name: name.to_owned(),
+                        lexical,
+                    };
+                }
+            }
+            return Ok(vec![(alias.to_owned(), out)]);
+        }
+        let mut out = Vec::new();
+        for (k, (key, members)) in buckets.iter().enumerate() {
+            let typed = classes(members).len() == 1;
+            let lexical_ok = lexical_ok(*key);
+            let null = if typed {
+                SqlExpr::Null(columns[members[0]].2.sql_type.clone())
+            } else {
+                SqlExpr::Null("\"pg_catalog\".\"text\"".to_owned())
+            };
+            let mut exprs_k = Vec::with_capacity(columns.len());
+            for (b, &(table, name, ty)) in columns.iter().enumerate() {
+                exprs_k.push(if !members.contains(&b) {
+                    null.clone()
+                } else if typed {
+                    exprs[b].clone()
+                } else {
+                    match ty.lexical.filter(|_| lexical_ok) {
+                        Some(lexical) => SqlExpr::Lexical {
+                            table,
+                            name: name.to_owned(),
+                            lexical,
+                        },
+                        None => {
+                            let names: Vec<&str> = members
+                                .iter()
+                                .map(|&m| columns[m].2.name.as_str())
+                                .collect();
+                            return Err(Error::UnsupportedFeature(format!(
+                                "?{variable} reads columns of SQL types {} in different UNION \
+                                 branches, whose terms can be the same: comparing them needs the \
+                                 natural lexical form of column {name} of {} ({}), which cannot \
+                                 be computed in SQL",
+                                names.join(", "),
+                                describe_table(&self.branches[b].from[table]),
+                                ty.name
+                            )));
+                        }
+                    }
+                });
+            }
+            let alias = if k == 0 {
+                alias.to_owned()
+            } else {
+                let fresh = (1..)
+                    .map(|n| format!("{alias}_{n}"))
+                    .find(|a| !used.contains(a))
+                    .expect("an unused alias exists");
+                used.insert(fresh.clone());
+                fresh
+            };
+            out.push((alias, exprs_k));
+        }
+        Ok(out)
+    }
 }
 
 impl SqlPlan {
@@ -482,8 +755,10 @@ impl SqlPlan {
             f: &mut impl FnMut(&LogicalTable, &mut String),
         ) {
             match e {
-                SqlExpr::Column { table, name } => f(&from[*table], name),
-                SqlExpr::Param(_) => {}
+                SqlExpr::Column { table, name } | SqlExpr::Lexical { table, name, .. } => {
+                    f(&from[*table], name);
+                }
+                SqlExpr::Param(_) | SqlExpr::Null(_) => {}
                 SqlExpr::Concat(parts) => parts.iter_mut().for_each(|p| expr(p, from, f)),
             }
         }
@@ -850,30 +1125,15 @@ impl<'a> Renderer<'a> {
         let Some(ty) = self.column_type(table, name) else {
             return Ok(format!("{column}::text"));
         };
-        Ok(match ty.lexical {
-            Some(Lexical::Text) => format!("{column}::text"),
-            Some(Lexical::Boolean) => {
-                format!("CASE {column} WHEN true THEN 'true' WHEN false THEN 'false' END")
-            }
-            Some(Lexical::Hex) => format!("upper(encode({column}, 'hex'))"),
-            // `numeric` output never uses an exponent, and trim_scale drops
-            // exactly the trailing fractional zeros, which is the XML
-            // Schema 1.1 decimalCanonicalMap (`3`, `12.5`); tested against
-            // `canonical_decimal` over many values in v12n-postgres.
-            Some(Lexical::Decimal) => format!("trim_scale({column})::text"),
-            None => {
-                let source = match &self.from[table] {
-                    LogicalTable::TableName(t) => format!("table {t}"),
-                    LogicalTable::SqlQuery(_) => "an rr:sqlQuery".to_owned(),
-                };
-                return Err(Error::UnsupportedFeature(format!(
-                    "comparing terms built from column {name} of {source} ({}) with terms of \
-                     a different SQL type or shape: its natural lexical form cannot be \
-                     computed in SQL",
-                    ty.name
-                )));
-            }
-        })
+        match ty.lexical {
+            Some(lexical) => Ok(lexical_sql(&column, lexical)),
+            None => Err(Error::UnsupportedFeature(format!(
+                "comparing terms built from column {name} of {} ({}) with terms of a \
+                 different SQL type or shape: its natural lexical form cannot be computed in SQL",
+                describe_table(&self.from[table]),
+                ty.name
+            ))),
+        }
     }
 
     fn expr(&mut self, expr: &SqlExpr) {
@@ -897,12 +1157,46 @@ impl<'a> Renderer<'a> {
                     }
                 }
             }
+            SqlExpr::Lexical {
+                table,
+                name,
+                lexical,
+            } => self
+                .sql
+                .push_str(&lexical_sql(&column_sql(*table, name), *lexical)),
+            // Typed, since `UNION` resolves an untyped NULL of two branches
+            // to text before it sees the third.
+            SqlExpr::Null(ty) => self.sql.push_str(&format!("NULL::{ty}")),
         }
     }
 }
 
 fn column_sql(table: usize, name: &str) -> String {
     format!("t{table}.{}", quote_identifier(name))
+}
+
+/// SQL for the natural lexical form of `column`.
+fn lexical_sql(column: &str, lexical: Lexical) -> String {
+    match lexical {
+        Lexical::Text => format!("{column}::text"),
+        Lexical::Boolean => {
+            format!("CASE {column} WHEN true THEN 'true' WHEN false THEN 'false' END")
+        }
+        Lexical::Hex => format!("upper(encode({column}, 'hex'))"),
+        // `numeric` output never uses an exponent, and trim_scale drops
+        // exactly the trailing fractional zeros, which is the XML Schema
+        // 1.1 decimalCanonicalMap (`3`, `12.5`); tested against
+        // `canonical_decimal` over many values in v12n-postgres.
+        Lexical::Decimal => format!("trim_scale({column})::text"),
+    }
+}
+
+/// A logical table for error messages.
+fn describe_table(table: &LogicalTable) -> String {
+    match table {
+        LogicalTable::TableName(t) => format!("table {t}"),
+        LogicalTable::SqlQuery(_) => "an rr:sqlQuery".to_owned(),
+    }
 }
 
 /// R2RML §7.3 IRI-safe version of a text expression: every character
@@ -934,10 +1228,10 @@ pub fn iri_safe_sql(text: &str) -> String {
 fn condition_tables(condition: &Condition) -> Vec<usize> {
     fn collect(expr: &SqlExpr, out: &mut BTreeSet<usize>) {
         match expr {
-            SqlExpr::Column { table, .. } => {
+            SqlExpr::Column { table, .. } | SqlExpr::Lexical { table, .. } => {
                 out.insert(*table);
             }
-            SqlExpr::Param(_) => {}
+            SqlExpr::Param(_) | SqlExpr::Null(_) => {}
             SqlExpr::Concat(parts) => parts.iter().for_each(|p| collect(p, out)),
         }
     }
@@ -1113,6 +1407,8 @@ mod tests {
             columns: vec!["a".into(), "b".into()],
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),
+            split_columns: Vec::new(),
+            lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 from: vec![view.clone(), view.clone()],
@@ -1152,6 +1448,8 @@ mod tests {
             columns: vec!["s".into()],
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),
+            split_columns: Vec::new(),
+            lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 from: vec![table.clone()],
@@ -1211,6 +1509,8 @@ mod tests {
             columns: vec!["x".into()],
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),
+            split_columns: Vec::new(),
+            lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 from: vec![
@@ -1268,6 +1568,8 @@ mod tests {
             columns: vec!["x".into()],
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),
+            split_columns: Vec::new(),
+            lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![branch("1", None), branch("2", Some("http://ex/dt"))],
             distinct: false,
@@ -1303,6 +1605,8 @@ mod tests {
     fn ty(group: &str, comparison: Comparison, lexical: Option<Lexical>) -> ColumnType {
         ColumnType {
             name: group.to_owned(),
+            sql_type: format!("pg_catalog.{group}"),
+            union_class: group.to_owned(),
             natural_datatype: (group == "integer")
                 .then(|| "http://www.w3.org/2001/XMLSchema#integer".to_owned()),
             group: group.to_owned(),
@@ -1337,6 +1641,8 @@ mod tests {
             columns: Vec::new(),
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),
+            split_columns: Vec::new(),
+            lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 from: vec![l.clone(), r.clone()],
@@ -1406,6 +1712,208 @@ mod tests {
         );
     }
 
+    const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+    fn union_type(class: &str, natural: Option<&str>, lexical: Option<Lexical>) -> ColumnType {
+        ColumnType {
+            name: class.to_owned(),
+            sql_type: format!("pg_catalog.{class}"),
+            union_class: class.to_owned(),
+            natural_datatype: natural.map(|n| format!("{XSD}{n}")),
+            group: class.to_owned(),
+            comparison: Comparison::Value,
+            lexical,
+        }
+    }
+
+    /// `?v` from column `v` of table `a` and of table `b`, as a literal of
+    /// natural datatype or in an IRI template, and a hidden `?h`.
+    fn union_plan(natural: bool) -> SqlPlan {
+        let branch = |t: &str| SqlBranch {
+            from: vec![LogicalTable::TableName(t.into())],
+            select: vec![column(0, "v"), column(0, "h")],
+            conditions: Vec::new(),
+            fixed_columns: vec![BTreeSet::new()],
+        };
+        let (term_type, value) = if natural {
+            (TermType::Literal, ResultValue::Column("v".into()))
+        } else {
+            (
+                TermType::Iri,
+                ResultValue::Template(vec![
+                    TemplatePart::Literal("http://ex/".into()),
+                    TemplatePart::Column("v".into()),
+                ]),
+            )
+        };
+        SqlPlan {
+            columns: vec!["v".into()],
+            hidden_columns: vec!["h".into()],
+            distinct_order: vec![1, 0],
+            projection: vec![ProjectedTerm {
+                variable: "v".into(),
+                term: Some(ResultTerm {
+                    term_type,
+                    value,
+                    datatype: None,
+                    language: None,
+                }),
+            }],
+            split_columns: Vec::new(),
+            lexical_hidden_columns: Default::default(),
+            branches: vec![branch("a"), branch("b")],
+            distinct: false,
+        }
+    }
+
+    fn with_union_types(plan: &SqlPlan, a: ColumnType, b: ColumnType) -> Result<SqlPlan, Error> {
+        let types: ColumnTypes = [
+            ((LogicalTable::TableName("a".into()), "v".to_owned()), a),
+            ((LogicalTable::TableName("b".into()), "v".to_owned()), b),
+        ]
+        .into();
+        plan.with_union_types(&types)
+    }
+
+    #[test]
+    fn union_columns_lists_the_columns_of_several_branches() {
+        let plan = union_plan(true);
+        let column = |t: &str, c: &str| (LogicalTable::TableName(t.into()), c.to_owned());
+        assert_eq!(
+            plan.union_columns(),
+            [
+                column("a", "v"),
+                column("a", "h"),
+                column("b", "v"),
+                column("b", "h")
+            ]
+        );
+        let mut single = plan;
+        single.branches.pop();
+        assert!(single.union_columns().is_empty());
+    }
+
+    #[test]
+    fn union_of_one_class_keeps_the_columns() {
+        let int = || union_type("integer", Some("integer"), Some(Lexical::Text));
+        for natural in [true, false] {
+            let plan = union_plan(natural);
+            assert_eq!(with_union_types(&plan, int(), int()).unwrap(), plan);
+        }
+    }
+
+    #[test]
+    fn union_splits_literals_of_different_natural_datatypes() {
+        let int = union_type("integer", Some("integer"), Some(Lexical::Text));
+        let text = union_type("text", None, Some(Lexical::Text));
+        let plan = with_union_types(&union_plan(true), int, text).unwrap();
+        assert_eq!(plan.columns, ["v", "v_1"]);
+        assert_eq!(plan.split_columns, [["v", "v_1"]]);
+        assert_eq!(plan.distinct_order, [2, 0, 1]);
+        assert_eq!(
+            plan.to_sql().sql,
+            "SELECT q.\"v\", q.\"v_1\"\nFROM (\n\
+             SELECT pg_typeof(t0.\"h\")::text || ' ' || t0.\"h\"::text AS \"h\", \
+             t0.\"v\" AS \"v\", NULL::pg_catalog.text AS \"v_1\"\n\
+             FROM \"a\" t0\n\
+             UNION\n\
+             SELECT pg_typeof(t0.\"h\")::text || ' ' || t0.\"h\"::text AS \"h\", \
+             NULL::pg_catalog.integer AS \"v\", t0.\"v\" AS \"v_1\"\n\
+             FROM \"b\" t0\n\
+             ) q"
+        );
+    }
+
+    #[test]
+    fn union_compares_terms_that_can_be_equal_by_lexical_form() {
+        let int = || union_type("integer", Some("integer"), Some(Lexical::Text));
+        let numeric = union_type("numeric", Some("decimal"), Some(Lexical::Decimal));
+        // Template values: 7 and 7.00 give the same IRI.
+        let plan = with_union_types(&union_plan(false), numeric, int()).unwrap();
+        assert!(plan.split_columns.is_empty());
+        let sql = plan.to_sql().sql;
+        assert!(
+            sql.contains("trim_scale(t0.\"v\")::text AS \"v\"\nFROM \"a\"")
+                && sql.contains("t0.\"v\"::text AS \"v\"\nFROM \"b\""),
+            "{sql}"
+        );
+        // Plain literals from text and uuid columns.
+        let text = union_type("text", None, Some(Lexical::Text));
+        let uuid = union_type("uuid", None, Some(Lexical::Text));
+        let plan = with_union_types(&union_plan(true), text, uuid).unwrap();
+        assert_eq!(plan.columns, ["v"]);
+        assert!(matches!(
+            &plan.branches[1].select[0],
+            SqlExpr::Lexical {
+                lexical: Lexical::Text,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn union_compares_hidden_columns_by_lexical_form_where_terms_can_be_equal() {
+        let int = || union_type("integer", Some("integer"), Some(Lexical::Text));
+        let text = || union_type("text", None, Some(Lexical::Text));
+        let double = || union_type("float8", Some("double"), None);
+        let a = LogicalTable::TableName("a".into());
+        let b = LogicalTable::TableName("b".into());
+        let types = |h_a: ColumnType, h_b: ColumnType| -> ColumnTypes {
+            [
+                ((a.clone(), "v".to_owned()), int()),
+                ((b.clone(), "v".to_owned()), int()),
+                ((a.clone(), "h".to_owned()), h_a),
+                ((b.clone(), "h".to_owned()), h_b),
+            ]
+            .into()
+        };
+        let mut plan = union_plan(true);
+        // A natural literal: 7 and "7" are different terms, which the type
+        // in the compared text keeps apart.
+        assert_eq!(plan.with_union_types(&types(int(), text())).unwrap(), plan);
+        // A template value: both give the same term.
+        plan.lexical_hidden_columns.insert("h".into());
+        let sql = plan
+            .with_union_types(&types(int(), text()))
+            .unwrap()
+            .to_sql()
+            .sql;
+        assert_eq!(
+            sql.matches("pg_typeof(t0.\"h\"::text)::text || ' ' || t0.\"h\"::text::text AS \"h\"")
+                .count(),
+            2,
+            "{sql}"
+        );
+        // No SQL for a double's form: kept, at worst a duplicate stays.
+        assert_eq!(
+            plan.with_union_types(&types(double(), int())).unwrap(),
+            plan
+        );
+    }
+
+    #[test]
+    fn union_without_sql_for_the_lexical_form_is_rejected() {
+        let int = || union_type("integer", Some("integer"), Some(Lexical::Text));
+        let double = union_type("float8", Some("double"), None);
+        let err = with_union_types(&union_plan(false), double, int()).unwrap_err();
+        assert!(
+            matches!(&err, Error::UnsupportedFeature(m)
+                if m.contains("?v") && m.contains("column v of table a (float8)")),
+            "{err}"
+        );
+        // Natural literals of different datatypes need no lexical form.
+        let double = union_type("float8", Some("double"), None);
+        assert!(with_union_types(&union_plan(true), double, int()).is_ok());
+        // Two classes of one natural datatype other than xsd:string: a
+        // lexical form read back would lose the datatype.
+        let a = union_type("numeric", Some("decimal"), Some(Lexical::Decimal));
+        let b = union_type("numeric2", Some("decimal"), Some(Lexical::Decimal));
+        assert!(matches!(
+            with_union_types(&union_plan(true), a, b),
+            Err(Error::UnsupportedFeature(_))
+        ));
+    }
+
     #[test]
     fn iri_safe_sql_keeps_nulls_and_uses_the_iunreserved_ranges() {
         let sql = iri_safe_sql("x");
@@ -1422,6 +1930,8 @@ mod tests {
             columns: vec!["s".into()],
             hidden_columns: if hidden { vec!["o".into()] } else { Vec::new() },
             distinct_order: Vec::new(),
+            split_columns: Vec::new(),
+            lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 from: vec![LogicalTable::TableName("\"T\"".into())],
@@ -1517,6 +2027,8 @@ mod tests {
             columns: Vec::new(),
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),
+            split_columns: Vec::new(),
+            lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: Vec::new(),
             distinct: false,

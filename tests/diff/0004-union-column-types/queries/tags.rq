@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Item 1 has tag 7 in both triples maps: one triple, one solution.
+SELECT ?s ?t WHERE { ?s ex:tag ?t }

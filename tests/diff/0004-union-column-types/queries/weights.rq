@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# An xsd:integer from gadgets, a plain literal from widgets.
+SELECT ?s ?w WHERE { ?s ex:weight ?w }

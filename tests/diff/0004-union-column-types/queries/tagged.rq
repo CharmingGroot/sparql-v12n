@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# The same triple once, with the tag not selected.
+SELECT ?s WHERE { ?s ex:tag ?t }
