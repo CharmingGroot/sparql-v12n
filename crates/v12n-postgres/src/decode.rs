@@ -5,7 +5,7 @@ use std::error::Error as StdError;
 
 use tokio_postgres::types::{FromSql, Type};
 use v12n_core::solution::SqlValue;
-use v12n_core::sql::{ColumnType, Comparison, Lexical};
+use v12n_core::sql::{ColumnType, Comparison, Lexical, quote_identifier};
 
 type BoxError = Box<dyn StdError + Sync + Send>;
 
@@ -165,8 +165,24 @@ pub(crate) fn column_type(ty: &Type) -> ColumnType {
         // R2RML §10.2: cast to a string, which is exactly `::text`.
         (None, _) => (ty.name(), Comparison::Text, Some(Lexical::Text)),
     };
+    let sql_type = format!(
+        "{}.{}",
+        quote_identifier(ty.schema()),
+        quote_identifier(ty.name())
+    );
+    // UNION resolves `real` and `double precision` to the latter, which
+    // changes the shortest form of a `real` value (0.1 is
+    // 0.10000000149011612 as a double). Integer widths and the string
+    // types widen without changing any value. A type without a decoder
+    // only combines with itself.
+    let union_class = match Decoder::for_type(ty) {
+        Some(Decoder::Float4 | Decoder::Float8) | None => sql_type.clone(),
+        Some(_) => group.to_owned(),
+    };
     ColumnType {
         name: ty.name().to_owned(),
+        sql_type,
+        union_class,
         natural_datatype: Decoder::for_type(ty)
             .and_then(Decoder::natural_datatype)
             .map(str::to_owned),

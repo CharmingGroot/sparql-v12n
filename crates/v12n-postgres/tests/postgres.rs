@@ -605,6 +605,131 @@ async fn numeric_compares_with_other_types_by_its_canonical_form() {
     );
 }
 
+/// A variable that reads columns of different SQL types in different
+/// UNION branches gets each branch's natural datatype (#24).
+#[tokio::test]
+async fn union_keeps_the_natural_datatype_of_each_branch() {
+    let Some(url) = database_url() else { return };
+    let v = "rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column \"v\" ] ]";
+    let mapping = views(&[
+        ("int", "SELECT 1 AS id, 7::int4 AS v", v),
+        ("bigint", "SELECT 2 AS id, 7::int8 AS v", v),
+        ("text", "SELECT 3 AS id, '7'::text AS v", v),
+        ("numeric", "SELECT 4 AS id, 7.50::numeric AS v", v),
+        ("real", "SELECT 5 AS id, 0.1::real AS v", v),
+        ("date", "SELECT 6 AS id, DATE '2024-02-29' AS v", v),
+        (
+            "uuid",
+            "SELECT 7 AS id, '00000000-0000-0000-0000-00000000000a'::uuid AS v",
+            v,
+        ),
+        ("interval", "SELECT 8 AS id, INTERVAL '1 day' AS v", v),
+        ("varchar", "SELECT 9 AS id, '7'::varchar AS v", v),
+    ]);
+    let xsd = |lexical: &str, datatype: &str| {
+        format!("\"{lexical}\"^^<http://www.w3.org/2001/XMLSchema#{datatype}>")
+    };
+    let query = "SELECT ?row ?v WHERE { ?row <http://example.org/v> ?v }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    let mut expected = [
+        (1, xsd("7", "integer")),
+        (2, xsd("7", "integer")),
+        (3, "\"7\"".to_owned()),
+        (4, xsd("7.5", "decimal")),
+        (5, xsd("1.0E-1", "double")),
+        (6, xsd("2024-02-29", "date")),
+        (7, "\"00000000-0000-0000-0000-00000000000a\"".to_owned()),
+        (8, "\"1 day\"".to_owned()),
+        (9, "\"7\"".to_owned()),
+    ]
+    .map(|(id, v)| format!("?row=<http://example.org/row/{id}> ?v={v}"));
+    expected.sort();
+    assert_eq!(rows, expected);
+
+    // Equal terms from columns of different types are one solution.
+    let query = "SELECT DISTINCT ?v WHERE { ?row <http://example.org/v> ?v }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    let mut expected = [
+        xsd("7", "integer"),
+        "\"7\"".to_owned(),
+        xsd("7.5", "decimal"),
+        xsd("1.0E-1", "double"),
+        xsd("2024-02-29", "date"),
+        "\"00000000-0000-0000-0000-00000000000a\"".to_owned(),
+        "\"1 day\"".to_owned(),
+    ]
+    .map(|v| format!("?v={v}"));
+    expected.sort();
+    assert_eq!(rows, expected);
+}
+
+/// Template values from columns of different types give the same IRI
+/// when their natural lexical forms are equal, so the same triple from
+/// two triples maps is still one solution.
+#[tokio::test]
+async fn union_compares_template_values_of_different_types_as_terms() {
+    let Some(url) = database_url() else { return };
+    let v = "rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column \"v\" ] ]";
+    let mapping = views(&[
+        ("int", "SELECT 1 AS id, 'x'::text AS v", v),
+        ("text", "SELECT '1'::text AS id, 'x'::text AS v", v),
+        ("numeric", "SELECT 1.00::numeric AS id, 'x'::text AS v", v),
+        ("space", "SELECT 'a b'::text AS id, 'x'::text AS v", v),
+        ("half", "SELECT 1.50::numeric AS id, 'x'::text AS v", v),
+    ]);
+    for query in [
+        "SELECT ?row ?v WHERE { ?row <http://example.org/v> ?v }",
+        "SELECT ?row WHERE { ?row <http://example.org/v> ?v }",
+    ] {
+        let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+            .await
+            .unwrap();
+        let v = if query.contains("?row ?v") {
+            " ?v=\"x\""
+        } else {
+            ""
+        };
+        let mut expected =
+            ["1", "1.5", "a%20b"].map(|id| format!("?row=<http://example.org/row/{id}>{v}"));
+        expected.sort();
+        assert_eq!(rows, expected, "{query}");
+    }
+
+    // The same for a variable that is not selected.
+    let tag = "rr:predicateObjectMap [ rr:predicate ex:tag ;
+        rr:objectMap [ rr:template \"http://example.org/tag/{t}\" ] ]";
+    let mapping = views(&[
+        ("int", "SELECT 1 AS id, 7 AS t", tag),
+        ("text", "SELECT 1 AS id, '7'::text AS t", tag),
+    ]);
+    let query = "SELECT ?row WHERE { ?row <http://example.org/tag> ?t }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    assert_eq!(rows, ["?row=<http://example.org/row/1>"]);
+
+    // No SQL computes the canonical form of a double (Discussion #35).
+    let mapping = views(&[
+        ("int", "SELECT 1 AS id, 'x'::text AS v", v),
+        ("double", "SELECT 1.5::float8 AS id, 'x'::text AS v", v),
+    ]);
+    let query = "SELECT ?row WHERE { ?row <http://example.org/v> ?v }";
+    let error = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::Core(v12n_core::Error::UnsupportedFeature(m)) if m.contains("float8")
+        ),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn comparison_sql_cannot_compute_is_rejected() {
     let Some(url) = database_url() else { return };

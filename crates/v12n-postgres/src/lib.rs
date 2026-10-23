@@ -113,8 +113,12 @@ impl Database {
         let timeout = self.limits.statement_timeout;
         let pg = |e| Error::from_postgres(e, timeout);
         let plan = self.resolve_columns(plan).await.map_err(pg)?;
+        let column_types = self.column_types(&plan).await.map_err(pg)?;
+        let plan = match &column_types {
+            Some(types) if plan.branches.len() > 1 => Cow::Owned(plan.with_union_types(types)?),
+            _ => plan,
+        };
         let plan = plan.as_ref();
-        let column_types = self.column_types(plan).await.map_err(pg)?;
         let keys = self.load_table_keys(plan).await.map_err(pg)?;
         let options = RenderOptions {
             text_params: &[],
@@ -288,13 +292,19 @@ impl Database {
         Ok(Cow::Owned(plan.with_resolved_columns(&resolved)))
     }
 
-    /// Types of the columns the plan compares as RDF terms, read by
-    /// preparing a statement that selects them. `None` when there are none.
+    /// Types of the columns the plan compares as RDF terms or combines
+    /// with `UNION`, read by preparing a statement that selects them.
+    /// `None` when there are none.
     async fn column_types(
         &self,
         plan: &SqlPlan,
     ) -> Result<Option<ColumnTypes>, tokio_postgres::Error> {
-        let columns = plan.term_columns();
+        let mut columns = plan.term_columns();
+        for column in plan.union_columns() {
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+        }
         if columns.is_empty() {
             return Ok(None);
         }

@@ -1,0 +1,11 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_with_union_types(\"SELECT ?s ?v WHERE { ?s ex:value ?v }\")"
+---
+SELECT t0."id" AS "s", t0."value" AS "v", NULL::"pg_catalog"."text" AS "v_1"
+FROM "readings" t0
+WHERE t0."id" IS NOT NULL AND t0."value" IS NOT NULL
+UNION
+SELECT t0."id" AS "s", NULL::"pg_catalog"."int4" AS "v", t0."value" AS "v_1"
+FROM "labels" t0
+WHERE t0."id" IS NOT NULL AND t0."value" IS NOT NULL

@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Item 1 from both triples maps: an integer key and a text key.
+SELECT ?w WHERE { <http://example.org/item/1> ex:weight ?w }

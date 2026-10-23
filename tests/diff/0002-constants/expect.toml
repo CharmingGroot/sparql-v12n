@@ -1,23 +1,6 @@
 # Known differences from Ontop. Each check fails once the difference is
 # gone, so these entries are removed together with the issue.
 
-# v12n fails in PostgreSQL: UNION types integer and text cannot be matched.
-[query.all-values]
-expect = "mismatch"
-issue = 24
-
-[query.template-constant]
-expect = "mismatch"
-issue = 24
-
-[query.template-non-canonical]
-expect = "mismatch"
-issue = 24
-
-[query.template-out-of-range]
-expect = "mismatch"
-issue = 24
-
 # Ontop keeps the numeric scale (12.50, 3.00); v12n writes the XSD 1.1
 # canonical forms (12.5, 3), as decided in Discussion #35.
 [query.prices]

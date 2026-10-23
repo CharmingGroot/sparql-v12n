@@ -192,28 +192,60 @@ struct TermBuilder {
 #[derive(Debug, Clone)]
 enum ValueBuilder {
     Constant(Term),
-    Column(usize),
+    Column(Columns),
     Template(Vec<Part>),
 }
 
 #[derive(Debug, Clone)]
 enum Part {
     Literal(String),
-    Column(usize),
+    Column(Columns),
+}
+
+/// Row positions that hold one value: one, or a group of
+/// [`SqlPlan::split_columns`], of which a row fills at most one.
+#[derive(Debug, Clone)]
+struct Columns(Vec<usize>);
+
+impl Columns {
+    fn value<'r>(&self, row: &'r [SqlValue]) -> &'r SqlValue {
+        self.0
+            .iter()
+            .map(|&i| &row[i])
+            .find(|v| !matches!(v, SqlValue::Null))
+            .unwrap_or(&SqlValue::Null)
+    }
 }
 
 impl SolutionBuilder {
     pub fn new(plan: &SqlPlan) -> Self {
-        let index: HashMap<&str, usize> = plan
+        let position: HashMap<&str, usize> = plan
             .columns
             .iter()
             .enumerate()
             .map(|(i, alias)| (alias.as_str(), i))
             .collect();
-        let column = |alias: &str| {
-            *index
+        let position = |alias: &str| {
+            *position
                 .get(alias)
                 .expect("projected terms only refer to result columns of the plan")
+        };
+        let mut index: HashMap<&str, Columns> = plan
+            .columns
+            .iter()
+            .map(|alias| (alias.as_str(), Columns(vec![position(alias)])))
+            .collect();
+        for group in &plan.split_columns {
+            index.insert(
+                &group[0],
+                Columns(group.iter().map(|alias| position(alias)).collect()),
+            );
+        }
+        let column = |alias: &str| {
+            index
+                .get(alias)
+                .expect("projected terms only refer to result columns of the plan")
+                .clone()
         };
         let terms = plan
             .projection
@@ -272,19 +304,20 @@ impl TermBuilder {
     fn build(&self, row: &[SqlValue]) -> Result<Option<Term>, Error> {
         let (lexical, natural) = match &self.value {
             ValueBuilder::Constant(term) => return Ok(Some(term.clone())),
-            ValueBuilder::Column(i) => {
-                let Some(lexical) = row[*i].natural_lexical_form() else {
+            ValueBuilder::Column(columns) => {
+                let value = columns.value(row);
+                let Some(lexical) = value.natural_lexical_form() else {
                     return Ok(None);
                 };
-                (lexical.into_owned(), row[*i].natural_datatype())
+                (lexical.into_owned(), value.natural_datatype())
             }
             ValueBuilder::Template(parts) => {
                 let mut out = String::new();
                 for part in parts {
                     match part {
                         Part::Literal(text) => out.push_str(text),
-                        Part::Column(i) => {
-                            let Some(value) = row[*i].natural_lexical_form() else {
+                        Part::Column(columns) => {
+                            let Some(value) = columns.value(row).natural_lexical_form() else {
                                 return Ok(None);
                             };
                             // R2RML §7.3: only IRI templates percent-encode values.

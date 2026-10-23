@@ -284,6 +284,11 @@ fn unfold_selects_hidden_variables_for_removing_duplicates() {
     // Every variable of the pattern, blank nodes included, in order of
     // first occurrence.
     assert_eq!(plan.hidden_columns, ["c", "a", "_:b", "n"]);
+    // Literals of natural datatype get their datatype from the SQL type.
+    assert_eq!(
+        plan.lexical_hidden_columns,
+        ["c", "_:b"].map(str::to_owned).into()
+    );
     assert_eq!(plan.branches[0].select.len(), 5);
     // DISTINCT over the selected variables needs none.
     let plan = unfold_query(SHOP, "SELECT DISTINCT ?order WHERE { ?order ex:amount ?a }").unwrap();

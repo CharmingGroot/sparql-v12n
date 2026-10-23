@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Pairs with the same weight term: 120 and "120" differ.
+SELECT ?a ?b WHERE { ?a ex:weight ?w . ?b ex:weight ?w }

@@ -1,0 +1,18 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#GadgetMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "gadgets" ] ;
+  rr:subjectMap [ rr:template "http://example.org/item/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:weight ; rr:objectMap [ rr:column "weight" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:tag ; rr:objectMap [ rr:template "http://example.org/tag/{tag}" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:price ; rr:objectMap [ rr:column "price" ] ] .
+
+# The same predicates from columns of other types, with the same subject
+# template over a text key.
+<#WidgetMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "widgets" ] ;
+  rr:subjectMap [ rr:template "http://example.org/item/{code}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:weight ; rr:objectMap [ rr:column "weight" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:tag ; rr:objectMap [ rr:template "http://example.org/tag/{tag}" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:price ; rr:objectMap [ rr:column "price" ] ] .
