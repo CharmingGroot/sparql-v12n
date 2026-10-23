@@ -9,6 +9,9 @@ use oxrdf::Term;
 use crate::Error;
 use crate::mapping::template::UCSCHAR;
 use crate::mapping::{BaseIri, LogicalTable, SCHEME_REGEX, TemplatePart, TermType};
+use crate::sparql::{CompareOp, TermTest};
+
+mod filter;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -183,6 +186,192 @@ pub enum Condition {
     /// matches only for some pairs of SQL types, so how this renders
     /// depends on the column types (see [`SqlPlan::to_sql_with`]).
     SameTerm(TermSql, TermSql),
+    /// A `FILTER` expression, which holds where its effective boolean
+    /// value is true (SPARQL 1.1 §17.2).
+    Filter(Filter),
+}
+
+/// A `FILTER` expression in SQL's three-valued logic, with `NULL` for a
+/// SPARQL error: `||`, `&&` and `!` treat an error exactly as SQL `OR`,
+/// `AND` and `NOT` treat `NULL` (SPARQL 1.1 §17.2, Filter Evaluation), and
+/// `WHERE` and `ON` keep a row only where the condition is true. Every
+/// part that can be an error renders as `NULL` there, never as `false`.
+///
+/// How a comparison renders depends on the datatypes of its operands
+/// (SPARQL 1.1 §17.3, Operator Mapping), which for a column without
+/// `rr:datatype` come from its SQL type, so like
+/// [`Condition::SameTerm`] it is rendered with the column types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Filter {
+    /// `true`, `false`, or an error (`None`).
+    Constant(Option<bool>),
+    And(Box<Filter>, Box<Filter>),
+    Or(Box<Filter>, Box<Filter>),
+    Not(Box<Filter>),
+    /// The expression of the first case whose conditions all hold; an
+    /// error where none does. A variable bound by several `OPTIONAL`
+    /// parts has one case per part, each holding where the part matched,
+    /// and an unbound variable is an error (SPARQL 1.1 §17.2).
+    Cases(Vec<(Vec<Condition>, Filter)>),
+    /// Whether any of the conditions holds, never an error: `BOUND` over
+    /// the parts that bind a variable.
+    Any(Vec<Condition>),
+    /// `=`, `<`, `<=`, `>`, `>=` per SPARQL 1.1 §17.3; `same_term` is when
+    /// the operands are the same RDF term, for RDFterm-equal.
+    Compare {
+        op: CompareOp,
+        left: FilterValue,
+        right: FilterValue,
+        same_term: TermMatch,
+    },
+    /// `sameTerm` (SPARQL 1.1 §17.4.1.8).
+    SameTerm {
+        left: FilterValue,
+        right: FilterValue,
+        same_term: TermMatch,
+    },
+    /// `isIRI`, `isBlank`, `isLiteral` (SPARQL 1.1 §17.4.2).
+    Test(TermTest, FilterValue),
+    /// The effective boolean value of a term (SPARQL 1.1 §17.2.2).
+    Ebv(FilterValue),
+}
+
+/// An RDF term in a `FILTER` expression, bound in every row where it is
+/// evaluated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterValue {
+    /// A term built by a term map from the columns of a row.
+    Term(FilterTerm),
+    /// A constant of the query or of the mapping.
+    Constant(Term),
+}
+
+/// A term map's term in a `FILTER` expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterTerm {
+    pub term_type: TermType,
+    /// The term's string, and its datatype for a literal without a
+    /// language tag.
+    pub term: TermSql,
+    pub language: Option<String>,
+}
+
+/// When two terms are the same RDF term.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TermMatch {
+    /// Never, whatever the rows hold.
+    Never,
+    /// When all conditions hold. A constant in them that no value can
+    /// match is bound to `NULL` (see [`Param`]), so they can be unknown
+    /// rather than false.
+    When(Vec<Condition>),
+}
+
+/// A part of a [`Filter`] that refers to columns.
+enum Part<'f> {
+    Condition(&'f Condition),
+    Term(&'f TermSql),
+}
+
+enum PartMut<'f> {
+    Condition(&'f mut Condition),
+    Term(&'f mut TermSql),
+}
+
+impl Filter {
+    /// Every condition inside, not recursing into them, and every term
+    /// map's term.
+    fn visit<'f>(&'f self, f: &mut dyn FnMut(Part<'f>)) {
+        fn value<'f>(v: &'f FilterValue, f: &mut dyn FnMut(Part<'f>)) {
+            if let FilterValue::Term(t) = v {
+                f(Part::Term(&t.term));
+            }
+        }
+        match self {
+            Self::Constant(_) => {}
+            Self::And(a, b) | Self::Or(a, b) => {
+                a.visit(f);
+                b.visit(f);
+            }
+            Self::Not(a) => a.visit(f),
+            Self::Cases(cases) => {
+                for (guards, filter) in cases {
+                    guards.iter().for_each(|c| f(Part::Condition(c)));
+                    filter.visit(f);
+                }
+            }
+            Self::Any(conditions) => conditions.iter().for_each(|c| f(Part::Condition(c))),
+            Self::Compare {
+                left,
+                right,
+                same_term,
+                ..
+            }
+            | Self::SameTerm {
+                left,
+                right,
+                same_term,
+            } => {
+                value(left, f);
+                value(right, f);
+                if let TermMatch::When(conditions) = same_term {
+                    conditions.iter().for_each(|c| f(Part::Condition(c)));
+                }
+            }
+            Self::Test(_, v) | Self::Ebv(v) => value(v, f),
+        }
+    }
+
+    fn visit_mut(&mut self, f: &mut dyn FnMut(PartMut<'_>)) {
+        fn value(v: &mut FilterValue, f: &mut dyn FnMut(PartMut<'_>)) {
+            if let FilterValue::Term(t) = v {
+                f(PartMut::Term(&mut t.term));
+            }
+        }
+        match self {
+            Self::Constant(_) => {}
+            Self::And(a, b) | Self::Or(a, b) => {
+                a.visit_mut(f);
+                b.visit_mut(f);
+            }
+            Self::Not(a) => a.visit_mut(f),
+            Self::Cases(cases) => {
+                for (guards, filter) in cases {
+                    guards.iter_mut().for_each(|c| f(PartMut::Condition(c)));
+                    filter.visit_mut(f);
+                }
+            }
+            Self::Any(conditions) => conditions.iter_mut().for_each(|c| f(PartMut::Condition(c))),
+            Self::Compare {
+                left,
+                right,
+                same_term,
+                ..
+            }
+            | Self::SameTerm {
+                left,
+                right,
+                same_term,
+            } => {
+                value(left, f);
+                value(right, f);
+                if let TermMatch::When(conditions) = same_term {
+                    conditions.iter_mut().for_each(|c| f(PartMut::Condition(c)));
+                }
+            }
+            Self::Test(_, v) | Self::Ebv(v) => value(v, f),
+        }
+    }
+
+    /// The conditions and terms inside.
+    fn parts(&self) -> (Vec<&Condition>, Vec<&TermSql>) {
+        let (mut conditions, mut terms) = (Vec::new(), Vec::new());
+        self.visit(&mut |part| match part {
+            Part::Condition(c) => conditions.push(c),
+            Part::Term(t) => terms.push(t),
+        });
+        (conditions, terms)
+    }
 }
 
 /// One side of a [`Condition::SameTerm`].
@@ -287,6 +476,10 @@ pub struct RenderOptions<'a> {
     pub column_types: Option<&'a ColumnTypes>,
     /// Unique keys of the tables that [`SqlPlan::key_tables`] lists.
     pub keys: Option<&'a TableKeys>,
+    /// The database encoding is not UTF-8, so `COLLATE "C"` does not
+    /// order strings by code point, which `FILTER` string comparisons need
+    /// (SPARQL 1.1 §17.3: the codepoint collation).
+    pub non_utf8: bool,
 }
 
 /// A projected variable and how to rebuild its RDF term from a result row.
@@ -538,6 +731,18 @@ impl SqlPlan {
                     .iter()
                     .flatten()
                     .for_each(|c| collect(c, from, out)),
+                Condition::Filter(filter) => {
+                    let (conditions, terms) = filter.parts();
+                    for c in conditions {
+                        collect(c, from, out);
+                    }
+                    for (table, name) in terms.iter().flat_map(|t| t.columns()) {
+                        let key = (from[table].clone(), name.to_owned());
+                        if !out.contains(&key) {
+                            out.push(key);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -917,6 +1122,10 @@ impl SqlPlan {
                         term(left, from, f);
                         term(right, from, f);
                     }
+                    Condition::Filter(filter) => filter.visit_mut(&mut |part| match part {
+                        PartMut::Condition(c) => condition(c, from, f),
+                        PartMut::Term(t) => term(t, from, f),
+                    }),
                 }
             }
             let conditions = branch
@@ -1292,6 +1501,14 @@ impl<'a> Renderer<'a> {
                     self.required = required;
                 }
                 Condition::SameTerm(left, right) => self.same_term(left, right)?,
+                Condition::Filter(filter) => {
+                    // A constant of a FILTER binds to NULL only where it is
+                    // compared as an RDF term, which fails that comparison
+                    // and not the branch.
+                    let required = std::mem::replace(&mut self.required, false);
+                    self.filter(filter, filter::Mode::Positive)?;
+                    self.required = required;
+                }
             }
         }
         Ok(())
@@ -1590,6 +1807,15 @@ fn condition_tables(condition: &Condition) -> Vec<usize> {
             Condition::SameTerm(left, right) => {
                 for (table, _) in left.columns().into_iter().chain(right.columns()) {
                     out.insert(table);
+                }
+            }
+            Condition::Filter(filter) => {
+                let (conditions, terms) = filter.parts();
+                for c in conditions {
+                    tables(c, out);
+                }
+                for t in terms {
+                    out.extend(t.columns().into_iter().map(|(table, _)| table));
                 }
             }
         }

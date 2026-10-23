@@ -1264,3 +1264,151 @@ async fn optional_compares_terms_across_column_types_and_union_branches() {
         ]
     );
 }
+
+/// The `?row` of every solution, by its id.
+async fn filtered_rows(url: &str, mapping: &str, patterns: &str, filter: &str) -> Vec<String> {
+    let query = format!(
+        "PREFIX ex: <http://example.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+         SELECT ?row WHERE {{ {patterns} FILTER({filter}) }}"
+    );
+    let (rows, _) = run(url, Limits::default(), &plan(mapping, &query))
+        .await
+        .unwrap_or_else(|e| panic!("{filter}: {e}"));
+    rows.iter()
+        .map(|r| {
+            r.trim_start_matches("?row=<http://example.org/row/")
+                .trim_end_matches('>')
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Values the operator mapping treats specially: NaN is never equal to or
+/// ordered with anything, -0 equals 0, `numeric` NaN and infinities and
+/// infinite timestamps are not values of their XSD datatypes, so comparing
+/// them is an error, which stays an error under negation.
+#[tokio::test]
+async fn filter_comparisons_follow_xpath_on_special_values() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        r"SELECT * FROM (VALUES
+            (1, 1.5::numeric, 1.5::float8, TIMESTAMP '2024-01-01 00:00:00'),
+            (2, 'NaN', 'NaN', 'infinity'),
+            (3, 'Infinity', '-0', '-infinity'),
+            (4, 0, 0, TIMESTAMP '2023-01-01 00:00:00')
+          ) AS v(id, d, f, ts)",
+        &["d", "f", "ts"],
+    );
+    let cases: [(&str, &str, &[&str]); 12] = [
+        ("?row ex:d ?d", "?d > 1", &["1"]),
+        ("?row ex:d ?d", "?d < 1", &["4"]),
+        ("?row ex:d ?d", "!(?d = 1.5)", &["4"]),
+        ("?row ex:d ?d", "?d", &["1"]),
+        (
+            "?row ex:d ?d ; ex:d ?e",
+            "!(?d != ?e)",
+            &["1", "2", "3", "4"],
+        ),
+        ("?row ex:f ?f", "?f > 1", &["1"]),
+        // NaN > 1 is false, not an error.
+        ("?row ex:f ?f", "!(?f > 1)", &["2", "3", "4"]),
+        ("?row ex:f ?f", "?f = 0", &["3", "4"]),
+        ("?row ex:f ?f ; ex:f ?g", "?f = ?g", &["1", "3", "4"]),
+        ("?row ex:f ?f", "?f", &["1"]),
+        (
+            "?row ex:ts ?t",
+            "?t < \"2023-06-01T00:00:00\"^^xsd:dateTime",
+            &["4"],
+        ),
+        (
+            "?row ex:ts ?t",
+            "!(?t = \"2024-01-01T00:00:00\"^^xsd:dateTime)",
+            &["4"],
+        ),
+    ];
+    for (patterns, filter, expected) in cases {
+        assert_eq!(
+            filtered_rows(&url, &mapping, patterns, filter).await,
+            expected,
+            "{filter}"
+        );
+    }
+}
+
+/// A constant compared as an RDF term is bound to NULL when no value of the
+/// column's type renders as it. In a FILTER that fails the comparison
+/// only: it is false under negation and does not empty the branch.
+#[tokio::test]
+async fn filter_constant_that_matches_no_value_is_false_not_an_error() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        r"SELECT * FROM (VALUES
+            (1, 7, '00000000-0000-0000-0000-00000000000a'::uuid),
+            (2, 8, '00000000-0000-0000-0000-00000000000b')
+          ) AS v(id, n, u)",
+        &["n", "u"],
+    );
+    let cases: [(&str, &str, &[&str]); 6] = [
+        ("?row ex:n ?n", "sameTerm(?n, 7)", &["1"]),
+        (
+            "?row ex:n ?n",
+            "!sameTerm(?n, \"07\"^^xsd:integer)",
+            &["1", "2"],
+        ),
+        (
+            "?row ex:n ?n",
+            "sameTerm(?n, \"07\"^^xsd:integer) || ?n = 8",
+            &["2"],
+        ),
+        (
+            "?row ex:u ?u",
+            "?u = \"00000000-0000-0000-0000-00000000000a\"",
+            &["1"],
+        ),
+        (
+            "?row ex:u ?u",
+            "!(?u = \"00000000-0000-0000-0000-00000000000A\")",
+            &["1", "2"],
+        ),
+        (
+            "?row ex:u ?u",
+            "?u > \"00000000-0000-0000-0000-00000000000a\"",
+            &["2"],
+        ),
+    ];
+    for (patterns, filter, expected) in cases {
+        assert_eq!(
+            filtered_rows(&url, &mapping, patterns, filter).await,
+            expected,
+            "{filter}"
+        );
+    }
+}
+
+/// Comparisons whose SQL would not match XPath are rejected when the column
+/// types are known, not approximated.
+#[tokio::test]
+async fn filter_comparisons_without_exact_sql_are_rejected() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        r"SELECT 1 AS id, 0.1::real AS r, DATE '2024-01-01' AS d, 'x'::char(3) AS c",
+        &["r", "d", "c"],
+    );
+    for (patterns, filter) in [
+        ("?row ex:r ?r", "?r > 0"),
+        ("?row ex:r ?r", "sameTerm(?r, 1.0E-1)"),
+        ("?row ex:d ?d", "?d = \"infinity\""),
+        ("?row ex:c ?c", "?c < \"y\""),
+    ] {
+        let query = format!(
+            "PREFIX ex: <http://example.org/> SELECT ?row WHERE {{ {patterns} FILTER({filter}) }}"
+        );
+        let err = run(&url, Limits::default(), &plan(&mapping, &query))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Core(v12n_core::Error::UnsupportedFeature(_))),
+            "{filter}: {err}"
+        );
+    }
+}

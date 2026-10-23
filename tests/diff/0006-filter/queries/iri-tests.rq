@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# An IRI and a literal are different terms: = is false, != true.
+SELECT ?i WHERE { ?i ex:parent ?p ; ex:name ?n FILTER(?p != ?i && isIRI(?p) && !isLiteral(?p) && isLiteral(?n) && ?p != "x") }

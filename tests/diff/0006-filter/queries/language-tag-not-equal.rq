@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Two different language-tagged literals: an error per SPARQL 1.1, false
+# where values are compared, which the negation tells apart.
+SELECT ?i WHERE { ?i ex:label ?l FILTER(?l != "bolt"@en) }

@@ -1,6 +1,6 @@
 PREFIX ex: <http://example.org/>
 
-# FILTER is not supported yet: High or above would keep 1001 and 1003.
+# High or above.
 SELECT ?finding ?severity WHERE {
   ?finding ex:severityId ?severity .
   FILTER(?severity >= 4)

@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A filter in a nested group sees only that group's variables: ?n is
+# unbound there, so the filter is an error for every row.
+SELECT ?i ?q WHERE { ?i ex:name ?n { ?i ex:qty ?q FILTER(?n = "bolt") } }

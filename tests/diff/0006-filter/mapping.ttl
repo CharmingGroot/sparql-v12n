@@ -1,0 +1,29 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#ItemMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "items" ] ;
+  rr:subjectMap [ rr:template "http://example.org/item/{id}" ; rr:class ex:Item ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:qty ; rr:objectMap [ rr:column "qty" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:stock ; rr:objectMap [ rr:column "stock" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:price ; rr:objectMap [ rr:column "price" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:weight ; rr:objectMap [ rr:column "weight" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:active ; rr:objectMap [ rr:column "active" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:created ; rr:objectMap [ rr:column "created" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:updated ; rr:objectMap [ rr:column "updated" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:released ; rr:objectMap [ rr:column "released" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:label ;
+    rr:objectMap [ rr:column "label" ; rr:language "en" ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:parent ;
+    rr:objectMap [ rr:template "http://example.org/item/{parent_id}" ]
+  ] ;
+  rr:predicateObjectMap [ rr:predicate ex:kind ; rr:object "part" ] .
+
+<#TagMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "tags" ] ;
+  rr:subjectMap [ rr:template "http://example.org/item/{item_id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:tag ; rr:objectMap [ rr:column "tag" ] ] .

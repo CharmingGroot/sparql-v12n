@@ -2,6 +2,7 @@
 //! Unfolding: triple patterns to SQL fragments, shared variables to joins,
 //! `OPTIONAL` to left joins.
 
+mod filter;
 mod term;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -13,7 +14,7 @@ use crate::Error;
 use crate::mapping::{
     BaseIri, LogicalTable, Mapping, MappingIndex, ObjectMap, TemplatePart, TermType, TriplesMap,
 };
-use crate::sparql::{Pattern, PatternTerm, RDF_TYPE, SelectQuery, TriplePattern};
+use crate::sparql::{Expression, Pattern, PatternTerm, RDF_TYPE, SelectQuery, TriplePattern};
 use crate::sql::{
     Condition, LeftJoin, ProjectedTerm, ResultTerm, ResultValue, SqlBranch, SqlExpr, SqlPlan,
 };
@@ -297,19 +298,32 @@ impl<'a> Branch<'a> {
                     .join(l, r, scope, scope, scope)?
                     .map(|env| settle(env, scope)))
             }
-            Pattern::LeftJoin(left, right) => {
+            Pattern::LeftJoin(left, right, expression) => {
                 let Some(l) = self.walk(left, scope, node, chosen, context)? else {
                     return Ok(None);
                 };
                 let node = node + left.left_joins();
-                self.optional(l, right, scope, node, context).map(Some)
+                self.optional(l, right, expression.as_ref(), scope, node, context)
+                    .map(Some)
+            }
+            // Filter(expr, P) keeps the solutions of P where expr holds, so
+            // it sees the variables of P only (SPARQL 1.1 §18.2.2.6).
+            Pattern::Filter(inner, expression) => {
+                let Some(env) = self.walk(inner, scope, node, chosen, context)? else {
+                    return Ok(None);
+                };
+                let filter = self.filter(expression, &env, &[scope])?;
+                self.conditions_mut(scope).push(Condition::Filter(filter));
+                Ok(Some(env))
             }
         }
     }
 
-    /// LeftJoin(left, right, true) (SPARQL 1.1 §18.5): every solution of
-    /// the left side, extended by each compatible solution of `right`
-    /// where there are some. The candidates of `right` are chosen here,
+    /// LeftJoin(left, right, expression) (SPARQL 1.1 §18.5): every
+    /// solution of the left side, extended by each compatible solution of
+    /// `right` for which the expression holds over both, where there are
+    /// some. The expression goes into the `ON` clause with the part's
+    /// other conditions. The candidates of `right` are chosen here,
     /// because the right side of a LeftJoin does not distribute over a
     /// union: a combination that can never be compatible with the left
     /// side is left out, and more than one that can is not supported.
@@ -317,6 +331,7 @@ impl<'a> Branch<'a> {
         &mut self,
         left: Env<'a>,
         right: &'a Pattern,
+        expression: Option<&'a Expression>,
         scope: Scope,
         node: usize,
         context: &Context<'a>,
@@ -353,6 +368,14 @@ impl<'a> Branch<'a> {
             else {
                 continue;
             };
+            if let Some(expression) = expression {
+                // In the `ON` clause, the left side's row and the part's
+                // candidate row both exist.
+                let filter = attempt.filter(expression, &env, &[scope, Some(group)])?;
+                attempt.groups[group]
+                    .conditions
+                    .push(Condition::Filter(filter));
+            }
             if matched.is_some() {
                 return Err(Error::UnsupportedFeature(
                     "OPTIONAL over triple patterns that more than one combination of triples \
@@ -597,7 +620,10 @@ impl<'a> Branch<'a> {
                             covered.insert((table, name.to_owned()));
                         }
                     }
-                    Condition::IsNotNull(_) | Condition::IsNull(_) | Condition::Or(_) => {}
+                    Condition::IsNotNull(_)
+                    | Condition::IsNull(_)
+                    | Condition::Or(_)
+                    | Condition::Filter(_) => {}
                 }
             }
             let mut not_null = Vec::new();

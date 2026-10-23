@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# !error is an error: the item without a quantity is not kept.
+SELECT ?i WHERE { ?i ex:name ?n OPTIONAL { ?i ex:qty ?q } FILTER(!(?q = 5)) }

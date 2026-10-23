@@ -325,3 +325,64 @@ fn optional_in_each_union_branch() {
         "SELECT ?s ?v ?d WHERE { ?s ex:value ?v OPTIONAL { ?s ex:measuredOn ?d } }"
     ));
 }
+
+/// The SQL with the shop's keys and the column types a database reports.
+fn explain_shop_with_types(body: &str) -> String {
+    let mapping = Mapping::from_turtle(SHOP).unwrap();
+    let index = MappingIndex::new(&mapping);
+    let query = sparql::parse(&format!("{PREFIXES}{body}")).unwrap();
+    let plan = unfold::unfold(&query, &mapping, &index).unwrap();
+    let int = || column_type("int4", Some("integer"));
+    let types: ColumnTypes = [
+        (("customers", "id"), int()),
+        (("customers", "name"), column_type("text", None)),
+        (("customers", "tier"), column_type("text", None)),
+        (("orders", "id"), int()),
+        (("orders", "customer_id"), int()),
+        (("orders", "amount"), int()),
+    ]
+    .into_iter()
+    .map(|((table, column), ty)| ((LogicalTable::TableName(table.into()), column.into()), ty))
+    .collect();
+    let keys = shop_keys();
+    let rendered = plan
+        .to_sql_with(&RenderOptions {
+            column_types: Some(&types),
+            keys: Some(&keys),
+            ..RenderOptions::default()
+        })
+        .unwrap();
+    let mut out = rendered.sql;
+    out.push_str("\n\n-- params\n");
+    for (i, p) in rendered.params.iter().enumerate() {
+        out.push_str(&format!("${} = {p:?}\n", i + 1));
+    }
+    out
+}
+
+/// A FILTER inside OPTIONAL is part of the `LEFT JOIN`'s `ON` clause: it
+/// decides whether the part matches, and sees the left side's variables.
+#[test]
+fn filter_inside_optional_is_in_the_left_join() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c ?o WHERE { ?c ex:tier ?t OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a FILTER(?a > 100 && ?t = \"VIP\") } }"
+    ));
+}
+
+/// After the OPTIONAL, the filter applies to the whole group, and a
+/// variable of the optional part is checked to be bound first.
+#[test]
+fn filter_after_optional_is_in_the_where_clause() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c ?o WHERE { ?c ex:tier ?t OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a } FILTER(!(?a > 100) || !BOUND(?o)) }"
+    ));
+}
+
+/// The constant is converted to the column's type, so the comparison can
+/// use an index on the column; IRIs compare through their templates.
+#[test]
+fn filter_comparisons_keep_the_column_as_it_is() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?o WHERE { ?o ex:amount ?a ; ex:placedBy ?c FILTER(?a >= 100.0 && ?c != <http://example.org/customer/7>) }"
+    ));
+}

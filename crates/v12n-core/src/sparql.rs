@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! SPARQL parsing into algebra and the supported-feature gate.
 
-use oxrdf::Term;
-use spargebra::algebra::GraphPattern;
+use oxrdf::{Literal, NamedNode, Term};
+use spargebra::algebra::{Expression as SparqlExpression, Function, GraphPattern};
 use spargebra::term::{NamedNodePattern, TermPattern};
 use spargebra::{Query, SparqlParser};
 
@@ -31,11 +31,63 @@ pub enum Pattern {
     /// `Join(left, right)`: a group with an `OPTIONAL` before other
     /// patterns, such as `{ A OPTIONAL { B } C }`.
     Join(Box<Pattern>, Box<Pattern>),
-    /// `LeftJoin(left, right, true)` from `OPTIONAL` (SPARQL 1.1 §18.5).
-    /// The algebra's filter expression is always `true` here: a `FILTER`
-    /// inside `OPTIONAL` would become it (§18.2.2.6, Translate Graph
-    /// Patterns), and is not supported yet.
-    LeftJoin(Box<Pattern>, Box<Pattern>),
+    /// `LeftJoin(left, right, expr)` from `OPTIONAL` (SPARQL 1.1 §18.5).
+    /// The expression is the `FILTER` of the optional group (§18.2.2.6,
+    /// Translate Graph Patterns), `None` for `true`. It is evaluated over
+    /// the merged solutions of both sides, so it can see the left side's
+    /// variables.
+    LeftJoin(Box<Pattern>, Box<Pattern>, Option<Expression>),
+    /// `Filter(expr, pattern)`: the `FILTER`s of a group, which apply to
+    /// the whole group (SPARQL 1.1 §18.2.2.6) and see only its variables.
+    Filter(Box<Pattern>, Expression),
+}
+
+/// A `FILTER` expression in the supported subset (SPARQL 1.1 §17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expression {
+    /// An IRI or a literal.
+    Constant(Term),
+    /// A variable name without `?`.
+    Variable(String),
+    Or(Box<Expression>, Box<Expression>),
+    And(Box<Expression>, Box<Expression>),
+    /// `!`; `A != B` is `!(A = B)` (SPARQL 1.1 §17.3, Operator Mapping).
+    Not(Box<Expression>),
+    Compare(CompareOp, Box<Expression>, Box<Expression>),
+    SameTerm(Box<Expression>, Box<Expression>),
+    Bound(String),
+    Test(TermTest, Box<Expression>),
+}
+
+/// The relational operators of SPARQL 1.1 §17.3, `!=` aside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Equal,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+}
+
+impl CompareOp {
+    /// The SQL operator.
+    pub fn sql(self) -> &'static str {
+        match self {
+            Self::Equal => "=",
+            Self::Less => "<",
+            Self::LessOrEqual => "<=",
+            Self::Greater => ">",
+            Self::GreaterOrEqual => ">=",
+        }
+    }
+}
+
+/// `isIRI`, `isBlank` and `isLiteral` (SPARQL 1.1 §17.4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermTest {
+    IsIri,
+    IsBlank,
+    IsLiteral,
 }
 
 impl Pattern {
@@ -61,12 +113,13 @@ impl Pattern {
                 left.collect_triple_patterns(out, optional);
                 right.collect_triple_patterns(out, optional);
             }
-            Self::LeftJoin(left, right) => {
+            Self::LeftJoin(left, right, _) => {
                 left.collect_triple_patterns(out, optional);
                 if optional {
                     right.collect_triple_patterns(out, optional);
                 }
             }
+            Self::Filter(inner, _) => inner.collect_triple_patterns(out, optional),
         }
     }
 
@@ -75,7 +128,8 @@ impl Pattern {
         match self {
             Self::Bgp(_) => 0,
             Self::Join(left, right) => left.left_joins() + right.left_joins(),
-            Self::LeftJoin(left, right) => left.left_joins() + 1 + right.left_joins(),
+            Self::LeftJoin(left, right, _) => left.left_joins() + 1 + right.left_joins(),
+            Self::Filter(inner, _) => inner.left_joins(),
         }
     }
 }
@@ -163,24 +217,124 @@ fn group(pattern: &GraphPattern) -> Result<Pattern, Error> {
             right,
             expression,
         } => {
-            if expression.is_some() {
-                return Err(unsupported("FILTER inside OPTIONAL"));
-            }
+            let expression = expression.as_ref().map(filter_expression).transpose()?;
             let left = group(left)?;
             Ok(match group(right)? {
                 // `{ }` has one solution that binds nothing, which extends
-                // every solution unchanged.
+                // every solution unchanged whether the expression holds
+                // or not.
                 Pattern::Bgp(right) if right.is_empty() => left,
-                // LeftJoin(Z, P), with Z the empty pattern, is P when P
-                // has solutions and Z otherwise. As the right side of
-                // another LeftJoin, both cases give LeftJoin(left, P).
-                Pattern::LeftJoin(inner_left, inner_right) if matches!(&*inner_left, Pattern::Bgp(p) if p.is_empty()) => {
-                    Pattern::LeftJoin(Box::new(left), inner_right)
+                // LeftJoin(Z, P, f), with Z the empty pattern, is the
+                // solutions of P for which f holds, or Z when there are
+                // none. As the right side of another LeftJoin, both cases
+                // give LeftJoin(left, Filter(f, P), expr).
+                Pattern::LeftJoin(inner_left, inner_right, inner_expression) if matches!(&*inner_left, Pattern::Bgp(p) if p.is_empty()) =>
+                {
+                    let right = match inner_expression {
+                        Some(f) => Box::new(Pattern::Filter(inner_right, f)),
+                        None => inner_right,
+                    };
+                    Pattern::LeftJoin(Box::new(left), right, expression)
                 }
-                right => Pattern::LeftJoin(Box::new(left), Box::new(right)),
+                right => Pattern::LeftJoin(Box::new(left), Box::new(right), expression),
             })
         }
+        GraphPattern::Filter { expr, inner } => Ok(Pattern::Filter(
+            Box::new(group(inner)?),
+            filter_expression(expr)?,
+        )),
         other => Err(unsupported(describe(other))),
+    }
+}
+
+/// A `FILTER` expression, checked against the supported subset.
+fn filter_expression(expression: &SparqlExpression) -> Result<Expression, Error> {
+    let boxed = |e: &SparqlExpression| filter_expression(e).map(Box::new);
+    Ok(match expression {
+        SparqlExpression::NamedNode(n) => Expression::Constant(n.clone().into()),
+        SparqlExpression::Literal(l) => Expression::Constant(l.clone().into()),
+        SparqlExpression::Variable(v) => Expression::Variable(v.as_str().to_owned()),
+        SparqlExpression::Or(a, b) => Expression::Or(boxed(a)?, boxed(b)?),
+        SparqlExpression::And(a, b) => Expression::And(boxed(a)?, boxed(b)?),
+        SparqlExpression::Not(a) => Expression::Not(boxed(a)?),
+        SparqlExpression::Equal(a, b) => compare(CompareOp::Equal, a, b)?,
+        SparqlExpression::Less(a, b) => compare(CompareOp::Less, a, b)?,
+        SparqlExpression::LessOrEqual(a, b) => compare(CompareOp::LessOrEqual, a, b)?,
+        SparqlExpression::Greater(a, b) => compare(CompareOp::Greater, a, b)?,
+        SparqlExpression::GreaterOrEqual(a, b) => compare(CompareOp::GreaterOrEqual, a, b)?,
+        SparqlExpression::SameTerm(a, b) => Expression::SameTerm(operand(a)?, operand(b)?),
+        SparqlExpression::Bound(v) => Expression::Bound(v.as_str().to_owned()),
+        SparqlExpression::FunctionCall(function, args) => {
+            let test = match function {
+                Function::IsIri => TermTest::IsIri,
+                Function::IsBlank => TermTest::IsBlank,
+                Function::IsLiteral => TermTest::IsLiteral,
+                other => return Err(unsupported(&format!("the {other} function in FILTER"))),
+            };
+            let [arg] = args.as_slice() else {
+                return Err(Error::QuerySyntax(format!("{function} takes one argument")));
+            };
+            Expression::Test(test, operand(arg)?)
+        }
+        SparqlExpression::In(..) => return Err(unsupported("IN and NOT IN in FILTER")),
+        SparqlExpression::Exists(_) => return Err(unsupported("EXISTS and NOT EXISTS")),
+        SparqlExpression::UnaryMinus(inner) | SparqlExpression::UnaryPlus(inner)
+            if numeric_literal(inner).is_some() =>
+        {
+            let (lexical, datatype) = numeric_literal(inner).expect("checked by the guard");
+            let lexical = match expression {
+                SparqlExpression::UnaryMinus(_) => format!("-{lexical}"),
+                _ => lexical.to_owned(),
+            };
+            Expression::Constant(Literal::new_typed_literal(lexical, datatype).into())
+        }
+        SparqlExpression::Add(..)
+        | SparqlExpression::Subtract(..)
+        | SparqlExpression::Multiply(..)
+        | SparqlExpression::Divide(..)
+        | SparqlExpression::UnaryPlus(_)
+        | SparqlExpression::UnaryMinus(_) => {
+            return Err(unsupported("arithmetic in FILTER"));
+        }
+        SparqlExpression::If(..) => return Err(unsupported("IF in FILTER")),
+        SparqlExpression::Coalesce(_) => return Err(unsupported("COALESCE in FILTER")),
+    })
+}
+
+/// A literal of a numeric datatype the grammar produces, `-3` being the
+/// unary minus applied to `3` (SPARQL 1.1 §19.8, Grammar). Its negation is
+/// written with a sign, as op:numeric-unary-minus would return it.
+fn numeric_literal(expression: &SparqlExpression) -> Option<(&str, NamedNode)> {
+    const NUMERIC: [&str; 3] = [
+        "http://www.w3.org/2001/XMLSchema#integer",
+        "http://www.w3.org/2001/XMLSchema#decimal",
+        "http://www.w3.org/2001/XMLSchema#double",
+    ];
+    match expression {
+        SparqlExpression::Literal(literal)
+            if NUMERIC.contains(&literal.datatype().as_str())
+                && !literal.value().starts_with(['+', '-'])
+                && literal.value() != "NaN" =>
+        {
+            Some((literal.value(), literal.datatype().into_owned()))
+        }
+        _ => None,
+    }
+}
+
+fn compare(op: CompareOp, a: &SparqlExpression, b: &SparqlExpression) -> Result<Expression, Error> {
+    Ok(Expression::Compare(op, operand(a)?, operand(b)?))
+}
+
+/// An argument that must be an RDF term: a variable or a constant. Other
+/// expressions as arguments, such as a comparison compared with `true`,
+/// are not supported.
+fn operand(expression: &SparqlExpression) -> Result<Box<Expression>, Error> {
+    match filter_expression(expression)? {
+        operand @ (Expression::Constant(_) | Expression::Variable(_)) => Ok(Box::new(operand)),
+        _ => Err(unsupported(
+            "expressions other than variables and constants as arguments in FILTER",
+        )),
     }
 }
 
@@ -312,7 +466,7 @@ mod tests {
     }
 
     fn left_join(left: Pattern, right: Pattern) -> Pattern {
-        Pattern::LeftJoin(Box::new(left), Box::new(right))
+        Pattern::LeftJoin(Box::new(left), Box::new(right), None)
     }
 
     #[test]
@@ -388,16 +542,114 @@ mod tests {
         assert_eq!(q.pattern, bgp(&[("c", "name", "n")]));
     }
 
+    fn variable(name: &str) -> Box<Expression> {
+        Box::new(Expression::Variable(name.to_owned()))
+    }
+
+    fn integer(value: i64) -> Box<Expression> {
+        Box::new(Expression::Constant(Literal::from(value).into()))
+    }
+
+    #[test]
+    fn parse_group_filters_wrap_the_whole_group() {
+        // Written between the triple patterns, the filters still apply to
+        // the group, joined with `&&`.
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n FILTER(?a > 1) ?c ex:amount ?a FILTER(!BOUND(?x)) }",
+        );
+        assert_eq!(
+            q.pattern,
+            Pattern::Filter(
+                Box::new(bgp(&[("c", "name", "n"), ("c", "amount", "a")])),
+                Expression::And(
+                    Box::new(Expression::Compare(
+                        CompareOp::Greater,
+                        variable("a"),
+                        integer(1)
+                    )),
+                    Box::new(Expression::Not(Box::new(Expression::Bound("x".into()))))
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn parse_filter_in_optional_is_the_left_join_expression() {
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t FILTER(isIRI(?n) && ?t != 2) } }",
+        );
+        let expression = Expression::And(
+            Box::new(Expression::Test(TermTest::IsIri, variable("n"))),
+            Box::new(Expression::Not(Box::new(Expression::Compare(
+                CompareOp::Equal,
+                variable("t"),
+                integer(2),
+            )))),
+        );
+        assert_eq!(
+            q.pattern,
+            Pattern::LeftJoin(
+                Box::new(bgp(&[("c", "name", "n")])),
+                Box::new(bgp(&[("c", "tier", "t")])),
+                Some(expression)
+            )
+        );
+        // A filter in a nested group stays in it, joined with the rest.
+        let q = parse_ok("SELECT * WHERE { ?c ex:name ?n { ?c ex:tier ?t FILTER(?t) } }");
+        assert_eq!(
+            q.pattern,
+            Pattern::Join(
+                Box::new(bgp(&[("c", "name", "n")])),
+                Box::new(Pattern::Filter(
+                    Box::new(bgp(&[("c", "tier", "t")])),
+                    *variable("t")
+                ))
+            )
+        );
+        // `OPTIONAL { OPTIONAL { P FILTER(f) } FILTER(e) }`: f filters P.
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n OPTIONAL { OPTIONAL { ?c ex:tier ?t FILTER(?t) } FILTER(?n) } }",
+        );
+        assert_eq!(
+            q.pattern,
+            Pattern::LeftJoin(
+                Box::new(bgp(&[("c", "name", "n")])),
+                Box::new(Pattern::Filter(
+                    Box::new(bgp(&[("c", "tier", "t")])),
+                    *variable("t")
+                )),
+                Some(*variable("n"))
+            )
+        );
+        assert_eq!(q.pattern.left_joins(), 1);
+    }
+
     #[test]
     fn parse_unsupported_features_are_rejected_by_name() {
         let cases = [
             (
-                "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t FILTER(?t = \"VIP\") } }",
-                "FILTER inside OPTIONAL",
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(?t IN (1, 2)) }",
+                "IN",
             ),
             (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(?t = \"VIP\") }",
-                "FILTER",
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(?t + 1 > 2) }",
+                "arithmetic",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(STRLEN(?t) > 2) }",
+                "the STRLEN function",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(UCASE(?t)) }",
+                "the UCASE function",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER((?t > 1) = true) }",
+                "expressions other than variables and constants",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER EXISTS { ?c ex:name ?n } }",
+                "EXISTS",
             ),
             (
                 "SELECT * WHERE { { ?c ex:name ?n } UNION { ?c ex:tier ?n } }",

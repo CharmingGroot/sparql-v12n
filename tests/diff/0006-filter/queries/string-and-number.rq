@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A string and a number are not comparable: an error, not false, so the
+# negation keeps nothing either.
+SELECT ?i WHERE { ?i ex:name ?n FILTER(?n = 5 || !(?n = 5)) }

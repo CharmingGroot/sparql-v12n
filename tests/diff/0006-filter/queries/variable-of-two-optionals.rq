@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# ?x is bound by either OPTIONAL part; the filter reads the one that matched.
+SELECT ?i ?x WHERE { ?i ex:name ?n OPTIONAL { ?i ex:qty ?x } OPTIONAL { ?i ex:stock ?x } FILTER(?x > 3) }

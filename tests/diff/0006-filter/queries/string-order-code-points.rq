@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Strings compare by code point (SPARQL 1.1 §17.3: fn:compare with the
+# codepoint collation), so "écrou" (U+00E9) comes after "z".
+SELECT ?n WHERE { ?i ex:name ?n FILTER(?n > "z") }

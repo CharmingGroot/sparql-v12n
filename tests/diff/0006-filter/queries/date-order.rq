@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# SPARQL 1.1 does not order xsd:date values; engines that do differ.
+SELECT ?i WHERE { ?i ex:released ?d FILTER(?d < "2024-01-01"^^xsd:date) }

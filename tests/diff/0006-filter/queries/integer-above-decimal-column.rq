@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# An integer column against a numeric one: compared as decimals.
+SELECT ?i WHERE { ?i ex:price ?p ; ex:qty ?q FILTER(?q > ?p) }

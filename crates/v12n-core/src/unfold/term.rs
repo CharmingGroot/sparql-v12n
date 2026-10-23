@@ -90,7 +90,7 @@ impl<'a> TermExpr<'a> {
     }
 
     /// The term as one side of a [`Condition::SameTerm`].
-    fn to_term_sql(self) -> TermSql {
+    pub fn to_term_sql(self) -> TermSql {
         let (value, datatype) = match self.value {
             TermValue::Constant(term) => (TermSqlValue::Param(lexical_form(term).into()), None),
             TermValue::Column { table, name } => (

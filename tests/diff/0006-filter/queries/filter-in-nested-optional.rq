@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# The inner OPTIONAL is LeftJoin(qty, tag, ?n = "bolt"), evaluated before
+# the outer one: ?n is not bound there, so no tag ever matches.
+SELECT ?i ?q ?t WHERE { ?i ex:name ?n OPTIONAL { ?i ex:qty ?q OPTIONAL { ?i ex:tag ?t FILTER(?n = "bolt") } } }

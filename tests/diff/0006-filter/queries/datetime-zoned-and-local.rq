@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Without a time zone on one side the order depends on an implicit time
+# zone, which SPARQL leaves to the implementation.
+SELECT ?i WHERE { ?i ex:updated ?u FILTER(?u >= "2024-01-01T00:00:00"^^xsd:dateTime) }
