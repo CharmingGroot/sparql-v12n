@@ -12,6 +12,7 @@ pub mod solution;
 pub mod sparql;
 pub mod sql;
 pub mod unfold;
+mod xpath_regex;
 mod xsd;
 
 pub use error::Error;

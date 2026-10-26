@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+# REGEX takes a string literal: a number is a type error.
+SELECT ?i WHERE { ?i ex:qty ?q FILTER(REGEX(?q, "1") || REGEX(STR(?q), "^1")) }

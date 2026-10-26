@@ -817,9 +817,9 @@ fn unfold_filter_compares_terms_through_template_decomposition() {
     };
     assert_eq!(
         *same_term,
-        TermMatch::When(vec![Condition::Eq(
+        Some(TermMatch::When(vec![Condition::Eq(
             column(0, "customer_id"),
             SqlExpr::Param("7".into())
-        )])
+        )]))
     );
 }

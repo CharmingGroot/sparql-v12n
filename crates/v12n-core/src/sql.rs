@@ -217,23 +217,30 @@ pub enum Filter {
     /// the parts that bind a variable.
     Any(Vec<Condition>),
     /// `=`, `<`, `<=`, `>`, `>=` per SPARQL 1.1 §17.3; `same_term` is when
-    /// the operands are the same RDF term, for RDFterm-equal.
+    /// the operands are the same RDF term, for RDFterm-equal, where both
+    /// are term maps' terms or constants (`None` compares their strings).
     Compare {
         op: CompareOp,
         left: FilterValue,
         right: FilterValue,
-        same_term: TermMatch,
+        same_term: Option<TermMatch>,
     },
     /// `sameTerm` (SPARQL 1.1 §17.4.1.8).
     SameTerm {
         left: FilterValue,
         right: FilterValue,
-        same_term: TermMatch,
+        same_term: Option<TermMatch>,
     },
     /// `isIRI`, `isBlank`, `isLiteral` (SPARQL 1.1 §17.4.2).
     Test(TermTest, FilterValue),
     /// The effective boolean value of a term (SPARQL 1.1 §17.2.2).
     Ebv(FilterValue),
+    /// `REGEX` (SPARQL 1.1 §17.4.3.14) with the XPath pattern and flags
+    /// already written as a PostgreSQL pattern with the same matches.
+    Regex {
+        text: FilterValue,
+        pattern: String,
+    },
 }
 
 /// An RDF term in a `FILTER` expression, bound in every row where it is
@@ -244,6 +251,32 @@ pub enum FilterValue {
     Term(FilterTerm),
     /// A constant of the query or of the mapping.
     Constant(Term),
+    /// `STR`: the lexical form of a literal or the string of an IRI, as a
+    /// simple literal (SPARQL 1.1 §17.4.2.5).
+    Str(Box<FilterValue>),
+    /// `LANG`: a literal's language tag, or `""` (SPARQL 1.1 §17.4.2.6).
+    Lang(Box<FilterValue>),
+    /// `DATATYPE`: a literal's datatype IRI (SPARQL 1.1 §17.4.2.7).
+    Datatype(Box<FilterValue>),
+}
+
+impl FilterValue {
+    /// The term map's term the value is built from, if any.
+    fn term(&self) -> Option<&FilterTerm> {
+        match self {
+            Self::Term(t) => Some(t),
+            Self::Constant(_) => None,
+            Self::Str(v) | Self::Lang(v) | Self::Datatype(v) => v.term(),
+        }
+    }
+
+    fn term_mut(&mut self) -> Option<&mut FilterTerm> {
+        match self {
+            Self::Term(t) => Some(t),
+            Self::Constant(_) => None,
+            Self::Str(v) | Self::Lang(v) | Self::Datatype(v) => v.term_mut(),
+        }
+    }
 }
 
 /// A term map's term in a `FILTER` expression.
@@ -283,7 +316,7 @@ impl Filter {
     /// map's term.
     fn visit<'f>(&'f self, f: &mut dyn FnMut(Part<'f>)) {
         fn value<'f>(v: &'f FilterValue, f: &mut dyn FnMut(Part<'f>)) {
-            if let FilterValue::Term(t) = v {
+            if let Some(t) = v.term() {
                 f(Part::Term(&t.term));
             }
         }
@@ -314,17 +347,17 @@ impl Filter {
             } => {
                 value(left, f);
                 value(right, f);
-                if let TermMatch::When(conditions) = same_term {
+                if let Some(TermMatch::When(conditions)) = same_term {
                     conditions.iter().for_each(|c| f(Part::Condition(c)));
                 }
             }
-            Self::Test(_, v) | Self::Ebv(v) => value(v, f),
+            Self::Test(_, v) | Self::Ebv(v) | Self::Regex { text: v, .. } => value(v, f),
         }
     }
 
     fn visit_mut(&mut self, f: &mut dyn FnMut(PartMut<'_>)) {
         fn value(v: &mut FilterValue, f: &mut dyn FnMut(PartMut<'_>)) {
-            if let FilterValue::Term(t) = v {
+            if let Some(t) = v.term_mut() {
                 f(PartMut::Term(&mut t.term));
             }
         }
@@ -355,11 +388,11 @@ impl Filter {
             } => {
                 value(left, f);
                 value(right, f);
-                if let TermMatch::When(conditions) = same_term {
+                if let Some(TermMatch::When(conditions)) = same_term {
                     conditions.iter_mut().for_each(|c| f(PartMut::Condition(c)));
                 }
             }
-            Self::Test(_, v) | Self::Ebv(v) => value(v, f),
+            Self::Test(_, v) | Self::Ebv(v) | Self::Regex { text: v, .. } => value(v, f),
         }
     }
 
