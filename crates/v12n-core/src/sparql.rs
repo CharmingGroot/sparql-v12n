@@ -40,6 +40,9 @@ pub enum Pattern {
     /// `Filter(expr, pattern)`: the `FILTER`s of a group, which apply to
     /// the whole group (SPARQL 1.1 §18.2.2.6) and see only its variables.
     Filter(Box<Pattern>, Expression),
+    /// `Union(left, right)` from `{ A } UNION { B }`: the solutions of both
+    /// sides as a bag (SPARQL 1.1 §18.5).
+    Union(Box<Pattern>, Box<Pattern>),
 }
 
 /// A `FILTER` expression in the supported subset (SPARQL 1.1 §17).
@@ -121,18 +124,10 @@ impl Pattern {
         out
     }
 
-    /// The triple patterns outside the right side of every `LeftJoin`,
-    /// which every solution matches, in the order they are written.
-    pub fn required_triple_patterns(&self) -> Vec<&TriplePattern> {
-        let mut out = Vec::new();
-        self.collect_triple_patterns(&mut out, false);
-        out
-    }
-
     fn collect_triple_patterns<'p>(&'p self, out: &mut Vec<&'p TriplePattern>, optional: bool) {
         match self {
             Self::Bgp(patterns) => out.extend(patterns),
-            Self::Join(left, right) => {
+            Self::Join(left, right) | Self::Union(left, right) => {
                 left.collect_triple_patterns(out, optional);
                 right.collect_triple_patterns(out, optional);
             }
@@ -146,11 +141,88 @@ impl Pattern {
         }
     }
 
+    /// The ways to choose one side of every `Union` outside the right side
+    /// of every `LeftJoin`, each the sides taken (`true` for the right one)
+    /// in the order the chosen `Union`s are written. Join, LeftJoin (on its
+    /// left side) and Filter distribute over a union (SPARQL 1.1 §18.5), so
+    /// the solutions of the pattern are the bag union of the solutions of
+    /// each choice, an arm without `Union`s. `None` when there are more
+    /// than `limit`.
+    pub fn arms(&self, limit: usize) -> Option<Vec<Vec<bool>>> {
+        let arms = match self {
+            Self::Bgp(_) => vec![Vec::new()],
+            Self::Join(left, right) => {
+                let (left, right) = (left.arms(limit)?, right.arms(limit)?);
+                if left.len().checked_mul(right.len())? > limit {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(left.len() * right.len());
+                for l in &left {
+                    for r in &right {
+                        out.push(l.iter().chain(r).copied().collect());
+                    }
+                }
+                out
+            }
+            Self::LeftJoin(left, _, _) | Self::Filter(left, _) => left.arms(limit)?,
+            Self::Union(left, right) => {
+                let side = |side: bool, arms: Vec<Vec<bool>>| {
+                    arms.into_iter().map(move |arm| {
+                        let mut out = vec![side];
+                        out.extend(arm);
+                        out
+                    })
+                };
+                let left = left.arms(limit)?;
+                let right = right.arms(limit)?;
+                side(false, left).chain(side(true, right)).collect()
+            }
+        };
+        (arms.len() <= limit).then_some(arms)
+    }
+
+    /// The triple patterns that every solution of an arm (see
+    /// [`arms`](Self::arms)) matches: those on the chosen side of every
+    /// `Union` and outside the right side of every `LeftJoin`, in the order
+    /// they are written.
+    pub fn required_triple_patterns(&self, arm: &[bool]) -> Vec<&TriplePattern> {
+        let mut out = Vec::new();
+        let mut sides = arm.iter().copied();
+        self.collect_required(&mut out, &mut sides);
+        out
+    }
+
+    fn collect_required<'p>(
+        &'p self,
+        out: &mut Vec<&'p TriplePattern>,
+        sides: &mut impl Iterator<Item = bool>,
+    ) {
+        match self {
+            Self::Bgp(patterns) => out.extend(patterns),
+            Self::Join(left, right) => {
+                left.collect_required(out, sides);
+                right.collect_required(out, sides);
+            }
+            Self::LeftJoin(inner, _, _) | Self::Filter(inner, _) => {
+                inner.collect_required(out, sides);
+            }
+            Self::Union(left, right) => {
+                if sides.next().expect("one side per Union of the arm") {
+                    right.collect_required(out, sides);
+                } else {
+                    left.collect_required(out, sides);
+                }
+            }
+        }
+    }
+
     /// Number of `LeftJoin` nodes in the pattern.
     pub fn left_joins(&self) -> usize {
         match self {
             Self::Bgp(_) => 0,
-            Self::Join(left, right) => left.left_joins() + right.left_joins(),
+            Self::Join(left, right) | Self::Union(left, right) => {
+                left.left_joins() + right.left_joins()
+            }
             Self::LeftJoin(left, right, _) => left.left_joins() + 1 + right.left_joins(),
             Self::Filter(inner, _) => inner.left_joins(),
         }
@@ -233,8 +305,17 @@ fn group(pattern: &GraphPattern) -> Result<Pattern, Error> {
                 left.extend(right);
                 Pattern::Bgp(left)
             }
+            // Join(Z, P) = P for the empty pattern Z, whose one solution
+            // binds nothing.
+            (Pattern::Bgp(empty), other) | (other, Pattern::Bgp(empty)) if empty.is_empty() => {
+                other
+            }
             (left, right) => Pattern::Join(Box::new(left), Box::new(right)),
         }),
+        GraphPattern::Union { left, right } => Ok(Pattern::Union(
+            Box::new(group(left)?),
+            Box::new(group(right)?),
+        )),
         GraphPattern::LeftJoin {
             left,
             right,
@@ -539,7 +620,7 @@ mod tests {
             )
         );
         assert_eq!(q.pattern.left_joins(), 2);
-        assert_eq!(q.pattern.required_triple_patterns().len(), 1);
+        assert_eq!(q.pattern.required_triple_patterns(&[]).len(), 1);
         assert_eq!(q.pattern.triple_patterns().len(), 3);
     }
 
@@ -559,7 +640,7 @@ mod tests {
         );
         let required: Vec<&str> = q
             .pattern
-            .required_triple_patterns()
+            .required_triple_patterns(&[])
             .iter()
             .map(|p| p.predicate.as_str())
             .collect();
@@ -596,6 +677,74 @@ mod tests {
         );
         // An empty OPTIONAL changes nothing.
         let q = parse_ok("SELECT * WHERE { ?c ex:name ?n OPTIONAL { } }");
+        assert_eq!(q.pattern, bgp(&[("c", "name", "n")]));
+    }
+
+    fn union(left: Pattern, right: Pattern) -> Pattern {
+        Pattern::Union(Box::new(left), Box::new(right))
+    }
+
+    #[test]
+    fn parse_union_keeps_both_sides_and_lists_the_arms() {
+        let q =
+            parse_ok("SELECT * WHERE { ?c ex:name ?n { ?c ex:tier ?t } UNION { ?c ex:city ?y } }");
+        assert_eq!(
+            q.pattern,
+            Pattern::Join(
+                Box::new(bgp(&[("c", "name", "n")])),
+                Box::new(union(
+                    bgp(&[("c", "tier", "t")]),
+                    bgp(&[("c", "city", "y")])
+                ))
+            )
+        );
+        let arms = q.pattern.arms(64).unwrap();
+        assert_eq!(arms, [vec![false], vec![true]]);
+        let required = |arm: &[bool]| -> Vec<String> {
+            q.pattern
+                .required_triple_patterns(arm)
+                .iter()
+                .map(|p| p.predicate.replace("http://example.org/", ""))
+                .collect()
+        };
+        assert_eq!(required(&arms[0]), ["name", "tier"]);
+        assert_eq!(required(&arms[1]), ["name", "city"]);
+        assert_eq!(q.pattern.triple_patterns().len(), 3);
+
+        // A union on each side of a join: every pair of sides, the sides
+        // listed in written order.
+        let q = parse_ok(
+            "SELECT * WHERE { { ?c ex:a ?x } UNION { { ?c ex:b ?x } UNION { ?c ex:c ?x } } \
+             { ?c ex:d ?y } UNION { ?c ex:e ?y } }",
+        );
+        assert_eq!(
+            q.pattern.arms(64).unwrap(),
+            [
+                vec![false, false],
+                vec![false, true],
+                vec![true, false, false],
+                vec![true, false, true],
+                vec![true, true, false],
+                vec![true, true, true],
+            ]
+        );
+        assert_eq!(q.pattern.arms(5), None);
+
+        // Unions inside OPTIONAL do not distribute over the left join.
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n OPTIONAL { { ?c ex:a ?x } UNION { ?c ex:b ?x } } }",
+        );
+        assert_eq!(q.pattern.arms(64).unwrap(), [Vec::<bool>::new()]);
+        assert_eq!(q.pattern.left_joins(), 1);
+
+        // `{ } UNION { P }` keeps the empty side, whose one solution binds
+        // nothing; `{ } P` is P.
+        let q = parse_ok("SELECT * WHERE { { } UNION { ?c ex:name ?n } }");
+        assert_eq!(
+            q.pattern,
+            union(Pattern::Bgp(Vec::new()), bgp(&[("c", "name", "n")]))
+        );
+        let q = parse_ok("SELECT * WHERE { { } { ?c ex:name ?n } }");
         assert_eq!(q.pattern, bgp(&[("c", "name", "n")]));
     }
 
@@ -715,10 +864,6 @@ mod tests {
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER EXISTS { ?c ex:name ?n } }",
                 "EXISTS",
-            ),
-            (
-                "SELECT * WHERE { { ?c ex:name ?n } UNION { ?c ex:tier ?n } }",
-                "UNION",
             ),
             ("SELECT * WHERE { ?c ?p ?o }", "variable predicates"),
             ("ASK { ?c ex:name ?n }", "ASK"),

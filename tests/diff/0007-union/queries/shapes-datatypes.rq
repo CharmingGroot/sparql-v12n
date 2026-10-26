@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Two datatypes from the mapping.
+SELECT ?x ?v WHERE { ?x ex:code ?v }

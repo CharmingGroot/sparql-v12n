@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# ?c is not selected; customer 1 and the partner with its IRI give the
+# same triple.
+SELECT ?n WHERE { ?c ex:name ?n }

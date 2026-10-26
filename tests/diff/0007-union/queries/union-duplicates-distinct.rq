@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# DISTINCT counts them once.
+SELECT DISTINCT ?c ?y WHERE { { ?c ex:city ?y } UNION { ?c ex:city ?y } }

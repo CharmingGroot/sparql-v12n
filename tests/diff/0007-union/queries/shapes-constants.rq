@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Constants of two triples maps.
+SELECT ?c ?k WHERE { ?c ex:kind ?k }

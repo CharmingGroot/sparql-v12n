@@ -18,44 +18,59 @@ use crate::sparql::{Expression, Pattern, PatternTerm, RDF_TYPE, SelectQuery, Tri
 use crate::sql::{
     Condition, LeftJoin, ProjectedTerm, ResultTerm, ResultValue, SqlBranch, SqlExpr, SqlPlan,
 };
-use term::{Equality, TermExpr, TermValue, is_injective, term_eq};
+use term::{Equality, LiteralType, TermExpr, TermValue, is_injective, literal_type, term_eq};
 
-/// Most UNION branches one query may unfold into. Each pattern with
-/// several candidate triples maps multiplies the count. The same limit
-/// applies to the combinations tried for each `OPTIONAL` part.
+/// Most SQL branches one query may unfold into. Each `UNION` adds its
+/// arms, and each pattern with several candidate triples maps multiplies
+/// the count. The same limit applies to the combinations tried for each
+/// `OPTIONAL` part.
 pub const MAX_BRANCHES: usize = 64;
 
 /// SQL type of the flag that tells whether an `OPTIONAL` part matched.
 const BOOLEAN: &str = "\"pg_catalog\".\"bool\"";
 
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
 /// Unfolds a query into a SQL plan over the mapping's logical tables.
 ///
-/// Every choice of triples maps for the required triple patterns is one
-/// UNION branch: Join and LeftJoin distribute over a union on their left
-/// side (SPARQL 1.1 §18.5). The right side of a LeftJoin does not, so each
-/// `OPTIONAL` part becomes a `LEFT JOIN` inside the branch.
+/// Each arm of the pattern, a choice of one side of every `UNION`, and
+/// every choice of triples maps for the arm's required triple patterns is
+/// one SQL branch: Join, Filter and LeftJoin (on its left side) distribute
+/// over a union (SPARQL 1.1 §18.5). The right side of a LeftJoin does not,
+/// so each `OPTIONAL` part becomes a `LEFT JOIN` inside the branch.
 pub fn unfold(
     query: &SelectQuery,
     mapping: &Mapping,
     index: &MappingIndex,
 ) -> Result<SqlPlan, Error> {
     let context = Context { mapping, index };
-    let candidates = query
-        .pattern
-        .required_triple_patterns()
-        .into_iter()
-        .map(|p| candidates(p, mapping, index))
-        .collect::<Result<Vec<_>, _>>()?;
-
+    let too_many = || Error::TooManyBranches {
+        limit: MAX_BRANCHES,
+    };
+    let arms = query.pattern.arms(MAX_BRANCHES).ok_or_else(too_many)?;
+    let mut total = 0usize;
     let mut branches = Vec::new();
-    for choice in combinations(&candidates)? {
-        let chosen: Vec<_> = candidates
-            .iter()
-            .zip(choice)
-            .map(|(list, c)| list[c])
-            .collect();
-        if let Some(branch) = Branch::build(&query.pattern, &chosen, &context)? {
-            branches.push(branch);
+    for (a, arm) in arms.iter().enumerate() {
+        let candidates = query
+            .pattern
+            .required_triple_patterns(arm)
+            .into_iter()
+            .map(|p| candidates(p, mapping, index))
+            .collect::<Result<Vec<_>, _>>()?;
+        let choices = combinations(&candidates)?;
+        total += choices.len();
+        if total > MAX_BRANCHES {
+            return Err(too_many());
+        }
+        for choice in choices {
+            let chosen: Vec<_> = candidates
+                .iter()
+                .zip(choice)
+                .map(|(list, c)| list[c])
+                .collect();
+            if let Some(branch) = Branch::build(&query.pattern, a, arm, &chosen, &context)? {
+                branches.push(branch);
+            }
         }
     }
     plan(query, branches, mapping.base_iri())
@@ -219,6 +234,8 @@ struct Group {
 /// joined, with its `OPTIONAL` parts left joined.
 #[derive(Debug, Clone)]
 struct Branch<'a> {
+    /// The arm of the pattern (see [`Pattern::arms`]) the branch belongs to.
+    arm: usize,
     from: Vec<LogicalTable>,
     /// Conditions on every row of the branch.
     conditions: Vec<Condition>,
@@ -236,10 +253,13 @@ impl<'a> Branch<'a> {
     /// `None` when the branch can never produce a row.
     fn build(
         pattern: &'a Pattern,
+        arm_index: usize,
+        arm: &[bool],
         chosen: &[Candidate<'a>],
         context: &Context<'a>,
     ) -> Result<Option<Self>, Error> {
         let mut branch = Self {
+            arm: arm_index,
             from: Vec::new(),
             conditions: Vec::new(),
             groups: Vec::new(),
@@ -247,7 +267,8 @@ impl<'a> Branch<'a> {
             env: Vec::new(),
         };
         let mut chosen = chosen.iter().copied();
-        let Some(env) = branch.walk(pattern, None, 1, &mut chosen, context)? else {
+        let mut sides = arm.iter().copied();
+        let Some(env) = branch.walk(pattern, None, 1, &mut sides, &mut chosen, context)? else {
             return Ok(None);
         };
         branch.env = env;
@@ -256,9 +277,10 @@ impl<'a> Branch<'a> {
     }
 
     /// Adds the tables and conditions of `pattern` to `scope`, taking the
-    /// candidates of its required triple patterns from `chosen`. Its
-    /// LeftJoins are numbered in the order they are written, starting at
-    /// `node`; 0 stands for the required patterns of the query.
+    /// side of each `Union` from `sides` and the candidates of its required
+    /// triple patterns from `chosen`. Its LeftJoins are numbered in the
+    /// order they are written, starting at `node`; 0 stands for the
+    /// required patterns of the query.
     ///
     /// Each part is translated on its own and then joined, as the algebra
     /// evaluates it (SPARQL 1.1 §18.6): the conditions linking two parts go
@@ -270,6 +292,7 @@ impl<'a> Branch<'a> {
         pattern: &'a Pattern,
         scope: Scope,
         node: usize,
+        sides: &mut impl Iterator<Item = bool>,
         chosen: &mut impl Iterator<Item = Candidate<'a>>,
         context: &Context<'a>,
     ) -> Result<Option<Env<'a>>, Error> {
@@ -287,11 +310,11 @@ impl<'a> Branch<'a> {
                 Ok(self.bgp(&chosen, scope, context.mapping))
             }
             Pattern::Join(left, right) => {
-                let Some(l) = self.walk(left, scope, node, chosen, context)? else {
+                let Some(l) = self.walk(left, scope, node, sides, chosen, context)? else {
                     return Ok(None);
                 };
                 let right_node = node + left.left_joins();
-                let Some(r) = self.walk(right, scope, right_node, chosen, context)? else {
+                let Some(r) = self.walk(right, scope, right_node, sides, chosen, context)? else {
                     return Ok(None);
                 };
                 Ok(self
@@ -299,7 +322,7 @@ impl<'a> Branch<'a> {
                     .map(|env| settle(env, scope)))
             }
             Pattern::LeftJoin(left, right, expression) => {
-                let Some(l) = self.walk(left, scope, node, chosen, context)? else {
+                let Some(l) = self.walk(left, scope, node, sides, chosen, context)? else {
                     return Ok(None);
                 };
                 let node = node + left.left_joins();
@@ -309,12 +332,23 @@ impl<'a> Branch<'a> {
             // Filter(expr, P) keeps the solutions of P where expr holds, so
             // it sees the variables of P only (SPARQL 1.1 §18.2.2.6).
             Pattern::Filter(inner, expression) => {
-                let Some(env) = self.walk(inner, scope, node, chosen, context)? else {
+                let Some(env) = self.walk(inner, scope, node, sides, chosen, context)? else {
                     return Ok(None);
                 };
                 let filter = self.filter(expression, &env, &[scope])?;
                 self.conditions_mut(scope).push(Condition::Filter(filter));
                 Ok(Some(env))
+            }
+            // The branch belongs to one side of the union: the solutions of
+            // the other side come from other branches, and the variables
+            // only that side binds are unbound here.
+            Pattern::Union(left, right) => {
+                if sides.next().expect("one side per Union of the arm") {
+                    let node = node + left.left_joins();
+                    self.walk(right, scope, node, sides, chosen, context)
+                } else {
+                    self.walk(left, scope, node, sides, chosen, context)
+                }
             }
         }
     }
@@ -323,10 +357,10 @@ impl<'a> Branch<'a> {
     /// solution of the left side, extended by each compatible solution of
     /// `right` for which the expression holds over both, where there are
     /// some. The expression goes into the `ON` clause with the part's
-    /// other conditions. The candidates of `right` are chosen here,
-    /// because the right side of a LeftJoin does not distribute over a
-    /// union: a combination that can never be compatible with the left
-    /// side is left out, and more than one that can is not supported.
+    /// other conditions. The arms and candidates of `right` are chosen
+    /// here, because the right side of a LeftJoin does not distribute over
+    /// a union: a choice that can never be compatible with the left side
+    /// is left out, and more than one that can is not supported.
     fn optional(
         &mut self,
         left: Env<'a>,
@@ -336,54 +370,76 @@ impl<'a> Branch<'a> {
         node: usize,
         context: &Context<'a>,
     ) -> Result<Env<'a>, Error> {
-        let candidates = right
-            .required_triple_patterns()
-            .into_iter()
-            .map(|p| candidates(p, context.mapping, context.index))
-            .collect::<Result<Vec<_>, _>>()?;
+        let arms = right.arms(MAX_BRANCHES).ok_or(Error::TooManyBranches {
+            limit: MAX_BRANCHES,
+        })?;
+        let several = || {
+            Error::UnsupportedFeature(
+                "OPTIONAL over a pattern that more than one combination of triples maps or \
+                 UNION side can match, which needs a UNION inside the OPTIONAL"
+                    .to_owned(),
+            )
+        };
         let mut matched: Option<(Self, Env<'a>)> = None;
-        for choice in combinations(&candidates)? {
-            let mut attempt = self.clone();
-            let group = attempt.groups.len();
-            let start = attempt.from.len();
-            attempt.groups.push(Group {
-                node,
-                parent: scope,
-                tables: start..start,
-                conditions: Vec::new(),
-            });
-            let mut chosen = candidates.iter().zip(choice).map(|(list, c)| list[c]);
-            let Some(inner) = attempt.walk(right, Some(group), node + 1, &mut chosen, context)?
-            else {
-                continue;
-            };
-            attempt.groups[group].tables.end = attempt.from.len();
-            if attempt.groups[group].tables.is_empty() {
-                // No triple pattern left: the part's one solution binds
-                // nothing and extends the left side unchanged.
-                continue;
+        // An arm without triple patterns, whose one solution binds nothing
+        // and extends the left side unchanged.
+        let mut empty = false;
+        for arm in &arms {
+            let candidates = right
+                .required_triple_patterns(arm)
+                .into_iter()
+                .map(|p| candidates(p, context.mapping, context.index))
+                .collect::<Result<Vec<_>, _>>()?;
+            for choice in combinations(&candidates)? {
+                let mut attempt = self.clone();
+                let group = attempt.groups.len();
+                let start = attempt.from.len();
+                attempt.groups.push(Group {
+                    node,
+                    parent: scope,
+                    tables: start..start,
+                    conditions: Vec::new(),
+                });
+                let mut sides = arm.iter().copied();
+                let mut chosen = candidates.iter().zip(choice).map(|(list, c)| list[c]);
+                let Some(inner) = attempt.walk(
+                    right,
+                    Some(group),
+                    node + 1,
+                    &mut sides,
+                    &mut chosen,
+                    context,
+                )?
+                else {
+                    continue;
+                };
+                attempt.groups[group].tables.end = attempt.from.len();
+                if attempt.groups[group].tables.is_empty() {
+                    if matched.is_some() {
+                        return Err(several());
+                    }
+                    empty = true;
+                    continue;
+                }
+                let inner = settle(inner, Some(group));
+                let Some(env) =
+                    attempt.join(left.clone(), inner, scope, Some(group), Some(group))?
+                else {
+                    continue;
+                };
+                if let Some(expression) = expression {
+                    // In the `ON` clause, the left side's row and the part's
+                    // candidate row both exist.
+                    let filter = attempt.filter(expression, &env, &[scope, Some(group)])?;
+                    attempt.groups[group]
+                        .conditions
+                        .push(Condition::Filter(filter));
+                }
+                if matched.is_some() || empty {
+                    return Err(several());
+                }
+                matched = Some((attempt, env));
             }
-            let inner = settle(inner, Some(group));
-            let Some(env) = attempt.join(left.clone(), inner, scope, Some(group), Some(group))?
-            else {
-                continue;
-            };
-            if let Some(expression) = expression {
-                // In the `ON` clause, the left side's row and the part's
-                // candidate row both exist.
-                let filter = attempt.filter(expression, &env, &[scope, Some(group)])?;
-                attempt.groups[group]
-                    .conditions
-                    .push(Condition::Filter(filter));
-            }
-            if matched.is_some() {
-                return Err(Error::UnsupportedFeature(
-                    "OPTIONAL over triple patterns that more than one combination of triples \
-                     maps can match, which needs a UNION inside the OPTIONAL"
-                        .to_owned(),
-                ));
-            }
-            matched = Some((attempt, env));
         }
         Ok(match matched {
             Some((attempt, env)) => {
@@ -686,7 +742,12 @@ fn collect_columns(expr: &SqlExpr, out: &mut HashSet<(usize, String)>) {
         SqlExpr::Column { table, name } | SqlExpr::Lexical { table, name, .. } => {
             out.insert((*table, name.clone()));
         }
-        SqlExpr::Param(_) | SqlExpr::Null(_) | SqlExpr::Unbound | SqlExpr::Matched(_) => {}
+        SqlExpr::Param(_)
+        | SqlExpr::Null(_)
+        | SqlExpr::Unbound
+        | SqlExpr::Matched(_)
+        | SqlExpr::True
+        | SqlExpr::Term { .. } => {}
         SqlExpr::Concat(parts) => parts.iter().for_each(|p| collect_columns(p, out)),
     }
 }
@@ -770,11 +831,18 @@ fn hidden_variables(query: &SelectQuery) -> Vec<&str> {
 }
 
 /// One way the results rebuild a variable: from the required patterns
-/// (`node` 0), or from the `OPTIONAL` part of LeftJoin `node`, whose
-/// source each branch has unless the part can never match there.
+/// (`node` 0), or from the `OPTIONAL` part of LeftJoin `node`, in the
+/// branches whose term there has one of the shapes of the alternative.
 struct Alternative<'a> {
     node: usize,
+    /// The source of each branch, `None` where the branch has no term of
+    /// these shapes: the part cannot match there, the branch's `UNION`
+    /// side does not bind the variable, or its term has another shape.
     sources: Vec<Option<Source<'a>>>,
+    /// Several shapes whose terms can be the same: the one result column
+    /// holds the term's string, computed in SQL, so that removing
+    /// duplicates compares terms.
+    computed: bool,
 }
 
 impl<'a> Alternative<'a> {
@@ -788,19 +856,141 @@ impl<'a> Alternative<'a> {
             .term
     }
 
-    /// A constant from an `OPTIONAL` part has no column to tell whether
-    /// the part matched, so it is selected with a flag that does.
+    /// A constant has no column to tell whether it is bound in a row, so
+    /// where some rows do not bind it, it is selected with a flag that
+    /// does: in an `OPTIONAL` part, or when some branches have no such
+    /// term.
     fn flagged(&self) -> bool {
-        self.node != 0 && self.reference().columns().is_empty()
+        !self.computed
+            && self.reference().columns().is_empty()
+            && (self.node != 0 || self.sources.iter().any(Option::is_none))
     }
 
     fn width(&self) -> usize {
-        if self.flagged() {
+        if self.flagged() || self.computed {
             1
         } else {
             self.reference().columns().len()
         }
     }
+}
+
+/// The alternatives for `variable`, with `per_branch` its sources in each
+/// branch, by node and then by shape.
+///
+/// Each branch rebuilds the variable from its own term map, and terms of
+/// different shapes take separate result columns, which the other
+/// branches leave `NULL`. Removing duplicates compares columns, which is
+/// exact when the shapes compared with each other can never produce the
+/// same term. Shapes that can are merged into one alternative whose column
+/// holds the term's string: those of branches of one `UNION` arm, whose
+/// duplicates are removed (Discussion #41), or of any branch under
+/// `DISTINCT`.
+fn alternatives_of<'a>(
+    variable: &str,
+    per_branch: &[Vec<(usize, Source<'a>)>],
+    arms: &[usize],
+    distinct: bool,
+) -> Result<Vec<Alternative<'a>>, Error> {
+    let mut nodes: Vec<usize> = per_branch.iter().flatten().map(|&(n, _)| n).collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+    let mut out = Vec::new();
+    for node in nodes {
+        let sources: Vec<Option<Source<'a>>> = per_branch
+            .iter()
+            .map(|a| a.iter().find(|&&(n, _)| n == node).map(|&(_, s)| s))
+            .collect();
+        // Distinct shapes in order of first branch, and each branch's.
+        let mut shapes: Vec<TermExpr<'a>> = Vec::new();
+        let shape_of: Vec<Option<usize>> = sources
+            .iter()
+            .map(|source| {
+                source.map(|s| {
+                    shapes
+                        .iter()
+                        .position(|t| shape(t) == shape(&s.term))
+                        .unwrap_or_else(|| {
+                            shapes.push(s.term);
+                            shapes.len() - 1
+                        })
+                })
+            })
+            .collect();
+        let compared = |i: usize, j: usize| {
+            distinct
+                || (0..sources.len()).any(|a| {
+                    shape_of[a] == Some(i)
+                        && (0..sources.len()).any(|b| shape_of[b] == Some(j) && arms[a] == arms[b])
+                })
+        };
+        // Classes of shapes that must be merged, as a union-find forest.
+        let mut class: Vec<usize> = (0..shapes.len()).collect();
+        fn root(class: &mut [usize], mut i: usize) -> usize {
+            while class[i] != i {
+                i = class[i];
+            }
+            i
+        }
+        for i in 0..shapes.len() {
+            for j in i + 1..shapes.len() {
+                if term_eq(&shapes[i], &shapes[j]) != Equality::Never && compared(i, j) {
+                    let (a, b) = (root(&mut class, i), root(&mut class, j));
+                    class[a.max(b)] = a.min(b);
+                }
+            }
+        }
+        let mut roots: Vec<usize> = Vec::new();
+        for i in 0..shapes.len() {
+            let r = root(&mut class, i);
+            if !roots.contains(&r) {
+                roots.push(r);
+            }
+        }
+        for r in roots {
+            let members: Vec<usize> = (0..shapes.len())
+                .filter(|&i| root(&mut class, i) == r)
+                .collect();
+            if members.len() > 1 {
+                check_computable(variable, members.iter().map(|&i| &shapes[i]))?;
+            }
+            out.push(Alternative {
+                node,
+                sources: sources
+                    .iter()
+                    .zip(&shape_of)
+                    .map(|(&s, shape)| s.filter(|_| shape.is_some_and(|i| members.contains(&i))))
+                    .collect(),
+                computed: members.len() > 1,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Whether terms of these shapes, which can be the same, can be compared
+/// as strings computed in SQL: IRIs and blank nodes are their strings, and
+/// literals of one fixed datatype or language tag their lexical forms. A
+/// literal of a column's natural datatype (R2RML §10.2) cannot: the
+/// datatype depends on the SQL type, so strings alone could merge
+/// different terms.
+fn check_computable<'t, 'a: 't>(
+    variable: &str,
+    mut shapes: impl Iterator<Item = &'t TermExpr<'a>>,
+) -> Result<(), Error> {
+    let first = shapes.next().expect("at least two shapes");
+    if first.term_type != TermType::Literal {
+        return Ok(());
+    }
+    let reference = literal_type(first);
+    if reference != LiteralType::Natural && shapes.all(|s| literal_type(s) == reference) {
+        return Ok(());
+    }
+    Err(Error::UnsupportedFeature(format!(
+        "?{variable} takes literals from differently shaped term maps whose terms can be the \
+         same, one of them of a column's natural datatype: removing duplicate solutions would \
+         have to compare their datatypes in SQL"
+    )))
 }
 
 fn plan(
@@ -841,40 +1031,14 @@ fn plan(
         .chain(hidden.iter().copied())
         .collect();
 
-    // Every branch must rebuild a variable the same way, since the result
-    // rows do not say which branch they came from. Removing duplicate
-    // solutions compares the columns of every variable across branches,
-    // which is only sound when they are built the same way too.
+    // The result rows do not say which branch they came from, so each
+    // alternative is built the same way in every branch that has it.
+    let arms: Vec<usize> = branches.iter().map(|b| b.arm).collect();
     let mut alternatives: Vec<Vec<Alternative<'_>>> = Vec::with_capacity(variables.len());
     for &variable in &variables {
         let per_branch: Vec<Vec<(usize, Source<'_>)>> =
             branches.iter().map(|b| b.alternatives(variable)).collect();
-        let mut nodes: Vec<usize> = per_branch.iter().flatten().map(|&(n, _)| n).collect();
-        nodes.sort_unstable();
-        nodes.dedup();
-        let mut list = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            let alternative = Alternative {
-                node,
-                sources: per_branch
-                    .iter()
-                    .map(|a| a.iter().find(|&&(n, _)| n == node).map(|&(_, s)| s))
-                    .collect(),
-            };
-            let reference = shape(alternative.reference());
-            if alternative
-                .sources
-                .iter()
-                .flatten()
-                .any(|s| shape(&s.term) != reference)
-            {
-                return Err(Error::UnsupportedFeature(format!(
-                    "?{variable} takes values from differently shaped term maps in different \
-                     UNION branches"
-                )));
-            }
-            list.push(alternative);
-        }
+        let list = alternatives_of(variable, &per_branch, &arms, query.distinct)?;
         if query.distinct {
             check_distinct(variable, &list)?;
         }
@@ -921,7 +1085,8 @@ fn plan(
     for (list, names) in alternatives[projected..].iter().zip(&aliases[projected..]) {
         for (alternative, names) in list.iter().zip(names) {
             let term = alternative.reference();
-            let natural = term.term_type == TermType::Literal
+            let natural = !alternative.computed
+                && term.term_type == TermType::Literal
                 && matches!(term.value, TermValue::Column { .. })
                 && term.datatype.is_none()
                 && term.language.is_none();
@@ -959,10 +1124,28 @@ fn plan(
         let mut select = Vec::new();
         for alternative in alternatives.iter().flatten() {
             match (alternative.sources[b], alternative.flagged()) {
-                (Some(source), true) => {
-                    let (table, name) = branch.witness(source.scope)?;
-                    select.push(SqlExpr::Matched(Box::new(column(table, name))));
+                (Some(source), _) if alternative.computed => {
+                    // A constant is a string in every row, also where its
+                    // `OPTIONAL` part did not match.
+                    let guard = match (source.term.columns().is_empty(), source.scope) {
+                        (true, Some(_)) => {
+                            let (table, name) = branch.witness(source.scope)?;
+                            Some(Box::new(column(table, name)))
+                        }
+                        _ => None,
+                    };
+                    select.push(SqlExpr::Term {
+                        term: source.term.to_term_sql(),
+                        guard,
+                    });
                 }
+                (Some(source), true) => match source.scope {
+                    None => select.push(SqlExpr::True),
+                    Some(_) => {
+                        let (table, name) = branch.witness(source.scope)?;
+                        select.push(SqlExpr::Matched(Box::new(column(table, name))));
+                    }
+                },
                 (Some(source), false) => {
                     select.extend(
                         source
@@ -979,6 +1162,7 @@ fn plan(
             }
         }
         sql_branches.push(SqlBranch {
+            arm: branch.arm,
             from: branch.from.clone(),
             select,
             conditions: branch.conditions.clone(),
@@ -1011,12 +1195,13 @@ fn plan(
 /// What `SELECT DISTINCT` cannot compare by column values.
 fn check_distinct(variable: &str, alternatives: &[Alternative<'_>]) -> Result<(), Error> {
     // The same term from two `OPTIONAL` parts sits in different columns.
-    if alternatives.len() > 1 {
+    if alternatives.iter().any(|a| a.node != alternatives[0].node) {
         return Err(Error::UnsupportedFeature(format!(
             "DISTINCT over ?{variable}, which more than one OPTIONAL part binds"
         )));
     }
-    for alternative in alternatives {
+    // A computed term is compared as the term's string.
+    for alternative in alternatives.iter().filter(|a| !a.computed) {
         let term = alternative.reference();
         if let TermValue::Template { template, .. } = term.value
             && !is_injective(template, term.term_type)
@@ -1043,6 +1228,25 @@ fn check_distinct(variable: &str, alternatives: &[Alternative<'_>]) -> Result<()
 fn result_term(alternative: &Alternative<'_>, names: &[String]) -> ResultTerm {
     let term = alternative.reference();
     let mut aliases = names.iter().cloned();
+    if alternative.computed {
+        // The string of an IRI or blank node, or the lexical form of a
+        // literal of the datatype or language tag all its shapes share.
+        let (datatype, language) = match literal_type(term) {
+            _ if term.term_type != TermType::Literal => (None, None),
+            LiteralType::Language(language) => (None, Some(language.to_owned())),
+            LiteralType::Datatype(datatype) if datatype != XSD_STRING => {
+                (Some(datatype.to_owned()), None)
+            }
+            _ => (None, None),
+        };
+        return ResultTerm {
+            term_type: term.term_type,
+            value: ResultValue::Column(aliases.next().unwrap_or_default()),
+            datatype,
+            language,
+            guard: None,
+        };
+    }
     let (value, guard) = match term.value {
         TermValue::Constant(c) => (
             ResultValue::Constant(c.clone()),

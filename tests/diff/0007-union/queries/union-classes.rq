@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Orders and partners: one side each.
+SELECT ?x WHERE { { ?x a ex:Order } UNION { ?x a ex:Partner } }

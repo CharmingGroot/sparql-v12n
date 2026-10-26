@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# The pattern after the union joins each side.
+SELECT ?x ?n WHERE { { ?x a ex:Client } UNION { ?x a ex:Partner } ?x ex:name ?n }

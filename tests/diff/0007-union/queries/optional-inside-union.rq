@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# OPTIONAL in one side.
+SELECT ?c ?y ?o WHERE {
+  { ?c a ex:Client OPTIONAL { ?c ex:city ?y } } UNION { ?o ex:placedBy ?c }
+}

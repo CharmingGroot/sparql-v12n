@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# An IRI template for orders, a literal column for wholesalers.
+SELECT ?x ?r WHERE { ?x ex:ref ?r }

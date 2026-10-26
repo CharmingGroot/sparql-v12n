@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Two subject templates that never give the same IRI (#29).
+SELECT ?c WHERE { ?c a ex:Client }

@@ -18,6 +18,11 @@ const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 /// An unfolded query: one `SELECT` per branch, combined with `UNION ALL`
 /// (or `UNION` under `DISTINCT`, or when duplicate triples are removed).
 ///
+/// The branches of one arm of the query's `UNION`s (see
+/// [`SqlBranch::arm`]) are the triples maps' ways to produce its solutions;
+/// the arms' solutions are combined as a bag (SPARQL 1.1 §18.5), so
+/// duplicates are only removed within an arm, unless under `DISTINCT`.
+///
 /// An RDF graph is a set of triples, so a basic graph pattern has one
 /// solution per distinct mapping of all its variables (SPARQL 1.1 §18.5),
 /// while duplicate rows of a logical table, or two term maps producing the
@@ -63,6 +68,10 @@ pub struct SqlPlan {
 /// One `SELECT ... FROM ... WHERE ...` of the plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlBranch {
+    /// The arm of the query's `UNION`s the branch belongs to: the choice of
+    /// one side of every `UNION` outside `OPTIONAL`. Branches of one arm
+    /// are consecutive in [`SqlPlan::branches`].
+    pub arm: usize,
     /// Logical tables; the one at position `n` is aliased `tn`.
     pub from: Vec<LogicalTable>,
     /// One expression per entry of [`SqlPlan::columns`], then one per
@@ -127,6 +136,16 @@ pub enum SqlExpr {
     /// `true` where the expression is not `NULL`, `NULL` where it is:
     /// whether the `OPTIONAL` part of a column matched.
     Matched(Box<SqlExpr>),
+    /// `true`: a constant term bound in every row of the branch.
+    True,
+    /// The string of an RDF term as text: an IRI (resolved against the base
+    /// IRI where it may be relative) or a blank node's value, or a literal's
+    /// lexical form, computed in SQL as for [`Condition::SameTerm`]. With a
+    /// guard, `NULL` where the guard is `NULL`.
+    Term {
+        term: TermSql,
+        guard: Option<Box<SqlExpr>>,
+    },
 }
 
 /// A constant of the query and what it has to match.
@@ -635,9 +654,21 @@ impl SqlPlan {
         if self.branches.is_empty() {
             r.sql.push_str("SELECT 1 WHERE false");
         }
-        let dedup = self.has_duplicates(options.keys);
-        let distinct = self.distinct || dedup;
-        let single = self.branches.len() == 1;
+        // Under `DISTINCT`, all branches form one group whose duplicates
+        // are removed; otherwise each arm is one, whose duplicates are
+        // removed unless keys prove there are none.
+        let groups: Vec<(Range<usize>, bool)> = if self.distinct {
+            vec![(0..self.branches.len(), true)]
+        } else {
+            self.arms()
+                .into_iter()
+                .map(|arm| {
+                    let dedup = arm_has_duplicates(&self.branches[arm.clone()], options.keys);
+                    (arm, dedup)
+                })
+                .collect()
+        };
+        let dedup = !self.distinct && groups.iter().any(|&(_, dedup)| dedup);
         let mut select = Select {
             aliases: self.columns.clone(),
             order: (0..self.columns.len()).collect(),
@@ -650,7 +681,7 @@ impl SqlPlan {
             } else {
                 select.order.clone_from(&self.distinct_order);
             }
-            if !single {
+            if self.branches.len() > 1 {
                 select.typed_text_from = Some(self.columns.len());
             }
         }
@@ -669,16 +700,31 @@ impl SqlPlan {
             r.sql.push_str(&outer.join(", "));
             r.sql.push_str("\nFROM (\n");
         }
-        for (i, branch) in self.branches.iter().enumerate() {
-            if i > 0 {
-                r.sql.push_str(if distinct {
-                    "\nUNION\n"
-                } else {
-                    "\nUNION ALL\n"
-                });
+        for (g, (range, distinct)) in groups.iter().enumerate() {
+            if g > 0 {
+                r.sql.push_str("\nUNION ALL\n");
             }
-            r.branch_index = i;
-            r.branch(branch, &select, distinct && single)?;
+            let single = range.len() == 1;
+            // `UNION` and `UNION ALL` apply from left to right, so a group
+            // after another is parenthesized.
+            let parenthesized = *distinct && !single && groups.len() > 1;
+            if parenthesized {
+                r.sql.push('(');
+            }
+            for i in range.clone() {
+                if i > range.start {
+                    r.sql.push_str(if *distinct {
+                        "\nUNION\n"
+                    } else {
+                        "\nUNION ALL\n"
+                    });
+                }
+                r.branch_index = i;
+                r.branch(&self.branches[i], &select, *distinct && single)?;
+            }
+            if parenthesized {
+                r.sql.push(')');
+            }
         }
         if subquery {
             r.sql.push_str("\n) q");
@@ -693,58 +739,65 @@ impl SqlPlan {
         })
     }
 
-    /// Whether two SQL rows may give the same solution of the pattern, so
-    /// that rendering removes duplicates. Never under `DISTINCT`, which
-    /// already does. Otherwise true unless the plan has one branch and
-    /// `keys` holds, for every table it reads, a unique key among the
-    /// table's [`SqlBranch::fixed_columns`]: then each solution fixes one
-    /// row of every table, and so one row of the result.
-    pub fn has_duplicates(&self, keys: Option<&TableKeys>) -> bool {
-        if self.distinct || self.branches.is_empty() {
-            return false;
-        }
-        let ([branch], Some(keys)) = (self.branches.as_slice(), keys) else {
-            return true;
-        };
-        !branch
-            .from
-            .iter()
-            .zip(&branch.fixed_columns)
-            .all(|(table, fixed)| {
-                let fixed: BTreeSet<String> = fixed.iter().map(|c| identifier_name(c)).collect();
-                keys.get(table).is_some_and(|keys| {
-                    keys.iter().any(|key| key.iter().all(|c| fixed.contains(c)))
-                })
-            })
-    }
-
-    /// The tables whose keys can show that the plan has no duplicates
-    /// ([`has_duplicates`](Self::has_duplicates)), each once. Empty when
-    /// keys cannot help: under `DISTINCT`, with several branches, or when
-    /// a branch reads an `rr:sqlQuery`, which has no keys.
-    pub fn key_tables(&self) -> Vec<LogicalTable> {
-        let [branch] = self.branches.as_slice() else {
-            return Vec::new();
-        };
-        if self.distinct
-            || branch
-                .from
-                .iter()
-                .any(|t| matches!(t, LogicalTable::SqlQuery(_)))
-        {
-            return Vec::new();
-        }
-        let mut out: Vec<LogicalTable> = Vec::new();
-        for table in &branch.from {
-            if !out.contains(table) {
-                out.push(table.clone());
+    /// The branches of each arm (see [`SqlBranch::arm`]), in order.
+    fn arms(&self) -> Vec<Range<usize>> {
+        let mut out: Vec<Range<usize>> = Vec::new();
+        for (i, branch) in self.branches.iter().enumerate() {
+            match out.last_mut() {
+                Some(last) if self.branches[last.start].arm == branch.arm => last.end = i + 1,
+                _ => out.push(i..i + 1),
             }
         }
         out
     }
 
-    /// The columns [`Condition::SameTerm`]s read, each once, in order of
-    /// appearance. Their types go into [`RenderOptions::column_types`].
+    /// Whether two SQL rows may give the same solution of an arm of the
+    /// pattern, so that rendering removes duplicates (see
+    /// [`SqlBranch::arm`]). Never under `DISTINCT`, which already does.
+    /// Otherwise true unless every arm has one branch and `keys` holds,
+    /// for every table that branch reads, a unique key among the table's
+    /// [`SqlBranch::fixed_columns`]: then each solution fixes one row of
+    /// every table, and so one row of the result.
+    pub fn has_duplicates(&self, keys: Option<&TableKeys>) -> bool {
+        !self.distinct
+            && self
+                .arms()
+                .into_iter()
+                .any(|arm| arm_has_duplicates(&self.branches[arm], keys))
+    }
+
+    /// The tables whose keys can show that an arm has no duplicates
+    /// ([`has_duplicates`](Self::has_duplicates)), each once. Empty when
+    /// keys cannot help: under `DISTINCT`, or when no arm has one branch
+    /// that reads tables only, without an `rr:sqlQuery`, which has no keys.
+    pub fn key_tables(&self) -> Vec<LogicalTable> {
+        let mut out: Vec<LogicalTable> = Vec::new();
+        if self.distinct {
+            return out;
+        }
+        for arm in self.arms() {
+            let [branch] = &self.branches[arm] else {
+                continue;
+            };
+            if branch
+                .from
+                .iter()
+                .any(|t| matches!(t, LogicalTable::SqlQuery(_)))
+            {
+                continue;
+            }
+            for table in &branch.from {
+                if !out.contains(table) {
+                    out.push(table.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// The columns [`Condition::SameTerm`]s and [`SqlExpr::Term`]s read,
+    /// each once, in order of appearance. Their types go into
+    /// [`RenderOptions::column_types`].
     pub fn term_columns(&self) -> Vec<(LogicalTable, String)> {
         fn collect(
             condition: &Condition,
@@ -781,6 +834,16 @@ impl SqlPlan {
         }
         let mut out: Vec<(LogicalTable, String)> = Vec::new();
         for branch in &self.branches {
+            for expr in &branch.select {
+                if let SqlExpr::Term { term, .. } = expr {
+                    for (table, name) in term.columns() {
+                        let key = (branch.from[table].clone(), name.to_owned());
+                        if !out.contains(&key) {
+                            out.push(key);
+                        }
+                    }
+                }
+            }
             for condition in branch.all_conditions() {
                 collect(condition, &branch.from, &mut out);
             }
@@ -1105,9 +1168,15 @@ impl SqlPlan {
                 SqlExpr::Column { table, name } | SqlExpr::Lexical { table, name, .. } => {
                     f(&from[*table], name);
                 }
-                SqlExpr::Param(_) | SqlExpr::Null(_) | SqlExpr::Unbound => {}
+                SqlExpr::Param(_) | SqlExpr::Null(_) | SqlExpr::Unbound | SqlExpr::True => {}
                 SqlExpr::Concat(parts) => parts.iter_mut().for_each(|p| expr(p, from, f)),
                 SqlExpr::Matched(inner) => expr(inner, from, f),
+                SqlExpr::Term { term: t, guard } => {
+                    term(t, from, f);
+                    if let Some(guard) = guard {
+                        expr(guard, from, f);
+                    }
+                }
             }
         }
         fn term(
@@ -1297,6 +1366,9 @@ impl<'a> Renderer<'a> {
         distinct: bool,
     ) -> Result<(), Error> {
         self.from = &branch.from;
+        // Constants of the select list are strings of terms, never
+        // compared, so binding one cannot empty the branch.
+        self.required = false;
         self.sql.push_str("SELECT ");
         if distinct {
             self.sql.push_str("DISTINCT ");
@@ -1316,13 +1388,13 @@ impl<'a> Renderer<'a> {
                 // (`numeric` 1.0 and 1.00, or `varchar` and `text`), which
                 // only keeps a duplicate.
                 let start = self.sql.len();
-                self.expr(&branch.select[entry]);
+                self.select_expr(&branch.select[entry])?;
                 let column = self.sql.split_off(start);
                 self.sql.push_str(&format!(
                     "pg_typeof({column})::text || ' ' || {column}::text"
                 ));
             } else {
-                self.expr(&branch.select[entry]);
+                self.select_expr(&branch.select[entry])?;
             }
             self.sql.push_str(" AS ");
             self.sql.push_str(&quote_identifier(&select.aliases[entry]));
@@ -1549,9 +1621,9 @@ impl<'a> Renderer<'a> {
 
     fn same_term(&mut self, left: &TermSql, right: &TermSql) -> Result<(), Error> {
         let Some(types) = self.options.column_types else {
-            self.term_side(left, None)?;
+            self.term_side(left, None, false)?;
             self.sql.push_str(" = ");
-            return self.term_side(right, None);
+            return self.term_side(right, None, false);
         };
         if !self.datatypes_agree(left, right, types) {
             self.sql.push_str("false");
@@ -1583,9 +1655,9 @@ impl<'a> Renderer<'a> {
             ));
             return Ok(());
         }
-        self.term_side(left, Some(types))?;
+        self.term_side(left, Some(types), false)?;
         self.sql.push_str(" = ");
-        self.term_side(right, Some(types))
+        self.term_side(right, Some(types), false)
     }
 
     /// R2RML §10.2: a literal from a column without `rr:datatype` has its
@@ -1624,16 +1696,21 @@ impl<'a> Renderer<'a> {
     }
 
     /// One side of a term comparison as a string expression. Without
-    /// `types`, columns are rendered as they are and template columns by
-    /// their text output.
+    /// `types`, columns are rendered as they are, or by their text output
+    /// with `text`, and template columns by their text output.
     ///
     /// With a base IRI, the side is the IRI R2RML §11.2 generates: `CASE
     /// WHEN s ~ '^scheme:' THEN s ELSE $base || s END`, the same test as
     /// [`has_scheme`](crate::mapping::has_scheme), with `s` rendered three
     /// times, since a column is the common case and costs nothing to repeat.
-    fn term_side(&mut self, side: &TermSql, types: Option<&ColumnTypes>) -> Result<(), Error> {
+    fn term_side(
+        &mut self,
+        side: &TermSql,
+        types: Option<&ColumnTypes>,
+        text: bool,
+    ) -> Result<(), Error> {
         let Some(base) = &side.base_iri else {
-            return self.term_string(side, types, false);
+            return self.term_string(side, types, text);
         };
         self.sql.push_str("CASE WHEN (");
         self.term_string(side, types, true)?;
@@ -1715,6 +1792,28 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// An entry of a select list: [`SqlExpr::Term`] or any other.
+    fn select_expr(&mut self, expr: &SqlExpr) -> Result<(), Error> {
+        let SqlExpr::Term { term, guard } = expr else {
+            self.expr(expr);
+            return Ok(());
+        };
+        if let Some(guard) = guard {
+            self.sql.push_str("CASE WHEN ");
+            self.expr(guard);
+            self.sql.push_str(" IS NOT NULL THEN ");
+        }
+        // Text in every branch, so that `UNION` combines them.
+        self.sql.push('(');
+        let types = self.options.column_types;
+        self.term_side(term, types, true)?;
+        self.sql.push_str(")::text");
+        if guard.is_some() {
+            self.sql.push_str(" END");
+        }
+        Ok(())
+    }
+
     fn expr(&mut self, expr: &SqlExpr) {
         match expr {
             SqlExpr::Column { table, name } => self.sql.push_str(&column_sql(*table, name)),
@@ -1754,8 +1853,28 @@ impl<'a> Renderer<'a> {
                 self.expr(inner);
                 self.sql.push_str(" IS NOT NULL THEN true END");
             }
+            SqlExpr::True => self.sql.push_str("true"),
+            SqlExpr::Term { .. } => unreachable!("only select lists hold terms"),
         }
     }
+}
+
+/// Whether the branches of one arm may give the same solution twice: one
+/// branch proves it may not when `keys` holds, for every table it reads, a
+/// unique key among its [`SqlBranch::fixed_columns`].
+fn arm_has_duplicates(branches: &[SqlBranch], keys: Option<&TableKeys>) -> bool {
+    let ([branch], Some(keys)) = (branches, keys) else {
+        return true;
+    };
+    !branch
+        .from
+        .iter()
+        .zip(&branch.fixed_columns)
+        .all(|(table, fixed)| {
+            let fixed: BTreeSet<String> = fixed.iter().map(|c| identifier_name(c)).collect();
+            keys.get(table)
+                .is_some_and(|keys| keys.iter().any(|key| key.iter().all(|c| fixed.contains(c))))
+        })
 }
 
 fn column_sql(table: usize, name: &str) -> String {
@@ -1818,9 +1937,15 @@ fn condition_tables(condition: &Condition) -> Vec<usize> {
             SqlExpr::Column { table, .. } | SqlExpr::Lexical { table, .. } => {
                 out.insert(*table);
             }
-            SqlExpr::Param(_) | SqlExpr::Null(_) | SqlExpr::Unbound => {}
+            SqlExpr::Param(_) | SqlExpr::Null(_) | SqlExpr::Unbound | SqlExpr::True => {}
             SqlExpr::Concat(parts) => parts.iter().for_each(|p| collect(p, out)),
             SqlExpr::Matched(inner) => collect(inner, out),
+            SqlExpr::Term { term, guard } => {
+                out.extend(term.columns().into_iter().map(|(table, _)| table));
+                if let Some(guard) = guard {
+                    collect(guard, out);
+                }
+            }
         }
     }
     fn tables(condition: &Condition, out: &mut BTreeSet<usize>) {
@@ -2019,6 +2144,7 @@ mod tests {
             lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
+                arm: 0,
                 from: vec![view.clone(), view.clone()],
                 select: vec![column(0, "Id"), column(1, "\"V\"")],
                 conditions: vec![
@@ -2062,6 +2188,7 @@ mod tests {
             lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
+                arm: 0,
                 from: vec![table.clone()],
                 select: vec![column(0, "ID")],
                 conditions: Vec::new(),
@@ -2200,6 +2327,7 @@ mod tests {
             lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
+                arm: 0,
                 from: vec![
                     LogicalTable::TableName("a".into()),
                     LogicalTable::SqlQuery("SELECT * FROM b;\n".into()),
@@ -2236,6 +2364,7 @@ mod tests {
     #[test]
     fn to_sql_with_text_params_casts_the_compared_column() {
         let branch = |value: &str, datatype: Option<&str>| SqlBranch {
+            arm: 0,
             from: vec![LogicalTable::TableName("t".into())],
             select: vec![column(0, "id")],
             conditions: vec![
@@ -2337,6 +2466,7 @@ mod tests {
             lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
+                arm: 0,
                 from: vec![l.clone(), r.clone()],
                 select: Vec::new(),
                 conditions: vec![Condition::SameTerm(left, right)],
@@ -2424,6 +2554,7 @@ mod tests {
     /// natural datatype or in an IRI template, and a hidden `?h`.
     fn union_plan(natural: bool) -> SqlPlan {
         let branch = |t: &str| SqlBranch {
+            arm: 0,
             from: vec![LogicalTable::TableName(t.into())],
             select: vec![column(0, "v"), column(0, "h")],
             conditions: Vec::new(),
@@ -2670,6 +2801,7 @@ mod tests {
             lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
+                arm: 0,
                 from: vec![LogicalTable::TableName("\"T\"".into())],
                 select: vec![column(0, "\"Id\""), column(0, "v")],
                 conditions: Vec::new(),

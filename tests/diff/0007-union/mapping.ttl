@@ -1,0 +1,77 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# ex:Client from two templates that never give the same IRI; ex:Customer
+# also from the partners' IRI column, which can.
+<#RetailMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "customers" ] ;
+  rr:subjectMap [
+    rr:template "http://example.org/customer/{id}" ;
+    rr:class ex:Client , ex:Customer
+  ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:kind ; rr:object "retail" ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:code ;
+    rr:objectMap [ rr:column "id" ; rr:datatype xsd:string ]
+  ] ;
+  rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] .
+
+<#WholesaleMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "wholesalers" ] ;
+  rr:subjectMap [
+    rr:template "http://example.org/wholesale/{code}" ;
+    rr:class ex:Client , ex:Customer
+  ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:homepage ;
+    rr:objectMap [ rr:column "homepage" ; rr:termType rr:IRI ]
+  ] ;
+  rr:predicateObjectMap [ rr:predicate ex:kind ; rr:object "wholesale" ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:code ;
+    rr:objectMap [ rr:column "code" ; rr:datatype ex:WholesaleCode ]
+  ] ;
+  rr:predicateObjectMap [ rr:predicate ex:ref ; rr:objectMap [ rr:column "code" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:label ;
+    rr:objectMap [ rr:template "{name} ({code})" ; rr:termType rr:Literal ]
+  ] .
+
+<#PartnerMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "partners" ] ;
+  rr:subjectMap [ rr:column "iri" ; rr:class ex:Customer , ex:Partner ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+
+<#OrderMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "orders" ] ;
+  rr:subjectMap [ rr:template "http://example.org/order/{id}" ; rr:class ex:Order ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:placedBy ;
+    rr:objectMap [ rr:template "http://example.org/customer/{customer_id}" ]
+  ] ;
+  rr:predicateObjectMap [ rr:predicate ex:amount ; rr:objectMap [ rr:column "amount" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:status ; rr:objectMap [ rr:column "status" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:ref ;
+    rr:objectMap [ rr:template "http://example.org/ref/{id}" ]
+  ] .
+
+<#EnglishNoteMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:sqlQuery "SELECT order_id, body FROM notes WHERE lang = 'en'" ] ;
+  rr:subjectMap [ rr:template "http://example.org/order/{order_id}" ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:comment ;
+    rr:objectMap [ rr:column "body" ; rr:language "en" ]
+  ] .
+
+<#SpanishNoteMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:sqlQuery "SELECT order_id, body FROM notes WHERE lang = 'es'" ] ;
+  rr:subjectMap [ rr:template "http://example.org/order/{order_id}" ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:comment ;
+    rr:objectMap [ rr:column "body" ; rr:language "es" ]
+  ] .

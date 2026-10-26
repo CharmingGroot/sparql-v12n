@@ -285,7 +285,8 @@ fn constant_eq(constant: &Term, other: &TermExpr<'_>, iri: bool) -> Equality {
 }
 
 /// What a literal term's datatype is known to be before reading any row.
-enum LiteralType<'a> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiteralType<'a> {
     Language(&'a str),
     Datatype(&'a str),
     /// A column without `rr:datatype` takes its datatype from the SQL
@@ -293,7 +294,7 @@ enum LiteralType<'a> {
     Natural,
 }
 
-fn literal_type<'a>(term: &TermExpr<'a>) -> LiteralType<'a> {
+pub(crate) fn literal_type<'a>(term: &TermExpr<'a>) -> LiteralType<'a> {
     if let TermValue::Constant(Term::Literal(literal)) = term.value {
         return match literal.language() {
             Some(language) => LiteralType::Language(language),
@@ -355,6 +356,11 @@ pub(crate) fn decompose_template<'a>(
     if !(lp.starts_with(rp) || rp.starts_with(lp)) || !(ls.ends_with(rs) || rs.ends_with(ls)) {
         return Decomposition::Disjoint;
     }
+    if term_type == TermType::Iri
+        && (has_text_never_in(left, right) || has_text_never_in(right, left))
+    {
+        return Decomposition::Disjoint;
+    }
     let same_shape = left.parts().len() == right.parts().len()
         && left
             .parts()
@@ -391,6 +397,26 @@ pub(crate) fn is_injective(template: &Template, term_type: TermType) -> bool {
     }) && !parts
         .windows(2)
         .any(|w| matches!(w, [TemplatePart::Column(_), TemplatePart::Column(_)]))
+}
+
+/// Whether every string of IRI template `a` has a character that no
+/// string of IRI template `b` has: one of `a`'s fixed text that IRI-safe
+/// encoding always escapes in values (R2RML §7.3) and that `b`'s fixed
+/// text lacks. `http://ex/{a};{b}` and `http://ex/{c}` are disjoint, since
+/// a value of `c` renders `;` as `%3B`.
+fn has_text_never_in(a: &Template, b: &Template) -> bool {
+    let fixed = |t: &Template| -> String {
+        t.parts()
+            .iter()
+            .filter_map(|p| match p {
+                TemplatePart::Literal(text) => Some(text.as_str()),
+                TemplatePart::Column(_) => None,
+            })
+            .collect()
+    };
+    let (a, b) = (fixed(a), fixed(b));
+    a.chars()
+        .any(|c| !is_iunreserved(c) && c != '%' && !b.contains(c))
 }
 
 /// The literal text every rendered string starts with.
@@ -584,6 +610,34 @@ mod tests {
         assert_eq!(
             decompose_template(&a, &b, TermType::Iri),
             Decomposition::Disjoint
+        );
+    }
+
+    #[test]
+    fn decompose_template_text_escaped_in_the_other_is_disjoint() {
+        // `;` is fixed text of the first; values of the second render it
+        // as `%3B`.
+        let (a, b) = (
+            template("http://ex/{id}/{first};{last}"),
+            template("http://ex/{id}/{name}"),
+        );
+        assert_eq!(
+            decompose_template(&a, &b, TermType::Iri),
+            Decomposition::Disjoint
+        );
+        assert_eq!(
+            decompose_template(&b, &a, TermType::Iri),
+            Decomposition::Disjoint
+        );
+        // Literals are not encoded, and `/` is fixed text of both.
+        assert_eq!(
+            decompose_template(&a, &b, TermType::Literal),
+            Decomposition::Unknown
+        );
+        let (a, b) = (template("http://ex/{a}/{b}"), template("http://ex/x/{c}"));
+        assert_eq!(
+            decompose_template(&a, &b, TermType::Iri),
+            Decomposition::Unknown
         );
     }
 
