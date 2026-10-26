@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# "époxy" (U+00E9) comes after every ASCII string by code point.
+SELECT ?l WHERE { ?p ex:label ?l FILTER(?l < "가") }
+ORDER BY ?l

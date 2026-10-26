@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# Ties (two products at 120) may come in either order.
+SELECT ?p ?price WHERE { ?p ex:price ?price }
+ORDER BY ?price

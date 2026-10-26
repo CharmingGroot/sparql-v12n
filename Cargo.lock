@@ -1375,6 +1375,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "futures-util",
+ "insta",
  "thiserror",
  "tokio",
  "tokio-postgres",

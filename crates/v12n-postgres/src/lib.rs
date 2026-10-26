@@ -17,8 +17,8 @@ use tokio_postgres::{Client, Config, NoTls, RowStream, Statement};
 use v12n_core::mapping::LogicalTable;
 use v12n_core::solution::{Solution, SolutionBuilder, SqlValue};
 use v12n_core::sql::{
-    ColumnTypes, RenderOptions, SqlPlan, TableKeys, column_name_probe, column_type_probe,
-    quote_identifier, quote_table_name,
+    ColumnTypes, RenderOptions, RenderedSql, SqlPlan, TableKeys, column_name_probe,
+    column_type_probe, quote_identifier, quote_table_name,
 };
 
 use bind::{Bound, bind};
@@ -140,17 +140,14 @@ impl Database {
         // happens to have exactly `row_limit` rows.
         let fetch = (self.limits.row_limit > 0)
             .then(|| i64::try_from(self.limits.row_limit.saturating_add(1)).unwrap_or(i64::MAX));
-        let limited = |sql: &str| match fetch {
-            Some(_) => count_rows(sql, rendered.params.len() + 1),
-            None => sql.to_owned(),
-        };
-
         let mut statement = self
             .client
-            .prepare(&limited(&rendered.sql))
+            .prepare(&statement_sql(plan, &rendered, None, fetch.is_some()))
             .await
             .map_err(pg)?;
-        let data_columns = statement.columns().len() - usize::from(fetch.is_some());
+        // The projected columns, then the sort keys, then the row count.
+        let data_columns = plan.columns.len();
+        let count_column = data_columns + rendered.order_by.len();
         let decoders: Vec<Option<Decoder>> = statement.columns()[..data_columns]
             .iter()
             .map(|c| Decoder::for_type(c.type_()))
@@ -164,19 +161,15 @@ impl Database {
             .filter(|(_, ty)| Decoder::for_type(ty).is_none())
             .map(|(i, _)| i)
             .collect();
-        let cast_columns =
-            decoders.iter().any(Option::is_none) && decoders.len() == plan.columns.len();
+        let cast_columns = decoders.iter().any(Option::is_none);
         let rendered = if cast_columns || !text_params.is_empty() {
             let rendered = plan.to_sql_with(&RenderOptions {
                 text_params: &text_params,
                 ..options
             })?;
-            let sql = if cast_columns {
-                cast_to_text(&rendered.sql, &plan.columns, &decoders)
-            } else {
-                rendered.sql.clone()
-            };
-            statement = self.client.prepare(&limited(&sql)).await.map_err(pg)?;
+            let cast = cast_columns.then_some(decoders.as_slice());
+            let sql = statement_sql(plan, &rendered, cast, fetch.is_some());
+            statement = self.client.prepare(&sql).await.map_err(pg)?;
             rendered
         } else {
             rendered
@@ -191,6 +184,7 @@ impl Database {
             builder: SolutionBuilder::new(plan),
             decoders,
             row_limit: self.limits.row_limit,
+            count_column,
             returned: 0,
             truncated: false,
             timeout,
@@ -364,21 +358,73 @@ impl Database {
     }
 }
 
+/// The statement that runs `rendered`: with the columns that `decoders`
+/// has no decoder for cast to text, and with the row count when the
+/// results are `limited` (then `$n` after the plan's parameters is the
+/// row limit plus one).
+fn statement_sql(
+    plan: &SqlPlan,
+    rendered: &RenderedSql,
+    decoders: Option<&[Option<Decoder>]>,
+    limited: bool,
+) -> String {
+    let sql = match decoders {
+        Some(decoders) => Cow::Owned(cast_to_text(rendered, &plan.columns, decoders)),
+        None => Cow::Borrowed(rendered.sql.as_str()),
+    };
+    if !limited {
+        return sql.into_owned();
+    }
+    let sliced = plan.limit.is_some() || plan.offset > 0;
+    count_rows(&sql, rendered.params.len() + 1, sliced, |table| {
+        rendered.order_by_clause(table)
+    })
+}
+
 /// Wraps `sql` so that every row also carries the number of rows, at most
 /// `$limit`, in an extra last column. The first row then tells whether
 /// the result exceeds the row limit, before any solution is handed out,
 /// so an HTTP response can mark the truncation in a header. PostgreSQL
 /// buffers the limited rows for the window; the client still streams.
 /// An empty `OVER ()` adds no sort, so the order of `sql` is kept.
-fn count_rows(sql: &str, limit_param: usize) -> String {
-    format!("SELECT q.*, count(*) OVER ()\nFROM (\n{sql}\nLIMIT ${limit_param}\n) q")
+///
+/// A query `LIMIT` at or below the row limit leaves at most that many
+/// rows, so the result is never reported as truncated. When `sql` has its
+/// own `LIMIT` or `OFFSET` (`sliced`), or its own `ORDER BY`, it is read
+/// as a subquery, since one `SELECT` takes only one `LIMIT`.
+///
+/// SQL keeps no order through a subquery, so with `ORDER BY` both the
+/// limited subquery and the outermost query sort again by the sort keys
+/// `sql` selects (`order_by` writes the clause for a table alias). Their
+/// rows are already in that order, so this costs little, and the order of
+/// the rows the client reads is the outermost query's.
+fn count_rows(
+    sql: &str,
+    limit_param: usize,
+    sliced: bool,
+    order_by: impl Fn(&str) -> String,
+) -> String {
+    let inner = if sliced || !order_by("l").is_empty() {
+        format!("SELECT *\nFROM (\n{sql}\n) l{}", order_by("l"))
+    } else {
+        sql.to_owned()
+    };
+    format!(
+        "SELECT q.*, count(*) OVER ()\nFROM (\n{inner}\nLIMIT ${limit_param}\n) q{}",
+        order_by("q")
+    )
 }
 
 /// R2RML §10.2: a value whose type has no natural datatype becomes a plain
 /// literal of the value cast to a string. Casting in SQL avoids decoding
-/// every binary format PostgreSQL has.
-fn cast_to_text(sql: &str, columns: &[String], decoders: &[Option<Decoder>]) -> String {
-    let select: Vec<String> = columns
+/// every binary format PostgreSQL has. The sort keys pass through, and the
+/// query sorts by them again, since SQL keeps no order through a subquery.
+fn cast_to_text(
+    rendered: &RenderedSql,
+    columns: &[String],
+    decoders: &[Option<Decoder>],
+) -> String {
+    let mut select: Vec<String> = columns
         .iter()
         .zip(decoders)
         .map(|(column, decoder)| {
@@ -389,7 +435,18 @@ fn cast_to_text(sql: &str, columns: &[String], decoders: &[Option<Decoder>]) -> 
             }
         })
         .collect();
-    format!("SELECT {}\nFROM (\n{sql}\n) q", select.join(", "))
+    select.extend(
+        rendered
+            .order_by
+            .iter()
+            .map(|c| format!("q.{}", quote_identifier(&c.alias))),
+    );
+    format!(
+        "SELECT {}\nFROM (\n{}\n) q{}",
+        select.join(", "),
+        rendered.sql,
+        rendered.order_by_clause("q")
+    )
 }
 
 /// The solutions of one query, read one row at a time.
@@ -399,6 +456,9 @@ pub struct Solutions {
     builder: SolutionBuilder,
     decoders: Vec<Decoder>,
     row_limit: u64,
+    /// The row count's column, after the projected columns and the sort
+    /// keys, which are never read.
+    count_column: usize,
     returned: u64,
     truncated: bool,
     timeout: Duration,
@@ -430,7 +490,7 @@ impl Solutions {
         if self.row_limit > 0 {
             if self.returned == 0 {
                 let total: i64 = row
-                    .try_get(self.decoders.len())
+                    .try_get(self.count_column)
                     .map_err(|e| Error::Database(e.to_string()))?;
                 self.truncated = u64::try_from(total).unwrap_or(0) > self.row_limit;
             }
@@ -461,5 +521,137 @@ impl Solutions {
     /// the first solution has been read.
     pub fn is_truncated(&self) -> bool {
         self.truncated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio_postgres::NoTls;
+    use v12n_core::mapping::{Mapping, MappingIndex};
+    use v12n_core::{sparql, unfold};
+
+    use super::*;
+
+    const SHOP: &str = include_str!("../../../examples/shop/mapping.ttl");
+
+    /// The statement `execute` prepares for `query` over the shop, with a
+    /// column `decoders` cannot read when `cast`.
+    fn statement(query: &str, cast: bool) -> String {
+        let mapping = Mapping::from_turtle(SHOP).unwrap();
+        let query = sparql::parse(&format!("PREFIX ex: <http://example.org/>\n{query}")).unwrap();
+        let plan = unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping)).unwrap();
+        let rendered = plan.to_sql();
+        let decoders: Vec<Option<Decoder>> = plan
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, _)| (i > 0).then_some(Decoder::Text))
+            .collect();
+        statement_sql(&plan, &rendered, cast.then_some(decoders.as_slice()), true)
+    }
+
+    /// SQL keeps no order through a subquery, so every query around one
+    /// with `ORDER BY` sorts again by the selected keys, and the client
+    /// reads the rows in the outermost query's order.
+    #[test]
+    fn every_wrapper_sorts_again_by_the_keys() {
+        for (name, query, cast) in [
+            (
+                "ordered",
+                "SELECT ?o ?a WHERE { ?o ex:amount ?a } ORDER BY DESC(?a)",
+                false,
+            ),
+            (
+                "ordered_and_sliced",
+                "SELECT ?o ?a WHERE { ?o ex:amount ?a } ORDER BY DESC(?a) LIMIT 2 OFFSET 1",
+                false,
+            ),
+            (
+                "ordered_cast",
+                "SELECT ?o ?a WHERE { ?o ex:amount ?a } ORDER BY DESC(?a) LIMIT 2",
+                true,
+            ),
+            (
+                "ordered_union",
+                "SELECT ?x WHERE { { ?x ex:name ?v } UNION { ?x ex:amount ?v } } ORDER BY ?v",
+                false,
+            ),
+            (
+                "sliced",
+                "SELECT ?o WHERE { ?o ex:amount ?a } LIMIT 2",
+                false,
+            ),
+            ("plain", "SELECT ?o WHERE { ?o ex:amount ?a }", false),
+        ] {
+            let sql = statement(query, cast);
+            insta::assert_snapshot!(name, sql, query);
+        }
+    }
+
+    /// The sort keys travel through the row count and are sorted by
+    /// again, and the plan still reads the index on the sorted column and
+    /// stops after the `LIMIT`. Runs against the `testenv` PostgreSQL when
+    /// `V12N_TEST_DATABASE_URL` is set.
+    #[tokio::test]
+    async fn wrapped_statement_keeps_the_index_on_the_sorted_column() {
+        let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
+            eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        tokio::spawn(connection);
+        client
+            .batch_execute(
+                "DROP SCHEMA IF EXISTS v12n_wrap CASCADE;
+                 CREATE SCHEMA v12n_wrap;
+                 CREATE TABLE v12n_wrap.items (id int PRIMARY KEY, price int NOT NULL);
+                 INSERT INTO v12n_wrap.items
+                   SELECT n, (n * 7919) % 10007 FROM generate_series(1, 100000) n;
+                 CREATE INDEX items_price ON v12n_wrap.items (price);
+                 ANALYZE v12n_wrap.items;",
+            )
+            .await
+            .unwrap();
+        let mapping = Mapping::from_turtle(
+            "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
+             <#M> rr:logicalTable [ rr:tableName \"v12n_wrap.items\" ] ;\n\
+               rr:subjectMap [ rr:template \"http://example.org/item/{id}\" ] ;\n\
+               rr:predicateObjectMap [ rr:predicate <http://example.org/price> ; \
+               rr:objectMap [ rr:column \"price\" ] ] .",
+        )
+        .unwrap();
+        let query = sparql::parse(
+            "SELECT ?i ?p WHERE { ?i <http://example.org/price> ?p } ORDER BY DESC(?p) LIMIT 3",
+        )
+        .unwrap();
+        let plan = unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping)).unwrap();
+        let database = Database::connect(&url, Limits::default()).await.unwrap();
+        let types = database.column_types(&plan).await.unwrap();
+        let keys = database.load_table_keys(&plan).await.unwrap();
+        let rendered = plan
+            .to_sql_with(&RenderOptions {
+                column_types: types.as_ref(),
+                keys: keys.as_ref(),
+                ..RenderOptions::default()
+            })
+            .unwrap();
+        let sql = statement_sql(&plan, &rendered, None, true);
+        let explain: Vec<String> = client
+            .query(&format!("EXPLAIN ANALYZE {sql}"), &[&3i64, &10_001i64])
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        client
+            .batch_execute("DROP SCHEMA v12n_wrap CASCADE")
+            .await
+            .unwrap();
+        let plan_text = explain.join("\n");
+        assert!(
+            plan_text.contains("Index Scan Backward using items_price"),
+            "{sql}\n{plan_text}"
+        );
+        assert!(!plan_text.contains("Seq Scan"), "{sql}\n{plan_text}");
     }
 }

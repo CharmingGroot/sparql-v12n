@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Compares two query results as bags of solutions.
+//! Compares two query results as bags of solutions, and as sequences
+//! where the query orders or slices them.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use oxrdf::Term;
-use spargebra::algebra::GraphPattern;
-use spargebra::{Query, SparqlParser};
+
+use crate::order::Order;
 
 /// One solution: the bound variables (without `?`) and their terms.
 /// Unbound variables are absent, so a solution with `?x` unbound differs
@@ -30,34 +32,24 @@ pub struct Diff {
     /// Solutions in the actual result only, once per extra copy.
     pub extra: Vec<Row>,
     /// Both solution sequences, when the bags are equal but `ORDER BY`
-    /// puts them in a different order.
+    /// puts them in a different order, or one is not in the order it
+    /// defines.
     pub order: Option<(Vec<Row>, Vec<Row>)>,
-}
-
-/// Whether the query has a top-level `ORDER BY`, which makes the order of
-/// solutions part of the answer (SPARQL 1.1 §15.1).
-pub fn has_order_by(query: &str) -> Result<bool, String> {
-    let query = SparqlParser::new()
-        .parse_query(query)
-        .map_err(|e| e.to_string())?;
-    let Query::Select { pattern, .. } = query else {
-        return Ok(false);
-    };
-    let mut pattern = &pattern;
-    loop {
-        pattern = match pattern {
-            GraphPattern::OrderBy { .. } => return Ok(true),
-            GraphPattern::Project { inner, .. }
-            | GraphPattern::Distinct { inner }
-            | GraphPattern::Reduced { inner }
-            | GraphPattern::Slice { inner, .. } => inner,
-            _ => return Ok(false),
-        };
-    }
+    /// Pairs of solutions a result has in an order SPARQL forbids: the
+    /// result (`Ontop` or `v12n`) and the positions.
+    pub unsorted: Vec<(&'static str, usize, usize)>,
 }
 
 /// `None` when `actual` has the same variables and the same bag of
-/// solutions as `expected`, and, if `ordered`, the same sequence.
+/// solutions as `expected`, in an order that `order` allows.
+///
+/// With `ORDER BY` over projected variables, each result must be in the
+/// order SPARQL 1.1 §15.1 defines, compared by [`Order::compare`]: where
+/// it leaves the order open (ties, and values `<` does not order), any
+/// order passes. With other comparators, whose values the results do not
+/// show, the sequences must be equal. With `LIMIT` or `OFFSET`, solutions
+/// only one result has must be unordered with respect to those only the
+/// other has, as where a tie is cut.
 ///
 /// Terms are compared as RDF terms: same kind, lexical form, datatype and
 /// language tag. Values are never normalized, so `"4"^^xsd:integer` and
@@ -67,7 +59,7 @@ pub fn has_order_by(query: &str) -> Result<bool, String> {
 pub fn compare(
     expected: &Results,
     actual: &Results,
-    ordered: bool,
+    order: &Order,
 ) -> Result<Option<Diff>, String> {
     for (who, results) in [("expected", expected), ("actual", actual)] {
         if results
@@ -105,7 +97,34 @@ pub fn compare(
         side.extend(std::iter::repeat_n(row.clone(), copies));
     }
 
-    if ordered && diff.missing.is_empty() && diff.extra.is_empty() {
+    let comparable = order.keys.is_some() && (order.ordered || order.sliced);
+    if comparable {
+        for (who, rows) in [("Ontop", &expected.rows), ("v12n", &actual.rows)] {
+            for (i, a) in rows.iter().enumerate() {
+                for (j, b) in rows.iter().enumerate().skip(i + 1) {
+                    if order.compare(a, b) == Some(Ordering::Greater) {
+                        diff.unsorted.push((who, i, j));
+                    }
+                }
+            }
+        }
+        if !diff.unsorted.is_empty() {
+            diff.order = Some((expected.rows.clone(), actual.rows.clone()));
+        }
+        // A slice may cut through solutions that have no order between
+        // them, so each result may keep different ones of them.
+        if order.sliced
+            && expected.rows.len() == actual.rows.len()
+            && diff.missing.iter().all(|m| {
+                diff.extra
+                    .iter()
+                    .all(|e| order.compare(m, e).is_none_or(Ordering::is_eq))
+            })
+        {
+            diff.missing.clear();
+            diff.extra.clear();
+        }
+    } else if order.ordered && diff.missing.is_empty() && diff.extra.is_empty() {
         let keys = |rows: &[Row]| rows.iter().map(key).collect::<Vec<_>>();
         if keys(&expected.rows) != keys(&actual.rows) {
             diff.order = Some((expected.rows.clone(), actual.rows.clone()));
@@ -225,11 +244,19 @@ impl fmt::Display for Diff {
             &extra.into_iter().flatten().collect::<Vec<_>>(),
         )?;
 
+        for who in ["Ontop", "v12n"] {
+            let mut pairs = self.unsorted.iter().filter(|(w, ..)| *w == who);
+            if let Some((_, i, j)) = pairs.next() {
+                writeln!(
+                    f,
+                    "  {who} is not in the order ORDER BY defines: solution {j} comes after {i} \
+                     ({} such pairs)",
+                    1 + pairs.count()
+                )?;
+            }
+        }
         if let Some((expected, actual)) = &self.order {
-            writeln!(
-                f,
-                "  same solutions in a different order (the query has ORDER BY):"
-            )?;
+            writeln!(f, "  the solutions in order:")?;
             for (i, (e, a)) in expected.iter().zip(actual).enumerate() {
                 let mark = if key(e) == key(a) { ' ' } else { '*' };
                 writeln!(f, "   {mark}{i:>3} Ontop {}", key(e))?;
@@ -277,7 +304,10 @@ mod tests {
         let b = row(&[("s", iri("b"))]);
         let expected = results(&["s"], vec![a.clone(), b.clone()]);
         let actual = results(&["s"], vec![b, a]);
-        assert_eq!(compare(&expected, &actual, false).unwrap(), None);
+        assert_eq!(
+            compare(&expected, &actual, &Order::default()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -285,7 +315,9 @@ mod tests {
         let a = row(&[("s", iri("a"))]);
         let expected = results(&["s"], vec![a.clone()]);
         let actual = results(&["s"], vec![a.clone(), a.clone()]);
-        let diff = compare(&expected, &actual, false).unwrap().unwrap();
+        let diff = compare(&expected, &actual, &Order::default())
+            .unwrap()
+            .unwrap();
         assert_eq!((diff.missing, diff.extra), (vec![], vec![a]));
     }
 
@@ -293,7 +325,11 @@ mod tests {
     fn compare_tells_unbound_from_bound() {
         let expected = results(&["s", "o"], vec![row(&[("s", iri("a"))])]);
         let actual = results(&["s", "o"], vec![row(&[("s", iri("a")), ("o", int("1"))])]);
-        assert!(compare(&expected, &actual, false).unwrap().is_some());
+        assert!(
+            compare(&expected, &actual, &Order::default())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -306,7 +342,9 @@ mod tests {
         ] {
             let actual = results(&["o"], vec![row(&[("o", other.clone())])]);
             assert!(
-                compare(&expected, &actual, false).unwrap().is_some(),
+                compare(&expected, &actual, &Order::default())
+                    .unwrap()
+                    .is_some(),
                 "{other}"
             );
         }
@@ -322,31 +360,90 @@ mod tests {
                 Literal::new_typed_literal("x", xsd::STRING).into(),
             )])],
         );
-        assert_eq!(compare(&plain, &string, false).unwrap(), None);
+        assert_eq!(compare(&plain, &string, &Order::default()).unwrap(), None);
     }
 
     #[test]
     fn compare_checks_variables_as_a_set() {
         let expected = results(&["a", "b"], vec![]);
         assert_eq!(
-            compare(&expected, &results(&["b", "a"], vec![]), false).unwrap(),
+            compare(&expected, &results(&["b", "a"], vec![]), &Order::default()).unwrap(),
             None
         );
-        let diff = compare(&expected, &results(&["a"], vec![]), false)
+        let diff = compare(&expected, &results(&["a"], vec![]), &Order::default())
             .unwrap()
             .unwrap();
         assert!(diff.variables.is_some());
     }
 
+    fn ordered(query_modifiers: &str) -> Order {
+        Order::of(&format!(
+            "SELECT ?s ?o WHERE {{ ?s ?p ?o }} {query_modifiers}"
+        ))
+        .unwrap()
+    }
+
     #[test]
-    fn compare_checks_the_sequence_with_order_by() {
+    fn compare_checks_the_order_order_by_defines() {
+        let a = row(&[("s", iri("a")), ("o", int("1"))]);
+        let b = row(&[("s", iri("b")), ("o", int("2"))]);
+        let expected = results(&["s", "o"], vec![a.clone(), b.clone()]);
+        let swapped = results(&["s", "o"], vec![b.clone(), a.clone()]);
+        let order = ordered("ORDER BY ?o");
+        assert_eq!(compare(&expected, &expected, &order).unwrap(), None);
+        let diff = compare(&expected, &swapped, &order).unwrap().unwrap();
+        assert_eq!(diff.unsorted, [("v12n", 0, 1)]);
+        assert!(diff.missing.is_empty());
+        // Descending, the other way round.
+        let diff = compare(&expected, &expected, &ordered("ORDER BY DESC(?o)"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(diff.unsorted, [("Ontop", 0, 1), ("v12n", 0, 1)]);
+    }
+
+    #[test]
+    fn compare_accepts_any_order_of_ties_and_unordered_values() {
+        let a = row(&[("s", iri("a")), ("o", int("1"))]);
+        let b = row(&[("s", iri("b")), ("o", int("1"))]);
+        let c = row(&[
+            ("s", iri("c")),
+            ("o", Literal::new_simple_literal("x").into()),
+        ]);
+        let expected = results(&["s", "o"], vec![a.clone(), b.clone(), c.clone()]);
+        let actual = results(&["s", "o"], vec![c, b, a]);
+        assert_eq!(
+            compare(&expected, &actual, &ordered("ORDER BY ?o")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn compare_needs_the_same_sequence_when_comparators_are_hidden() {
         let a = row(&[("s", iri("a"))]);
         let b = row(&[("s", iri("b"))]);
         let expected = results(&["s"], vec![a.clone(), b.clone()]);
         let actual = results(&["s"], vec![b, a]);
-        assert_eq!(compare(&expected, &expected, true).unwrap(), None);
-        let diff = compare(&expected, &actual, true).unwrap().unwrap();
+        let order = Order::of("SELECT ?s WHERE { ?s ?p ?o } ORDER BY ?o").unwrap();
+        assert_eq!(order.keys, None);
+        let diff = compare(&expected, &actual, &order).unwrap().unwrap();
         assert!(diff.order.is_some() && diff.missing.is_empty());
+    }
+
+    #[test]
+    fn compare_lets_a_slice_cut_through_ties_only() {
+        let row_of = |s: &str, o: &str| row(&[("s", iri(s)), ("o", int(o))]);
+        let order = ordered("ORDER BY ?o LIMIT 1");
+        let tie = results(&["s", "o"], vec![row_of("a", "1")]);
+        let other_tie = results(&["s", "o"], vec![row_of("b", "1")]);
+        assert_eq!(compare(&tie, &other_tie, &order).unwrap(), None);
+        let larger = results(&["s", "o"], vec![row_of("c", "2")]);
+        let diff = compare(&tie, &larger, &order).unwrap().unwrap();
+        assert_eq!((diff.missing.len(), diff.extra.len()), (1, 1));
+        // Without ORDER BY, any solutions may be cut off: only their number
+        // is compared.
+        assert_eq!(compare(&tie, &larger, &ordered("LIMIT 1")).unwrap(), None);
+        let two = results(&["s", "o"], vec![row_of("a", "1"), row_of("c", "2")]);
+        assert!(compare(&tie, &two, &ordered("LIMIT 1")).unwrap().is_some());
     }
 
     #[test]
@@ -355,7 +452,7 @@ mod tests {
             &["s"],
             vec![row(&[("s", oxrdf::BlankNode::default().into())])],
         );
-        assert!(compare(&blank, &blank, false).is_err());
+        assert!(compare(&blank, &blank, &Order::default()).is_err());
     }
 
     #[test]
@@ -377,7 +474,7 @@ mod tests {
                 row(&[("f", iri("3")), ("s", int("6"))]),
             ],
         );
-        let text = compare(&expected, &actual, false)
+        let text = compare(&expected, &actual, &Order::default())
             .unwrap()
             .unwrap()
             .to_string();
@@ -396,14 +493,5 @@ mod tests {
                  \x20   ?f=<http://example.org/3>  ?s=\"6\"^^{int}\n"
             )
         );
-    }
-
-    #[test]
-    fn has_order_by_looks_through_projection_and_slices() {
-        let q = |s: &str| has_order_by(&format!("SELECT ?s WHERE {{ ?s ?p ?o }} {s}")).unwrap();
-        assert!(!q(""));
-        assert!(q("ORDER BY ?s"));
-        assert!(q("ORDER BY ?s LIMIT 2"));
-        assert!(has_order_by("SELECT DISTINCT ?s WHERE { ?s ?p ?o } ORDER BY ?s").unwrap());
     }
 }

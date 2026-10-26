@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?n ?price WHERE { ?p ex:name ?n ; ex:price ?price FILTER(?price < 100) }
+ORDER BY ?price ?n

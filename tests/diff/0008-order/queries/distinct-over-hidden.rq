@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# ORDER BY over a variable DISTINCT does not project.
+SELECT DISTINCT ?c WHERE { ?p ex:category ?c ; ex:price ?price }
+ORDER BY ?price

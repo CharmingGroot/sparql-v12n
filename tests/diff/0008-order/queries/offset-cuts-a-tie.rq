@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?p ?price WHERE { ?p ex:price ?price }
+ORDER BY DESC(?price)
+OFFSET 2

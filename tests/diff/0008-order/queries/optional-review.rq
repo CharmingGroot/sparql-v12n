@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# Unbound review stars sort first; products with two reviews twice.
+SELECT ?p ?stars WHERE { ?p a ex:Product OPTIONAL { ?r ex:about ?p ; ex:stars ?stars } }
+ORDER BY DESC(?stars) ?p

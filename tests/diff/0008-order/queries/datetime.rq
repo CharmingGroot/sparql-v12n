@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?p ?a ?n WHERE { ?p ex:added ?a ; ex:name ?n }
+ORDER BY ?a ?n

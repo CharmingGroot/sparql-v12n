@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# ?price is not projected: the sequence must match exactly.
+SELECT ?n WHERE { ?p ex:name ?n ; ex:price ?price }
+ORDER BY DESC(?price) ?n

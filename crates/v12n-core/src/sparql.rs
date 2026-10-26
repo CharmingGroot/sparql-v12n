@@ -2,7 +2,7 @@
 //! SPARQL parsing into algebra and the supported-feature gate.
 
 use oxrdf::{Literal, NamedNode, Term};
-use spargebra::algebra::{Expression as SparqlExpression, Function, GraphPattern};
+use spargebra::algebra::{Expression as SparqlExpression, Function, GraphPattern, OrderExpression};
 use spargebra::term::{NamedNodePattern, TermPattern};
 use spargebra::{Query, SparqlParser};
 
@@ -11,14 +11,30 @@ use crate::Error;
 /// IRI of `rdf:type`, whose constant objects are looked up as classes.
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
-/// A `SELECT` query in the supported subset: a projection, optionally
-/// `DISTINCT`, over a graph pattern.
+/// A `SELECT` query in the supported subset: a graph pattern with the
+/// solution modifiers in the order SPARQL 1.1 §18.2.5 applies them
+/// (Converting Solution Modifiers): `ORDER BY`, projection, `DISTINCT`,
+/// then `OFFSET` and `LIMIT`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectQuery {
     /// Projected variable names, without `?`, in `SELECT` order.
     pub variables: Vec<String>,
     pub distinct: bool,
     pub pattern: Pattern,
+    /// The order comparators of `ORDER BY`, in order; empty without one.
+    pub order_by: Vec<OrderCondition>,
+    /// Solutions skipped from the start (`OFFSET`), 0 without one.
+    pub offset: usize,
+    /// Most solutions returned (`LIMIT`).
+    pub limit: Option<usize>,
+}
+
+/// One order comparator of `ORDER BY` (SPARQL 1.1 §15.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderCondition {
+    /// A variable or an expression of the `FILTER` subset.
+    pub expression: Expression,
+    pub descending: bool,
 }
 
 /// A graph pattern in the supported subset, as the SPARQL algebra builds
@@ -72,6 +88,30 @@ pub enum Expression {
 }
 
 impl Expression {
+    /// The variables the expression mentions, `BOUND`'s included.
+    pub fn variables(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        self.collect_variables(&mut out);
+        out
+    }
+
+    fn collect_variables<'e>(&'e self, out: &mut Vec<&'e str>) {
+        match self {
+            Self::Constant(_) => {}
+            Self::Variable(v) | Self::Bound(v) => out.push(v),
+            Self::Or(a, b) | Self::And(a, b) | Self::Compare(_, a, b) | Self::SameTerm(a, b) => {
+                a.collect_variables(out);
+                b.collect_variables(out);
+            }
+            Self::Not(a)
+            | Self::Test(_, a)
+            | Self::Str(a)
+            | Self::Lang(a)
+            | Self::Datatype(a)
+            | Self::Regex(a, _, _) => a.collect_variables(out),
+        }
+    }
+
     /// Whether the expression is an RDF term rather than a boolean.
     pub(crate) fn is_term(&self) -> bool {
         matches!(
@@ -263,12 +303,32 @@ pub fn parse(query: &str) -> Result<SelectQuery, Error> {
         return Err(unsupported("FROM and FROM NAMED"));
     }
 
-    let (distinct, projected) = match pattern {
+    // spargebra nests the modifiers as the algebra does (SPARQL 1.1
+    // §18.2.5): Slice(Distinct(Project(OrderBy(P)))).
+    let (offset, limit, sliced) = match pattern {
+        GraphPattern::Slice {
+            inner,
+            start,
+            length,
+        } => (start, length, *inner),
+        other => (0, None, other),
+    };
+    let (distinct, projected) = match sliced {
         GraphPattern::Distinct { inner } => (true, *inner),
         other => (false, other),
     };
     let GraphPattern::Project { inner, variables } = projected else {
         return Err(unsupported(describe(&projected)));
+    };
+    let (order_by, inner) = match *inner {
+        GraphPattern::OrderBy { inner, expression } => {
+            let conditions = expression
+                .iter()
+                .map(order_condition)
+                .collect::<Result<Vec<_>, _>>()?;
+            (conditions, *inner)
+        }
+        other => (Vec::new(), other),
     };
     let pattern = group(&inner)?;
     if pattern.triple_patterns().is_empty() {
@@ -278,6 +338,22 @@ pub fn parse(query: &str) -> Result<SelectQuery, Error> {
         variables: variables.iter().map(|v| v.as_str().to_owned()).collect(),
         distinct,
         pattern,
+        order_by,
+        offset,
+        limit,
+    })
+}
+
+/// An order comparator: a term, compared as SPARQL 1.1 §15.1 orders them,
+/// or a boolean expression, whose value is a boolean literal or an error.
+fn order_condition(condition: &OrderExpression) -> Result<OrderCondition, Error> {
+    let (expression, descending) = match condition {
+        OrderExpression::Asc(e) => (e, false),
+        OrderExpression::Desc(e) => (e, true),
+    };
+    Ok(OrderCondition {
+        expression: expression_in(expression, Site::OrderBy)?,
+        descending,
     })
 }
 
@@ -321,7 +397,10 @@ fn group(pattern: &GraphPattern) -> Result<Pattern, Error> {
             right,
             expression,
         } => {
-            let expression = expression.as_ref().map(filter_expression).transpose()?;
+            let expression = expression
+                .as_ref()
+                .map(|e| expression_in(e, Site::Filter))
+                .transpose()?;
             let left = group(left)?;
             Ok(match group(right)? {
                 // `{ }` has one solution that binds nothing, which extends
@@ -345,15 +424,35 @@ fn group(pattern: &GraphPattern) -> Result<Pattern, Error> {
         }
         GraphPattern::Filter { expr, inner } => Ok(Pattern::Filter(
             Box::new(group(inner)?),
-            filter_expression(expr)?,
+            expression_in(expr, Site::Filter)?,
         )),
         other => Err(unsupported(describe(other))),
     }
 }
 
-/// A `FILTER` expression, checked against the supported subset.
-fn filter_expression(expression: &SparqlExpression) -> Result<Expression, Error> {
-    let boxed = |e: &SparqlExpression| filter_expression(e).map(Box::new);
+/// Where an expression is written, for error messages.
+#[derive(Debug, Clone, Copy)]
+enum Site {
+    Filter,
+    OrderBy,
+}
+
+impl Site {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Filter => "FILTER",
+            Self::OrderBy => "ORDER BY",
+        }
+    }
+}
+
+/// A `FILTER` or `ORDER BY` expression, checked against the supported
+/// subset, which is the same for both.
+fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression, Error> {
+    let boxed = |e: &SparqlExpression| expression_in(e, site).map(Box::new);
+    let operand = |e: &SparqlExpression| operand(e, site);
+    let compare = |op, a, b| compare(op, a, b, site);
+    let in_site = |what: &str| unsupported(&format!("{what} in {}", site.name()));
     Ok(match expression {
         SparqlExpression::NamedNode(n) => Expression::Constant(n.clone().into()),
         SparqlExpression::Literal(l) => Expression::Constant(l.clone().into()),
@@ -399,7 +498,7 @@ fn filter_expression(expression: &SparqlExpression) -> Result<Expression, Error>
                     | Function::Datatype => {
                         Error::QuerySyntax(format!("{function} takes one argument"))
                     }
-                    other => unsupported(&format!("the {other} function in FILTER")),
+                    other => in_site(&format!("the {other} function")),
                 });
             };
             match function {
@@ -409,10 +508,10 @@ fn filter_expression(expression: &SparqlExpression) -> Result<Expression, Error>
                 Function::Str => Expression::Str(operand(arg)?),
                 Function::Lang => Expression::Lang(operand(arg)?),
                 Function::Datatype => Expression::Datatype(operand(arg)?),
-                other => return Err(unsupported(&format!("the {other} function in FILTER"))),
+                other => return Err(in_site(&format!("the {other} function"))),
             }
         }
-        SparqlExpression::In(..) => return Err(unsupported("IN and NOT IN in FILTER")),
+        SparqlExpression::In(..) => return Err(in_site("IN and NOT IN")),
         SparqlExpression::Exists(_) => return Err(unsupported("EXISTS and NOT EXISTS")),
         SparqlExpression::UnaryMinus(inner) | SparqlExpression::UnaryPlus(inner)
             if numeric_literal(inner).is_some() =>
@@ -430,10 +529,10 @@ fn filter_expression(expression: &SparqlExpression) -> Result<Expression, Error>
         | SparqlExpression::Divide(..)
         | SparqlExpression::UnaryPlus(_)
         | SparqlExpression::UnaryMinus(_) => {
-            return Err(unsupported("arithmetic in FILTER"));
+            return Err(in_site("arithmetic"));
         }
-        SparqlExpression::If(..) => return Err(unsupported("IF in FILTER")),
-        SparqlExpression::Coalesce(_) => return Err(unsupported("COALESCE in FILTER")),
+        SparqlExpression::If(..) => return Err(in_site("IF")),
+        SparqlExpression::Coalesce(_) => return Err(in_site("COALESCE")),
     })
 }
 
@@ -458,21 +557,31 @@ fn numeric_literal(expression: &SparqlExpression) -> Option<(&str, NamedNode)> {
     }
 }
 
-fn compare(op: CompareOp, a: &SparqlExpression, b: &SparqlExpression) -> Result<Expression, Error> {
-    Ok(Expression::Compare(op, operand(a)?, operand(b)?))
+fn compare(
+    op: CompareOp,
+    a: &SparqlExpression,
+    b: &SparqlExpression,
+    site: Site,
+) -> Result<Expression, Error> {
+    Ok(Expression::Compare(
+        op,
+        operand(a, site)?,
+        operand(b, site)?,
+    ))
 }
 
 /// An argument that must be an RDF term: a variable, a constant, or `STR`,
 /// `LANG` or `DATATYPE` of one. Other expressions as arguments, such as a
 /// comparison compared with `true`, are not supported.
-fn operand(expression: &SparqlExpression) -> Result<Box<Expression>, Error> {
-    let operand = filter_expression(expression)?;
+fn operand(expression: &SparqlExpression, site: Site) -> Result<Box<Expression>, Error> {
+    let operand = expression_in(expression, site)?;
     if operand.is_term() {
         Ok(Box::new(operand))
     } else {
-        Err(unsupported(
-            "expressions other than terms as arguments in FILTER",
-        ))
+        Err(unsupported(&format!(
+            "expressions other than terms as arguments in {}",
+            site.name()
+        )))
     }
 }
 
@@ -500,11 +609,12 @@ fn describe(pattern: &GraphPattern) -> &'static str {
         GraphPattern::Extend { .. } => "BIND and SELECT expressions",
         GraphPattern::Minus { .. } => "MINUS",
         GraphPattern::Values { .. } => "VALUES",
-        GraphPattern::OrderBy { .. } => "ORDER BY",
-        GraphPattern::Project { .. } => "subqueries",
-        GraphPattern::Distinct { .. } => "nested DISTINCT",
+        // Solution modifiers inside a pattern come from a subquery.
+        GraphPattern::OrderBy { .. }
+        | GraphPattern::Project { .. }
+        | GraphPattern::Distinct { .. }
+        | GraphPattern::Slice { .. } => "subqueries",
         GraphPattern::Reduced { .. } => "REDUCED",
-        GraphPattern::Slice { .. } => "LIMIT and OFFSET",
         GraphPattern::Group { .. } => "GROUP BY and aggregates",
         GraphPattern::Service { .. } => "SERVICE",
         // Variants that exist only with spargebra's optional features.
@@ -872,8 +982,19 @@ mod tests {
                 "CONSTRUCT",
             ),
             ("DESCRIBE ?c WHERE { ?c ex:name ?n }", "DESCRIBE"),
-            ("SELECT * WHERE { ?c ex:name ?n } ORDER BY ?n", "ORDER BY"),
-            ("SELECT * WHERE { ?c ex:name ?n } LIMIT 1", "LIMIT"),
+            (
+                "SELECT * WHERE { ?c ex:name ?n } ORDER BY UCASE(?n)",
+                "the UCASE function in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:amount ?a } ORDER BY (?a + 1)",
+                "arithmetic in ORDER BY",
+            ),
+            ("SELECT REDUCED * WHERE { ?c ex:name ?n }", "REDUCED"),
+            (
+                "SELECT * WHERE { { SELECT ?c WHERE { ?c ex:name ?n } LIMIT 1 } }",
+                "subqueries",
+            ),
             ("SELECT * WHERE { ?c ex:knows+ ?d }", "property paths"),
             ("SELECT * FROM ex:g WHERE { ?c ex:name ?n }", "FROM"),
             ("SELECT * WHERE { GRAPH ?g { ?c ex:name ?n } }", "GRAPH"),
@@ -890,6 +1011,48 @@ mod tests {
                 "{query}\n=> {err}"
             );
         }
+    }
+
+    #[test]
+    fn parse_solution_modifiers_in_algebra_order() {
+        let q = parse_ok(
+            "SELECT DISTINCT ?c WHERE { ?c ex:name ?n } ORDER BY DESC(?n) STR(?c) (?n > \"K\") \
+             LIMIT 5 OFFSET 10",
+        );
+        assert!(q.distinct);
+        assert_eq!(q.variables, ["c"]);
+        assert_eq!((q.offset, q.limit), (10, Some(5)));
+        assert_eq!(
+            q.order_by,
+            [
+                OrderCondition {
+                    expression: *variable("n"),
+                    descending: true,
+                },
+                OrderCondition {
+                    expression: Expression::Str(variable("c")),
+                    descending: false,
+                },
+                OrderCondition {
+                    expression: Expression::Compare(
+                        CompareOp::Greater,
+                        variable("n"),
+                        Box::new(Expression::Constant(
+                            Literal::new_simple_literal("K").into()
+                        )),
+                    ),
+                    descending: false,
+                },
+            ]
+        );
+        assert_eq!(q.order_by[2].expression.variables(), ["n"]);
+
+        let q = parse_ok("SELECT * WHERE { ?c ex:name ?n }");
+        assert_eq!((q.order_by.len(), q.offset, q.limit), (0, 0, None));
+        let q = parse_ok("SELECT * WHERE { ?c ex:name ?n } OFFSET 3");
+        assert_eq!((q.offset, q.limit), (3, None));
+        let q = parse_ok("SELECT * WHERE { ?c ex:name ?n } LIMIT 0");
+        assert_eq!(q.limit, Some(0));
     }
 
     #[test]

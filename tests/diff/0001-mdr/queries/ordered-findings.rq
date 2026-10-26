@@ -1,6 +1,6 @@
 PREFIX ex: <http://example.org/>
 
-# ORDER BY is not supported yet.
+# The most severe findings first; ties by finding IRI.
 SELECT ?finding ?severity WHERE {
   ?finding ex:severityId ?severity .
 }

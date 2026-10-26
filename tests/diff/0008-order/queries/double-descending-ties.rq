@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Equal doubles, then by name; products without a rating have no triple.
+# ?r is not projected (Ontop writes doubles differently, #25), so the
+# sequence must match exactly.
+SELECT ?p ?n WHERE { ?p ex:rating ?r ; ex:name ?n }
+ORDER BY DESC(?r) ?n

@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?n WHERE { ?p ex:name ?n }
+ORDER BY DESC(?n)

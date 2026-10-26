@@ -1,0 +1,20 @@
+---
+source: crates/v12n-postgres/src/lib.rs
+expression: "SELECT ?o ?a WHERE { ?o ex:amount ?a } ORDER BY DESC(?a)"
+---
+SELECT q.*, count(*) OVER ()
+FROM (
+SELECT *
+FROM (
+SELECT q."o", q."a", q."o1_text"
+FROM (
+SELECT DISTINCT t0."id" AS "o", t0."amount" AS "a", (t0."amount"::text) AS "o1_text"
+FROM "orders" t0
+WHERE t0."id" IS NOT NULL AND t0."amount" IS NOT NULL
+) q
+ORDER BY q."o1_text" COLLATE "C" DESC
+) l
+ORDER BY l."o1_text" COLLATE "C" DESC
+LIMIT $1
+) q
+ORDER BY q."o1_text" COLLATE "C" DESC

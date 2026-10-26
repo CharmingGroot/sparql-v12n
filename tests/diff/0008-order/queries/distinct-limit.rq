@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# DISTINCT applies before LIMIT; the unbound category sorts first.
+SELECT DISTINCT ?c WHERE { ?p ex:name ?n OPTIONAL { ?p ex:category ?c } }
+ORDER BY ?c
+LIMIT 2

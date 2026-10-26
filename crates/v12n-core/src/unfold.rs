@@ -16,7 +16,8 @@ use crate::mapping::{
 };
 use crate::sparql::{Expression, Pattern, PatternTerm, RDF_TYPE, SelectQuery, TriplePattern};
 use crate::sql::{
-    Condition, LeftJoin, ProjectedTerm, ResultTerm, ResultValue, SqlBranch, SqlExpr, SqlPlan,
+    Condition, LeftJoin, OrderKey, ProjectedTerm, ResultTerm, ResultValue, SqlBranch, SqlExpr,
+    SqlPlan,
 };
 use term::{Equality, LiteralType, TermExpr, TermValue, is_injective, literal_type, term_eq};
 
@@ -1178,6 +1179,9 @@ fn plan(
     mut branches: Vec<Branch<'_>>,
     base_iri: Option<&BaseIri>,
 ) -> Result<SqlPlan, Error> {
+    if query.distinct {
+        check_distinct_order(query)?;
+    }
     // Number the arms in order of first branch, and put the branches of
     // each arm together.
     let mut ids: Vec<Vec<usize>> = Vec::new();
@@ -1212,6 +1216,9 @@ fn plan(
             branches: Vec::new(),
             distinct: query.distinct,
             base_iri: base_iri.cloned(),
+            order: order_keys(query),
+            offset: query.offset,
+            limit: query.limit,
         });
     }
 
@@ -1371,6 +1378,11 @@ fn plan(
                 })
                 .collect(),
             fixed_columns: branch.fixed_columns(),
+            order: query
+                .order_by
+                .iter()
+                .map(|c| branch.order_value(&c.expression))
+                .collect::<Result<_, _>>()?,
         });
     }
 
@@ -1384,7 +1396,41 @@ fn plan(
         branches: sql_branches,
         distinct: query.distinct,
         base_iri: base_iri.cloned(),
+        order: order_keys(query),
+        offset: query.offset,
+        limit: query.limit,
     })
+}
+
+fn order_keys(query: &SelectQuery) -> Vec<OrderKey> {
+    query
+        .order_by
+        .iter()
+        .map(|c| OrderKey {
+            descending: c.descending,
+        })
+        .collect()
+}
+
+/// `ORDER BY` applies before projection and `DISTINCT` after it (SPARQL
+/// 1.1 §18.2.5), and Distinct must keep the order OrderBy gives (§18.5).
+/// A solution of `SELECT DISTINCT` stands for all those it projects, which
+/// a comparator over a variable it does not project can put at different
+/// places, so such a comparator does not order them.
+fn check_distinct_order(query: &SelectQuery) -> Result<(), Error> {
+    for condition in &query.order_by {
+        if let Some(variable) = condition
+            .expression
+            .variables()
+            .into_iter()
+            .find(|v| !query.variables.iter().any(|p| p == v))
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "ORDER BY over ?{variable}, which SELECT DISTINCT does not project"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// What `SELECT DISTINCT` cannot compare by column values.

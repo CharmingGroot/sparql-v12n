@@ -1,0 +1,21 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"SELECT ?x ?v WHERE { { ?x ex:name ?v } UNION { ?x ex:amount ?v } } \\\n         ORDER BY ?v (?v > 100) LIMIT 5\")"
+---
+SELECT q."x", q."x_1", q."v", q."o1_rank", q."o1_exact", q."o1_text", q."o2_rank", q."o2_boolean"
+FROM (
+SELECT t0."id" AS "x", NULL AS "x_1", t0."name" AS "v", 6 AS "o1_rank", NULL::int8 AS "o1_exact", (t0."name"::text) AS "o1_text", CASE WHEN (NULL::bool) IS NULL THEN 0 ELSE 4 END AS "o2_rank", (NULL::bool) AS "o2_boolean"
+FROM "customers" t0
+WHERE t0."id" IS NOT NULL AND t0."name" IS NOT NULL
+UNION ALL
+SELECT NULL AS "x", t0."id" AS "x_1", t0."amount" AS "v", 3 AS "o1_rank", t0."amount" AS "o1_exact", NULL::text AS "o1_text", CASE WHEN (t0."amount" > $1::int8) IS NULL THEN 0 ELSE 4 END AS "o2_rank", (t0."amount" > $2::int8) AS "o2_boolean"
+FROM "orders" t0
+WHERE t0."id" IS NOT NULL AND t0."amount" IS NOT NULL
+) q
+ORDER BY q."o1_rank", q."o1_exact", q."o1_text" COLLATE "C", q."o2_rank", q."o2_boolean"
+LIMIT $3::int8
+
+-- params
+$1 = "100"
+$2 = "100"
+$3 = "5"

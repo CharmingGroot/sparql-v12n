@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# Strings by code point: Hangul (U+B4DC, U+C9C1) after ASCII.
+SELECT ?l WHERE { ?p ex:label ?l FILTER(?l != "époxy") }
+ORDER BY ?l

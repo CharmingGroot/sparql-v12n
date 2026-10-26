@@ -1,0 +1,15 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"SELECT DISTINCT ?n WHERE { ?c ex:tier ?n } ORDER BY DESC(?n) LIMIT 2\")"
+---
+SELECT q."n", q."o1_text"
+FROM (
+SELECT DISTINCT t0."tier" AS "n", (t0."tier"::text) AS "o1_text"
+FROM "customers" t0
+WHERE t0."id" IS NOT NULL AND t0."tier" IS NOT NULL
+) q
+ORDER BY q."o1_text" COLLATE "C" DESC
+LIMIT $1::int8
+
+-- params
+$1 = "2"
