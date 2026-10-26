@@ -1,0 +1,24 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain(OPTIONAL,\n&format!(\"{PREFIXES}SELECT ?o ?n WHERE {{ ?o ex:placedBy ?p OPTIONAL {{ ?p ex:name ?n }} }}\"))"
+---
+SELECT q."o", q."n"
+FROM (
+SELECT t0."id" AS "o", pg_typeof(t0."person_id")::text || ' ' || t0."person_id"::text AS "p", t1."name" AS "n"
+FROM "orders" t0
+LEFT JOIN "people" t1 ON t1."id" = t0."person_id" AND t1."name" IS NOT NULL
+WHERE t1."id" IS NOT NULL AND t0."id" IS NOT NULL AND t0."person_id" IS NOT NULL
+UNION
+SELECT t0."id" AS "o", pg_typeof(t0."person_id")::text || ' ' || t0."person_id"::text AS "p", t1."name" AS "n"
+FROM "orders" t0
+LEFT JOIN "contractors" t1 ON t1."code" = t0."person_id" AND t1."name" IS NOT NULL
+WHERE t1."code" IS NOT NULL AND t0."id" IS NOT NULL AND t0."person_id" IS NOT NULL
+UNION
+SELECT t0."id" AS "o", pg_typeof(t0."person_id")::text || ' ' || t0."person_id"::text AS "p", NULL AS "n"
+FROM "orders" t0
+LEFT JOIN "people" t1 ON t1."id" = t0."person_id" AND t1."name" IS NOT NULL
+LEFT JOIN "contractors" t2 ON t2."code" = t0."person_id" AND t2."name" IS NOT NULL
+WHERE t1."id" IS NULL AND t2."code" IS NULL AND t0."id" IS NOT NULL AND t0."person_id" IS NOT NULL
+) q
+
+-- params

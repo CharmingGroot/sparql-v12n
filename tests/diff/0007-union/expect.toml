@@ -1,8 +1,3 @@
-# Both sides of the union can extend an order, which needs a UNION
-# inside the LEFT JOIN (#51, second part).
-[query.union-inside-optional-both-sides]
-expect = "rejected"
-
 # Literals of a column's natural datatype against a literal template whose
 # strings can be the same: comparing their datatypes needs the column type.
 [query.shapes-natural-and-template-literal]

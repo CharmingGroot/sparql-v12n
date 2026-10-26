@@ -37,7 +37,9 @@ const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 /// every choice of triples maps for the arm's required triple patterns is
 /// one SQL branch: Join, Filter and LeftJoin (on its left side) distribute
 /// over a union (SPARQL 1.1 §18.5). The right side of a LeftJoin does not,
-/// so each `OPTIONAL` part becomes a `LEFT JOIN` inside the branch.
+/// so each `OPTIONAL` part becomes a `LEFT JOIN` inside the branch, and a
+/// part that several choices can match splits the branch (see
+/// [`Branch::optional`]).
 pub fn unfold(
     query: &SelectQuery,
     mapping: &Mapping,
@@ -68,8 +70,9 @@ pub fn unfold(
                 .zip(choice)
                 .map(|(list, c)| list[c])
                 .collect();
-            if let Some(branch) = Branch::build(&query.pattern, a, arm, &chosen, &context)? {
-                branches.push(branch);
+            branches.extend(Branch::build(&query.pattern, a, arm, &chosen, &context)?);
+            if branches.len() > MAX_BRANCHES {
+                return Err(too_many());
             }
         }
     }
@@ -219,6 +222,28 @@ fn settle<'a>(mut env: Env<'a>, scope: Scope) -> Env<'a> {
     env
 }
 
+/// A branch with the variables of the part of the pattern walked so far.
+type Fork<'a> = (Branch<'a>, Env<'a>);
+
+/// The sides of the `Union`s of an arm, in the order they are walked.
+type Sides<'s> = std::iter::Copied<std::slice::Iter<'s, bool>>;
+
+/// The candidates of the required triple patterns, in the order they are
+/// walked.
+type Chosen<'s, 'a> = std::iter::Copied<std::slice::Iter<'s, Candidate<'a>>>;
+
+/// What one choice of arm and triples maps for the right side of a
+/// LeftJoin gives.
+enum Attempt<'a> {
+    /// No triple pattern: the side's one solution binds nothing.
+    Empty,
+    /// Never compatible with the left side.
+    NoMatch,
+    /// The branch with the side as `OPTIONAL` part `group`, and the
+    /// variables of both sides.
+    Matched(Fork<'a>, usize),
+}
+
 /// An `OPTIONAL` part of a branch.
 #[derive(Debug, Clone)]
 struct Group {
@@ -234,8 +259,11 @@ struct Group {
 /// joined, with its `OPTIONAL` parts left joined.
 #[derive(Debug, Clone)]
 struct Branch<'a> {
-    /// The arm of the pattern (see [`Pattern::arms`]) the branch belongs to.
-    arm: usize,
+    /// The arm of the pattern (see [`Pattern::arms`]) the branch belongs
+    /// to, followed by the arm of the right side of each LeftJoin that
+    /// split the branch (see [`Branch::optional`]). Branches with equal
+    /// arms remove their duplicates together.
+    arm: Vec<usize>,
     from: Vec<LogicalTable>,
     /// Conditions on every row of the branch.
     conditions: Vec<Condition>,
@@ -250,16 +278,17 @@ struct Branch<'a> {
 }
 
 impl<'a> Branch<'a> {
-    /// `None` when the branch can never produce a row.
+    /// The branches the pattern gives with these choices; none when they
+    /// can never produce a row.
     fn build(
         pattern: &'a Pattern,
         arm_index: usize,
         arm: &[bool],
         chosen: &[Candidate<'a>],
         context: &Context<'a>,
-    ) -> Result<Option<Self>, Error> {
-        let mut branch = Self {
-            arm: arm_index,
+    ) -> Result<Vec<Self>, Error> {
+        let branch = Self {
+            arm: vec![arm_index],
             from: Vec::new(),
             conditions: Vec::new(),
             groups: Vec::new(),
@@ -268,12 +297,15 @@ impl<'a> Branch<'a> {
         };
         let mut chosen = chosen.iter().copied();
         let mut sides = arm.iter().copied();
-        let Some(env) = branch.walk(pattern, None, 1, &mut sides, &mut chosen, context)? else {
-            return Ok(None);
-        };
-        branch.env = env;
-        branch.add_not_null();
-        Ok(Some(branch))
+        let forks = branch.walk(pattern, None, 1, &mut sides, &mut chosen, context)?;
+        Ok(forks
+            .into_iter()
+            .map(|(mut branch, env)| {
+                branch.env = env;
+                branch.add_not_null();
+                branch
+            })
+            .collect())
     }
 
     /// Adds the tables and conditions of `pattern` to `scope`, taking the
@@ -286,16 +318,18 @@ impl<'a> Branch<'a> {
     /// evaluates it (SPARQL 1.1 §18.6): the conditions linking two parts go
     /// to the node that joins them, never into a part.
     ///
-    /// `None` when `pattern` has no solutions in `scope`.
+    /// Returns the branches `pattern` gives, more than one where an
+    /// `OPTIONAL` part splits it, each with the variables bound; none when
+    /// `pattern` has no solutions in `scope`.
     fn walk(
-        &mut self,
+        self,
         pattern: &'a Pattern,
         scope: Scope,
         node: usize,
-        sides: &mut impl Iterator<Item = bool>,
-        chosen: &mut impl Iterator<Item = Candidate<'a>>,
+        sides: &mut Sides<'_>,
+        chosen: &mut Chosen<'_, 'a>,
         context: &Context<'a>,
-    ) -> Result<Option<Env<'a>>, Error> {
+    ) -> Result<Vec<Fork<'a>>, Error> {
         match pattern {
             Pattern::Bgp(patterns) => {
                 let chosen: Vec<_> = patterns
@@ -307,37 +341,64 @@ impl<'a> Branch<'a> {
                         (p, candidate)
                     })
                     .collect();
-                Ok(self.bgp(&chosen, scope, context.mapping))
+                let mut branch = self;
+                Ok(branch
+                    .bgp(&chosen, scope, context.mapping)
+                    .map(|env| (branch, env))
+                    .into_iter()
+                    .collect())
             }
             Pattern::Join(left, right) => {
-                let Some(l) = self.walk(left, scope, node, sides, chosen, context)? else {
-                    return Ok(None);
-                };
+                let lefts = self.walk(left, scope, node, sides, chosen, context)?;
+                if lefts.is_empty() {
+                    skip(right, sides, chosen);
+                    return Ok(Vec::new());
+                }
                 let right_node = node + left.left_joins();
-                let Some(r) = self.walk(right, scope, right_node, sides, chosen, context)? else {
-                    return Ok(None);
-                };
-                Ok(self
-                    .join(l, r, scope, scope, scope)?
-                    .map(|env| settle(env, scope)))
+                let (sides_at, chosen_at) = (sides.clone(), chosen.clone());
+                let mut out = Vec::new();
+                for (branch, l) in lefts {
+                    // Every branch walks the right side with the same choices.
+                    *sides = sides_at.clone();
+                    *chosen = chosen_at.clone();
+                    for (mut branch, r) in
+                        branch.walk(right, scope, right_node, sides, chosen, context)?
+                    {
+                        if let Some(env) = branch.join(l.clone(), r, scope, scope, scope)? {
+                            out.push((branch, settle(env, scope)));
+                        }
+                    }
+                }
+                check_count(out.len())?;
+                Ok(out)
             }
             Pattern::LeftJoin(left, right, expression) => {
-                let Some(l) = self.walk(left, scope, node, sides, chosen, context)? else {
-                    return Ok(None);
-                };
+                let lefts = self.walk(left, scope, node, sides, chosen, context)?;
                 let node = node + left.left_joins();
-                self.optional(l, right, expression.as_ref(), scope, node, context)
-                    .map(Some)
+                let mut out = Vec::new();
+                for (branch, l) in lefts {
+                    out.extend(branch.optional(
+                        l,
+                        right,
+                        expression.as_ref(),
+                        scope,
+                        node,
+                        context,
+                    )?);
+                }
+                check_count(out.len())?;
+                Ok(out)
             }
             // Filter(expr, P) keeps the solutions of P where expr holds, so
             // it sees the variables of P only (SPARQL 1.1 §18.2.2.6).
             Pattern::Filter(inner, expression) => {
-                let Some(env) = self.walk(inner, scope, node, sides, chosen, context)? else {
-                    return Ok(None);
-                };
-                let filter = self.filter(expression, &env, &[scope])?;
-                self.conditions_mut(scope).push(Condition::Filter(filter));
-                Ok(Some(env))
+                let mut out = Vec::new();
+                for (mut branch, env) in self.walk(inner, scope, node, sides, chosen, context)? {
+                    let filter = branch.filter(expression, &env, &[scope])?;
+                    branch.conditions_mut(scope).push(Condition::Filter(filter));
+                    out.push((branch, env));
+                }
+                Ok(out)
             }
             // The branch belongs to one side of the union: the solutions of
             // the other side come from other branches, and the variables
@@ -357,99 +418,184 @@ impl<'a> Branch<'a> {
     /// solution of the left side, extended by each compatible solution of
     /// `right` for which the expression holds over both, where there are
     /// some. The expression goes into the `ON` clause with the part's
-    /// other conditions. The arms and candidates of `right` are chosen
-    /// here, because the right side of a LeftJoin does not distribute over
-    /// a union: a choice that can never be compatible with the left side
-    /// is left out, and more than one that can is not supported.
+    /// other conditions.
+    ///
+    /// The right side of a LeftJoin does not distribute over a union, so
+    /// its arms and triples maps are chosen here. A choice that can never
+    /// be compatible with the left side is left out. When one is left, the
+    /// part is one `LEFT JOIN` in the branch. When several are, `right` is
+    /// their union R1 ∪ ... ∪ Rn, and LeftJoin(L, R1 ∪ ... ∪ Rn) is
+    /// Join(L, R1) ∪ ... ∪ Join(L, Rn) ∪ Diff(L, R1 ∪ ... ∪ Rn), so the branch
+    /// splits: one branch per Ri, where its `LEFT JOIN` matched, and one
+    /// with the `LEFT JOIN` of every Ri, where none matched, which keeps
+    /// the left side's solutions that nothing extends. Each split branch
+    /// keeps the `ON` clauses of its parts, so compatibility and the
+    /// expression decide whether a part matches exactly as for one part.
     fn optional(
-        &mut self,
+        self,
         left: Env<'a>,
         right: &'a Pattern,
         expression: Option<&'a Expression>,
         scope: Scope,
         node: usize,
         context: &Context<'a>,
-    ) -> Result<Env<'a>, Error> {
+    ) -> Result<Vec<Fork<'a>>, Error> {
         let arms = right.arms(MAX_BRANCHES).ok_or(Error::TooManyBranches {
             limit: MAX_BRANCHES,
         })?;
-        let several = || {
-            Error::UnsupportedFeature(
-                "OPTIONAL over a pattern that more than one combination of triples maps or \
-                 UNION side can match, which needs a UNION inside the OPTIONAL"
-                    .to_owned(),
-            )
-        };
-        let mut matched: Option<(Self, Env<'a>)> = None;
-        // An arm without triple patterns, whose one solution binds nothing
-        // and extends the left side unchanged.
-        let mut empty = false;
-        for arm in &arms {
+        // Each choice that matches, with what identifies it among the
+        // outcomes of `attempt`, and the arm of an empty one.
+        let mut matched: Vec<(Fork<'a>, usize, usize)> = Vec::new();
+        let mut choices: Vec<(usize, Vec<Candidate<'a>>, usize)> = Vec::new();
+        let mut empty: Option<usize> = None;
+        for (a, arm) in arms.iter().enumerate() {
             let candidates = right
                 .required_triple_patterns(arm)
                 .into_iter()
                 .map(|p| candidates(p, context.mapping, context.index))
                 .collect::<Result<Vec<_>, _>>()?;
             for choice in combinations(&candidates)? {
-                let mut attempt = self.clone();
-                let group = attempt.groups.len();
-                let start = attempt.from.len();
-                attempt.groups.push(Group {
-                    node,
-                    parent: scope,
-                    tables: start..start,
-                    conditions: Vec::new(),
-                });
-                let mut sides = arm.iter().copied();
-                let mut chosen = candidates.iter().zip(choice).map(|(list, c)| list[c]);
-                let Some(inner) = attempt.walk(
-                    right,
-                    Some(group),
-                    node + 1,
-                    &mut sides,
-                    &mut chosen,
-                    context,
-                )?
-                else {
-                    continue;
-                };
-                attempt.groups[group].tables.end = attempt.from.len();
-                if attempt.groups[group].tables.is_empty() {
-                    if matched.is_some() {
-                        return Err(several());
+                let chosen: Vec<Candidate<'a>> = candidates
+                    .iter()
+                    .zip(choice)
+                    .map(|(list, c)| list[c])
+                    .collect();
+                let attempts = self
+                    .clone()
+                    .attempt(&left, right, expression, scope, node, arm, &chosen, context)?;
+                for (k, attempt) in attempts.into_iter().enumerate() {
+                    match attempt {
+                        Attempt::Empty => empty = Some(a),
+                        Attempt::NoMatch => {}
+                        Attempt::Matched(fork, group) => {
+                            matched.push((fork, group, a));
+                            choices.push((a, chosen.clone(), k));
+                        }
                     }
-                    empty = true;
-                    continue;
                 }
-                let inner = settle(inner, Some(group));
-                let Some(env) =
-                    attempt.join(left.clone(), inner, scope, Some(group), Some(group))?
-                else {
-                    continue;
-                };
-                if let Some(expression) = expression {
-                    // In the `ON` clause, the left side's row and the part's
-                    // candidate row both exist.
-                    let filter = attempt.filter(expression, &env, &[scope, Some(group)])?;
-                    attempt.groups[group]
-                        .conditions
-                        .push(Condition::Filter(filter));
-                }
-                if matched.is_some() || empty {
-                    return Err(several());
-                }
-                matched = Some((attempt, env));
+                check_count(matched.len())?;
             }
         }
-        Ok(match matched {
-            Some((attempt, env)) => {
-                *self = attempt;
-                env
+        if matched.is_empty() {
+            // Nothing extends the left side, or only the empty pattern's
+            // one solution does: the left side's solutions stay as they are.
+            return Ok(vec![(self, left)]);
+        }
+        if matched.len() == 1 && empty.is_none() {
+            let ((branch, env), _, _) = matched.pop().expect("one choice matches");
+            return Ok(vec![(branch, env)]);
+        }
+        if empty.is_some() && expression.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "OPTIONAL with a FILTER over a UNION with an empty side".to_owned(),
+            ));
+        }
+        let mut out = Vec::with_capacity(matched.len() + 1);
+        for ((mut branch, env), group, a) in matched {
+            let (table, name) = branch.witness(Some(group))?;
+            branch
+                .conditions_mut(scope)
+                .push(Condition::IsNotNull(column(table, name)));
+            branch.arm.push(a);
+            out.push((branch, env));
+        }
+        match empty {
+            // The empty pattern's solution is compatible with every left
+            // solution, so none is left over for Diff.
+            Some(a) => {
+                let mut branch = self;
+                branch.arm.push(a);
+                out.push((branch, left));
             }
-            // Nothing can extend the left side, whose solutions stay as
-            // they are.
-            None => left,
-        })
+            None => {
+                let mut rest = self;
+                for (a, chosen, k) in choices {
+                    let arm = &arms[a];
+                    let attempt = rest
+                        .attempt(&left, right, expression, scope, node, arm, &chosen, context)?
+                        .into_iter()
+                        .nth(k);
+                    let Some(Attempt::Matched((branch, _), group)) = attempt else {
+                        unreachable!("a choice matches the same way on any branch");
+                    };
+                    rest = branch;
+                    let (table, name) = rest.witness(Some(group))?;
+                    rest.conditions_mut(scope)
+                        .push(Condition::IsNull(column(table, name)));
+                }
+                // Diff's solutions are never those of a Join, so they can
+                // be compared with those of any arm.
+                rest.arm.push(0);
+                out.push((rest, left));
+            }
+        }
+        check_count(out.len())?;
+        Ok(out)
+    }
+
+    /// The right side of a LeftJoin with these choices, as a new `OPTIONAL`
+    /// part of the branch: one outcome per branch the side gives.
+    #[allow(clippy::too_many_arguments)]
+    fn attempt(
+        self,
+        left: &Env<'a>,
+        right: &'a Pattern,
+        expression: Option<&'a Expression>,
+        scope: Scope,
+        node: usize,
+        arm: &[bool],
+        chosen: &[Candidate<'a>],
+        context: &Context<'a>,
+    ) -> Result<Vec<Attempt<'a>>, Error> {
+        let mut branch = self;
+        let group = branch.groups.len();
+        let start = branch.from.len();
+        branch.groups.push(Group {
+            node,
+            parent: scope,
+            tables: start..start,
+            conditions: Vec::new(),
+        });
+        let mut sides = arm.iter().copied();
+        let mut chosen = chosen.iter().copied();
+        let forks = branch.walk(
+            right,
+            Some(group),
+            node + 1,
+            &mut sides,
+            &mut chosen,
+            context,
+        )?;
+        let mut out = Vec::with_capacity(forks.len());
+        for (mut attempt, inner) in forks {
+            attempt.groups[group].tables.end = attempt.from.len();
+            if attempt.groups[group].tables.is_empty() {
+                if !attempt.groups[group].conditions.is_empty() {
+                    return Err(Error::UnsupportedFeature(
+                        "a FILTER in a UNION side without triple patterns inside OPTIONAL"
+                            .to_owned(),
+                    ));
+                }
+                out.push(Attempt::Empty);
+                continue;
+            }
+            let inner = settle(inner, Some(group));
+            let Some(env) = attempt.join(left.clone(), inner, scope, Some(group), Some(group))?
+            else {
+                out.push(Attempt::NoMatch);
+                continue;
+            };
+            if let Some(expression) = expression {
+                // In the `ON` clause, the left side's row and the part's
+                // candidate row both exist.
+                let filter = attempt.filter(expression, &env, &[scope, Some(group)])?;
+                attempt.groups[group]
+                    .conditions
+                    .push(Condition::Filter(filter));
+            }
+            out.push(Attempt::Matched((attempt, env), group));
+        }
+        Ok(out)
     }
 
     /// Joins the solutions of two parts evaluated in `left_scope` and
@@ -730,6 +876,40 @@ impl<'a> Branch<'a> {
     }
 }
 
+/// Takes the choices of `pattern` from `sides` and `chosen` without
+/// walking it, so that every walk takes the same choices whatever a
+/// branch gives.
+fn skip(pattern: &Pattern, sides: &mut Sides<'_>, chosen: &mut Chosen<'_, '_>) {
+    match pattern {
+        Pattern::Bgp(patterns) => {
+            for _ in patterns {
+                chosen.next();
+            }
+        }
+        Pattern::Join(left, right) => {
+            skip(left, sides, chosen);
+            skip(right, sides, chosen);
+        }
+        Pattern::LeftJoin(inner, _, _) | Pattern::Filter(inner, _) => skip(inner, sides, chosen),
+        Pattern::Union(left, right) => {
+            if sides.next().expect("one side per Union of the arm") {
+                skip(right, sides, chosen);
+            } else {
+                skip(left, sides, chosen);
+            }
+        }
+    }
+}
+
+fn check_count(count: usize) -> Result<(), Error> {
+    if count > MAX_BRANCHES {
+        return Err(Error::TooManyBranches {
+            limit: MAX_BRANCHES,
+        });
+    }
+    Ok(())
+}
+
 fn column(table: usize, name: &str) -> SqlExpr {
     SqlExpr::Column {
         table,
@@ -995,9 +1175,25 @@ fn check_computable<'t, 'a: 't>(
 
 fn plan(
     query: &SelectQuery,
-    branches: Vec<Branch<'_>>,
+    mut branches: Vec<Branch<'_>>,
     base_iri: Option<&BaseIri>,
 ) -> Result<SqlPlan, Error> {
+    // Number the arms in order of first branch, and put the branches of
+    // each arm together.
+    let mut ids: Vec<Vec<usize>> = Vec::new();
+    for branch in &branches {
+        if !ids.contains(&branch.arm) {
+            ids.push(branch.arm.clone());
+        }
+    }
+    let arm_id = |arm: &Vec<usize>| {
+        ids.iter()
+            .position(|id| id == arm)
+            .expect("every arm is numbered")
+    };
+    branches.sort_by_key(|b| arm_id(&b.arm));
+    let arms: Vec<usize> = branches.iter().map(|b| arm_id(&b.arm)).collect();
+
     if branches.is_empty() {
         return Ok(SqlPlan {
             columns: Vec::new(),
@@ -1033,7 +1229,6 @@ fn plan(
 
     // The result rows do not say which branch they came from, so each
     // alternative is built the same way in every branch that has it.
-    let arms: Vec<usize> = branches.iter().map(|b| b.arm).collect();
     let mut alternatives: Vec<Vec<Alternative<'_>>> = Vec::with_capacity(variables.len());
     for &variable in &variables {
         let per_branch: Vec<Vec<(usize, Source<'_>)>> =
@@ -1162,7 +1357,7 @@ fn plan(
             }
         }
         sql_branches.push(SqlBranch {
-            arm: branch.arm,
+            arm: arms[b],
             from: branch.from.clone(),
             select,
             conditions: branch.conditions.clone(),

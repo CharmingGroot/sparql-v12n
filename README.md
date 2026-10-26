@@ -318,10 +318,22 @@ part:
 - Duplicate triples count once inside each part, as in any basic graph
   pattern.
 
-Not supported yet, and rejected as unsupported: an optional part that
-more than one combination of triples maps, or more than one side of a
-`UNION` inside it, can match (it needs a `UNION` inside the `LEFT JOIN`);
-`SELECT DISTINCT` over a variable that only several `OPTIONAL` parts bind.
+- An optional part that more than one combination of triples maps, or
+  more than one side of a `UNION` inside it, can match is the union of
+  those choices, and LeftJoin(L, R1 ∪ R2) is Join(L, R1) ∪ Join(L, R2) ∪
+  Diff(L, R1 ∪ R2). The SQL branch splits into one branch per choice,
+  with its `LEFT JOIN` and `WHERE` its part matched (PostgreSQL turns this
+  into an inner join), and one branch with the `LEFT JOIN` of every
+  choice and `WHERE` none matched (an anti-join), which keeps the left
+  solutions that nothing extends. Each part keeps its `ON` clause, so
+  compatibility and the `FILTER` inside `OPTIONAL` decide whether it
+  matches as for a single part. Inside an outer part, the splits become
+  the outer part's choices. A `UNION` with an empty side extends every
+  left solution unchanged through that side.
+
+Not supported yet, and rejected as unsupported: `SELECT DISTINCT` over a
+variable that only several `OPTIONAL` parts bind; a `FILTER` inside
+`OPTIONAL` around a `UNION` with an empty side.
 
 ## UNION
 
@@ -342,9 +354,9 @@ solutions.
 - A `FILTER` in one side applies to that side's solutions only, and a
   `FILTER` of the group around the union to the solutions of both, where
   a variable of the other side is unbound.
-- A `UNION` inside `OPTIONAL` does not distribute over the left join. It
-  works where only one of its sides can match the left side, and is
-  rejected otherwise (see `OPTIONAL`).
+- A `UNION` inside `OPTIONAL` does not distribute over the left join;
+  its sides are choices of the optional part (see `OPTIONAL`), and each
+  side's solutions stay in their own arm.
 
 A variable can take its values from term maps of different shapes in
 different sides or term maps: a template in one and a column or another

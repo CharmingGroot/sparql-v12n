@@ -68,9 +68,10 @@ pub struct SqlPlan {
 /// One `SELECT ... FROM ... WHERE ...` of the plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlBranch {
-    /// The arm of the query's `UNION`s the branch belongs to: the choice of
-    /// one side of every `UNION` outside `OPTIONAL`. Branches of one arm
-    /// are consecutive in [`SqlPlan::branches`].
+    /// The arm the branch belongs to: the choice of one side of every
+    /// `UNION` outside `OPTIONAL`, and of the side of a `UNION` inside an
+    /// `OPTIONAL` part that splits the branch. Branches of one arm are
+    /// consecutive in [`SqlPlan::branches`].
     pub arm: usize,
     /// Logical tables; the one at position `n` is aliased `tn`.
     pub from: Vec<LogicalTable>,

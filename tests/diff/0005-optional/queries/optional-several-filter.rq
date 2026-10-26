@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# The filter decides, for each triples map, whether the part matches.
+SELECT ?o ?n WHERE { ?o ex:placedBy ?p OPTIONAL { ?p ex:name ?n FILTER(?n != "Ann") } }

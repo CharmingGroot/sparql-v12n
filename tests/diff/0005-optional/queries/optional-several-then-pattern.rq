@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A pattern after the split part joins every branch.
+SELECT ?p ?n ?ph WHERE { ?o ex:placedBy ?p OPTIONAL { ?p ex:name ?n } ?p ex:phone ?ph }

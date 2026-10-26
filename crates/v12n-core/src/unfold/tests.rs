@@ -683,7 +683,7 @@ fn unfold_pattern_after_optional_joins_where_unbound_or_equal() {
 }
 
 #[test]
-fn unfold_optional_over_several_matching_triples_maps_is_unsupported() {
+fn unfold_optional_over_several_matching_triples_maps_splits_the_branch() {
     let mapping = with_prefixes(
         r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
   rr:subjectMap [ rr:template "http://ex/{id}" ] ;
@@ -693,13 +693,99 @@ fn unfold_optional_over_several_matching_triples_maps_is_unsupported() {
   rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "w" ] ] ;
   rr:predicateObjectMap [ rr:predicate ex:q ; rr:objectMap [ rr:column "x" ] ] ."#,
     );
-    let err = unfold_query(
+    let plan = unfold_query(
         &mapping,
         "SELECT * WHERE { ?s ex:q ?x OPTIONAL { ?s ex:p ?v } }",
     )
+    .unwrap();
+    // One branch per matching choice, where its part matched, and one
+    // where none did; all of one arm, whose duplicates are removed.
+    assert_eq!(plan.branches.len(), 3);
+    assert!(plan.branches.iter().all(|b| b.arm == 0));
+    let witness = |table| SqlExpr::Column {
+        table,
+        name: "id".into(),
+    };
+    for b in &plan.branches[..2] {
+        assert_eq!(b.left_joins.len(), 1);
+        assert_eq!(b.conditions[0], Condition::IsNotNull(witness(1)));
+    }
+    let rest = &plan.branches[2];
+    assert_eq!(rest.left_joins.len(), 2);
+    assert_eq!(
+        rest.conditions[..2],
+        [Condition::IsNull(witness(1)), Condition::IsNull(witness(2))]
+    );
+    // ?v is unbound where no part matched; the choices share its column.
+    assert_eq!(rest.select[1], SqlExpr::Unbound);
+    assert_eq!(plan.projection[1].terms.len(), 1);
+    let sql = plan.to_sql().sql;
+    assert!(
+        sql.contains(
+            "LEFT JOIN \"a\" t1 ON t1.\"id\" = t0.\"id\" AND t1.\"v\" IS NOT NULL\n\
+                      LEFT JOIN \"b\" t2 ON t2.\"id\" = t0.\"id\" AND t2.\"w\" IS NOT NULL\n\
+                      WHERE t1.\"id\" IS NULL AND t2.\"id\" IS NULL"
+        ),
+        "{sql}"
+    );
+}
+
+/// An `OPTIONAL` that splits inside another part makes the outer part's
+/// choices, which split the branch in turn.
+#[test]
+fn unfold_split_optional_nested_in_a_part_splits_the_outer_part() {
+    let mapping = with_prefixes(
+        r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "v" ] ] .
+<#B> rr:logicalTable [ rr:tableName "b" ] ;
+  rr:subjectMap [ rr:template "http://ex/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "w" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:q ; rr:objectMap [ rr:column "x" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:r ; rr:objectMap [ rr:column "y" ] ] ."#,
+    );
+    let plan = unfold_query(
+        &mapping,
+        "SELECT * WHERE { ?s ex:q ?x OPTIONAL { ?s ex:r ?y OPTIONAL { ?s ex:p ?v } } }",
+    )
+    .unwrap();
+    // Three choices for the outer part (the inner one matched through A,
+    // through B, or not at all), and the branch where none matched.
+    assert_eq!(plan.branches.len(), 4);
+    // The inner part's witness conditions decide whether the outer part
+    // matches: they are in its ON clause.
+    let first = &plan.branches[0];
+    assert_eq!(first.left_joins[1].parent, Some(0));
+    assert!(
+        first.left_joins[0]
+            .conditions
+            .contains(&Condition::IsNotNull(SqlExpr::Column {
+                table: 2,
+                name: "id".into()
+            }))
+    );
+    // Where none matched, every choice's parts are left joined: the outer
+    // part with the inner one through A, through B, and with both.
+    assert_eq!(plan.branches[3].left_joins.len(), 2 + 2 + 3);
+}
+
+/// A `UNION` with an empty side: its one solution extends every left
+/// solution unchanged, so no branch is left for those nothing extends.
+#[test]
+fn unfold_optional_over_a_union_with_an_empty_side() {
+    let plan =
+        union_query("SELECT ?x ?v WHERE { ?x ex:q ?w OPTIONAL { { } UNION { ?x ex:p ?v } } }")
+            .unwrap();
+    let arms: Vec<usize> = plan.branches.iter().map(|b| b.arm).collect();
+    assert_eq!(arms, [0, 1]);
+    assert_eq!(plan.branches[0].left_joins.len(), 1);
+    assert!(plan.branches[1].left_joins.is_empty());
+    let err = union_query(
+        "SELECT ?x ?v WHERE { ?x ex:q ?w OPTIONAL { { } UNION { ?x ex:p ?v } FILTER(?v) } }",
+    )
     .unwrap_err();
     assert!(
-        matches!(&err, Error::UnsupportedFeature(f) if f.contains("OPTIONAL")),
+        matches!(&err, Error::UnsupportedFeature(f) if f.contains("empty side")),
         "{err}"
     );
 }
@@ -1040,21 +1126,22 @@ fn unfold_constant_in_one_union_side_is_selected_as_a_flag() {
 }
 
 #[test]
-fn unfold_union_inside_optional_with_one_matching_side() {
+fn unfold_union_inside_optional_splits_where_both_sides_match() {
     let plan = union_query(
         "SELECT ?x ?v WHERE { ?x ex:q ?w OPTIONAL { { ?x ex:p ?v } UNION { ?x ex:missing ?v } } }",
     )
     .unwrap();
     assert_eq!(plan.branches.len(), 1);
     assert_eq!(plan.branches[0].left_joins.len(), 1);
-    let err = union_query(
+    let plan = union_query(
         "SELECT ?x ?v WHERE { ?x ex:q ?w OPTIONAL { { ?x ex:p ?v } UNION { ?x ex:q ?v } } }",
     )
-    .unwrap_err();
-    assert!(
-        matches!(&err, Error::UnsupportedFeature(f) if f.contains("UNION")),
-        "{err}"
-    );
+    .unwrap();
+    // The sides' solutions are a bag: each side's branch is its own arm.
+    // The branch where neither matched can share an arm with either.
+    let arms: Vec<usize> = plan.branches.iter().map(|b| b.arm).collect();
+    assert_eq!(arms, [0, 0, 1]);
+    assert_eq!(plan.branches[1].left_joins.len(), 2);
 }
 
 #[test]

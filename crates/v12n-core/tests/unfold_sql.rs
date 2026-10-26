@@ -443,3 +443,18 @@ fn shapes_that_can_be_equal_compare_term_strings() {
         &format!("{PREFIXES}SELECT ?c WHERE {{ ?c ex:name \"Ann\" }}")
     ));
 }
+
+const OPTIONAL: &str = include_str!("../../../tests/diff/0005-optional/mapping.ttl");
+
+/// `ex:name` of a person comes from two triples maps: one branch where
+/// each part matched (its `LEFT JOIN` with the witness not `NULL`, which
+/// PostgreSQL plans as an inner join), and one where neither did.
+#[test]
+fn optional_matched_by_several_triples_maps_splits_the_branch() {
+    insta::assert_snapshot!(explain(
+        OPTIONAL,
+        &format!(
+            "{PREFIXES}SELECT ?o ?n WHERE {{ ?o ex:placedBy ?p OPTIONAL {{ ?p ex:name ?n }} }}"
+        )
+    ));
+}
