@@ -1,0 +1,12 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"SELECT ?o WHERE { ?o ex:amount ?a ; ex:placedBy ?c FILTER(?a >= 100.0 && ?c != <http://example.org/customer/7>) }\")"
+---
+SELECT t0."id" AS "o"
+FROM "orders" t0
+JOIN "orders" t1 ON t1."id" = t0."id" AND (t0."amount" >= $1::int8 AND NOT (coalesce((t1."customer_id" = $2), false)))
+WHERE t0."amount" IS NOT NULL AND t1."customer_id" IS NOT NULL
+
+-- params
+$1 = "100"
+$2 = "7"

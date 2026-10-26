@@ -1,0 +1,18 @@
+# Comparisons SPARQL 1.1 leaves to extensions (§17.3.1), where engines that
+# compare the values give other answers than the type error the
+# specification gives.
+[query.date-order]
+expect = "rejected"
+
+[query.language-tag-not-equal]
+expect = "rejected"
+
+[query.datetime-zoned-and-local]
+expect = "rejected"
+
+# Ontop orders strings by the database collation (en_US.utf8 in the test
+# environment), where "écrou" sorts before "z"; SPARQL orders them by code
+# point (#26).
+[query.string-order-code-points]
+expect = "mismatch"
+issue = 26

@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# 09:00 at +09:00 is 00:00 UTC.
+SELECT ?i WHERE { ?i ex:updated ?u FILTER(?u >= "2024-01-01T09:00:00+09:00"^^xsd:dateTime) }

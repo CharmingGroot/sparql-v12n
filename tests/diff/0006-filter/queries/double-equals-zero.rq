@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# -0 equals 0 (op:numeric-equal on doubles).
+SELECT ?i WHERE { ?i ex:weight ?w FILTER(?w = 0) }

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::sparql;
-use crate::sql::{TermSql, TermSqlValue};
+use crate::sql::{Filter, TermMatch, TermSql, TermSqlValue};
 
 const SHOP: &str = include_str!("../../../../examples/shop/mapping.ttl");
 
@@ -554,6 +554,7 @@ fn condition_reads_table(condition: &Condition, table: usize) -> bool {
             .into_iter()
             .chain(r.columns())
             .any(|(t, _)| t == table),
+        Condition::Filter(_) => false,
     }
 }
 
@@ -698,4 +699,127 @@ fn unfold_optional_with_empty_left_side_has_only_the_left_join() {
     let branch = &plan.branches[0];
     assert!(branch.conditions.is_empty());
     assert_eq!(branch.left_joins[0].tables, 0..1);
+}
+
+fn filters(conditions: &[Condition]) -> Vec<&Filter> {
+    conditions
+        .iter()
+        .filter_map(|c| match c {
+            Condition::Filter(f) => Some(f),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn unfold_group_filter_goes_to_the_branch_and_optional_filter_to_its_join() {
+    // After the OPTIONAL: the filter applies to the whole group.
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c ex:name ?n OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a } FILTER(?a > 5) }",
+    )
+    .unwrap();
+    let branch = &plan.branches[0];
+    assert_eq!(filters(&branch.conditions).len(), 1);
+    assert!(filters(&branch.left_joins[0].conditions).is_empty());
+    // ?a is bound only where the part matched, so the filter checks that.
+    assert!(matches!(
+        filters(&branch.conditions)[0],
+        Filter::Cases(cases) if cases.len() == 1 && cases[0].0 == [Condition::IsNotNull(column(2, "amount"))]
+    ));
+
+    // Inside the OPTIONAL: the filter decides whether the part matches,
+    // and both sides are bound there.
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c ex:name ?n OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a FILTER(?a > 5 && ?n = \"x\") } }",
+    )
+    .unwrap();
+    let branch = &plan.branches[0];
+    assert!(filters(&branch.conditions).is_empty());
+    let [Filter::And(a, n)] = filters(&branch.left_joins[0].conditions)[..] else {
+        panic!("{:?}", branch.left_joins[0].conditions);
+    };
+    assert!(matches!(**a, Filter::Compare { .. }));
+    assert!(matches!(**n, Filter::Compare { .. }));
+}
+
+#[test]
+fn unfold_filter_in_a_nested_group_sees_only_its_variables() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c ex:name ?n { ?c ex:tier ?t FILTER(?n = \"x\" || BOUND(?n)) } }",
+    )
+    .unwrap();
+    assert_eq!(
+        filters(&plan.branches[0].conditions),
+        [&Filter::Or(
+            Box::new(Filter::Constant(None)),
+            Box::new(Filter::Constant(Some(false)))
+        )]
+    );
+}
+
+#[test]
+fn unfold_filter_in_a_nested_optional_does_not_see_the_outer_left_side() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?o ex:placedBy ?c OPTIONAL { ?o ex:amount ?a FILTER(BOUND(?n) && BOUND(?c)) } } }",
+    )
+    .unwrap();
+    let joins = &plan.branches[0].left_joins;
+    assert_eq!(joins[1].parent, Some(0));
+    assert_eq!(
+        filters(&joins[1].conditions),
+        [&Filter::And(
+            Box::new(Filter::Constant(Some(false))),
+            Box::new(Filter::Constant(Some(true)))
+        )]
+    );
+}
+
+#[test]
+fn unfold_filter_over_a_variable_of_two_optional_parts_has_a_case_for_each() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?o WHERE { ?o ex:amount ?a OPTIONAL { ?o ex:placedBy ?c } \
+         OPTIONAL { ?c ex:name ?n } FILTER(BOUND(?c) && isIRI(?c)) }",
+    )
+    .unwrap();
+    let branch = &plan.branches[0];
+    let [Filter::And(bound, test)] = filters(&branch.conditions)[..] else {
+        panic!("{:?}", branch.conditions);
+    };
+    let guards = vec![
+        Condition::IsNotNull(column(1, "customer_id")),
+        Condition::IsNotNull(column(2, "id")),
+    ];
+    assert_eq!(**bound, Filter::Any(guards.clone()));
+    let Filter::Cases(cases) = &**test else {
+        panic!("{test:?}");
+    };
+    let case_guards: Vec<Vec<Condition>> = cases.iter().map(|(g, _)| g.clone()).collect();
+    assert_eq!(
+        case_guards,
+        [vec![guards[0].clone()], vec![guards[1].clone()]]
+    );
+}
+
+#[test]
+fn unfold_filter_compares_terms_through_template_decomposition() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?o WHERE { ?o ex:placedBy ?c FILTER(?c = <http://example.org/customer/7>) }",
+    )
+    .unwrap();
+    let [Filter::Compare { same_term, .. }] = filters(&plan.branches[0].conditions)[..] else {
+        panic!();
+    };
+    assert_eq!(
+        *same_term,
+        TermMatch::When(vec![Condition::Eq(
+            column(0, "customer_id"),
+            SqlExpr::Param("7".into())
+        )])
+    );
 }

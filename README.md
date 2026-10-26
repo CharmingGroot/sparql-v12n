@@ -210,13 +210,7 @@ text, and constants are compared with that same text (`col::text = $1`),
 which cannot use an index on the column.
 
 Value comparisons across datatypes, such as `FILTER(?amount = 7.0)` on an
-integer column, belong to `FILTER`, which is not supported yet. When it
-is, the plan is to convert the constant to the column's type in the
-engine when the value is exactly representable (`7.0` becomes `7`) and to
-treat the equality as false otherwise (`7.5`), rather than casting the
-column, which in
-PostgreSQL turns `id = 7.0` into `id::numeric = 7.0` and stops it from
-using an index on `id`.
+integer column, belong to `FILTER` (see below).
 
 ## Variables shared across columns
 
@@ -323,10 +317,72 @@ part:
 - Duplicate triples count once inside each part, as in any basic graph
   pattern.
 
-Not supported yet, and rejected as unsupported: `FILTER` inside
-`OPTIONAL`; an optional part that more than one combination of triples
-maps can match (it needs a `UNION` inside the `LEFT JOIN`); `SELECT
-DISTINCT` over a variable that only several `OPTIONAL` parts bind.
+Not supported yet, and rejected as unsupported: an optional part that
+more than one combination of triples maps can match (it needs a `UNION`
+inside the `LEFT JOIN`); `SELECT DISTINCT` over a variable that only
+several `OPTIONAL` parts bind.
+
+## FILTER
+
+`FILTER` follows SPARQL's evaluation rules, errors included. An error is
+neither true nor false: `error || true` is true, `error && false` is
+false, and `!error` is still an error. The SQL uses `NULL` for an error,
+which SQL's `AND`, `OR` and `NOT` treat the same way, and `WHERE` keeps a
+row only where the filter is true. A comparison that SPARQL makes an
+error is `NULL` in the SQL, never `false`, so `FILTER(!(?x = 5))` drops
+the rows where `?x` is unbound or a string.
+
+Where a filter applies:
+
+- A `FILTER` in a group applies to the whole group, wherever it is
+  written, and sees only the group's variables: in `{ ?s ex:name ?n {
+  ?s ex:qty ?q FILTER(?n = "x") } }` the filter is an error, since `?n`
+  is not bound inside the nested group.
+- A `FILTER` inside `OPTIONAL` goes into the `ON` clause of the part's
+  `LEFT JOIN`: it decides whether the part matches, never which rows of
+  the left side are kept, and it sees the left side's variables. Where
+  it is an error the part does not match, as SQL's `LEFT JOIN` does. A
+  `FILTER` after the `OPTIONAL` is in `WHERE` and drops rows.
+- An unbound variable is an error for every function except `BOUND`. A
+  variable that only `OPTIONAL` parts bind is read from the part that
+  matched (`CASE WHEN part matched THEN ... END`).
+
+Comparisons follow the SPARQL operator mapping:
+
+| Operands | `=`, `!=`, `<`, `<=`, `>`, `>=` |
+|---|---|
+| Numbers (`xsd:integer`, `xsd:decimal`, `xsd:double`) | By value, with XPath type promotion: `7.0` equals the integer 7, `-0` equals `0`, and NaN equals nothing. |
+| Strings (simple literals, `xsd:string`) | By code point (`COLLATE "C"`, which needs a UTF-8 database). |
+| `xsd:boolean` | `false` < `true`. |
+| `xsd:dateTime` | By instant when both have a time zone or neither has one; comparing one with a time zone and one without depends on an implicit time zone and is rejected. |
+| IRIs, blank nodes, and literals of other types | `=` and `!=` only, as RDF terms (RDFterm-equal); `<` and the others are an error. Two different literals are an error. |
+
+A constant compared with a column is converted to the column's type
+where that gives the same answer (`?qty > 5` is `qty > $1::int8`, `?qty =
+7.0` is `qty = $1::int8`), so an index on the column can be used.
+Otherwise the column is cast to the type XPath promotes to (`?qty < 5.5`
+casts the integer column to `numeric`, `?qty < 5.5e0` to `float8`), which
+no index on the column serves.
+
+`sameTerm`, `BOUND`, `isIRI`, `isBlank` and `isLiteral` are supported,
+and a term where a boolean is expected stands for its effective boolean
+value (an empty string and zero are false).
+
+Rejected as unsupported rather than answered differently from engines
+that extend SPARQL:
+
+- ordering or comparing two literals of the same datatype outside the
+  table, such as `xsd:date`, and two language-tagged literals except with
+  `=` outside a negation;
+- comparisons over `real` columns, values of a column whose `rr:datatype`
+  is a numeric, boolean or dateTime datatype other than the column's
+  natural one, `xsd:float` and the derived integer types, and dateTime
+  constants outside the years 1 to 9999 or finer than a microsecond;
+- `sameTerm` over `real` or `double precision` columns (PostgreSQL finds
+  `-0` and `0` equal);
+- other functions (`STR`, `LANG`, `DATATYPE`, `REGEX` and the rest),
+  arithmetic, `IN`, `EXISTS`, and expressions other than variables and
+  constants as operands.
 
 ## Layout
 

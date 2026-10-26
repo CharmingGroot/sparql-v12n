@@ -54,6 +54,9 @@ impl Default for Limits {
 pub struct Database {
     client: Client,
     limits: Limits,
+    /// Whether the server encoding is UTF-8, where `COLLATE "C"` orders
+    /// strings by code point.
+    utf8: bool,
 }
 
 impl Database {
@@ -92,15 +95,21 @@ impl Database {
         // request, so the task's own result adds nothing.
         tokio::spawn(connection);
         let timeout_ms = format!("{}ms", timeout.as_millis());
-        client
-            .execute(
+        let row = client
+            .query_one(
                 "SELECT set_config('statement_timeout', $1, false), \
-                 set_config('default_transaction_read_only', 'on', false)",
+                 set_config('default_transaction_read_only', 'on', false), \
+                 current_setting('server_encoding')",
                 &[&timeout_ms],
             )
             .await
             .map_err(|e| Error::from_postgres(e, timeout))?;
-        Ok(Self { client, limits })
+        let encoding: String = row.get(2);
+        Ok(Self {
+            client,
+            limits,
+            utf8: encoding == "UTF8",
+        })
     }
 
     /// Whether the connection is gone, e.g. after a server restart.
@@ -124,6 +133,7 @@ impl Database {
             text_params: &[],
             column_types: column_types.as_ref(),
             keys: keys.as_ref(),
+            non_utf8: !self.utf8,
         };
         let rendered = plan.to_sql_with(&options)?;
         // One row past the limit tells a cut-off result from one that

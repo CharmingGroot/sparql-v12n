@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Numbers compare by value across datatypes: 5.0 is 5 (op:numeric-equal).
+SELECT ?i WHERE { ?i ex:qty ?q FILTER(?q = 5.0) }

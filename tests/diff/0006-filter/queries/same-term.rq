@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# sameTerm compares terms, not values: 5.0 is not the term 5.
+SELECT ?i WHERE { ?i ex:qty ?q FILTER(sameTerm(?q, 5) || sameTerm(?q, 12.0)) }

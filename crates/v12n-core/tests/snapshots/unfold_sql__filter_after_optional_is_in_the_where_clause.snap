@@ -1,0 +1,12 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"SELECT ?c ?o WHERE { ?c ex:tier ?t OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a } FILTER(!(?a > 100) || !BOUND(?o)) }\")"
+---
+SELECT t0."id" AS "c", t1."id" AS "o"
+FROM "customers" t0
+LEFT JOIN ("orders" t1
+JOIN "orders" t2 ON t2."id" = t1."id") ON t1."customer_id" = t0."id" AND t2."amount" IS NOT NULL
+WHERE (NOT (CASE WHEN t2."amount" IS NOT NULL THEN t2."amount" > $1::int8 END) OR NOT ((t1."id" IS NOT NULL))) AND t0."id" IS NOT NULL AND t0."tier" IS NOT NULL
+
+-- params
+$1 = "100"

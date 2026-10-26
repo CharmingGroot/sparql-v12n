@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# op:numeric-greater-than on an integer column and an integer constant.
+SELECT ?i ?q WHERE { ?i ex:qty ?q FILTER(?q > 5) }
