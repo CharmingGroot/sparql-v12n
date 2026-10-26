@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# The same side twice inside OPTIONAL: each order's status counts twice.
+SELECT ?o ?s WHERE { ?o ex:amount ?a OPTIONAL { { ?o ex:status ?s } UNION { ?o ex:status ?s } } }

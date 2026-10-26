@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# The filter of the optional group applies to both sides of its union.
+SELECT ?o ?x WHERE {
+  ?o ex:amount ?a
+  OPTIONAL { { ?o ex:placedBy ?x } UNION { ?o ex:status ?x } FILTER(isLiteral(?x)) }
+}

@@ -404,8 +404,7 @@ async fn numeric_template_matches_the_canonical_form_of_any_scale() {
 }
 
 /// One triples map per `(name, sql, predicate-object maps)`, all with the
-/// subject `http://example.org/row/{id}`: subjects of different shapes
-/// cannot share a variable across UNION branches yet.
+/// subject `http://example.org/row/{id}`.
 fn views(rows: &[(&str, &str, &str)]) -> String {
     let maps: String = rows
         .iter()
@@ -1564,4 +1563,95 @@ async fn shapes_that_can_be_equal_are_compared_as_the_built_terms() {
     .await
     .unwrap();
     assert_eq!(rows, expected);
+}
+
+/// An `OPTIONAL` part that two triples maps can match splits the branch:
+/// the same triple from both counts once, left solutions that neither
+/// extends stay once with the variable unbound, and a `UNION` inside the
+/// part keeps each side's solutions.
+#[tokio::test]
+async fn optional_matched_by_several_triples_maps_splits_the_branch() {
+    let Some(url) = database_url() else { return };
+    let name =
+        "rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column \"name\" ] ]";
+    let mapping = views(&[
+        (
+            "orders",
+            "SELECT * FROM (VALUES (1), (2), (3)) AS r(id)",
+            "rr:predicateObjectMap [ rr:predicate ex:order ; rr:objectMap [ rr:column \"id\" ] ]",
+        ),
+        // Row 1 twice and also in the other view: one triple.
+        (
+            "people",
+            "SELECT * FROM (VALUES (1, 'Ann'), (1, 'Ann'), (2, 'Bo')) AS r(id, name)",
+            name,
+        ),
+        (
+            "contractors",
+            "SELECT * FROM (VALUES (1, 'Ann'), (2, 'Bea')) AS r(id, name)",
+            name,
+        ),
+    ]);
+    let query =
+        |body: &str| format!("PREFIX ex: <http://example.org/>\nSELECT ?r ?n WHERE {{ {body} }}");
+    let row = |id: u8, name: Option<&str>| match name {
+        Some(name) => format!("?r=<http://example.org/row/{id}> ?n=\"{name}\""),
+        None => format!("?r=<http://example.org/row/{id}>"),
+    };
+    let (rows, _) = run(
+        &url,
+        Limits::default(),
+        &plan(
+            &mapping,
+            &query("?r ex:order ?o OPTIONAL { ?r ex:name ?n }"),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            row(1, Some("Ann")),
+            row(2, Some("Bea")),
+            row(2, Some("Bo")),
+            row(3, None)
+        ]
+    );
+    // The filter decides per triples map; row 2 keeps Bo only, row 1 none.
+    let (rows, _) = run(
+        &url,
+        Limits::default(),
+        &plan(
+            &mapping,
+            &query(
+                "?r ex:order ?o OPTIONAL { ?r ex:name ?n FILTER(?n != \"Ann\" && ?n != \"Bea\") }",
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows, [row(1, None), row(2, Some("Bo")), row(3, None)]);
+    // A union inside the part is a bag: Ann once from each side.
+    let (rows, _) = run(
+        &url,
+        Limits::default(),
+        &plan(
+            &mapping,
+            &query("?r ex:order ?o OPTIONAL { { ?r ex:name ?n } UNION { ?r ex:name ?n } }"),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            row(1, Some("Ann")),
+            row(1, Some("Ann")),
+            row(2, Some("Bea")),
+            row(2, Some("Bea")),
+            row(2, Some("Bo")),
+            row(2, Some("Bo")),
+            row(3, None)
+        ]
+    );
 }

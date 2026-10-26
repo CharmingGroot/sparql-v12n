@@ -1,4 +1,0 @@
-# The optional part could match through either of two triples maps, which
-# needs a UNION inside the OPTIONAL (#51).
-[query.optional-several-triples-maps]
-expect = "rejected"
