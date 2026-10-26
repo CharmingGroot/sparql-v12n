@@ -68,6 +68,34 @@ issue = 26
 solutions = 0
 ```
 
+## Rejected queries: outside the MVP
+
+The MVP is SPARQL `SELECT` with basic graph patterns, `FILTER`,
+`OPTIONAL`, `UNION`, `ORDER BY`, `LIMIT` and `OFFSET`. Each query recorded
+as `rejected` uses a form outside it, which v12n rejects rather than
+answer differently from SPARQL 1.1 or from engines that extend it:
+
+| Query | Why |
+|---|---|
+| `0006-filter/date-order` | `<` on `xsd:date`: no row of the operator mapping (SPARQL 1.1 §17.3), so a type error, which engines that extend SPARQL (§17.3.1) turn into a comparison of values (Discussion #57). |
+| `0006-filter/language-tag-not-equal` | `!=` on two different language-tagged literals: an error by RDFterm-equal, false where values are compared, and the negation tells the two apart (Discussion #57). |
+| `0006-filter/datetime-zoned-and-local` | dateTimes with and without a time zone: their order depends on an implicit time zone that SPARQL leaves to the implementation (Discussion #57). |
+| `0006-filter/regex-digit-class` | `\d` is every Unicode decimal digit in XPath, which PostgreSQL has only through the database locale (Discussion #57). |
+| `0007-union/shapes-natural-and-template-literal` | A variable from a column of natural datatype and a literal template: removing duplicates would compare their datatypes, which depend on the column's SQL type (Discussion #60). |
+| `0008-order/distinct-over-hidden` | `ORDER BY` over a variable that `SELECT DISTINCT` does not project: one solution stands for several that the order puts at different places (Discussion #63). |
+| `w3c/R2RMLTC0012e/type-ious` | A self-join on blank nodes from a template over a `float8` column: no SQL computes the canonical `xsd:double` form (Discussion #35). Removing self-joins on keys (#28, V6) would make the comparison unnecessary. |
+
+## Known differences from Ontop
+
+| Queries | Issue | Difference |
+|---|---|---|
+| `0002-constants/prices`, `price-constant`, `price-integral-constant` | #25 | Ontop keeps the scale of `numeric` values (`12.50`); v12n writes XSD 1.1 canonical forms (`12.5`), as decided in Discussion #35. |
+| `w3c/R2RMLTC0005a/owes`, `R2RMLTC0005b/amount`, `R2RMLTC0005b/type-ious`, `R2RMLTC0012a/amount`, `R2RMLTC0012e/amount`, `0009-literals/double-canonical` | #25 | Ontop writes an `xsd:double` as PostgreSQL's text output (`30`) and matches constants against it; v12n writes and matches the canonical form (`3.0E1`). |
+| `0002-constants/uuid-uppercase` | #26 | Ontop matches a `uuid` constant by value; the terms differ in case. |
+| `0006-filter/string-order-code-points`, `0008-order/string-accent`, `0008-order/string-hangul` | #26 | Ontop orders strings by the database collation; SPARQL orders them by code point. |
+| `0002-constants/date-non-canonical`, `date-invalid` (Ontop error) | #26 | Ontop refuses ill-typed `xsd:date` constants, which match nothing. |
+| `w3c/R2RMLTC0009c/name`, `R2RMLTC0009d/name`, `R2RMLTC0009d/numsport`, `R2RMLTC0019a/name` (Ontop error) | #26 | Ontop does not start with a computed `rr:sqlQuery` column, and does not resolve relative IRIs from columns. |
+
 ## Running
 
 ```sh
