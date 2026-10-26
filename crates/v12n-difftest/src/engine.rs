@@ -62,6 +62,19 @@ pub fn rejected_at_planning(
     }
 }
 
+/// The error that loading an invalid mapping gives, which `v12n check`
+/// reports with exit code 2. An `UnsupportedFeature` error does not count:
+/// the mapping may be valid, and the check would pass for the wrong reason.
+pub fn mapping_error(mapping: &str) -> Result<String, String> {
+    match Mapping::from_turtle(mapping) {
+        Err(v12n_core::Error::UnsupportedFeature(feature)) => Err(format!(
+            "expected an invalid mapping, but it is rejected as unsupported: {feature}"
+        )),
+        Err(e) => Ok(e.to_string()),
+        Ok(_) => Err("expected a mapping error, but the mapping loads".to_owned()),
+    }
+}
+
 /// All solutions, with no row limit so that a cut-off result cannot pass
 /// for a complete one.
 pub fn run(

@@ -7,7 +7,7 @@ It rewrites a SPARQL query into SQL using an R2RML mapping, runs the SQL on the
 source database, and returns SPARQL results. The mapping also defines exactly
 which tables and columns can be queried.
 
-> Status: early development. Not usable yet.
+> Status: Experimental. The MVP SPARQL subset is implemented and checked against Ontop and the W3C R2RML tests; APIs and output may change before 1.0.
 
 ## Supported SPARQL
 
@@ -262,6 +262,10 @@ joins, `sameTerm` and `=` in `FILTER` where it means RDFterm-equal,
   `"5"^^xsd:decimal` match nothing there, and neither does a custom
   datatype. In `FILTER`, where numbers compare by value, `xsd:float` and
   the derived integer types are rejected (see `FILTER`).
+- **`char(n)`** values keep their trailing pad spaces in RDF terms, as the
+  SQL standard and the W3C RDB2RDF expected output have them (D018:
+  `"Venus          "`). For unpadded values, use `varchar` or `text`, or
+  an R2RML view with `rtrim()`.
 
 Value comparisons across datatypes, such as `FILTER(?amount = 7.0)` on an
 integer column, belong to `FILTER` (see below).

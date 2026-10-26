@@ -630,19 +630,33 @@ fn resource(term: &Term, local: &str, ctx: &Ctx<'_>) -> Result<NamedOrBlankNode,
 /// so the tag is kept in lower case, the form query constants and results
 /// have; terms of two term maps that differ only in the case of their tags
 /// are then the same term everywhere.
+///
+/// A valid tag (BCP 47 §2.2.9) is well-formed and uses registered
+/// subtags. Checking every subtag would need the IANA registry, so only
+/// the primary language subtag's length is checked: the registry has no
+/// primary language subtags of 4 to 8 letters (§2.2.1), so a tag such as
+/// `english`, well-formed but not valid, is rejected (W3C test
+/// R2RMLTC0015b). Private use (`x-…`) and grandfathered (`i-…`) tags are
+/// left to the well-formedness check.
 fn language_tag(tag: &str, ctx: &Ctx<'_>) -> Result<String, Error> {
-    Literal::new_language_tagged_literal("", tag)
-        .map(|literal| {
-            literal
-                .language()
-                .expect("a language-tagged literal has a tag")
-                .to_owned()
-        })
-        .map_err(|e| {
-            Error::InvalidMapping(format!(
-                "{ctx}: rr:language {tag:?} is not a valid language tag: {e}"
-            ))
-        })
+    let invalid = |reason: String| {
+        Error::InvalidMapping(format!(
+            "{ctx}: rr:language {tag:?} is not a valid language tag: {reason}"
+        ))
+    };
+    let tag = Literal::new_language_tagged_literal("", tag)
+        .map_err(|e| invalid(e.to_string()))?
+        .language()
+        .expect("a language-tagged literal has a tag")
+        .to_owned();
+    let primary = tag.split('-').next().unwrap_or_default();
+    if !matches!(primary.len(), 1..=3) {
+        return Err(invalid(format!(
+            "no registered primary language subtag has {} letters",
+            primary.len()
+        )));
+    }
+    Ok(tag)
 }
 
 fn iri(term: &Term, local: &str, ctx: &Ctx<'_>) -> Result<String, Error> {

@@ -59,6 +59,29 @@ pub fn check(case_dir: &str, query: &str) {
     }
 }
 
+/// Checks that the mapping of the case in `case_dir`, whose `case.toml`
+/// has `expect = "mapping-error"`, does not load, and panics with a report
+/// otherwise. Neither a database nor Ontop is needed. Used by the
+/// generated tests.
+pub fn check_mapping_error(case_dir: &str) {
+    match run_mapping_error(Path::new(case_dir)) {
+        Ok(error) => eprintln!("mapping rejected: {error}"),
+        Err(error) => panic!("{error}"),
+    }
+}
+
+/// The error that loading the mapping of the case in `case_dir` gives.
+pub fn run_mapping_error(case_dir: &Path) -> Result<String, Error> {
+    let case = Case::load(case_dir)?;
+    if !case.expects_mapping_error {
+        return Err(Error::case(
+            case_dir.join("case.toml"),
+            "the case does not expect a mapping error",
+        ));
+    }
+    engine::mapping_error(&case.mapping).map_err(|e| Error::Failed(format!("{}: {e}", case.name)))
+}
+
 /// Runs one query of the case in `case_dir`. Queries that planning
 /// rejects need neither a database nor Ontop.
 pub fn run(case_dir: &Path, query: &str) -> Result<Outcome, Error> {
@@ -255,5 +278,29 @@ mod tests {
             assert_eq!(with_database(url, "diff_x").unwrap(), expected, "{url}");
         }
         assert!(with_database("host=h dbname=shop", "diff_x").is_err());
+    }
+
+    #[test]
+    fn mapping_error_needs_an_invalid_mapping() {
+        let mapping = |subject_map: &str| {
+            format!(
+                "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
+                 <http://ex/A> rr:logicalTable [ rr:tableName \"a\" ] ;\n\
+                 {subject_map}\n\
+                 rr:predicateObjectMap [ rr:predicate <http://ex/p> ; rr:objectMap [ rr:column \"x\" ] ] ."
+            )
+        };
+        let valid = mapping("rr:subjectMap [ rr:template \"http://ex/{id}\" ] ;");
+        let unsupported = mapping(
+            "rr:subjectMap [ rr:template \"http://ex/{id}\" ; rr:graphMap [ rr:constant <http://ex/g> ] ] ;",
+        );
+        let invalid = mapping("");
+
+        let loads = engine::mapping_error(&valid).unwrap_err();
+        assert!(loads.contains("the mapping loads"), "{loads}");
+        let unsupported = engine::mapping_error(&unsupported).unwrap_err();
+        assert!(unsupported.contains("unsupported"), "{unsupported}");
+        let invalid = engine::mapping_error(&invalid).unwrap();
+        assert!(invalid.contains("has no rr:subjectMap"), "{invalid}");
     }
 }

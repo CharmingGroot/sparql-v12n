@@ -125,4 +125,11 @@ mapping = "../../../w3c/rdb2rdf/D001-1table1column1row/r2rmla.ttl"
 base_iri = "http://example.com/base/"   # optional: v12n's base IRI (--base-iri)
 ```
 
+A W3C test without expected output has an invalid mapping. Its case has
+`expect = "mapping-error"` in `case.toml` and no queries; its one test,
+`mapping_error`, passes when loading the mapping fails as invalid (`v12n
+check` exits with 2), and fails when the mapping loads or is rejected
+only as unsupported. It needs neither a database nor Ontop, so plain
+`cargo test` runs it and `testenv/difftest.sh` leaves the case out.
+
 `tests/diff/w3c/README.md` lists the included and skipped tests.

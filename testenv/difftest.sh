@@ -39,9 +39,14 @@ log() { printf '[difftest %3ss] %s\n' "$SECONDS" "$*" >&2; }
 has_nextest() { cargo nextest --version >/dev/null 2>&1; }
 
 # Same discovery, naming and case.toml reading as crates/v12n-difftest.
+# Cases that expect a mapping error need neither a database nor Ontop;
+# plain `cargo test` checks them.
 all_cases() {
   local dir
   for dir in "$root"/examples/*/ "$root"/tests/diff/*/ "$root"/tests/diff/w3c/*/; do
+    if [ -f "$dir/case.toml" ] && grep -qx 'expect = "mapping-error"' "$dir/case.toml"; then
+      continue
+    fi
     if [ -f "$dir/mapping.ttl" ] || [ -f "$dir/case.toml" ]; then
       printf '%s\n' "${dir%/}"
     fi

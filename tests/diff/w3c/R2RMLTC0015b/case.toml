@@ -1,0 +1,5 @@
+# W3C R2RML test R2RMLTC0015b: Generation of language tags from a table with language information, and a term map with invalid rr:language value
+# No expected output: the mapping is invalid.
+sql = "../../../w3c/rdb2rdf/D015-1table3columns1composityeprimarykey3rows2languages/create.sql"
+mapping = "../../../w3c/rdb2rdf/D015-1table3columns1composityeprimarykey3rows2languages/r2rmlb.ttl"
+expect = "mapping-error"

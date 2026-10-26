@@ -3,7 +3,8 @@
 //! filters, `nextest --partition` and JUnit reports work per query.
 //!
 //! A case is a directory under one of [`CASE_ROOTS`] with a `mapping.ttl`
-//! or a `case.toml`; its queries are `queries/*.rq`.
+//! or a `case.toml`; its queries are `queries/*.rq`. A case whose
+//! `case.toml` expects a mapping error gets one test, `mapping_error`.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -28,11 +29,22 @@ fn main() {
             let name = file_name(&case);
             let module = format!("case_{}", ident(&name));
             assert!(modules.insert(module.clone()), "two cases are named {name}");
-            let queries = case.join("queries");
             rerun_if_changed(&case);
-            rerun_if_changed(&queries);
 
             writeln!(out, "mod {module} {{").unwrap();
+            // Before watching `queries/`: such a case has none, and cargo
+            // reruns a build script whose watched path does not exist.
+            if expects_mapping_error(&case) {
+                writeln!(
+                    out,
+                    "    #[test]\n    fn mapping_error() {{\n        v12n_difftest::check_mapping_error({:?});\n    }}\n}}",
+                    case.display().to_string(),
+                )
+                .unwrap();
+                continue;
+            }
+            let queries = case.join("queries");
+            rerun_if_changed(&queries);
             for query in
                 sorted_entries(&queries).filter(|p| p.extension().is_some_and(|e| e == "rq"))
             {
@@ -55,6 +67,13 @@ fn main() {
 
 fn is_case(dir: &Path) -> bool {
     dir.join("mapping.ttl").is_file() || dir.join("case.toml").is_file()
+}
+
+/// Read line by line, as `testenv/difftest.sh` does; `Case::load` checks
+/// the whole file.
+fn expects_mapping_error(dir: &Path) -> bool {
+    fs::read_to_string(dir.join("case.toml"))
+        .is_ok_and(|text| text.lines().any(|l| l == r#"expect = "mapping-error""#))
 }
 
 fn rerun_if_changed(path: &Path) {

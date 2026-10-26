@@ -22,18 +22,27 @@ for v12n. Ontop 5.5.0 has no setting for it: it puts the same IRI in front
 of every template that does not start with an absolute IRI, and does not
 resolve values of `rr:column` at all.
 
-## Included: 35 of 63 R2RML tests
+## Included: 39 of 63 R2RML tests
 
 R2RMLTC0000, 0001a, 0001b, 0002a, 0002b, 0002d, 0002i, 0002j, 0003b, 0003c,
 0004a, 0005a, 0005b, 0007a, 0007c, 0007d, 0008b, 0008c, 0009a, 0009c, 0009d,
 0010a, 0010b, 0010c, 0011a, 0011b, 0012a, 0012b, 0012e, 0013a, 0014d, 0015a,
 0018a, 0019a, 0020a. Known differences are in each case's `expect.toml`.
 
-## Skipped: 28
+R2RMLTC0004b, 0012c, 0012d and 0015b have no expected output: the mapping
+is invalid. Their `case.toml` has `expect = "mapping-error"`, and the check
+is that loading the mapping fails as invalid, which `v12n check` reports
+with exit code 2. A mapping that loads, or is rejected only as
+unsupported, fails the check. Ontop is not asked.
+
+## Skipped: 24
 
 | Tests | Reason |
 |---|---|
-| R2RMLTC0002c, 0002e, 0002f, 0002g, 0002h, 0003a, 0004b, 0007h, 0012c, 0012d, 0015b, 0019b, 0020b | The test expects the mapping to be rejected (no expected output), so there are no answers to compare. |
+| R2RMLTC0002c, 0002e, 0002f, 0002g, 0002h | The mapping is invalid against the database (an unknown column or table, an identifier in the wrong case, invalid SQL, a duplicate column name). v12n loads a mapping without the database, so it cannot tell. |
+| R2RMLTC0003a | An unknown `rr:sqlVersion`: v12n ignores `rr:sqlVersion`. |
+| R2RMLTC0007h | A graph map that produces literals: v12n rejects every graph map as unsupported, so the check would pass for the wrong reason. |
+| R2RMLTC0019b, 0020b | A data error (a column value that is not a valid IRI), not a mapping error: v12n reports it when a query reaches the row. |
 | R2RMLTC0006a, 0007b, 0007e, 0007f, 0007g, 0008a, 0009b | Named graphs (`rr:graph`, `rr:graphMap`): not supported, and `GRAPH` queries are outside the supported subset. |
 | R2RMLTC0014a, 0014b, 0014c | `rr:inverseExpression`: not supported. |
 | R2RMLTC0016a, 0016b, 0016c, 0016d, 0016e | `create.sql` uses `VARBINARY`, which PostgreSQL rejects. |
