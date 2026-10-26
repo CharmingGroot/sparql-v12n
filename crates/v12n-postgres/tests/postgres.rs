@@ -1491,3 +1491,77 @@ async fn str_lang_and_datatype_of_row_terms() {
         );
     }
 }
+
+/// Subjects from templates over columns of several types and from an IRI
+/// column (#29): where the strings can be the same they are computed in
+/// SQL, which must give exactly the IRIs the results are built as, so the
+/// same triple counts once.
+#[tokio::test]
+async fn shapes_that_can_be_equal_are_compared_as_the_built_terms() {
+    let Some(url) = database_url() else { return };
+    let map = |name: &str, sql: &str, subject: &str| {
+        format!(
+            "<#{name}> rr:logicalTable [ rr:sqlQuery \"\"\"{sql}\"\"\" ] ;\n\
+             rr:subjectMap [ {subject} ] ;\n\
+             rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column \"v\" ] ] .\n"
+        )
+    };
+    let template = "rr:template \"http://example.org/row/{id}\"";
+    let column = "rr:column \"iri\"";
+    let mapping = format!(
+        "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n@prefix ex: <http://example.org/> .\n{}{}{}{}",
+        map("int", "SELECT 1 AS id, 'x'::text AS v", template),
+        map(
+            "numeric",
+            "SELECT 1.50::numeric AS id, 'x'::text AS v",
+            template
+        ),
+        map(
+            "space",
+            "SELECT 'a b'::text AS id, 'x'::text AS v",
+            template
+        ),
+        map(
+            "iri",
+            "SELECT * FROM (VALUES ('http://example.org/row/1', 'x'), \
+             ('http://example.org/row/1.5', 'x'), ('http://example.org/row/a%20b', 'x'), \
+             ('http://example.org/row/a%2Db', 'x'), ('http://example.org/other', 'x')) AS r(iri, v)",
+            column
+        ),
+    );
+    let mut expected: Vec<String> = ["row/1", "row/1.5", "row/a%20b", "row/a%2Db", "other"]
+        .iter()
+        .map(|s| format!("?s=<http://example.org/{s}>"))
+        .collect();
+    expected.sort();
+    for query in [
+        "SELECT ?s WHERE { ?s <http://example.org/v> ?v }",
+        "SELECT DISTINCT ?s WHERE { ?s <http://example.org/v> ?v }",
+    ] {
+        let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+            .await
+            .unwrap();
+        assert_eq!(rows, expected, "{query}");
+    }
+    // A query-level UNION keeps each side's solutions: twice, or once
+    // under DISTINCT.
+    let both = "{ ?s <http://example.org/v> ?v } UNION { ?s <http://example.org/v> ?v }";
+    let (rows, _) = run(
+        &url,
+        Limits::default(),
+        &plan(&mapping, &format!("SELECT ?s WHERE {{ {both} }}")),
+    )
+    .await
+    .unwrap();
+    let mut twice: Vec<String> = expected.iter().chain(&expected).cloned().collect();
+    twice.sort();
+    assert_eq!(rows, twice);
+    let (rows, _) = run(
+        &url,
+        Limits::default(),
+        &plan(&mapping, &format!("SELECT DISTINCT ?s WHERE {{ {both} }}")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows, expected);
+}

@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# ?n is unbound in solutions of the second side, ?a in the first.
+SELECT ?x ?n ?a WHERE { { ?x ex:name ?n } UNION { ?x ex:amount ?a } }

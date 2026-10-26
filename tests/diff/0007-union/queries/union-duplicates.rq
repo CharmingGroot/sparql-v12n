@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Both sides give the same solutions, which count twice.
+SELECT ?c ?y WHERE { { ?c ex:city ?y } UNION { ?c ex:city ?y } }

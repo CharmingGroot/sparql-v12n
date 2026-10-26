@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# Three sides, one nested.
+SELECT ?x ?n ?y ?s WHERE {
+  { ?x ex:name ?n } UNION { { ?x ex:city ?y } UNION { ?x ex:status ?s } }
+}

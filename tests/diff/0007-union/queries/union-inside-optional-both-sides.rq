@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/>
+
+# Both sides of the union can extend an order: a UNION inside the
+# LEFT JOIN.
+SELECT ?o ?x WHERE {
+  ?o ex:amount ?a
+  OPTIONAL { { ?o ex:placedBy ?x } UNION { ?o ex:status ?x } }
+}

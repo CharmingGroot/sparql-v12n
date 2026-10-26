@@ -837,7 +837,7 @@ impl<'a> Renderer<'a> {
                 let types = self.options.column_types;
                 self.sql.push('(');
                 if term.base_iri.is_some() {
-                    self.term_side(term, types)?;
+                    self.term_side(term, types, false)?;
                 } else {
                     self.term_string(term, types, true)?;
                 }

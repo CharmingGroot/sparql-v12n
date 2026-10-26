@@ -386,3 +386,60 @@ fn filter_comparisons_keep_the_column_as_it_is() {
         "SELECT ?o WHERE { ?o ex:amount ?a ; ex:placedBy ?c FILTER(?a >= 100.0 && ?c != <http://example.org/customer/7>) }"
     ));
 }
+
+const UNION: &str = include_str!("../../../tests/diff/0007-union/mapping.ttl");
+
+fn union_keys() -> TableKeys {
+    [
+        ("customers", "id"),
+        ("wholesalers", "code"),
+        ("orders", "id"),
+    ]
+    .into_iter()
+    .map(|(t, k)| (LogicalTable::TableName(t.into()), vec![vec![k.to_owned()]]))
+    .collect()
+}
+
+/// Each side of the union is one arm; the arms' solutions are a bag, and
+/// keys prove that neither arm has duplicates, so the rows are kept.
+#[test]
+fn query_union_combines_arms_with_union_all() {
+    insta::assert_snapshot!(explain_with_keys(
+        UNION,
+        &format!(
+            "{PREFIXES}SELECT ?x ?y ?a WHERE {{ {{ ?x ex:city ?y }} UNION {{ ?x ex:amount ?a }} }}"
+        ),
+        Some(&union_keys())
+    ));
+}
+
+/// An arm read from two triples maps removes its own duplicates with
+/// `UNION`, in parentheses, before the bag union with the other arm.
+#[test]
+fn query_union_arm_of_several_branches_removes_its_duplicates() {
+    insta::assert_snapshot!(explain_with_keys(
+        UNION,
+        &format!("{PREFIXES}SELECT ?x WHERE {{ {{ ?x a ex:Client }} UNION {{ ?x a ex:Order }} }}"),
+        Some(&union_keys())
+    ));
+}
+
+/// Terms of different shapes that are never the same take their own
+/// columns (#29): templates with different prefixes, and two constants.
+#[test]
+fn shapes_take_their_own_columns() {
+    insta::assert_snapshot!(explain(
+        UNION,
+        &format!("{PREFIXES}SELECT ?c ?k WHERE {{ ?c ex:kind ?k }}")
+    ));
+}
+
+/// A template and an IRI column can give the same IRI, so both select the
+/// IRI's string and duplicates are removed on it.
+#[test]
+fn shapes_that_can_be_equal_compare_term_strings() {
+    insta::assert_snapshot!(explain(
+        UNION,
+        &format!("{PREFIXES}SELECT ?c WHERE {{ ?c ex:name \"Ann\" }}")
+    ));
+}

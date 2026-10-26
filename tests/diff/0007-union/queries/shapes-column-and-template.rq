@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# The partners' IRI column repeats customer 1's IRI from the template:
+# one triple, so one solution.
+SELECT ?c WHERE { ?c a ex:Customer }

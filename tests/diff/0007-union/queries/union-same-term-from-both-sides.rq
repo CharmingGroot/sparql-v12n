@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# Customers 1 and 3 come from both sides. ?o is not selected: customer 1
+# placed two orders, so it counts twice in the second side.
+SELECT ?c WHERE { { ?c a ex:Client } UNION { ?o ex:placedBy ?c } }

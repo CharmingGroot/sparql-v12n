@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# A literal of the natural datatype of a text column against a literal
+# template: the same string is the same term, which SQL cannot tell
+# without the column type.
+SELECT ?l WHERE { ?x ex:label ?l }

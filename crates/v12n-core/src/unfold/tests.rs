@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::sparql;
-use crate::sql::{Filter, TermMatch, TermSql, TermSqlValue};
+use crate::sql::{Filter, RenderOptions, TableKeys, TermMatch, TermSql, TermSqlValue};
 
 const SHOP: &str = include_str!("../../../../examples/shop/mapping.ttl");
 
@@ -175,18 +175,106 @@ fn unfold_disjoint_templates_drop_the_branch() {
 }
 
 #[test]
-fn unfold_differently_shaped_projection_is_unsupported() {
+fn unfold_differently_shaped_projection_takes_columns_per_shape() {
     let mapping = with_prefixes(
         r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
   rr:subjectMap [ rr:template "http://ex/a/{id}" ; rr:class ex:Thing ] .
 <#B> rr:logicalTable [ rr:tableName "b" ] ;
   rr:subjectMap [ rr:template "http://ex/b/{id}" ; rr:class ex:Thing ] ."#,
     );
-    let err = unfold_query(&mapping, "SELECT ?x WHERE { ?x a ex:Thing }").unwrap_err();
+    let plan = unfold_query(&mapping, "SELECT ?x WHERE { ?x a ex:Thing }").unwrap();
+    // The templates never render the same IRI: each has its columns, which
+    // the other branch leaves NULL, and the first bound one is the value.
+    assert_eq!(plan.columns, ["x", "x_1"]);
+    assert_eq!(plan.projection[0].terms.len(), 2);
+    assert_eq!(
+        plan.branches[0].select,
+        [
+            SqlExpr::Column {
+                table: 0,
+                name: "id".into()
+            },
+            SqlExpr::Unbound
+        ]
+    );
+    assert_eq!(plan.branches[1].select[0], SqlExpr::Unbound);
+    // Also under DISTINCT, since no term is in two columns.
+    assert!(unfold_query(&mapping, "SELECT DISTINCT ?x WHERE { ?x a ex:Thing }").is_ok());
+}
+
+/// Shapes whose terms can be the same, compared when duplicates are
+/// removed, share one column holding the term's string.
+#[test]
+fn unfold_overlapping_shapes_share_a_computed_column() {
+    let mapping = with_prefixes(
+        r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/a/{id}" ; rr:class ex:Thing ] .
+<#B> rr:logicalTable [ rr:tableName "b" ] ;
+  rr:subjectMap [ rr:column "iri" ; rr:class ex:Thing ] .
+<#C> rr:logicalTable [ rr:tableName "c" ] ;
+  rr:subjectMap [ rr:template "http://ex/c/{id}" ; rr:class ex:Other ] ."#,
+    );
+    let plan = unfold_query(&mapping, "SELECT ?x WHERE { ?x a ex:Thing }").unwrap();
+    assert_eq!(plan.columns, ["x"]);
+    assert_eq!(
+        plan.projection[0].terms,
+        [ResultTerm {
+            term_type: TermType::Iri,
+            value: ResultValue::Column("x".into()),
+            datatype: None,
+            language: None,
+            guard: None,
+        }]
+    );
     assert!(
-        matches!(&err, Error::UnsupportedFeature(f) if f.contains("?x")),
+        plan.branches
+            .iter()
+            .all(|b| matches!(&b.select[..], [SqlExpr::Term { guard: None, .. }])),
+        "{plan:?}"
+    );
+    let sql = plan.to_sql().sql;
+    assert!(
+        sql.starts_with("SELECT ($1 || CASE WHEN t0.\"id\"::text IS NULL")
+            && sql.contains("\nUNION\nSELECT (t0.\"iri\"::text)::text AS \"x\""),
+        "{sql}"
+    );
+    // In different arms of a UNION, the shapes are never compared.
+    let plan = unfold_query(
+        &mapping,
+        "SELECT ?x WHERE { { ?x a ex:Thing } UNION { ?x a ex:Other } }",
+    )
+    .unwrap();
+    assert_eq!(plan.columns, ["x", "x_1"]);
+    let plan = unfold_query(
+        &mapping,
+        "SELECT ?x WHERE { { ?x a ex:Other } UNION { ?x a ex:Other } }",
+    )
+    .unwrap();
+    assert_eq!(plan.columns, ["x"]);
+}
+
+#[test]
+fn unfold_overlapping_literals_of_a_natural_datatype_are_unsupported() {
+    let mapping = with_prefixes(
+        r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/a/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:tag ; rr:objectMap [ rr:column "code" ] ] .
+<#B> rr:logicalTable [ rr:tableName "b" ] ;
+  rr:subjectMap [ rr:template "http://ex/b/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:label ;
+    rr:objectMap [ rr:template "{first} {last}" ; rr:termType rr:Literal ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:tag ;
+    rr:objectMap [ rr:column "tag" ; rr:language "en" ] ] ."#,
+    );
+    let err = unfold_query(&mapping, "SELECT ?l WHERE { ?s ex:label ?l }").unwrap_err();
+    assert!(
+        matches!(&err, Error::UnsupportedFeature(f) if f.contains("?l") && f.contains("natural datatype")),
         "{err}"
     );
+    // A language-tagged literal is never a literal of a natural datatype.
+    let plan = unfold_query(&mapping, "SELECT DISTINCT ?l WHERE { ?s ex:tag ?l }").unwrap();
+    assert_eq!(plan.projection[0].terms.len(), 2);
 }
 
 #[test]
@@ -315,20 +403,19 @@ fn unfold_fixed_columns_are_those_of_injective_terms() {
 }
 
 #[test]
-fn unfold_hidden_variable_of_different_shapes_is_unsupported() {
+fn unfold_hidden_variable_of_overlapping_shapes_is_compared_as_its_string() {
     let mapping = with_prefixes(
         r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
   rr:subjectMap [ rr:template "http://ex/a/{id}" ] ;
   rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "v" ] ] .
 <#B> rr:logicalTable [ rr:tableName "b" ] ;
-  rr:subjectMap [ rr:template "http://ex/b/{id}" ] ;
+  rr:subjectMap [ rr:column "iri" ] ;
   rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "v" ] ] ."#,
     );
-    let err = unfold_query(&mapping, "SELECT ?v WHERE { ?s ex:p ?v }").unwrap_err();
-    assert!(
-        matches!(&err, Error::UnsupportedFeature(f) if f.contains("?s")),
-        "{err}"
-    );
+    let plan = unfold_query(&mapping, "SELECT ?v WHERE { ?s ex:p ?v }").unwrap();
+    assert_eq!(plan.hidden_columns, ["s"]);
+    assert!(plan.lexical_hidden_columns.contains("s"));
+    assert!(matches!(plan.branches[1].select[1], SqlExpr::Term { .. }));
     assert!(unfold_query(&mapping, "SELECT DISTINCT ?v WHERE { ?s ex:p ?v }").is_ok());
 }
 
@@ -821,5 +908,165 @@ fn unfold_filter_compares_terms_through_template_decomposition() {
             column(0, "customer_id"),
             SqlExpr::Param("7".into())
         )]))
+    );
+}
+
+const UNION_MAPPING: &str = r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/{id}" ; rr:class ex:Thing ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "v" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:kind ; rr:object "a" ] .
+<#B> rr:logicalTable [ rr:tableName "b" ] ;
+  rr:subjectMap [ rr:template "http://ex/{id}" ; rr:class ex:Thing ] ;
+  rr:predicateObjectMap [ rr:predicate ex:q ; rr:objectMap [ rr:column "w" ] ] ."#;
+
+fn union_query(query: &str) -> Result<SqlPlan, Error> {
+    unfold_query(&with_prefixes(UNION_MAPPING), query)
+}
+
+#[test]
+fn unfold_union_gives_each_arm_its_branches() {
+    let plan =
+        union_query("SELECT ?x ?v ?w WHERE { { ?x ex:p ?v } UNION { ?x ex:q ?w } }").unwrap();
+    let arms: Vec<usize> = plan.branches.iter().map(|b| b.arm).collect();
+    assert_eq!(arms, [0, 1]);
+    // A variable of one side is unbound in the other.
+    assert_eq!(plan.branches[0].select[2], SqlExpr::Unbound);
+    assert_eq!(plan.branches[1].select[1], SqlExpr::Unbound);
+    // Bag union of the arms; duplicates are removed within each.
+    assert_eq!(
+        plan.to_sql().sql,
+        "SELECT DISTINCT t0.\"id\" AS \"x\", t0.\"v\" AS \"v\", NULL AS \"w\"\n\
+         FROM \"a\" t0\n\
+         WHERE t0.\"id\" IS NOT NULL AND t0.\"v\" IS NOT NULL\n\
+         UNION ALL\n\
+         SELECT DISTINCT t0.\"id\" AS \"x\", NULL AS \"v\", t0.\"w\" AS \"w\"\n\
+         FROM \"b\" t0\n\
+         WHERE t0.\"id\" IS NOT NULL AND t0.\"w\" IS NOT NULL"
+    );
+    // The same side twice counts twice; under DISTINCT once.
+    let plan = union_query("SELECT ?x WHERE { { ?x ex:p ?v } UNION { ?x ex:p ?v } }").unwrap();
+    assert!(plan.to_sql().sql.contains("\nUNION ALL\n"));
+    let plan =
+        union_query("SELECT DISTINCT ?x WHERE { { ?x ex:p ?v } UNION { ?x ex:p ?v } }").unwrap();
+    let sql = plan.to_sql().sql;
+    assert!(
+        sql.contains("\nUNION\n") && !sql.contains("UNION ALL"),
+        "{sql}"
+    );
+}
+
+#[test]
+fn unfold_union_arm_with_several_branches_is_parenthesized() {
+    let plan = union_query("SELECT ?x WHERE { { ?x a ex:Thing } UNION { ?x ex:p ?v } }").unwrap();
+    let arms: Vec<usize> = plan.branches.iter().map(|b| b.arm).collect();
+    assert_eq!(arms, [0, 0, 1]);
+    let sql = plan.to_sql().sql;
+    assert!(
+        sql.starts_with("SELECT q.\"x\"\nFROM (\n(SELECT ")
+            && sql.contains("\nUNION\nSELECT ")
+            && sql.contains(")\nUNION ALL\nSELECT DISTINCT "),
+        "{sql}"
+    );
+}
+
+#[test]
+fn unfold_union_with_keys_keeps_the_rows_of_proven_arms() {
+    let plan =
+        union_query("SELECT ?x ?v WHERE { { ?x ex:p ?v } UNION { ?x a ex:Thing } }").unwrap();
+    let keys: TableKeys = ["a", "b"]
+        .into_iter()
+        .map(|t| {
+            (
+                LogicalTable::TableName(t.into()),
+                vec![vec!["id".to_owned()]],
+            )
+        })
+        .collect();
+    // The second arm has two branches, so only the first can be proven.
+    assert_eq!(plan.key_tables(), [LogicalTable::TableName("a".into())]);
+    let sql = plan
+        .to_sql_with(&RenderOptions {
+            keys: Some(&keys),
+            ..RenderOptions::default()
+        })
+        .unwrap()
+        .sql;
+    assert!(
+        sql.starts_with("SELECT t0.\"id\" AS \"x\", t0.\"v\" AS \"v\"\nFROM \"a\" t0")
+            && sql.contains("UNION ALL\n(SELECT "),
+        "{sql}"
+    );
+    assert!(plan.has_duplicates(Some(&keys)));
+}
+
+#[test]
+fn unfold_filter_in_a_union_side_applies_to_that_side_only() {
+    let plan = union_query(
+        "SELECT ?x WHERE { { ?x ex:p ?v FILTER(?v > 1) } UNION { ?x ex:q ?w } FILTER(BOUND(?w)) }",
+    )
+    .unwrap();
+    let count = |b: &SqlBranch| {
+        b.conditions
+            .iter()
+            .filter(|c| matches!(c, Condition::Filter(_)))
+            .count()
+    };
+    assert_eq!(count(&plan.branches[0]), 2);
+    assert_eq!(count(&plan.branches[1]), 1);
+    // `?w` is unbound in the first side: BOUND is false there.
+    assert!(
+        plan.branches[0]
+            .conditions
+            .contains(&Condition::Filter(Filter::Constant(Some(false))))
+    );
+}
+
+#[test]
+fn unfold_union_side_that_cannot_match_has_no_branch() {
+    let plan =
+        union_query("SELECT ?x WHERE { { ?x ex:p ?v } UNION { ?x ex:missing ?v } }").unwrap();
+    assert_eq!(plan.branches.len(), 1);
+}
+
+#[test]
+fn unfold_constant_in_one_union_side_is_selected_as_a_flag() {
+    let plan = union_query("SELECT ?k WHERE { { ?x ex:kind ?k } UNION { ?x ex:q ?w } }").unwrap();
+    assert_eq!(plan.branches[0].select[0], SqlExpr::True);
+    assert_eq!(
+        plan.branches[1].select[0],
+        SqlExpr::Null(BOOLEAN.to_owned())
+    );
+    assert_eq!(plan.projection[0].terms[0].guard.as_deref(), Some("k"));
+}
+
+#[test]
+fn unfold_union_inside_optional_with_one_matching_side() {
+    let plan = union_query(
+        "SELECT ?x ?v WHERE { ?x ex:q ?w OPTIONAL { { ?x ex:p ?v } UNION { ?x ex:missing ?v } } }",
+    )
+    .unwrap();
+    assert_eq!(plan.branches.len(), 1);
+    assert_eq!(plan.branches[0].left_joins.len(), 1);
+    let err = union_query(
+        "SELECT ?x ?v WHERE { ?x ex:q ?w OPTIONAL { { ?x ex:p ?v } UNION { ?x ex:q ?v } } }",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::UnsupportedFeature(f) if f.contains("UNION")),
+        "{err}"
+    );
+}
+
+#[test]
+fn unfold_union_counts_arms_towards_the_branch_limit() {
+    let sides: Vec<String> = (0..=MAX_BRANCHES)
+        .map(|_| "{ ?x ex:p ?v }".to_owned())
+        .collect();
+    let err = union_query(&format!("SELECT ?x WHERE {{ {} }}", sides.join(" UNION "))).unwrap_err();
+    assert_eq!(
+        err,
+        Error::TooManyBranches {
+            limit: MAX_BRANCHES
+        }
     );
 }

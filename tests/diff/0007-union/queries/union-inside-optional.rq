@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Only the first side of the union can match the order.
+SELECT ?o ?c WHERE {
+  ?o ex:amount ?a
+  OPTIONAL { { ?o ex:placedBy ?c } UNION { ?o ex:homepage ?c } }
+}

@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# ?x from a template in one side and an IRI column in the other: the
+# sides are never compared, so customer 1 counts in both.
+SELECT ?x WHERE { { ?x a ex:Client } UNION { ?x a ex:Partner } }

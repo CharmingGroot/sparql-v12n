@@ -1,0 +1,17 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_with_keys(UNION,\n&format!(\"{PREFIXES}SELECT ?x WHERE {{ {{ ?x a ex:Client }} UNION {{ ?x a ex:Order }} }}\"),\nSome(&union_keys()))"
+---
+(SELECT t0."id" AS "x", NULL AS "x_1", NULL AS "x_2"
+FROM "customers" t0
+WHERE t0."id" IS NOT NULL
+UNION
+SELECT NULL AS "x", t0."code" AS "x_1", NULL AS "x_2"
+FROM "wholesalers" t0
+WHERE t0."code" IS NOT NULL)
+UNION ALL
+SELECT NULL AS "x", NULL AS "x_1", t0."id" AS "x_2"
+FROM "orders" t0
+WHERE t0."id" IS NOT NULL
+
+-- params

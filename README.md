@@ -270,10 +270,11 @@ and only then does `SELECT` project, so `SELECT ?city WHERE { ?p ex:city
 The generated SQL removes duplicates with `DISTINCT` (or `UNION` across
 term maps) over the columns of every variable of the pattern, in a
 subquery when some are not selected. Before running a query that reads
-tables (not views) through a single combination of term maps, the engine
-reads their unique keys from the catalog; when every table has a key
-among the columns the solution fixes, no two rows can give the same
-solution and the SQL keeps all rows without `DISTINCT`. Otherwise
+tables (not views) through a single combination of term maps (in some
+side of a `UNION`), the engine reads their unique keys from the catalog;
+when every table has a key among the columns the solution fixes, no two
+rows can give the same solution and the SQL keeps all rows without
+`DISTINCT`. Otherwise
 PostgreSQL has to deduplicate, which costs a hash or sort over the rows
 and, unless an index delivers them in order, reads all of them before the
 first one is returned. `v12n explain` has no database and always shows the
@@ -318,9 +319,54 @@ part:
   pattern.
 
 Not supported yet, and rejected as unsupported: an optional part that
-more than one combination of triples maps can match (it needs a `UNION`
-inside the `LEFT JOIN`); `SELECT DISTINCT` over a variable that only
-several `OPTIONAL` parts bind.
+more than one combination of triples maps, or more than one side of a
+`UNION` inside it, can match (it needs a `UNION` inside the `LEFT JOIN`);
+`SELECT DISTINCT` over a variable that only several `OPTIONAL` parts bind.
+
+## UNION
+
+`{ A } UNION { B }` has the solutions of both sides as a bag: a solution
+that both sides give counts twice, and once under `SELECT DISTINCT`. A
+variable that only one side binds is unbound in the other side's
+solutions.
+
+- Joins, `FILTER`s and `OPTIONAL` distribute over a union on their left
+  side, so the engine unfolds each arm, a choice of one side of every
+  `UNION`, on its own, and combines the arms with `UNION ALL`. Each arm is
+  translated as any other pattern: duplicate triples count once inside
+  it (`DISTINCT`, or `UNION` across its term maps, or nothing when keys
+  prove there are no duplicates, now checked per arm), and the arms are
+  never compared with each other. The number of arms times the term map
+  combinations of each is limited to 64, like the branches of one
+  pattern.
+- A `FILTER` in one side applies to that side's solutions only, and a
+  `FILTER` of the group around the union to the solutions of both, where
+  a variable of the other side is unbound.
+- A `UNION` inside `OPTIONAL` does not distribute over the left join. It
+  works where only one of its sides can match the left side, and is
+  rejected otherwise (see `OPTIONAL`).
+
+A variable can take its values from term maps of different shapes in
+different sides or term maps: a template in one and a column or another
+template in the other, constants, IRIs and literals, or literals of
+different datatypes or language tags. The results rebuild each value
+from the term map of the row's branch:
+
+- Terms of shapes that can never be the same get separate result
+  columns, and each branch fills its own: `http://example.org/customer/{id}`
+  and `http://example.org/wholesale/{code}` (different fixed text, or text
+  that IRI-safe encoding always escapes in the other's values), an IRI and
+  a literal, two different constants, or two language tags. Removing
+  duplicates on the columns stays exact.
+- Shapes that can give the same term and whose duplicates are compared,
+  in one arm or under `SELECT DISTINCT`, share one result column with the
+  term's string, computed in SQL as for joins (the IRI-safe template, the
+  IRI resolved against the base IRI, the natural lexical form), so the
+  same triple from a template and from an IRI column counts once. Such a
+  column cannot use an index and computes the string for every row. It is
+  rejected as unsupported where SQL cannot compute the lexical form (as
+  for joins), and for literals where one of the shapes is a column of
+  natural datatype, whose datatype depends on the SQL type.
 
 ## FILTER
 

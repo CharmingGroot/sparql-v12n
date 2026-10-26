@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# Each filter applies to its own side only.
+SELECT ?o ?a ?s WHERE {
+  { ?o ex:amount ?a FILTER(?a > 90) } UNION { ?o ex:status ?s FILTER(?s = "open") }
+}
