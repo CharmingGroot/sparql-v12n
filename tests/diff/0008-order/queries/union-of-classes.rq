@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?x WHERE { { ?x a ex:Product } UNION { ?x a ex:Review } }
+ORDER BY DESC(?x)

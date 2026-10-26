@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# Unbound sorts first ascending.
+SELECT ?p ?c ?n WHERE { ?p ex:name ?n OPTIONAL { ?p ex:category ?c } }
+ORDER BY ?c ?n

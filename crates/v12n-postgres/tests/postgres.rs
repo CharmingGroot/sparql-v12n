@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use tokio_postgres::NoTls;
 use tokio_postgres::types::Type;
-use v12n_core::mapping::{BaseIri, Mapping, MappingIndex};
+use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
 use v12n_core::solution::canonical_decimal;
-use v12n_core::sql::{RenderOptions, SqlPlan};
+use v12n_core::sql::{ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, SqlPlan};
 use v12n_core::{sparql, unfold};
 use v12n_postgres::{Database, Error, Limits};
 
@@ -33,6 +33,17 @@ fn plan(mapping: &str, query: &str) -> SqlPlan {
 /// Each solution as `?var=term` pairs in N-Triples syntax, sorted, since
 /// SPARQL results have no order without `ORDER BY`.
 async fn run(url: &str, limits: Limits, plan: &SqlPlan) -> Result<(Vec<String>, bool), Error> {
+    let (mut rows, truncated) = run_in_order(url, limits, plan).await?;
+    rows.sort();
+    Ok((rows, truncated))
+}
+
+/// Like [`run`], in the order the solutions arrive.
+async fn run_in_order(
+    url: &str,
+    limits: Limits,
+    plan: &SqlPlan,
+) -> Result<(Vec<String>, bool), Error> {
     let database = Database::connect(url, limits).await?;
     let mut solutions = database.execute(plan).await?;
     let mut rows = Vec::new();
@@ -45,7 +56,6 @@ async fn run(url: &str, limits: Limits, plan: &SqlPlan) -> Result<(Vec<String>, 
             .collect();
         rows.push(row.join(" "));
     }
-    rows.sort();
     Ok((rows, solutions.is_truncated()))
 }
 
@@ -1654,4 +1664,367 @@ async fn optional_matched_by_several_triples_maps_splits_the_branch() {
             row(3, None)
         ]
     );
+}
+
+/// One value per row, each from its own column, so that `?v` takes terms
+/// of every kind; row 17 has none.
+const KINDS: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+<#V> rr:logicalTable [ rr:sqlQuery """SELECT * FROM (VALUES
+    (1, 10, NULL::numeric, NULL::float8, NULL, NULL::bool, NULL::timestamp, NULL::date, NULL, NULL, NULL::int),
+    (2, 9, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+    (3, NULL, 9.5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+    (4, NULL, NULL, 1e1, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+    (5, NULL, NULL, 'NaN', NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+    (6, NULL, NULL, NULL, 'a', NULL, NULL, NULL, NULL, NULL, NULL),
+    (7, NULL, NULL, NULL, 'Z', NULL, NULL, NULL, NULL, NULL, NULL),
+    (8, NULL, NULL, NULL, 'é', NULL, NULL, NULL, NULL, NULL, NULL),
+    (9, NULL, NULL, NULL, NULL, true, NULL, NULL, NULL, NULL, NULL),
+    (10, NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, NULL, NULL),
+    (11, NULL, NULL, NULL, NULL, NULL, '2024-01-01 00:00:00', NULL, NULL, NULL, NULL),
+    (12, NULL, NULL, NULL, NULL, NULL, 'infinity', NULL, NULL, NULL, NULL),
+    (13, NULL, NULL, NULL, NULL, NULL, NULL, '2024-01-01', NULL, NULL, NULL),
+    (14, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'b', NULL, NULL),
+    (15, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'http://example.org/Z', NULL),
+    (16, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'http://example.org/a', NULL),
+    (17, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1)
+  ) AS v(id, i, d, f, s, b, ts, dt, l, link, e)""" ] ;
+  rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:i ; rr:objectMap [ rr:column "i" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:d ; rr:objectMap [ rr:column "d" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:f ; rr:objectMap [ rr:column "f" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:s ; rr:objectMap [ rr:column "s" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:b ; rr:objectMap [ rr:column "b" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:ts ; rr:objectMap [ rr:column "ts" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:dt ; rr:objectMap [ rr:column "dt" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:l ; rr:objectMap [ rr:column "l" ; rr:language "en" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:link ; rr:objectMap [ rr:column "link" ; rr:termType rr:IRI ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:e ; rr:objectMap [ rr:column "e" ] ] .
+"#;
+
+/// The row numbers of the solutions, in order.
+async fn ordered_rows(url: &str, mapping: &str, body: &str, limits: Limits) -> (Vec<u32>, bool) {
+    let query = format!(
+        "PREFIX ex: <http://example.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n{body}"
+    );
+    let (rows, truncated) = run_in_order(url, limits, &plan(mapping, &query))
+        .await
+        .unwrap_or_else(|e| panic!("{body}: {e}"));
+    let ids = rows
+        .iter()
+        .map(|r| {
+            let start = r.find("<http://example.org/row/").expect("a row IRI") + 24;
+            let end = start + r[start..].find('>').expect("the end of the IRI");
+            r[start..end].parse().expect("a row number")
+        })
+        .collect();
+    (ids, truncated)
+}
+
+/// SPARQL 1.1 §15.1: no value, blank nodes, IRIs, then literals; IRIs and
+/// strings by code point; numbers by value across datatypes, booleans,
+/// dateTimes by `<`. Between kinds of literals SPARQL leaves the order
+/// open; this engine puts numbers, booleans, dateTimes, strings,
+/// language-tagged literals and then other datatypes. The infinite
+/// timestamp is the plain literal "infinity", among the strings. 10 and
+/// 1.0E1 are equal numbers: their order is open too.
+#[tokio::test]
+async fn order_by_follows_the_sparql_order_across_kinds_of_terms() {
+    let Some(url) = database_url() else { return };
+    let union = "SELECT ?row ?v WHERE { { ?row ex:i ?v } UNION { ?row ex:d ?v } \
+                 UNION { ?row ex:f ?v } UNION { ?row ex:s ?v } UNION { ?row ex:b ?v } \
+                 UNION { ?row ex:ts ?v } UNION { ?row ex:dt ?v } UNION { ?row ex:l ?v } \
+                 UNION { ?row ex:link ?v } UNION { ?row ex:e ?x } }";
+    let ascending = [17, 15, 16, 2, 3, 1, 4, 5, 10, 9, 11, 7, 6, 12, 8, 14, 13];
+    let (rows, _) = ordered_rows(
+        &url,
+        KINDS,
+        &format!("{union} ORDER BY ?v"),
+        Limits::default(),
+    )
+    .await;
+    assert_eq!(rows, ascending);
+    // Descending is the reverse, unbound last.
+    let (rows, _) = ordered_rows(
+        &url,
+        KINDS,
+        &format!("{union} ORDER BY DESC(?v)"),
+        Limits::default(),
+    )
+    .await;
+    let mut descending = ascending;
+    descending.reverse();
+    assert_eq!(rows, descending);
+}
+
+/// Numbers compare by value with XPath's promotion: integers and decimals
+/// exactly, and as doubles when the other is a double. NaN orders with
+/// nothing; it comes after every number here, as in PostgreSQL.
+#[tokio::test]
+async fn order_by_compares_numbers_by_value_across_datatypes() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        r"SELECT * FROM (VALUES
+            (1, -1, NULL::numeric, NULL::float8),
+            (2, 3, NULL, NULL),
+            (3, NULL, 0.10000000000000000001, NULL),
+            (4, NULL, 0.1, NULL),
+            (5, NULL, 2.5, NULL),
+            (6, NULL, NULL, '-Infinity'),
+            (7, NULL, NULL, 'Infinity'),
+            (8, NULL, NULL, 'NaN'),
+            (9, NULL, NULL, 0.5),
+            (10, NULL, NULL, -0.0)
+          ) AS v(id, i, d, f)",
+        &["i", "d", "f"],
+    );
+    let exact = "SELECT ?row WHERE { { ?row ex:i ?v } UNION { ?row ex:d ?v } }";
+    // Without the decimals that are equal to the double 0.1.
+    let all = "SELECT ?row WHERE { { ?row ex:i ?v } UNION { ?row ex:d ?v } UNION { ?row ex:f ?v } \
+               FILTER(!(?v > 0 && ?v < 0.2)) }";
+    let cases: [(String, &[u32]); 3] = [
+        // Two decimals that one double cannot tell apart.
+        (format!("{exact} ORDER BY ?v"), &[1, 4, 3, 5, 2]),
+        (format!("{exact} ORDER BY DESC(?v)"), &[2, 5, 3, 4, 1]),
+        (format!("{all} ORDER BY ?v"), &[6, 1, 10, 9, 5, 2, 7, 8]),
+    ];
+    for (query, expected) in cases {
+        let (rows, _) = ordered_rows(&url, &mapping, &query, Limits::default()).await;
+        assert_eq!(rows, expected, "{query}");
+    }
+}
+
+/// Unbound sorts first ascending and last descending; strings compare by
+/// code point, not by the database collation; later comparators order
+/// ties of earlier ones.
+#[tokio::test]
+async fn order_by_strings_by_code_point_with_several_comparators() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        r"SELECT * FROM (VALUES
+            (1, 'b', 'é'), (2, 'a', 'Z'), (3, 'b', NULL), (4, 'a', 'z'),
+            (5, 'b', '가'), (6, 'a', NULL), (7, 'b', 'a')
+          ) AS v(id, g, s)",
+        &["g", "s"],
+    );
+    let cases: [(&str, &[u32]); 3] = [
+        (
+            "SELECT ?row WHERE { ?row ex:g ?g OPTIONAL { ?row ex:s ?s } } ORDER BY ?s ?g",
+            &[6, 3, 2, 7, 4, 1, 5],
+        ),
+        (
+            "SELECT ?row WHERE { ?row ex:g ?g OPTIONAL { ?row ex:s ?s } } ORDER BY DESC(?s) ?g",
+            &[5, 1, 4, 7, 2, 6, 3],
+        ),
+        (
+            "SELECT ?row WHERE { ?row ex:g ?g OPTIONAL { ?row ex:s ?s } } \
+             ORDER BY DESC(?g) (?s < \"b\") STR(?row)",
+            &[3, 1, 5, 7, 6, 4, 2],
+        ),
+    ];
+    for (query, expected) in cases {
+        let (rows, _) = ordered_rows(&url, &mapping, query, Limits::default()).await;
+        assert_eq!(rows, expected, "{query}");
+    }
+}
+
+/// The infinite values of a timestamp column are the plain literals
+/// "-infinity" and "infinity". Alone, the column sorts as it is: their
+/// order against dateTimes is open, so they stay at its ends. With other
+/// strings, they sort among them by code point.
+#[tokio::test]
+async fn order_by_puts_infinite_timestamps_among_strings_where_there_are_some() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        r"SELECT * FROM (VALUES
+            (1, TIMESTAMP '2024-01-01 00:00:00', NULL),
+            (2, 'infinity', NULL),
+            (3, '-infinity', NULL),
+            (4, '2023-01-01 00:00:00', NULL),
+            (5, NULL, 'a')
+          ) AS v(id, ts, s)",
+        &["ts", "s"],
+    );
+    let alone = "SELECT ?row WHERE { ?row ex:ts ?v }";
+    let mixed = "SELECT ?row WHERE { { ?row ex:ts ?v } UNION { ?row ex:s ?v } }";
+    let cases: [(String, &[u32]); 4] = [
+        (format!("{alone} ORDER BY ?v"), &[3, 4, 1, 2]),
+        (format!("{alone} ORDER BY DESC(?v)"), &[2, 1, 4, 3]),
+        (format!("{mixed} ORDER BY ?v"), &[4, 1, 3, 5, 2]),
+        (format!("{mixed} ORDER BY DESC(?v)"), &[2, 5, 3, 1, 4]),
+    ];
+    for (query, expected) in cases {
+        let (rows, _) = ordered_rows(&url, &mapping, &query, Limits::default()).await;
+        assert_eq!(rows, expected, "{query}");
+    }
+}
+
+/// OFFSET and LIMIT apply after ORDER BY and DISTINCT (SPARQL 1.1
+/// §18.2.5). A query LIMIT at or below the row limit is never reported as
+/// truncation; above it, the row limit still cuts and says so.
+#[tokio::test]
+async fn limit_and_offset_slice_after_order_and_distinct() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        r"SELECT * FROM (VALUES (1, 'x'), (2, 'y'), (3, 'x'), (4, 'z'), (5, 'y')) AS v(id, t)",
+        &["t"],
+    );
+    let distinct = |modifiers: &str| {
+        format!(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT DISTINCT ?t WHERE {{ ?row ex:t ?t }} ORDER BY DESC(?t) {modifiers}"
+        )
+    };
+    for (modifiers, expected) in [
+        ("", &["z", "y", "x"][..]),
+        ("LIMIT 2", &["z", "y"]),
+        ("OFFSET 1", &["y", "x"]),
+        ("LIMIT 1 OFFSET 2", &["x"]),
+        ("OFFSET 3", &[]),
+        ("LIMIT 0", &[]),
+    ] {
+        let (rows, truncated) = run_in_order(
+            &url,
+            Limits::default(),
+            &plan(&mapping, &distinct(modifiers)),
+        )
+        .await
+        .unwrap();
+        let expected: Vec<String> = expected.iter().map(|t| format!("?t=\"{t}\"")).collect();
+        assert_eq!((rows, truncated), (expected, false), "{modifiers}");
+    }
+
+    let limits = Limits {
+        row_limit: 2,
+        ..Limits::default()
+    };
+    let body = "SELECT ?row WHERE { ?row ex:t ?t } ORDER BY ?row";
+    for (modifiers, expected, truncated) in [
+        ("LIMIT 2", &[1, 2][..], false),
+        ("LIMIT 1", &[1], false),
+        ("LIMIT 3", &[1, 2], true),
+        ("OFFSET 3", &[4, 5], false),
+        ("OFFSET 2", &[3, 4], true),
+        ("OFFSET 2 LIMIT 2", &[3, 4], false),
+    ] {
+        let (rows, cut) =
+            ordered_rows(&url, &mapping, &format!("{body} {modifiers}"), limits).await;
+        assert_eq!((rows.as_slice(), cut), (expected, truncated), "{modifiers}");
+    }
+}
+
+/// When one `SELECT` reads the column of the comparator, it sorts by the
+/// column itself, so an index on it delivers the rows in order.
+#[tokio::test]
+async fn order_by_a_column_keeps_its_index() {
+    let Some(url) = database_url() else { return };
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS v12n_order CASCADE;
+             CREATE SCHEMA v12n_order;
+             CREATE TABLE v12n_order.items (id int PRIMARY KEY, price int NOT NULL);
+             INSERT INTO v12n_order.items SELECT n, (n * 7919) % 10007 FROM generate_series(1, 20000) n;
+             CREATE INDEX items_price ON v12n_order.items (price);
+             ANALYZE v12n_order.items;",
+        )
+        .await
+        .unwrap();
+    let mapping = "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
+         <#M> rr:logicalTable [ rr:tableName \"v12n_order.items\" ] ;\n\
+           rr:subjectMap [ rr:template \"http://example.org/item/{id}\" ] ;\n\
+           rr:predicateObjectMap [ rr:predicate <http://example.org/price> ; rr:objectMap [ rr:column \"price\" ] ] .";
+    let database = Database::connect(&url, Limits::default()).await.unwrap();
+    let mut plans = Vec::new();
+    for direction in ["", "DESC"] {
+        let plan = plan(
+            mapping,
+            &format!(
+                "SELECT ?i ?p WHERE {{ ?i <http://example.org/price> ?p }} ORDER BY {direction}(?p) LIMIT 3"
+            ),
+        );
+        let keys = database.table_keys(&plan).await.unwrap();
+        let int = ColumnType {
+            name: "int4".into(),
+            sql_type: "\"pg_catalog\".\"int4\"".into(),
+            union_class: "integer".into(),
+            natural_datatype: Some("http://www.w3.org/2001/XMLSchema#integer".into()),
+            group: "integer".into(),
+            comparison: Comparison::Value,
+            lexical: Some(Lexical::Text),
+        };
+        let table = LogicalTable::TableName("v12n_order.items".into());
+        let types: ColumnTypes = [
+            ((table.clone(), "id".to_owned()), int.clone()),
+            ((table, "price".to_owned()), int),
+        ]
+        .into();
+        let sql = plan
+            .to_sql_with(&RenderOptions {
+                keys: keys.as_ref(),
+                column_types: Some(&types),
+                ..RenderOptions::default()
+            })
+            .unwrap();
+        let (rows, _) = run_in_order(&url, Limits::default(), &plan).await.unwrap();
+        plans.push((sql, rows));
+    }
+    client
+        .batch_execute("SET enable_sort = off; SET enable_seqscan = off")
+        .await
+        .unwrap();
+    for (rendered, rows) in &plans {
+        let explain: Vec<String> = client
+            .query(&format!("EXPLAIN {}", rendered.sql), &[&3i64])
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert!(
+            explain
+                .iter()
+                .any(|line| line.contains("Index Scan") && line.contains("items_price")),
+            "{}\n{explain:#?}",
+            rendered.sql
+        );
+        assert_eq!(rows.len(), 3);
+    }
+    assert!(plans[0].1[0].ends_with("?p=\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>"));
+    assert!(plans[1].1[0].ends_with("?p=\"10006\"^^<http://www.w3.org/2001/XMLSchema#integer>"));
+    client
+        .batch_execute("DROP SCHEMA v12n_order CASCADE")
+        .await
+        .unwrap();
+}
+
+/// What SQL cannot order the way SPARQL does is rejected.
+#[tokio::test]
+async fn order_by_without_an_exact_sql_order_is_rejected() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        r"SELECT * FROM (VALUES
+            (1, TIMESTAMP '2024-01-01 00:00:00', TIMESTAMPTZ '2024-01-01 00:00:00Z', 1.5::real)
+          ) AS v(id, ts, tz, r)",
+        &["ts", "tz", "r"],
+    );
+    for (body, reason) in [
+        (
+            "SELECT ?row WHERE { { ?row ex:ts ?v } UNION { ?row ex:tz ?v } } ORDER BY ?v",
+            "with and without a time zone",
+        ),
+        ("SELECT ?row WHERE { ?row ex:r ?v } ORDER BY ?v", "float4"),
+    ] {
+        let query = format!("PREFIX ex: <http://example.org/>\n{body}");
+        let database = Database::connect(&url, Limits::default()).await.unwrap();
+        match database.execute(&plan(&mapping, &query)).await {
+            Err(Error::Core(v12n_core::Error::UnsupportedFeature(feature))) => {
+                assert!(feature.contains(reason), "{feature}")
+            }
+            Err(e) => panic!("{body}: {e}"),
+            Ok(_) => panic!("{body}: expected an unsupported-feature error"),
+        }
+    }
 }

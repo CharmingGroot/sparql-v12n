@@ -12,6 +12,7 @@ use crate::mapping::{BaseIri, LogicalTable, SCHEME_REGEX, TemplatePart, TermType
 use crate::sparql::{CompareOp, TermTest};
 
 mod filter;
+mod order;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -63,6 +64,32 @@ pub struct SqlPlan {
     /// The base IRI that relative IRIs of the results resolve against
     /// (R2RML §11.2), from the mapping.
     pub base_iri: Option<BaseIri>,
+    /// The order comparators of `ORDER BY`, whose values each branch gives
+    /// in [`SqlBranch::order`]; empty without one.
+    pub order: Vec<OrderKey>,
+    /// `OFFSET`: solutions skipped after ordering and removing duplicates
+    /// (SPARQL 1.1 §18.2.5, Slice).
+    pub offset: usize,
+    /// `LIMIT`: most solutions returned after `OFFSET`.
+    pub limit: Option<usize>,
+}
+
+/// One order comparator of `ORDER BY` (SPARQL 1.1 §15.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderKey {
+    pub descending: bool,
+}
+
+/// The value of an order comparator in the rows of a branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderValue {
+    /// A term: the value of the first case whose conditions all hold, or
+    /// no value where none does. A variable bound by several `OPTIONAL`
+    /// parts has one case per part, as in [`Filter::Cases`].
+    Term(Vec<(Vec<Condition>, FilterValue)>),
+    /// A boolean expression, rendered as a [`Filter`]: a boolean literal,
+    /// or no value where it is an error.
+    Boolean(Box<Filter>),
 }
 
 /// One `SELECT ... FROM ... WHERE ...` of the plan.
@@ -90,6 +117,8 @@ pub struct SqlBranch {
     /// distinct terms. When they include a unique key of the table, the
     /// table contributes at most one row to each solution.
     pub fixed_columns: Vec<BTreeSet<String>>,
+    /// The value of each of [`SqlPlan::order`] in the rows of the branch.
+    pub order: Vec<OrderValue>,
 }
 
 /// An `OPTIONAL` part of a branch: `LEFT JOIN (tables) ON conditions`, so
@@ -427,6 +456,38 @@ impl Filter {
     }
 }
 
+impl OrderValue {
+    /// Every condition inside, not recursing into them, and every term
+    /// map's term.
+    fn visit<'f>(&'f self, f: &mut dyn FnMut(Part<'f>)) {
+        match self {
+            Self::Term(cases) => {
+                for (guards, value) in cases {
+                    guards.iter().for_each(|c| f(Part::Condition(c)));
+                    if let Some(t) = value.term() {
+                        f(Part::Term(&t.term));
+                    }
+                }
+            }
+            Self::Boolean(filter) => filter.visit(f),
+        }
+    }
+
+    fn visit_mut(&mut self, f: &mut dyn FnMut(PartMut<'_>)) {
+        match self {
+            Self::Term(cases) => {
+                for (guards, value) in cases {
+                    guards.iter_mut().for_each(|c| f(PartMut::Condition(c)));
+                    if let Some(t) = value.term_mut() {
+                        f(PartMut::Term(&mut t.term));
+                    }
+                }
+            }
+            Self::Boolean(filter) => filter.visit_mut(f),
+        }
+    }
+}
+
 /// One side of a [`Condition::SameTerm`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TermSql {
@@ -647,6 +708,11 @@ impl SqlPlan {
     /// are not selected. This compares column values, so two different
     /// values that a template renders as the same string (see
     /// [`SqlPlan::hidden_columns`]) still count twice.
+    ///
+    /// `ORDER BY` sorts by keys that put the solutions in SPARQL's order
+    /// (see `order.rs`): by expressions over the tables when the plan is
+    /// one plain `SELECT`, otherwise by keys every branch selects, outside
+    /// a subquery. `LIMIT` and `OFFSET` come last, as parameters.
     pub fn to_sql_with(&self, options: &RenderOptions<'_>) -> Result<RenderedSql, Error> {
         let mut r = Renderer {
             options: *options,
@@ -674,6 +740,7 @@ impl SqlPlan {
             aliases: self.columns.clone(),
             order: (0..self.columns.len()).collect(),
             typed_text_from: None,
+            slots: Vec::new(),
         };
         if dedup {
             select.aliases.extend(self.hidden_columns.iter().cloned());
@@ -688,7 +755,34 @@ impl SqlPlan {
         }
         let subquery = select.aliases.len() > self.columns.len()
             || select.order.iter().enumerate().any(|(i, &o)| i != o);
-        if subquery {
+        let layouts = if self.order.is_empty() || self.branches.is_empty() {
+            Vec::new()
+        } else {
+            r.order_layouts(self)?
+        };
+        let ordered = layouts.iter().any(|l| !l.slots.is_empty());
+        // One plain `SELECT` sorts by expressions over its tables, which
+        // keeps an index on a sorted column usable. Anything else selects
+        // the sort keys and sorts the rows of the subquery: `UNION`
+        // combines rows of different branches, and `SELECT DISTINCT`
+        // cannot sort by expressions it does not select.
+        let direct = ordered && self.branches.len() == 1 && !subquery && !groups[0].1;
+        let wrapped = subquery || (ordered && !direct);
+        if ordered && !direct {
+            let used: HashSet<&str> = select.aliases.iter().map(String::as_str).collect();
+            let mut names = Vec::new();
+            for (k, layout) in layouts.iter().enumerate() {
+                for &slot in &layout.slots {
+                    let mut name = format!("o{}_{}", k + 1, order::slot_name(slot));
+                    while used.contains(name.as_str()) {
+                        name.push('_');
+                    }
+                    names.push((name, k, slot));
+                }
+            }
+            select.slots = names;
+        }
+        if wrapped {
             r.sql.push_str("SELECT ");
             if self.columns.is_empty() {
                 r.sql.push('1');
@@ -721,14 +815,46 @@ impl SqlPlan {
                     });
                 }
                 r.branch_index = i;
-                r.branch(&self.branches[i], &select, *distinct && single)?;
+                r.branch(&self.branches[i], &select, &layouts, *distinct && single)?;
             }
             if parenthesized {
                 r.sql.push(')');
             }
         }
-        if subquery {
+        if wrapped {
             r.sql.push_str("\n) q");
+        }
+        // Sort keys and limits never empty a branch.
+        r.required = false;
+        if wrapped && ordered {
+            let slots = select.slots.clone();
+            let mut next = slots.iter();
+            r.order_by(self, &layouts, |r, _, slot| {
+                let (name, _, s) = next.next().expect("one name per slot");
+                debug_assert_eq!(*s, slot);
+                r.sql.push_str(&format!("q.{}", quote_identifier(name)));
+                Ok(())
+            })?;
+        } else if direct {
+            let branch = &self.branches[0];
+            r.order_by(self, &layouts, |r, k, slot| {
+                r.order_slot(branch, k, &layouts[k], slot)
+            })?;
+        }
+        if !self.branches.is_empty() {
+            // Constants are bound parameters, here as elsewhere; no result
+            // has more rows than `int8` counts.
+            let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX).to_string();
+            if let Some(limit) = self.limit {
+                r.sql.push_str("\nLIMIT ");
+                r.expr(&SqlExpr::Param(count(limit).into()));
+                r.sql.push_str("::int8");
+            }
+            if self.offset > 0 {
+                r.sql.push_str("\nOFFSET ");
+                r.expr(&SqlExpr::Param(count(self.offset).into()));
+                r.sql.push_str("::int8");
+            }
         }
         Ok(RenderedSql {
             sql: r.sql,
@@ -847,6 +973,23 @@ impl SqlPlan {
             }
             for condition in branch.all_conditions() {
                 collect(condition, &branch.from, &mut out);
+            }
+            for value in &branch.order {
+                let mut conditions = Vec::new();
+                let mut terms = Vec::new();
+                value.visit(&mut |part| match part {
+                    Part::Condition(c) => conditions.push(c),
+                    Part::Term(t) => terms.push(t),
+                });
+                for c in conditions {
+                    collect(c, &branch.from, &mut out);
+                }
+                for (table, name) in terms.iter().flat_map(|t| t.columns()) {
+                    let key = (branch.from[table].clone(), name.to_owned());
+                    if !out.contains(&key) {
+                        out.push(key);
+                    }
+                }
             }
         }
         out
@@ -1238,6 +1381,12 @@ impl SqlPlan {
             for c in conditions {
                 condition(c, from, &mut f);
             }
+            for value in &mut branch.order {
+                value.visit_mut(&mut |part| match part {
+                    PartMut::Condition(c) => condition(c, from, &mut f),
+                    PartMut::Term(t) => term(t, from, &mut f),
+                });
+            }
             for (table, fixed) in from.iter().zip(&mut branch.fixed_columns) {
                 *fixed = std::mem::take(fixed)
                     .into_iter()
@@ -1337,6 +1486,9 @@ struct Select {
     /// Entries from here on are only compared, never decoded, and are
     /// selected as their type and text output.
     typed_text_from: Option<usize>,
+    /// The sort keys selected after the entries, for sorting outside:
+    /// each alias, order comparator and slot.
+    slots: Vec<(String, usize, order::Slot)>,
 }
 
 #[derive(Default)]
@@ -1364,6 +1516,7 @@ impl<'a> Renderer<'a> {
         &mut self,
         branch: &'a SqlBranch,
         select: &Select,
+        layouts: &[order::Layout],
         distinct: bool,
     ) -> Result<(), Error> {
         self.from = &branch.from;
@@ -1399,6 +1552,14 @@ impl<'a> Renderer<'a> {
             }
             self.sql.push_str(" AS ");
             self.sql.push_str(&quote_identifier(&select.aliases[entry]));
+        }
+        for (i, (alias, key, slot)) in select.slots.iter().enumerate() {
+            if i > 0 || !select.order.is_empty() {
+                self.sql.push_str(", ");
+            }
+            self.order_slot(branch, *key, &layouts[*key], *slot)?;
+            self.sql.push_str(" AS ");
+            self.sql.push_str(&quote_identifier(alias));
         }
 
         self.required = true;
@@ -2138,6 +2299,9 @@ mod tests {
             base_iri: None,
         };
         let plan = SqlPlan {
+            order: Vec::new(),
+            offset: 0,
+            limit: None,
             columns: vec!["a".into(), "b".into()],
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),
@@ -2145,6 +2309,7 @@ mod tests {
             lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
+                order: Vec::new(),
                 arm: 0,
                 from: vec![view.clone(), view.clone()],
                 select: vec![column(0, "Id"), column(1, "\"V\"")],
@@ -2182,6 +2347,9 @@ mod tests {
     fn resolved_columns_keep_keys_matching_the_fixed_columns() {
         let table = LogicalTable::TableName("t".into());
         let plan = SqlPlan {
+            order: Vec::new(),
+            offset: 0,
+            limit: None,
             columns: vec!["s".into()],
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),
@@ -2189,6 +2357,7 @@ mod tests {
             lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
+                order: Vec::new(),
                 arm: 0,
                 from: vec![table.clone()],
                 select: vec![column(0, "ID")],
@@ -2321,6 +2490,9 @@ mod tests {
     #[test]
     fn to_sql_places_linking_conditions_in_on_and_numbers_params_in_order() {
         let plan = SqlPlan {
+            order: Vec::new(),
+            offset: 0,
+            limit: None,
             columns: vec!["x".into()],
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),
@@ -2328,6 +2500,7 @@ mod tests {
             lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
+                order: Vec::new(),
                 arm: 0,
                 from: vec![
                     LogicalTable::TableName("a".into()),
@@ -2365,6 +2538,7 @@ mod tests {
     #[test]
     fn to_sql_with_text_params_casts_the_compared_column() {
         let branch = |value: &str, datatype: Option<&str>| SqlBranch {
+            order: Vec::new(),
             arm: 0,
             from: vec![LogicalTable::TableName("t".into())],
             select: vec![column(0, "id")],
@@ -2385,6 +2559,9 @@ mod tests {
             fixed_columns: Vec::new(),
         };
         let plan = SqlPlan {
+            order: Vec::new(),
+            offset: 0,
+            limit: None,
             columns: vec!["x".into()],
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),
@@ -2460,6 +2637,9 @@ mod tests {
             LogicalTable::TableName("r".into()),
         );
         let plan = SqlPlan {
+            order: Vec::new(),
+            offset: 0,
+            limit: None,
             columns: Vec::new(),
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),
@@ -2467,6 +2647,7 @@ mod tests {
             lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
+                order: Vec::new(),
                 arm: 0,
                 from: vec![l.clone(), r.clone()],
                 select: Vec::new(),
@@ -2555,6 +2736,7 @@ mod tests {
     /// natural datatype or in an IRI template, and a hidden `?h`.
     fn union_plan(natural: bool) -> SqlPlan {
         let branch = |t: &str| SqlBranch {
+            order: Vec::new(),
             arm: 0,
             from: vec![LogicalTable::TableName(t.into())],
             select: vec![column(0, "v"), column(0, "h")],
@@ -2574,6 +2756,9 @@ mod tests {
             )
         };
         SqlPlan {
+            order: Vec::new(),
+            offset: 0,
+            limit: None,
             columns: vec!["v".into()],
             hidden_columns: vec!["h".into()],
             distinct_order: vec![1, 0],
@@ -2795,6 +2980,9 @@ mod tests {
 
     fn keyed_plan(fixed: &[&str], hidden: bool) -> SqlPlan {
         SqlPlan {
+            order: Vec::new(),
+            offset: 0,
+            limit: None,
             columns: vec!["s".into()],
             hidden_columns: if hidden { vec!["o".into()] } else { Vec::new() },
             distinct_order: Vec::new(),
@@ -2802,6 +2990,7 @@ mod tests {
             lexical_hidden_columns: Default::default(),
             projection: Vec::new(),
             branches: vec![SqlBranch {
+                order: Vec::new(),
                 arm: 0,
                 from: vec![LogicalTable::TableName("\"T\"".into())],
                 select: vec![column(0, "\"Id\""), column(0, "v")],
@@ -2895,6 +3084,9 @@ mod tests {
     #[test]
     fn to_sql_without_branches_returns_no_rows() {
         let plan = SqlPlan {
+            order: Vec::new(),
+            offset: 0,
+            limit: None,
             columns: Vec::new(),
             hidden_columns: Vec::new(),
             distinct_order: Vec::new(),

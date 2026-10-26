@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# IRIs before literals; numbers and strings have no order between them.
+SELECT ?p ?v WHERE {
+  { ?p ex:section ?v } UNION { ?p ex:price ?v } UNION { ?p ex:name ?v }
+}
+ORDER BY ?v

@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# The seventh and eighth prices are both 120: either may be kept.
+SELECT ?p ?price WHERE { ?p ex:price ?price }
+ORDER BY ?price
+LIMIT 7

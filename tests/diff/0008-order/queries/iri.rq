@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# IRIs compare as strings: product/10 comes before product/2.
+SELECT ?p ?n WHERE { ?p ex:name ?n }
+ORDER BY ?p

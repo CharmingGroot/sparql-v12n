@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# A boolean comparator: false before true, errors (no price) first.
+SELECT ?n WHERE { ?p ex:name ?n OPTIONAL { ?p ex:price ?price } }
+ORDER BY (?price > 50) ?n

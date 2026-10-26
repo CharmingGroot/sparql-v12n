@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# Decimals sort by value, not by their text.
+SELECT ?p ?w WHERE { ?p ex:weight ?w }
+ORDER BY ?w

@@ -465,6 +465,57 @@ that extend SPARQL:
   them) as operands;
 - string ordering and `REGEX` in a database whose encoding is not UTF-8.
 
+## ORDER BY, LIMIT and OFFSET
+
+The solution modifiers apply in the algebra's order: `ORDER BY`, then
+projection, `DISTINCT`, `OFFSET` and `LIMIT` (SPARQL 1.1 §18.2.5), all in
+the SQL.
+
+`ORDER BY` takes variables and the expressions `FILTER` supports, each
+`ASC` (the default) or `DESC`. Solutions are in SPARQL's order (§15.1):
+
+1. no value (an unbound variable, or an expression that is an error)
+2. blank nodes
+3. IRIs, by code point
+4. literals: where the `<` operator orders two of them, by `<`, as in
+   `FILTER`: numbers by value with XPath type promotion, strings by code
+   point, `false` before `true`, dateTimes by instant.
+
+Where SPARQL leaves the order open, the engine uses a fixed order of its
+own, decided in Discussion #63:
+
+- literals of different kinds: numbers, booleans, dateTimes, strings,
+  language-tagged literals, then other datatypes;
+- language-tagged literals by lexical form, then language tag; other
+  datatypes by datatype IRI, then by value for `date` and `time` columns,
+  by lexical form otherwise;
+- NaN after every number, and `numeric` NaN and infinities where
+  PostgreSQL puts them; equal numbers of different datatypes (`1` and
+  `1.0`) in no particular order;
+- the infinite values of `date` and `timestamp` columns are plain
+  literals (`"infinity"`) and sort among the strings.
+
+`DESC` reverses all of it, so unbound values come last. Each comparator
+becomes a few SQL sort keys (the kind of term, then a value per kind), so
+values of different SQL types and of different `UNION` branches sort
+together. When one plain `SELECT` reads a comparator's column and nothing
+else can be in it (a required numeric, boolean or dateTime column), the SQL
+sorts by the column itself and an index on it delivers the rows in order;
+strings and IRIs sort under `COLLATE "C"`, which an index of another
+collation does not serve. `v12n explain` has no column types and shows
+every column sorted as a string.
+
+`LIMIT` and `OFFSET` are bound parameters of the SQL. A query `LIMIT` at
+or below the row limit leaves at most that many solutions, so the result
+is never reported as truncated; above it the row limit still applies.
+
+Rejected as unsupported: `ORDER BY` over a variable that `SELECT DISTINCT`
+does not project (a projected solution may stand for several that it
+puts at different places); comparators over values with and without a
+time zone, over `real` columns, or over strings in a database whose
+encoding is not UTF-8; and, as in `FILTER`, other functions, arithmetic
+and string forms SQL cannot compute.
+
 ## Layout
 
 | Path | Contents |

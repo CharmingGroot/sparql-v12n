@@ -6,7 +6,7 @@ use oxrdf::Term;
 
 use crate::Error;
 use crate::sparql::Expression;
-use crate::sql::{Condition, Filter, FilterTerm, FilterValue, TermMatch};
+use crate::sql::{Condition, Filter, FilterTerm, FilterValue, OrderValue, TermMatch};
 use crate::xpath_regex::{Untranslated, translate};
 
 use super::term::{Equality, TermExpr, TermValue, term_eq};
@@ -41,6 +41,26 @@ impl<'a> Branch<'a> {
             certain,
         }
         .boolean(expression)
+    }
+
+    /// The value of an `ORDER BY` comparator over the branch's solutions,
+    /// in which only the sources of the whole branch are always bound.
+    pub(super) fn order_value(&self, expression: &'a Expression) -> Result<OrderValue, Error> {
+        let context = Context {
+            branch: self,
+            env: &self.env,
+            certain: &[None],
+        };
+        if !expression.is_term() {
+            return Ok(OrderValue::Boolean(Box::new(context.boolean(expression)?)));
+        }
+        Ok(OrderValue::Term(
+            context
+                .operand(expression)?
+                .into_iter()
+                .map(|(guard, leaf)| (guard.into_iter().collect(), leaf.value))
+                .collect(),
+        ))
     }
 
     /// A condition that holds exactly when `source` is bound.

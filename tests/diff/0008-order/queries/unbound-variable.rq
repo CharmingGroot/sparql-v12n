@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# A variable the pattern does not bind is unbound in every solution.
+SELECT ?n WHERE { ?p ex:name ?n }
+ORDER BY ?missing DESC(?n)

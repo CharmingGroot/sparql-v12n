@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# Any three products: only their number is compared.
+SELECT ?p WHERE { ?p a ex:Product }
+LIMIT 3

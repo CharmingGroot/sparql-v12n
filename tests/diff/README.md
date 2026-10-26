@@ -22,6 +22,16 @@ Every directory with a `mapping.ttl` or a `case.toml` under `examples/`,
 
 - Solutions are compared as a bag: order is ignored unless the query has a
   top-level `ORDER BY`, and duplicates count.
+- With `ORDER BY` over projected variables, each result must be in the
+  order SPARQL 1.1 §15.1 defines (unbound, blank nodes, IRIs by code point,
+  literals by `<`). Where it leaves the order open, ties and values that
+  `<` does not order, any order passes. With other comparators, whose
+  values the results do not show, the sequences must be equal, so such
+  queries should have no ties.
+- With `LIMIT` or `OFFSET`, solutions only one engine returned must be
+  unordered with respect to those only the other returned, as where a
+  slice cuts through a tie. Without `ORDER BY`, any solutions may be cut
+  off and only their number is compared.
 - Terms are compared as RDF terms: kind, lexical form, datatype and
   language tag. `"4"^^xsd:integer`, `"04"^^xsd:integer` and `"4"` all
   differ. A literal written with `xsd:string` and one without a datatype are

@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# Ties broken by the IRI, compared as a string by code point.
+SELECT ?p ?price WHERE { ?p ex:price ?price }
+ORDER BY DESC(?price) ?p

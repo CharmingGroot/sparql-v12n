@@ -1,0 +1,9 @@
+PREFIX ex: <http://example.org/>
+
+# Integers, decimals and doubles compare by value (XPath promotion). ?v is
+# not projected (Ontop writes doubles differently, #25), so the sequence
+# must match exactly; no two values of different datatypes are equal.
+SELECT ?p WHERE {
+  { ?p ex:price ?v } UNION { ?p ex:weight ?v } UNION { ?p ex:rating ?v }
+}
+ORDER BY ?v ?p

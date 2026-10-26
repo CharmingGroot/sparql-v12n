@@ -140,8 +140,9 @@ impl Database {
         // happens to have exactly `row_limit` rows.
         let fetch = (self.limits.row_limit > 0)
             .then(|| i64::try_from(self.limits.row_limit.saturating_add(1)).unwrap_or(i64::MAX));
+        let sliced = plan.limit.is_some() || plan.offset > 0;
         let limited = |sql: &str| match fetch {
-            Some(_) => count_rows(sql, rendered.params.len() + 1),
+            Some(_) => count_rows(sql, rendered.params.len() + 1, sliced),
             None => sql.to_owned(),
         };
 
@@ -370,7 +371,17 @@ impl Database {
 /// so an HTTP response can mark the truncation in a header. PostgreSQL
 /// buffers the limited rows for the window; the client still streams.
 /// An empty `OVER ()` adds no sort, so the order of `sql` is kept.
-fn count_rows(sql: &str, limit_param: usize) -> String {
+///
+/// A query `LIMIT` at or below the row limit leaves at most that many
+/// rows, so the result is never reported as truncated. When `sql` has its
+/// own `LIMIT` or `OFFSET` (`sliced`), it is read as a subquery, since one
+/// `SELECT` takes only one `LIMIT`.
+fn count_rows(sql: &str, limit_param: usize, sliced: bool) -> String {
+    let sql = if sliced {
+        Cow::Owned(format!("SELECT *\nFROM (\n{sql}\n) l"))
+    } else {
+        Cow::Borrowed(sql)
+    };
     format!("SELECT q.*, count(*) OVER ()\nFROM (\n{sql}\nLIMIT ${limit_param}\n) q")
 }
 

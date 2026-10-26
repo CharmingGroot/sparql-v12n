@@ -1,0 +1,16 @@
+# Ontop orders strings by the database collation (en_US.utf8 in the test
+# environment), where "époxy" sorts next to "epoxy"; SPARQL orders them by
+# code point (#26).
+[query.string-accent]
+expect = "mismatch"
+issue = 26
+
+# A solution of SELECT DISTINCT stands for several that ORDER BY over a
+# variable it does not project would put at different places.
+[query.distinct-over-hidden]
+expect = "rejected"
+
+# Ontop orders the Hangul strings by the database collation (#26).
+[query.string-hangul]
+expect = "mismatch"
+issue = 26

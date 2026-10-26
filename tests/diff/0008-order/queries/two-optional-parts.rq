@@ -1,0 +1,10 @@
+PREFIX ex: <http://example.org/>
+
+# ?x is bound by either OPTIONAL part: the first that matched gives it.
+SELECT ?p ?x WHERE {
+  ?p ex:name ?n
+  OPTIONAL { ?p ex:category ?x FILTER(?x = "power") }
+  OPTIONAL { ?p ex:label ?x }
+  FILTER(?n != "epoxy")
+}
+ORDER BY DESC(?x) ?p

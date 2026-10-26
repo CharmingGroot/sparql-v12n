@@ -66,6 +66,9 @@ fn canonical_decimal_rejects_non_decimals() {
 
 fn plan(columns: &[&str], projection: Vec<(&str, Option<ResultTerm>)>) -> SqlPlan {
     SqlPlan {
+        order: Vec::new(),
+        offset: 0,
+        limit: None,
         columns: columns.iter().map(|c| (*c).to_owned()).collect(),
         hidden_columns: Vec::new(),
         distinct_order: Vec::new(),

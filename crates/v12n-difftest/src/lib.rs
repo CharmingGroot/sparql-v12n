@@ -8,12 +8,14 @@ mod compare;
 mod engine;
 mod error;
 mod ontop;
+mod order;
 
 use std::path::Path;
 
 pub use case::{Case, Expectation, QueryCase};
-pub use compare::{Diff, Results, Row, compare, has_order_by};
+pub use compare::{Diff, Results, Row, compare};
 pub use error::Error;
+pub use order::Order;
 
 /// Base PostgreSQL URL. Each case is loaded into its own database, named
 /// by [`Case::database`], which replaces the database in this URL.
@@ -166,8 +168,8 @@ fn diff(
     actual: &Results,
 ) -> Result<Option<Diff>, Error> {
     let failed = |e: String| Error::Failed(format!("{label}: {e}"));
-    let ordered = has_order_by(query).map_err(failed)?;
-    compare(expected, actual, ordered).map_err(failed)
+    let order = Order::of(query).map_err(failed)?;
+    compare(expected, actual, &order).map_err(failed)
 }
 
 struct Environment {

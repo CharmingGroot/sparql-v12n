@@ -458,3 +458,62 @@ fn optional_matched_by_several_triples_maps_splits_the_branch() {
         )
     ));
 }
+
+/// One plain `SELECT` sorts by the integer column itself, so an index on
+/// it can deliver the rows in order and stop at the `LIMIT`.
+#[test]
+fn order_by_an_integer_column_sorts_the_column_itself() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?o ?a WHERE { ?o ex:amount ?a } ORDER BY DESC(?a) LIMIT 10 OFFSET 20"
+    ));
+}
+
+/// IRIs sort as strings by code point, so a template's IRIs are built in
+/// SQL and compared under `COLLATE "C"`.
+#[test]
+fn order_by_iris_compares_their_strings_by_code_point() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c ?n WHERE { ?c ex:name ?n } ORDER BY ?n DESC(?c)"
+    ));
+}
+
+/// A variable that may be unbound sorts first by its rank: no value, then
+/// numbers.
+#[test]
+fn order_by_an_optional_variable_ranks_unbound_first() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c ?a WHERE { ?c ex:name ?n OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a } } ORDER BY ?a"
+    ));
+}
+
+/// Over a `UNION`, every arm selects the sort keys of its own terms, and
+/// the rows of all arms are sorted together; a boolean expression ranks
+/// its errors as no value.
+#[test]
+fn order_by_over_a_union_sorts_the_selected_keys() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?x ?v WHERE { { ?x ex:name ?v } UNION { ?x ex:amount ?v } } \
+         ORDER BY ?v (?v > 100) LIMIT 5"
+    ));
+}
+
+/// `DISTINCT` applies before `LIMIT`, and the sort keys, functions of the
+/// projected terms, are selected with them.
+#[test]
+fn order_by_with_distinct_selects_the_keys_and_limits_after() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT DISTINCT ?n WHERE { ?c ex:tier ?n } ORDER BY DESC(?n) LIMIT 2"
+    ));
+}
+
+/// Without `ORDER BY`, `LIMIT` applies to the bag union of the arms.
+#[test]
+fn limit_without_order_by_applies_to_the_whole_union() {
+    insta::assert_snapshot!(explain_with_keys(
+        UNION,
+        &format!(
+            "{PREFIXES}SELECT ?x WHERE {{ {{ ?x a ex:Client }} UNION {{ ?x a ex:Order }} }} LIMIT 3"
+        ),
+        Some(&union_keys())
+    ));
+}

@@ -29,7 +29,7 @@ pub(super) enum Mode {
 
 /// What an operand is for the operator mapping (SPARQL 1.1 §17.3).
 #[derive(Debug, Clone, PartialEq)]
-enum Kind {
+pub(super) enum Kind {
     Iri,
     BlankNode,
     /// A simple literal or `xsd:string`.
@@ -64,7 +64,7 @@ impl Kind {
 /// How SQL writes an operand's string: the IRI, a blank node's label, or
 /// a literal's lexical form.
 #[derive(Debug, Clone)]
-enum Text<'v> {
+pub(super) enum Text<'v> {
     /// The term map's term (R2RML §11.2 for IRIs).
     Term(&'v super::TermSql),
     Constant(String),
@@ -80,21 +80,21 @@ enum Text<'v> {
 
 /// An operand of a comparison, with what its rendering needs.
 #[derive(Clone)]
-struct Operand<'v> {
-    value: &'v FilterValue,
-    kind: Kind,
+pub(super) struct Operand<'v> {
+    pub(super) value: &'v FilterValue,
+    pub(super) kind: Kind,
     /// `None` for a type error.
-    term_type: Option<TermType>,
-    text: Text<'v>,
+    pub(super) term_type: Option<TermType>,
+    pub(super) text: Text<'v>,
     /// The column of a literal whose value is the column's own value.
-    column: Option<(usize, &'v str)>,
+    pub(super) column: Option<(usize, &'v str)>,
     /// A constant literal's value.
-    constant: Option<Value>,
+    pub(super) constant: Option<Value>,
     /// A `date`, `timestamp` or `timestamptz` column, whose infinite
     /// values are plain literals (`"infinity"`, see the decoder).
-    infinite: bool,
+    pub(super) infinite: bool,
     /// A column whose SQL type is `real` or `double precision`.
-    float: bool,
+    pub(super) float: bool,
 }
 
 /// The value of `numeric` columns that is not an `xsd:decimal`: `NaN` and
@@ -198,7 +198,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// The operand as the operator mapping sees it.
-    fn operand<'v>(&self, value: &'v FilterValue) -> Operand<'v> {
+    pub(super) fn operand<'v>(&self, value: &'v FilterValue) -> Operand<'v> {
         let mut operand = Operand {
             value,
             kind: Kind::Unknown,
@@ -334,7 +334,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// The datatype IRI of a literal operand.
-    fn datatype<'v>(&self, literal: &Operand<'v>) -> Text<'v> {
+    pub(super) fn datatype<'v>(&self, literal: &Operand<'v>) -> Text<'v> {
         if let Kind::Lang(_) = literal.kind {
             return Text::Constant(RDF_LANG_STRING.to_owned());
         }
@@ -729,7 +729,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// A numeric operand as a value of type `ty`.
-    fn number(
+    pub(super) fn number(
         &mut self,
         operand: &Operand<'_>,
         number: Option<&Number>,
@@ -763,7 +763,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// A boolean or dateTime operand as a value of SQL type `ty`.
-    fn typed_value(&mut self, operand: &Operand<'_>, ty: &str) -> Result<(), Error> {
+    pub(super) fn typed_value(&mut self, operand: &Operand<'_>, ty: &str) -> Result<(), Error> {
         let value = match &operand.constant {
             Some(Value::Boolean(b)) => b.to_string(),
             Some(Value::DateTime(d)) => d.canonical.clone(),
@@ -822,7 +822,7 @@ impl<'a> Renderer<'a> {
 
     /// The operand's string as text: an IRI, a blank node's label or a
     /// literal's lexical form.
-    fn text(&mut self, operand: &Operand<'_>) -> Result<(), Error> {
+    pub(super) fn text(&mut self, operand: &Operand<'_>) -> Result<(), Error> {
         match &operand.text {
             Text::Constant(text) => {
                 if text.contains('\0') {
@@ -981,12 +981,12 @@ fn assumed(other: &Kind) -> Kind {
     }
 }
 
-fn unsupported(reason: &str) -> Error {
+pub(super) fn unsupported(reason: &str) -> Error {
     Error::UnsupportedFeature(reason.to_owned())
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::{ColumnTypes, Comparison, Lexical, RenderOptions, SqlPlan};
     use super::*;
     use crate::mapping::{LogicalTable, Mapping, MappingIndex};
@@ -1008,7 +1008,7 @@ mod tests {
         ("u", "uuid"),
     ];
 
-    fn mapping() -> String {
+    pub(in crate::sql) fn mapping() -> String {
         let objects: String = COLUMNS
             .iter()
             .map(|(c, _)| {
@@ -1029,7 +1029,7 @@ mod tests {
         )
     }
 
-    fn column_type(sql: &str) -> ColumnType {
+    pub(in crate::sql) fn column_type(sql: &str) -> ColumnType {
         let xsd = |local: &str| Some(format!("{XSD}{local}"));
         let (group, natural, comparison, lexical) = match sql {
             "int4" | "int8" => (
@@ -1069,7 +1069,7 @@ mod tests {
         }
     }
 
-    fn plan(query: &str) -> Result<SqlPlan, Error> {
+    pub(in crate::sql) fn plan(query: &str) -> Result<SqlPlan, Error> {
         let mapping = Mapping::from_turtle(&mapping()).unwrap();
         let index = MappingIndex::new(&mapping);
         let query = sparql::parse(&format!(
@@ -1078,8 +1078,9 @@ mod tests {
         unfold::unfold(&query, &mapping, &index)
     }
 
-    fn sql_of(query: &str, non_utf8: bool) -> Result<String, Error> {
-        let types: ColumnTypes = COLUMNS
+    /// The SQL types of the columns of [`COLUMNS`].
+    pub(in crate::sql) fn types() -> ColumnTypes {
+        COLUMNS
             .iter()
             .map(|(c, ty)| {
                 (
@@ -1087,7 +1088,11 @@ mod tests {
                     column_type(ty),
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    fn sql_of(query: &str, non_utf8: bool) -> Result<String, Error> {
+        let types = types();
         Ok(plan(query)?
             .to_sql_with(&RenderOptions {
                 column_types: Some(&types),

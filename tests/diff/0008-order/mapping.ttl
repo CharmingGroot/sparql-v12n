@@ -1,0 +1,28 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#ProductMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "products" ] ;
+  rr:subjectMap [ rr:template "http://example.org/product/{id}" ; rr:class ex:Product ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:category ; rr:objectMap [ rr:column "category" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:price ; rr:objectMap [ rr:column "price" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:weight ; rr:objectMap [ rr:column "weight" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:rating ; rr:objectMap [ rr:column "rating" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:inStock ; rr:objectMap [ rr:column "in_stock" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:added ; rr:objectMap [ rr:column "added" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "label" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:section ;
+    rr:objectMap [ rr:template "http://example.org/section/{category}" ]
+  ] .
+
+<#ReviewMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "reviews" ] ;
+  rr:subjectMap [ rr:template "http://example.org/review/{id}" ; rr:class ex:Review ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:about ;
+    rr:objectMap [ rr:template "http://example.org/product/{product_id}" ]
+  ] ;
+  rr:predicateObjectMap [ rr:predicate ex:stars ; rr:objectMap [ rr:column "stars" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:note ; rr:objectMap [ rr:column "note" ] ] .
