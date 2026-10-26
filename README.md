@@ -502,7 +502,11 @@ together. When one plain `SELECT` reads a comparator's column and nothing
 else can be in it (a required numeric, boolean or dateTime column), the SQL
 sorts by the column itself and an index on it delivers the rows in order;
 strings and IRIs sort under `COLLATE "C"`, which an index of another
-collation does not serve. `v12n explain` has no column types and shows
+collation does not serve. The sort keys are selected as extra columns,
+never part of the results, and every query the engine wraps around
+another (the row count, the cast of columns to text) sorts again by them,
+since SQL keeps no order through a subquery: the outermost query decides
+the order the rows arrive in. `v12n explain` has no column types and shows
 every column sorted as a string.
 
 `LIMIT` and `OFFSET` are bound parameters of the SQL. A query `LIMIT` at

@@ -1914,6 +1914,76 @@ async fn limit_and_offset_slice_after_order_and_distinct() {
     }
 }
 
+/// The order comes from the outermost query, through the row count, the
+/// cast of columns without a decoder (`inet`) and the subqueries of
+/// `UNION` and `DISTINCT`; the sort keys are not part of the solutions.
+#[tokio::test]
+async fn order_holds_through_every_wrapper_and_keys_stay_hidden() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        r"SELECT n AS id, (n * 37) % 101 AS k, ('10.0.0.' || n)::inet AS addr,
+                 'g' || (n % 4) AS g
+          FROM generate_series(1, 60) n",
+        &["k", "addr", "g"],
+    );
+    let limits = |row_limit| Limits {
+        row_limit,
+        ..Limits::default()
+    };
+    // Every solution has exactly the projected variables.
+    let query = "PREFIX ex: <http://example.org/>\n\
+                 SELECT ?row ?addr WHERE { ?row ex:k ?k ; ex:addr ?addr } ORDER BY DESC(?k) LIMIT 8";
+    let database = Database::connect(&url, limits(5)).await.unwrap();
+    let mut solutions = database.execute(&plan(&mapping, query)).await.unwrap();
+    assert_eq!(solutions.variables(), ["row", "addr"]);
+    let mut keys = Vec::new();
+    while let Some(solution) = solutions.try_next().await.unwrap() {
+        assert_eq!(solution.values().len(), 2);
+        let row = solution.values()[0].as_ref().unwrap().to_string();
+        let id: i64 = row
+            .trim_start_matches("<http://example.org/row/")
+            .trim_end_matches('>')
+            .parse()
+            .unwrap();
+        keys.push((id * 37) % 101);
+    }
+    assert!(solutions.is_truncated());
+    assert_eq!(keys, [100, 99, 97, 96, 94]);
+
+    let cases: [(&str, Limits, &[u32], bool); 4] = [
+        // A query LIMIT under the row limit is never truncation.
+        (
+            "SELECT ?row WHERE { ?row ex:k ?k ; ex:addr ?a } ORDER BY ?k LIMIT 4",
+            limits(5),
+            &[41, 11, 52, 22],
+            false,
+        ),
+        (
+            "SELECT ?row WHERE { { ?row ex:k ?k FILTER(?k < 3) } UNION { ?row ex:g \"g0\" ; ex:k ?k } } \
+             ORDER BY DESC(?k) ?row LIMIT 3",
+            limits(3),
+            &[60, 8, 16],
+            false,
+        ),
+        (
+            "SELECT DISTINCT ?row ?g WHERE { ?row ex:k ?k ; ex:g ?g } ORDER BY ?g DESC(?row) OFFSET 1",
+            limits(3),
+            &[60, 56, 52],
+            true,
+        ),
+        (
+            "SELECT ?row WHERE { ?row ex:k ?k } ORDER BY DESC(?k) OFFSET 58",
+            limits(0),
+            &[11, 41],
+            false,
+        ),
+    ];
+    for (body, limits, expected, truncated) in cases {
+        let (rows, cut) = ordered_rows(&url, &mapping, body, limits).await;
+        assert_eq!((rows.as_slice(), cut), (expected, truncated), "{body}");
+    }
+}
+
 /// When one `SELECT` reads the column of the comparator, it sorts by the
 /// column itself, so an index on it delivers the rows in order.
 #[tokio::test]

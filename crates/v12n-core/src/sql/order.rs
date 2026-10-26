@@ -88,7 +88,7 @@ struct Sort<'v> {
 }
 
 impl Slot {
-    fn collated(self) -> bool {
+    pub(super) fn collated(self) -> bool {
         matches!(self, Self::Datatype | Self::Text | Self::Language)
     }
 }
@@ -489,31 +489,6 @@ impl<'a> Renderer<'a> {
         }
         Ok(())
     }
-
-    /// `ORDER BY` entries for the slots, each rendered by `slot` and sorted
-    /// in the comparator's direction.
-    pub(super) fn order_by(
-        &mut self,
-        plan: &'a SqlPlan,
-        layouts: &[Layout],
-        mut slot: impl FnMut(&mut Self, usize, Slot) -> Result<(), Error>,
-    ) -> Result<(), Error> {
-        let mut first = true;
-        for (k, (key, layout)) in plan.order.iter().zip(layouts).enumerate() {
-            for &s in &layout.slots {
-                self.sql.push_str(if first { "\nORDER BY " } else { ", " });
-                first = false;
-                slot(self, k, s)?;
-                if s.collated() {
-                    self.sql.push_str(" COLLATE \"C\"");
-                }
-                if key.descending {
-                    self.sql.push_str(" DESC");
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 /// The column of a term built from a column alone.
@@ -586,17 +561,18 @@ mod tests {
             .sql)
     }
 
-    /// The `ORDER BY` clause of `?s ex:<predicate> ?x` ordered by `order`.
+    /// The sort keys `?s ex:<predicate> ?x` ordered by `order` selects
+    /// after `?s` and `?x`, and its `ORDER BY` clause, which sorts by them.
     fn order_by(predicate: &str, order: &str) -> String {
         let sql = render(
             &format!("SELECT ?s ?x WHERE {{ ?s ex:{predicate} ?x }} ORDER BY {order}"),
             false,
         )
         .unwrap();
-        sql.split("\nORDER BY ")
-            .nth(1)
-            .unwrap_or_default()
-            .to_owned()
+        let select = sql.lines().next().unwrap_or_default();
+        let keys = select.split_once(" AS \"x\", ").map_or("", |(_, k)| k);
+        let order = sql.split("\nORDER BY ").nth(1).unwrap_or_default();
+        format!("{keys} | {order}")
     }
 
     fn rejected(query: &str) -> String {
@@ -611,20 +587,45 @@ mod tests {
     /// SQL order, which is SPARQL's.
     #[test]
     fn one_column_of_one_kind_sorts_as_it_is() {
-        assert_eq!(order_by("i4", "?x"), "t0.\"i4\"");
-        assert_eq!(order_by("i8", "DESC(?x)"), "t0.\"i8\" DESC");
-        assert_eq!(order_by("dec", "?x"), "t0.\"dec\"");
-        assert_eq!(order_by("f8", "?x"), "t0.\"f8\"");
-        assert_eq!(order_by("b", "?x"), "t0.\"b\"");
+        assert_eq!(
+            order_by("i4", "?x"),
+            "t0.\"i4\" AS \"o1_exact\" | \"o1_exact\""
+        );
+        assert_eq!(
+            order_by("i8", "DESC(?x)"),
+            "t0.\"i8\" AS \"o1_exact\" | \"o1_exact\" DESC"
+        );
+        assert_eq!(
+            order_by("dec", "?x"),
+            "t0.\"dec\" AS \"o1_exact\" | \"o1_exact\""
+        );
+        assert_eq!(
+            order_by("f8", "?x"),
+            "t0.\"f8\" AS \"o1_double\" | \"o1_double\""
+        );
+        assert_eq!(
+            order_by("b", "?x"),
+            "t0.\"b\" AS \"o1_boolean\" | \"o1_boolean\""
+        );
         // Infinite timestamps and dates are strings, which no other value
         // here is: they stay at the column's ends.
-        assert_eq!(order_by("ts", "?x"), "t0.\"ts\"");
-        assert_eq!(order_by("d", "?x"), "t0.\"d\"");
-        assert_eq!(order_by("txt", "?x"), "(t0.\"txt\"::text) COLLATE \"C\"");
-        assert_eq!(order_by("u", "?x"), "(t0.\"u\"::text) COLLATE \"C\"");
+        assert_eq!(
+            order_by("ts", "?x"),
+            "t0.\"ts\" AS \"o1_datetime\" | \"o1_datetime\""
+        );
+        assert_eq!(order_by("d", "?x"), "t0.\"d\" AS \"o1_date\" | \"o1_date\"");
+        assert_eq!(
+            order_by("txt", "?x"),
+            "(t0.\"txt\"::text) COLLATE \"C\" AS \"o1_text\" | \"o1_text\""
+        );
+        assert_eq!(
+            order_by("u", "DESC(?x)"),
+            "(t0.\"u\"::text) COLLATE \"C\" AS \"o1_text\" | \"o1_text\" DESC"
+        );
         assert_eq!(
             order_by("label", "?x"),
-            "(t0.\"txt\"::text) COLLATE \"C\", $1::text COLLATE \"C\""
+            "(t0.\"txt\"::text) COLLATE \"C\" AS \"o1_text\", $1::text COLLATE \"C\" AS \
+             \"o1_language\" | \"o1_text\", \"o1_language\""
         );
         assert!(order_by("link", "?x").starts_with("($1 || CASE WHEN t0.\"i4\"::text IS NULL"));
     }
@@ -633,14 +634,15 @@ mod tests {
     fn expressions_rank_their_errors_as_no_value() {
         assert_eq!(
             order_by("i4", "(?x > 3)"),
-            "CASE WHEN (t0.\"i4\" > $1::int8) IS NULL THEN 0 ELSE 4 END, (t0.\"i4\" > $2::int8)"
+            "CASE WHEN (t0.\"i4\" > $1::int8) IS NULL THEN 0 ELSE 4 END AS \"o1_rank\", \
+             (t0.\"i4\" > $2::int8) AS \"o1_boolean\" | \"o1_rank\", \"o1_boolean\""
         );
         assert_eq!(
             order_by("i4", "STR(?s)").matches("COLLATE \"C\"").count(),
             1
         );
         // A variable the pattern does not bind has no value: no sort key.
-        assert_eq!(order_by("i4", "?nothing"), "");
+        assert_eq!(order_by("i4", "?nothing"), " | ");
     }
 
     /// Numbers of several types sort as doubles where some are doubles,
@@ -685,10 +687,14 @@ mod tests {
         )
         .unwrap();
         assert!(
-            sql.ends_with(
-                "ORDER BY CASE WHEN t1.\"b\" IS NOT NULL THEN 4 ELSE 0 END, \
-                 CASE WHEN t1.\"b\" IS NOT NULL THEN t1.\"b\" END"
+            sql.contains(
+                "CASE WHEN t1.\"b\" IS NOT NULL THEN 4 ELSE 0 END AS \"o1_rank\", \
+                 CASE WHEN t1.\"b\" IS NOT NULL THEN t1.\"b\" END AS \"o1_boolean\""
             ),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with("ORDER BY \"o1_rank\", \"o1_boolean\""),
             "{sql}"
         );
         let sql = render(

@@ -2,7 +2,7 @@
 source: crates/v12n-core/tests/unfold_sql.rs
 expression: "explain_shop_with_types(\"SELECT DISTINCT ?n WHERE { ?c ex:tier ?n } ORDER BY DESC(?n) LIMIT 2\")"
 ---
-SELECT q."n"
+SELECT q."n", q."o1_text"
 FROM (
 SELECT DISTINCT t0."tier" AS "n", (t0."tier"::text) AS "o1_text"
 FROM "customers" t0

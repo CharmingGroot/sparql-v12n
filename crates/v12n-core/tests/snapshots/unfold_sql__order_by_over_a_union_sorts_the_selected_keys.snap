@@ -2,7 +2,7 @@
 source: crates/v12n-core/tests/unfold_sql.rs
 expression: "explain_shop_with_types(\"SELECT ?x ?v WHERE { { ?x ex:name ?v } UNION { ?x ex:amount ?v } } \\\n         ORDER BY ?v (?v > 100) LIMIT 5\")"
 ---
-SELECT q."x", q."x_1", q."v"
+SELECT q."x", q."x_1", q."v", q."o1_rank", q."o1_exact", q."o1_text", q."o2_rank", q."o2_boolean"
 FROM (
 SELECT t0."id" AS "x", NULL AS "x_1", t0."name" AS "v", 6 AS "o1_rank", NULL::int8 AS "o1_exact", (t0."name"::text) AS "o1_text", CASE WHEN (NULL::bool) IS NULL THEN 0 ELSE 4 END AS "o2_rank", (NULL::bool) AS "o2_boolean"
 FROM "customers" t0

@@ -663,6 +663,49 @@ pub struct RenderedSql {
     /// For a parameter that is one of the alternatives of a
     /// [`Condition::EqAny`], an id it shares with the other alternatives.
     pub param_alternatives: Vec<Option<usize>>,
+    /// The sort keys of `ORDER BY`, selected after the columns of
+    /// [`SqlPlan::columns`] in this order. They are not part of the
+    /// results. SQL keeps no order through a subquery, so a query that
+    /// reads this one as a subquery sorts again by them
+    /// ([`order_by_clause`](Self::order_by_clause)).
+    pub order_by: Vec<OrderColumn>,
+}
+
+/// A sort key column of a rendered query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderColumn {
+    pub alias: String,
+    /// Compared under `COLLATE "C"`, by code point.
+    pub collated: bool,
+    pub descending: bool,
+}
+
+impl RenderedSql {
+    /// `\nORDER BY` over the sort keys as columns of table alias `table`,
+    /// or nothing without `ORDER BY`.
+    pub fn order_by_clause(&self, table: &str) -> String {
+        order_by_clause(&self.order_by, table)
+    }
+}
+
+fn order_by_clause(columns: &[OrderColumn], table: &str) -> String {
+    if columns.is_empty() {
+        return String::new();
+    }
+    let keys: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            let mut key = format!("{table}.{}", quote_identifier(&c.alias));
+            if c.collated {
+                key.push_str(" COLLATE \"C\"");
+            }
+            if c.descending {
+                key.push_str(" DESC");
+            }
+            key
+        })
+        .collect();
+    format!("\nORDER BY {}", keys.join(", "))
 }
 
 impl SqlPlan {
@@ -741,6 +784,7 @@ impl SqlPlan {
             order: (0..self.columns.len()).collect(),
             typed_text_from: None,
             slots: Vec::new(),
+            collate_slots: false,
         };
         if dedup {
             select.aliases.extend(self.hidden_columns.iter().cloned());
@@ -768,7 +812,7 @@ impl SqlPlan {
         // cannot sort by expressions it does not select.
         let direct = ordered && self.branches.len() == 1 && !subquery && !groups[0].1;
         let wrapped = subquery || (ordered && !direct);
-        if ordered && !direct {
+        if ordered {
             let used: HashSet<&str> = select.aliases.iter().map(String::as_str).collect();
             let mut names = Vec::new();
             for (k, layout) in layouts.iter().enumerate() {
@@ -781,17 +825,31 @@ impl SqlPlan {
                 }
             }
             select.slots = names;
+            select.collate_slots = direct;
         }
+        // The sort keys are result columns after the projected ones, so
+        // that a query around this one can sort by them again: SQL keeps no
+        // order through a subquery.
+        let order_by: Vec<OrderColumn> = select
+            .slots
+            .iter()
+            .map(|(alias, k, slot)| OrderColumn {
+                alias: alias.clone(),
+                collated: slot.collated(),
+                descending: self.order[*k].descending,
+            })
+            .collect();
         if wrapped {
             r.sql.push_str("SELECT ");
-            if self.columns.is_empty() {
-                r.sql.push('1');
-            }
             let outer: Vec<String> = self
                 .columns
                 .iter()
+                .chain(order_by.iter().map(|c| &c.alias))
                 .map(|c| format!("q.{}", quote_identifier(c)))
                 .collect();
+            if outer.is_empty() {
+                r.sql.push('1');
+            }
             r.sql.push_str(&outer.join(", "));
             r.sql.push_str("\nFROM (\n");
         }
@@ -827,19 +885,23 @@ impl SqlPlan {
         // Sort keys and limits never empty a branch.
         r.required = false;
         if wrapped && ordered {
-            let slots = select.slots.clone();
-            let mut next = slots.iter();
-            r.order_by(self, &layouts, |r, _, slot| {
-                let (name, _, s) = next.next().expect("one name per slot");
-                debug_assert_eq!(*s, slot);
-                r.sql.push_str(&format!("q.{}", quote_identifier(name)));
-                Ok(())
-            })?;
+            r.sql.push_str(&order_by_clause(&order_by, "q"));
         } else if direct {
-            let branch = &self.branches[0];
-            r.order_by(self, &layouts, |r, k, slot| {
-                r.order_slot(branch, k, &layouts[k], slot)
-            })?;
+            // By the names of the selected keys, which stand for their
+            // expressions, so an index on a sorted column serves the sort;
+            // the keys are selected with their collation.
+            let keys: Vec<String> = order_by
+                .iter()
+                .map(|c| {
+                    let key = quote_identifier(&c.alias);
+                    if c.descending {
+                        format!("{key} DESC")
+                    } else {
+                        key
+                    }
+                })
+                .collect();
+            r.sql.push_str(&format!("\nORDER BY {}", keys.join(", ")));
         }
         if !self.branches.is_empty() {
             // Constants are bound parameters, here as elsewhere; no result
@@ -863,6 +925,7 @@ impl SqlPlan {
             param_branches: r.param_branches,
             param_required: r.param_required,
             param_alternatives: r.param_alternatives,
+            order_by,
         })
     }
 
@@ -1489,6 +1552,9 @@ struct Select {
     /// The sort keys selected after the entries, for sorting outside:
     /// each alias, order comparator and slot.
     slots: Vec<(String, usize, order::Slot)>,
+    /// Whether the sort keys compared by code point are selected with
+    /// `COLLATE "C"`, for sorting by their names.
+    collate_slots: bool,
 }
 
 #[derive(Default)]
@@ -1527,7 +1593,7 @@ impl<'a> Renderer<'a> {
         if distinct {
             self.sql.push_str("DISTINCT ");
         }
-        if select.order.is_empty() {
+        if select.order.is_empty() && select.slots.is_empty() {
             self.sql.push('1');
         }
         for (i, &entry) in select.order.iter().enumerate() {
@@ -1558,6 +1624,9 @@ impl<'a> Renderer<'a> {
                 self.sql.push_str(", ");
             }
             self.order_slot(branch, *key, &layouts[*key], *slot)?;
+            if select.collate_slots && slot.collated() {
+                self.sql.push_str(" COLLATE \"C\"");
+            }
             self.sql.push_str(" AS ");
             self.sql.push_str(&quote_identifier(alias));
         }

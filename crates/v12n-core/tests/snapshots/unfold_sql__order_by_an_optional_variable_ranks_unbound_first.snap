@@ -2,11 +2,11 @@
 source: crates/v12n-core/tests/unfold_sql.rs
 expression: "explain_shop_with_types(\"SELECT ?c ?a WHERE { ?c ex:name ?n OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a } } ORDER BY ?a\")"
 ---
-SELECT t0."id" AS "c", t2."amount" AS "a"
+SELECT t0."id" AS "c", t2."amount" AS "a", CASE WHEN t2."amount" IS NOT NULL THEN 3 ELSE 0 END AS "o1_rank", CASE WHEN t2."amount" IS NOT NULL THEN t2."amount" END AS "o1_exact"
 FROM "customers" t0
 LEFT JOIN ("orders" t1
 JOIN "orders" t2 ON t2."id" = t1."id") ON t1."customer_id" = t0."id" AND t2."amount" IS NOT NULL
 WHERE t0."id" IS NOT NULL AND t0."name" IS NOT NULL
-ORDER BY CASE WHEN t2."amount" IS NOT NULL THEN 3 ELSE 0 END, CASE WHEN t2."amount" IS NOT NULL THEN t2."amount" END
+ORDER BY "o1_rank", "o1_exact"
 
 -- params
