@@ -9,6 +9,28 @@ which tables and columns can be queried.
 
 > Status: early development. Not usable yet.
 
+## Supported SPARQL
+
+`SELECT` queries over one R2RML mapping and one PostgreSQL database. Each
+supported feature below is compared with [Ontop](https://ontop-vkg.org/) by
+the differential tests (`tests/diff`). The rejected forms, and anything not
+listed, fail as unsupported (`v12n query` exit code 1, HTTP 501) rather
+than give different answers.
+
+| Feature | Notes | Rejected |
+|---|---|---|
+| Basic graph patterns | Constant predicates and `rdf:type`; constants and shared variables match RDF terms, across column types; a triple counts once however many rows give it | Variable predicates, property paths, `GRAPH`, `FROM` and `FROM NAMED` |
+| `SELECT`, `SELECT *`, `DISTINCT` | Bag semantics over the solutions | `REDUCED`, expressions in `SELECT`, `BIND`, subqueries, `GROUP BY` and aggregates |
+| `OPTIONAL` | Nested and sequential, `FILTER` inside, unbound variables | `SELECT DISTINCT` over a variable that only several `OPTIONAL` parts bind; a `FILTER` inside `OPTIONAL` around a `UNION` with an empty side |
+| `UNION` | Bag union of its sides, inside `OPTIONAL` too; term maps of different shapes for one variable | Removing duplicates across a column of natural datatype and another literal shape of the same variable |
+| `FILTER` | `=`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `\|\|`, `!`, `BOUND`, `sameTerm`, `isIRI`, `isBlank`, `isLiteral`, `STR`, `LANG`, `DATATYPE`, `REGEX`, with SPARQL's error semantics | Other functions, arithmetic, `IN`, `EXISTS`; comparisons SPARQL 1.1 leaves to extensions (ordering `xsd:date`, `!=` on language-tagged literals, dateTimes with and without a time zone); comparisons over `real` columns; `REGEX` with `\d`, `\w`, `\p{..}` and back-references |
+| `ORDER BY`, `LIMIT`, `OFFSET` | SPARQL 1.1 order, a fixed order where it leaves one open | `ORDER BY` over a variable that `SELECT DISTINCT` does not project |
+| Literals | RDF 1.1 term equality: language tags in lower case, `xsd:string` is the simple literal, XSD 1.1 canonical lexical forms | `xsd:float` and derived integer types compared by value in `FILTER` |
+| Other forms | No RDFS inference: `rdf:type` matches the classes the mapping states | `ASK`, `CONSTRUCT`, `DESCRIBE`, `MINUS`, `VALUES`, `SERVICE` |
+
+The sections below give the details, and `tests/diff/README.md` lists the
+known differences from Ontop and why each rejected test query is rejected.
+
 ## Planned interfaces
 
 | Interface | Use |
