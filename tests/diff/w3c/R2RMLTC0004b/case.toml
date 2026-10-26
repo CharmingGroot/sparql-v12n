@@ -1,0 +1,5 @@
+# W3C R2RML test R2RMLTC0004b: Two column mapping, presence of rr:termType rr:Literal on rr:subjectMap
+# No expected output: the mapping is invalid.
+sql = "../../../w3c/rdb2rdf/D004-1table2columns1row/create.sql"
+mapping = "../../../w3c/rdb2rdf/D004-1table2columns1row/r2rmlb.ttl"
+expect = "mapping-error"

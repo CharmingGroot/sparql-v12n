@@ -2,7 +2,9 @@
 //! Case directories: `schema.sql`, `data.sql` and `mapping.ttl`, or a
 //! `case.toml` that points at SQL and mapping files kept elsewhere (the
 //! vendored W3C test cases, which must stay unmodified); then
-//! `queries/*.rq` and an optional `expect.toml`.
+//! `queries/*.rq` and an optional `expect.toml`. A `case.toml` with
+//! `expect = "mapping-error"` has neither: its check is that the mapping
+//! does not load.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,6 +25,9 @@ pub struct Case {
     /// `case.toml`. Ontop 5.5.0 always uses `http://example.com/base/`, the
     /// base IRI of the W3C test cases, for templates; it has no setting.
     pub base_iri: Option<String>,
+    /// The mapping is invalid (a W3C test without expected output), so the
+    /// case has no queries.
+    pub expects_mapping_error: bool,
     expectations: BTreeMap<String, Expectation>,
 }
 
@@ -60,6 +65,13 @@ struct CaseFile {
     sql: String,
     mapping: String,
     base_iri: Option<String>,
+    expect: Option<CaseKind>,
+}
+
+#[derive(Deserialize)]
+enum CaseKind {
+    #[serde(rename = "mapping-error")]
+    MappingError,
 }
 
 #[derive(Deserialize)]
@@ -95,6 +107,7 @@ impl Case {
             .to_owned();
         let case_path = dir.join("case.toml");
         let mut base_iri = None;
+        let mut expects_mapping_error = false;
         let mapping = if case_path.is_file() {
             let file: CaseFile =
                 toml::from_str(&read(&case_path)?).map_err(|e| Error::case(&case_path, e))?;
@@ -106,13 +119,32 @@ impl Case {
                 ));
             }
             base_iri = file.base_iri;
+            expects_mapping_error = matches!(file.expect, Some(CaseKind::MappingError));
             read(&dir.join(&file.mapping))?
         } else {
             read(&dir.join("mapping.ttl"))?
         };
+        let expect_path = dir.join("expect.toml");
+        if expects_mapping_error {
+            for path in [dir.join("queries"), expect_path] {
+                if path.exists() {
+                    return Err(Error::case(
+                        &path,
+                        "a case that expects a mapping error has no queries or expectations",
+                    ));
+                }
+            }
+            return Ok(Self {
+                name,
+                dir: dir.to_owned(),
+                mapping,
+                base_iri,
+                expects_mapping_error,
+                expectations: BTreeMap::new(),
+            });
+        }
         let queries = query_names(dir)?;
 
-        let expect_path = dir.join("expect.toml");
         let mut expectations = BTreeMap::new();
         if expect_path.is_file() {
             let file: ExpectFile =
@@ -151,6 +183,7 @@ impl Case {
             dir: dir.to_owned(),
             mapping,
             base_iri,
+            expects_mapping_error,
             expectations,
         })
     }

@@ -268,6 +268,37 @@ fn from_turtle_language_tags_are_kept_in_lower_case() {
 }
 
 #[test]
+fn from_turtle_language_tags_need_a_registrable_primary_subtag() {
+    let mapping = |tag: &str| {
+        format!(
+            r#"
+<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/{{id}}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ;
+    rr:objectMap [ rr:column "x" ; rr:language "{tag}" ] ] .
+"#
+        )
+    };
+    for tag in [
+        "en",
+        "gsw",
+        "zh-Hant-TW",
+        "sgn-BE-FR",
+        "i-klingon",
+        "x-private",
+    ] {
+        parse(&mapping(tag)).unwrap_or_else(|e| panic!("{tag}: {e}"));
+    }
+    // Well-formed BCP 47, but no primary language subtag of 4 to 8 letters
+    // is registered (W3C test R2RMLTC0015b uses "english" and "spanish").
+    for tag in ["english", "spanish", "abcd", "abcdefgh-US"] {
+        let err = parse_err(&mapping(tag));
+        assert!(matches!(err, Error::InvalidMapping(_)), "{tag} => {err}");
+        assert!(err.to_string().contains("letters"), "{tag} => {err}");
+    }
+}
+
+#[test]
 fn from_turtle_repeated_triples_do_not_duplicate_classes() {
     let mapping = parse(
         r#"

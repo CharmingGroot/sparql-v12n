@@ -16,7 +16,8 @@ test-cases page as <https://www.w3.org/Consortium/Legal/copyright-documents>).
 - Only the databases and R2RML tests that the differential tests use are
   included: each directory has the test database's `create.sql`, its
   `manifest.ttl`, and the mapping (`r2rml*.ttl`) and expected output
-  (`mapped*.nq`) of each included test.
+  (`mapped*.nq`) of each included test. Tests that expect a mapping error
+  have no expected output.
 
 The queries and expectations that run these tests are this project's own
 files, in `tests/diff/w3c/<test id>/`. `tests/diff/w3c/README.md` lists the
