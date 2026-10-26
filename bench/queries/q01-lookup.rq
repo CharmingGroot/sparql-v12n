@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# Simple BGP lookup by a constant subject: one row through the primary key.
+SELECT ?title ?severity WHERE {
+  <http://example.org/alert/4242> ex:title ?title ; ex:severityId ?severity .
+}

@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Every asset, with its criticality where it is not NULL.
+SELECT ?asset ?criticality WHERE {
+  ?asset a ex:Asset .
+  OPTIONAL { ?asset ex:criticality ?criticality }
+}

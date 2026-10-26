@@ -1,0 +1,60 @@
+name: Benchmark
+
+# L5: v12n against Ontop on scaled MDR data (bench/run.sh). Manual only
+# for now; it never runs on pull requests or pushes, so it cannot block
+# one. Results are uploaded as an artifact to compare with bench/RESULTS.md.
+on:
+  workflow_dispatch:
+    inputs:
+      alerts:
+        description: "Alerts to generate (100000 or 1000000)"
+        default: "100000"
+        type: choice
+        options: ["100000", "1000000"]
+      runs:
+        description: "Timed runs per query and engine"
+        default: "20"
+        type: string
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - uses: actions/cache@v6
+        with:
+          path: testenv/jdbc
+          key: jdbc-${{ hashFiles('testenv/fetch-jdbc.sh') }}
+      - run: testenv/fetch-jdbc.sh
+      # A separate step, so the log shows pull time apart from the benchmark.
+      - name: Pull pinned images
+        run: |
+          grep -oE '"(postgres|ontop/ontop):[^"]+"' bench/run.sh | tr -d '"' |
+            xargs -n1 -P2 docker pull -q
+      - run: bench/run.sh
+        env:
+          BENCH_ALERTS: ${{ inputs.alerts }}
+          BENCH_RUNS: ${{ inputs.runs }}
+          BENCH_OUT: ${{ github.workspace }}/bench/results/ci
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-${{ inputs.alerts }}
+          path: bench/results/ci/
+          if-no-files-found: warn

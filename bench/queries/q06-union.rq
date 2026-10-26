@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/>
+
+# Bag union of two selections on the same table.
+SELECT ?finding WHERE {
+  { ?finding ex:severityId 5 }
+  UNION
+  { ?finding ex:title "data-exfiltration" }
+}
