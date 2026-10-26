@@ -23,6 +23,8 @@ pub const DATABASE_URL_VAR: &str = "V12N_DIFF_DATABASE_URL";
 /// Path of a file with one `<case> <Ontop SPARQL endpoint URL>` per line;
 /// the URL is `-` when Ontop did not start with the case's mapping.
 pub const ENDPOINTS_VAR: &str = "V12N_DIFF_ENDPOINTS";
+/// Optional path of a file that gets one line per retried Ontop request.
+pub const RETRY_LOG_VAR: &str = "V12N_DIFF_RETRY_LOG";
 
 /// What a passing check did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +107,7 @@ pub fn run(case_dir: &Path, query: &str) -> Result<Outcome, Error> {
     let expected = if endpoint == "-" {
         Err("Ontop did not start with this mapping; its container log has the cause".to_owned())
     } else {
-        ontop::query(&endpoint, &query.text)
+        ontop::query(&endpoint, &label, &query.text)
     };
     let actual = engine::run(
         &database_url,
