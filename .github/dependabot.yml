@@ -1,20 +1,26 @@
 version: 2
+# Every update pull request runs CI and, for Cargo.lock, the differential
+# tests, so updates come in a few grouped pull requests. Security updates
+# are not limited by this schedule.
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: monthly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 2
     groups:
       minor-and-patch:
         update-types: [minor, patch]
+      major:
+        update-types: [major]
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: monthly
+      interval: quarterly
+    open-pull-requests-limit: 1
     groups:
       actions:
         patterns: ["*"]
     ignore:
-      # The msrv job pins the minimum supported Rust version on purpose.
+      # The MSRV check pins the minimum supported Rust version on purpose.
       - dependency-name: dtolnay/rust-toolchain
