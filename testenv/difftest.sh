@@ -24,6 +24,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="$root/target/difftest"
 compose_file="$out/compose.yml"
 endpoints="$out/endpoints"
+retry_log="$out/ontop-retries"
 project="${DIFF_PROJECT:-v12n-difftest}"
 pg_port="${DIFF_PG_PORT:-55433}"
 ontop_port="${DIFF_ONTOP_PORT:-58100}"
@@ -194,17 +195,26 @@ build() {
   fi
 }
 
-# Runs the tests of the cases whose Ontop endpoints are up.
+# Runs the tests of the cases whose Ontop endpoints are up, then prints
+# the Ontop requests that were retried, which the test runner would only
+# show for failing tests.
 run_tests() {
-  local filters=() name _url
+  local filters=() name _url status=0
   while read -r name _url; do filters+=("$(module "$name")"); done <"$endpoints"
   export V12N_DIFF_DATABASE_URL="postgresql://v12n:v12n-dev@127.0.0.1:$pg_port/v12n"
   export V12N_DIFF_ENDPOINTS="$endpoints"
+  export V12N_DIFF_RETRY_LOG="$retry_log"
+  rm -f "$retry_log"
   if has_nextest; then
-    cargo nextest run -p v12n-difftest --locked --profile "$profile" "$@" "${filters[@]}"
+    cargo nextest run -p v12n-difftest --locked --profile "$profile" "$@" "${filters[@]}" || status=$?
   else
-    cargo test -p v12n-difftest --locked --test differential -- "$@" "${filters[@]}"
+    cargo test -p v12n-difftest --locked --test differential -- "$@" "${filters[@]}" || status=$?
   fi
+  if [ -s "$retry_log" ]; then
+    log "Ontop requests retried: $(grep -c . "$retry_log")"
+    cat "$retry_log" >&2
+  fi
+  return "$status"
 }
 
 # Keeps the exit status of the run while removing the environment.

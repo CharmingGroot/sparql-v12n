@@ -113,6 +113,13 @@ while editing a case.
 Without `V12N_DIFF_DATABASE_URL` and `V12N_DIFF_ENDPOINTS`, `cargo test`
 still runs the `rejected` checks and skips the comparisons.
 
+Ontop 5.5.0 sometimes fails a query with HTTP 500 and a
+`ConcurrentModificationException` when it answers several at once. The
+harness sends such a request again, at most twice, and
+`testenv/difftest.sh` prints the retried requests after each run (the
+file named by `V12N_DIFF_RETRY_LOG`). Any other Ontop error is reported
+as before.
+
 ## W3C RDB2RDF test cases
 
 `tests/diff/w3c/` has one case per included R2RML test. A `case.toml`
