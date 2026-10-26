@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# The three term maps give the same terms.
+SELECT ?s WHERE { ?s ex:text ?x ; ex:plain ?x ; ex:tpl ?x }

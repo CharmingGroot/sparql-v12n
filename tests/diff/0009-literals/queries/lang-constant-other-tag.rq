@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A different tag is a different term.
+SELECT ?s WHERE { ?s ex:labelEn "chat"@en }

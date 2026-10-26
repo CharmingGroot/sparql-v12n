@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# DATATYPE of a simple literal is xsd:string.
+SELECT ?s WHERE { ?s ex:text ?x FILTER(DATATYPE(?x) = xsd:string) }

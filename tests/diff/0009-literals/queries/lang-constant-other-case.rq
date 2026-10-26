@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# The mapping writes EN-us, the constant EN-US: the same tag.
+SELECT ?s WHERE { ?s ex:labelEn "chat"@EN-US }

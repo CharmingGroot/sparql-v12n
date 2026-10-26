@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Each tag gives its own terms.
+SELECT DISTINCT ?l WHERE { { ?s ex:labelEn ?l } UNION { ?s ex:labelDe ?l } }

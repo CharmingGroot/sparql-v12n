@@ -1,0 +1,23 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# The same column as a language-tagged literal (the tag written in mixed
+# case), with rr:datatype xsd:string, as a natural plain literal, and as a
+# literal template: the last three give the same simple literal (RDF 1.1).
+<#WordMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "words" ] ;
+  rr:subjectMap [ rr:template "http://example.org/word/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:labelEn ;
+    rr:objectMap [ rr:column "word" ; rr:language "EN-us" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:labelDe ;
+    rr:objectMap [ rr:column "word" ; rr:language "de" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:text ;
+    rr:objectMap [ rr:column "word" ; rr:datatype xsd:string ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:plain ; rr:objectMap [ rr:column "word" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:tpl ;
+    rr:objectMap [ rr:template "{word}" ; rr:termType rr:Literal ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:count ; rr:objectMap [ rr:column "count" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:ratio ; rr:objectMap [ rr:column "ratio" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:price ; rr:objectMap [ rr:column "price" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:ok ; rr:objectMap [ rr:column "ok" ] ] .

@@ -5,7 +5,7 @@ use std::error::Error as StdError;
 
 use tokio_postgres::types::{FromSql, Type};
 use v12n_core::solution::SqlValue;
-use v12n_core::sql::{ColumnType, Comparison, Lexical, quote_identifier};
+use v12n_core::sql::{ColumnType, Comparison, Lexical, TermKey, quote_identifier};
 
 type BoxError = Box<dyn StdError + Sync + Send>;
 
@@ -140,7 +140,9 @@ impl Decoder {
 /// Within a group, `=` on values agrees with equality of natural lexical
 /// forms, except for floating point (`-0 = 0`) and types without a
 /// decoder (`'1 day' = '24 hours'` for `interval`), whose text output is
-/// compared instead. Across groups only the natural lexical forms can be
+/// compared instead, and `bpchar`, whose `=` ignores trailing spaces and
+/// so also compares the lengths ([`TermKey`]). Constants and removing
+/// duplicates use the same keys. Across groups only the natural lexical forms can be
 /// compared, and SQL computes them only where the text output already is
 /// that form, or for booleans, binaries and `numeric` (`trim_scale`).
 /// Floating point and date/time types are left out until an SQL
@@ -179,6 +181,11 @@ pub(crate) fn column_type(ty: &Type) -> ColumnType {
         Some(Decoder::Float4 | Decoder::Float8) | None => sql_type.clone(),
         Some(_) => group.to_owned(),
     };
+    let term_key = match Decoder::for_type(ty) {
+        Some(Decoder::Float4 | Decoder::Float8) => Some(TermKey::Text),
+        _ if *ty == Type::BPCHAR => Some(TermKey::OctetLength),
+        _ => None,
+    };
     ColumnType {
         name: ty.name().to_owned(),
         sql_type,
@@ -189,6 +196,7 @@ pub(crate) fn column_type(ty: &Type) -> ColumnType {
         group: group.to_owned(),
         comparison,
         lexical,
+        term_key,
     }
 }
 

@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use oxrdf::{BlankNode, NamedOrBlankNode, Term, Triple};
+use oxrdf::{BlankNode, Literal, NamedOrBlankNode, Term, Triple};
 use oxttl::TurtleParser;
 
 use super::{
@@ -14,6 +14,7 @@ use crate::Error;
 
 const RR: &str = "http://www.w3.org/ns/r2rml#";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
 
 /// Valid R2RML properties this engine rejects instead of ignoring, since
 /// dropping them would silently change query answers.
@@ -432,7 +433,10 @@ impl<'g> Reader<'g> {
             .one(node, "datatype", ctx)?
             .map(|t| iri(t, "datatype", ctx))
             .transpose()?;
-        let language = self.one_string(node, "language", ctx)?;
+        let language = self
+            .one_string(node, "language", ctx)?
+            .map(|tag| language_tag(&tag, ctx))
+            .transpose()?;
         let term_type = self
             .one(node, "termType", ctx)?
             .map(|t| match t {
@@ -494,6 +498,14 @@ impl<'g> Reader<'g> {
             term_map.term_type = term_type;
         } else if position == Position::Object && (datatype.is_some() || language.is_some()) {
             term_map.term_type = TermType::Literal;
+        }
+        // RDF 1.1 Concepts §3.3: rdf:langString is the datatype of
+        // language-tagged strings only, so a term map without a language
+        // tag cannot produce a literal of it.
+        if datatype.as_deref() == Some(RDF_LANG_STRING) {
+            return Err(Error::InvalidMapping(format!(
+                "{ctx}: rr:datatype rdf:langString needs a language tag; use rr:language instead"
+            )));
         }
         if datatype.is_some() && language.is_some() {
             return Err(Error::InvalidMapping(format!(
@@ -611,6 +623,26 @@ fn resource(term: &Term, local: &str, ctx: &Ctx<'_>) -> Result<NamedOrBlankNode,
             "{ctx}: rr:{local} must point to a resource, got {term}"
         ))),
     }
+}
+
+/// R2RML §7.5: the value of `rr:language` must be a valid language tag
+/// (BCP 47). Tags are compared case-insensitively (RDF 1.1 Concepts §3.3),
+/// so the tag is kept in lower case, the form query constants and results
+/// have; terms of two term maps that differ only in the case of their tags
+/// are then the same term everywhere.
+fn language_tag(tag: &str, ctx: &Ctx<'_>) -> Result<String, Error> {
+    Literal::new_language_tagged_literal("", tag)
+        .map(|literal| {
+            literal
+                .language()
+                .expect("a language-tagged literal has a tag")
+                .to_owned()
+        })
+        .map_err(|e| {
+            Error::InvalidMapping(format!(
+                "{ctx}: rr:language {tag:?} is not a valid language tag: {e}"
+            ))
+        })
 }
 
 fn iri(term: &Term, local: &str, ctx: &Ctx<'_>) -> Result<String, Error> {

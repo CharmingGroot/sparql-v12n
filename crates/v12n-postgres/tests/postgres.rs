@@ -9,7 +9,9 @@ use tokio_postgres::NoTls;
 use tokio_postgres::types::Type;
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
 use v12n_core::solution::canonical_decimal;
-use v12n_core::sql::{ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, SqlPlan};
+use v12n_core::sql::{
+    ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, SqlPlan, TermKey,
+};
 use v12n_core::{sparql, unfold};
 use v12n_postgres::{Database, Error, Limits};
 
@@ -1405,7 +1407,6 @@ async fn filter_comparisons_without_exact_sql_are_rejected() {
     );
     for (patterns, filter) in [
         ("?row ex:r ?r", "?r > 0"),
-        ("?row ex:r ?r", "sameTerm(?r, 1.0E-1)"),
         ("?row ex:d ?d", "?d = \"infinity\""),
         ("?row ex:c ?c", "?c < \"y\""),
     ] {
@@ -2024,6 +2025,7 @@ async fn order_by_a_column_keeps_its_index() {
             group: "integer".into(),
             comparison: Comparison::Value,
             lexical: Some(Lexical::Text),
+            term_key: None,
         };
         let table = LogicalTable::TableName("v12n_order.items".into());
         let types: ColumnTypes = [
@@ -2095,6 +2097,305 @@ async fn order_by_without_an_exact_sql_order_is_rejected() {
             }
             Err(e) => panic!("{body}: {e}"),
             Ok(_) => panic!("{body}: expected an unsupported-feature error"),
+        }
+    }
+}
+
+/// `-0 = 0` holds in PostgreSQL, while `-0.0E0` and `0.0E0` are different
+/// `xsd:double` terms (#59): a zero constant matches only rows of its own
+/// sign, through the same index as before.
+#[tokio::test]
+async fn zero_constants_match_only_rows_of_their_sign() {
+    let Some(url) = database_url() else { return };
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS v12n_zero CASCADE;
+             CREATE SCHEMA v12n_zero;
+             CREATE TABLE v12n_zero.v (id int PRIMARY KEY, f float8 NOT NULL, r real NOT NULL);
+             INSERT INTO v12n_zero.v VALUES (1, '-0', '-0'), (2, '0', '0'), (3, 1.5, 1.5);
+             INSERT INTO v12n_zero.v SELECT n, n, n FROM generate_series(4, 5000) n;
+             CREATE INDEX v_f ON v12n_zero.v (f);
+             ANALYZE v12n_zero.v;",
+        )
+        .await
+        .unwrap();
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+        <#V> rr:logicalTable [ rr:tableName "v12n_zero.v" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:f ; rr:objectMap [ rr:column "f" ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:r ; rr:objectMap [ rr:column "r" ; rr:datatype xsd:float ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:zero ; rr:objectMap [ rr:constant "0.0E0"^^xsd:double ] ] .
+    "#;
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    let row = |id: u8| format!("?row=<http://example.org/row/{id}>");
+    for (predicate, object, expected) in [
+        ("f", format!("\"0.0E0\"^^<{xsd}double>"), vec![row(2)]),
+        ("f", format!("\"-0.0E0\"^^<{xsd}double>"), vec![row(1)]),
+        ("f", format!("\"1.5E0\"^^<{xsd}double>"), vec![row(3)]),
+        ("r", format!("\"0.0E0\"^^<{xsd}float>"), vec![row(2)]),
+        ("r", format!("\"-0.0E0\"^^<{xsd}float>"), vec![row(1)]),
+    ] {
+        assert_eq!(
+            subjects(&url, mapping, predicate, &object).await,
+            expected,
+            "{predicate} {object}"
+        );
+    }
+    // A constant of the mapping joined with a column compares the same way.
+    let (rows, _) = run(
+        &url,
+        Limits::default(),
+        &plan(
+            mapping,
+            "PREFIX ex: <http://example.org/> SELECT ?row WHERE { ?row ex:zero ?z ; ex:f ?z }",
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows, [row(2)]);
+    // sameTerm compares terms as a triple pattern does; `=` compares
+    // numbers, and -0 = 0 there (XPath op:numeric-equal).
+    for (filter, expected) in [
+        ("sameTerm(?f, 0.0E0)", vec!["2"]),
+        ("sameTerm(?f, -0.0E0)", vec!["1"]),
+        ("!sameTerm(?f, 0.0E0) && ?f < 1", vec!["1"]),
+        ("sameTerm(?r, \"1.5E0\"^^xsd:float)", vec!["3"]),
+        ("?f = 0.0E0", vec!["1", "2"]),
+    ] {
+        assert_eq!(
+            filtered_rows(&url, mapping, "?row ex:f ?f ; ex:r ?r", filter).await,
+            expected,
+            "{filter}"
+        );
+    }
+
+    // The value comparison still finds the rows through the index; the
+    // text of the value only filters them.
+    let plan = plan(
+        mapping,
+        &format!("SELECT ?row WHERE {{ ?row <http://example.org/f> \"0.0E0\"^^<{xsd}double> }}"),
+    );
+    let sql = plan
+        .to_sql_with(&RenderOptions {
+            keyed_params: &[(0, TermKey::Text)],
+            ..RenderOptions::default()
+        })
+        .unwrap()
+        .sql;
+    assert!(
+        sql.contains(r#"(t0."f" = $1 AND t0."f"::text = $1::text)"#),
+        "{sql}"
+    );
+    client
+        .batch_execute("SET enable_seqscan = off")
+        .await
+        .unwrap();
+    let explain: Vec<String> = client
+        .query(&format!("EXPLAIN {sql}"), &[&0.0f64])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(
+        explain
+            .iter()
+            .any(|line| line.contains("Index Cond: (f = ")),
+        "{explain:#?}"
+    );
+    client
+        .batch_execute("DROP SCHEMA v12n_zero CASCADE")
+        .await
+        .unwrap();
+}
+
+/// Joins compare floating point columns by their text output, which tells
+/// `-0` from `0`, and removing duplicates compares it too.
+#[tokio::test]
+async fn joins_and_duplicates_tell_minus_zero_from_zero() {
+    let Some(url) = database_url() else { return };
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#A> rr:logicalTable [ rr:sqlQuery """SELECT * FROM (VALUES (1, '-0'::float8), (2, '0'::float8), (2, '-0'::float8)) v(id, f)""" ] ;
+          rr:subjectMap [ rr:template "http://example.org/a/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:f ; rr:objectMap [ rr:column "f" ] ] .
+        <#B> rr:logicalTable [ rr:sqlQuery """SELECT * FROM (VALUES (1, '0'::float8)) v(id, g)""" ] ;
+          rr:subjectMap [ rr:template "http://example.org/b/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:g ; rr:objectMap [ rr:column "g" ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:i ; rr:objectMap [ rr:template "http://example.org/v/{g}" ] ] .
+        <#C> rr:logicalTable [ rr:sqlQuery """SELECT * FROM (VALUES (1, '-0'::float8)) v(id, g)""" ] ;
+          rr:subjectMap [ rr:template "http://example.org/c/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:i ; rr:objectMap [ rr:template "http://example.org/v/{g}" ] ] .
+    "#;
+    let rows = |query: &str| {
+        let plan = plan(
+            mapping,
+            &format!("PREFIX ex: <http://example.org/> {query}"),
+        );
+        let url = url.clone();
+        async move { run(&url, Limits::default(), &plan).await.unwrap().0 }
+    };
+    let double = |v: &str| format!("\"{v}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+    assert_eq!(
+        rows("SELECT ?a ?b WHERE { ?a ex:f ?x . ?b ex:g ?x }").await,
+        ["?a=<http://example.org/a/2> ?b=<http://example.org/b/1>"]
+    );
+    assert_eq!(
+        rows("SELECT DISTINCT ?x WHERE { ?a ex:f ?x }").await,
+        [
+            format!("?x={}", double("-0.0E0")),
+            format!("?x={}", double("0.0E0"))
+        ]
+    );
+    // Row 2 has two triples, so the hidden ?x keeps it twice.
+    assert_eq!(
+        rows("SELECT ?a WHERE { ?a ex:f ?x }").await,
+        [
+            "?a=<http://example.org/a/1>",
+            "?a=<http://example.org/a/2>",
+            "?a=<http://example.org/a/2>"
+        ]
+    );
+    assert_eq!(
+        rows("SELECT DISTINCT ?x WHERE { { ?a ex:f ?x } UNION { ?b ex:g ?x } }").await,
+        [
+            format!("?x={}", double("-0.0E0")),
+            format!("?x={}", double("0.0E0"))
+        ]
+    );
+    // IRIs from templates over the two zeros are two IRIs.
+    assert_eq!(
+        rows("SELECT DISTINCT ?i WHERE { ?s ex:i ?i }").await,
+        [
+            "?i=<http://example.org/v/-0.0E0>",
+            "?i=<http://example.org/v/0.0E0>"
+        ]
+    );
+}
+
+/// `bpchar` values keep their padding, and so do their literals, while
+/// its `=` ignores trailing spaces: every comparison also compares the
+/// lengths.
+#[tokio::test]
+async fn padded_strings_compare_as_the_terms_they_give() {
+    let Some(url) = database_url() else { return };
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#A> rr:logicalTable [ rr:sqlQuery """SELECT 1 AS id, 'a'::char(3) AS c3, 'a'::char(5) AS c5""" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:c ; rr:objectMap [ rr:column "c3" ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:d ; rr:objectMap [ rr:column "c5" ] ] .
+        <#B> rr:logicalTable [ rr:sqlQuery """SELECT 2 AS id, 'a'::char(5) AS c5""" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:c ; rr:objectMap [ rr:column "c5" ] ] .
+    "#;
+    let rows = |query: &str| {
+        let plan = plan(
+            mapping,
+            &format!("PREFIX ex: <http://example.org/> {query}"),
+        );
+        let url = url.clone();
+        async move { run(&url, Limits::default(), &plan).await.unwrap().0 }
+    };
+    let row = |id: u8| format!("?s=<http://example.org/row/{id}>");
+    assert_eq!(rows("SELECT ?s WHERE { ?s ex:c \"a  \" }").await, [row(1)]);
+    assert_eq!(
+        rows("SELECT ?s WHERE { ?s ex:c \"a    \" }").await,
+        [row(2)]
+    );
+    assert!(rows("SELECT ?s WHERE { ?s ex:c \"a\" }").await.is_empty());
+    assert!(
+        rows("SELECT ?s WHERE { ?s ex:c ?x ; ex:d ?x }")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        rows("SELECT ?s WHERE { ?s ex:c ?x FILTER(?x = \"a  \") }").await,
+        [row(1)]
+    );
+    assert_eq!(
+        rows("SELECT DISTINCT ?x WHERE { ?s ex:c ?x }").await,
+        ["?x=\"a    \"", "?x=\"a  \""]
+    );
+}
+
+/// Language tags compare case-insensitively (RDF 1.1): the mapping's
+/// tags are kept in lower case, so tags that differ only in case give
+/// one term.
+#[tokio::test]
+async fn language_tags_that_differ_in_case_are_one_term() {
+    let Some(url) = database_url() else { return };
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#A> rr:logicalTable [ rr:sqlQuery "SELECT 1 AS id, 'chat'::text AS t" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:label ;
+            rr:objectMap [ rr:column "t" ; rr:language "EN-us" ], [ rr:column "t" ; rr:language "en-US" ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:other ; rr:objectMap [ rr:column "t" ; rr:language "en-us" ] ] .
+    "#;
+    let rows = |query: &str| {
+        let plan = plan(
+            mapping,
+            &format!("PREFIX ex: <http://example.org/> {query}"),
+        );
+        let url = url.clone();
+        async move { run(&url, Limits::default(), &plan).await.unwrap().0 }
+    };
+    assert_eq!(
+        rows("SELECT ?x WHERE { ?s ex:label ?x }").await,
+        ["?x=\"chat\"@en-us"]
+    );
+    assert_eq!(
+        rows("SELECT DISTINCT ?x WHERE { { ?s ex:label ?x } UNION { ?s ex:other ?x } }").await,
+        ["?x=\"chat\"@en-us"]
+    );
+    assert_eq!(
+        rows("SELECT ?s WHERE { ?s ex:label \"chat\"@EN-US ; ex:other ?x FILTER(LANG(?x) = \"en-us\") }")
+            .await,
+        ["?s=<http://example.org/row/1>"]
+    );
+}
+
+/// A query whose projected variables read no column, only constants of
+/// the mapping, selects a constant in their place; the row count after it
+/// is still found.
+#[tokio::test]
+async fn constant_terms_alone_are_projected() {
+    let Some(url) = database_url() else { return };
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#A> rr:logicalTable [ rr:sqlQuery "SELECT * FROM (VALUES (1), (2)) v(id)" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:constant "Chat"@EN ] ] .
+    "#;
+    for (query, expected) in [
+        ("SELECT ?x WHERE { ?s ex:label ?x }", 2),
+        ("SELECT DISTINCT ?x WHERE { ?s ex:label ?x }", 1),
+        (
+            "SELECT * WHERE { <http://example.org/row/1> ex:label \"Chat\"@en }",
+            1,
+        ),
+    ] {
+        let plan = plan(
+            mapping,
+            &format!("PREFIX ex: <http://example.org/> {query}"),
+        );
+        let (rows, truncated) = run(&url, Limits::default(), &plan)
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        assert_eq!(rows.len(), expected, "{query}: {rows:?}");
+        assert!(!truncated);
+        if expected == 2 {
+            assert_eq!(rows[0], "?x=\"Chat\"@en");
         }
     }
 }

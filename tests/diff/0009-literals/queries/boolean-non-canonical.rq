@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# "1" is a valid xsd:boolean form, but not the canonical one the column gives.
+SELECT ?s WHERE { ?s ex:ok "1"^^xsd:boolean }

@@ -17,11 +17,11 @@ use tokio_postgres::{Client, Config, NoTls, RowStream, Statement};
 use v12n_core::mapping::LogicalTable;
 use v12n_core::solution::{Solution, SolutionBuilder, SqlValue};
 use v12n_core::sql::{
-    ColumnTypes, RenderOptions, RenderedSql, SqlPlan, TableKeys, column_name_probe,
+    ColumnTypes, RenderOptions, RenderedSql, SqlPlan, TableKeys, TermKey, column_name_probe,
     column_type_probe, quote_identifier, quote_table_name,
 };
 
-use bind::{Bound, bind};
+use bind::{Bound, bind, term_key};
 use decode::{Decoder, Raw, column_type};
 pub use error::Error;
 
@@ -122,15 +122,22 @@ impl Database {
         let timeout = self.limits.statement_timeout;
         let pg = |e| Error::from_postgres(e, timeout);
         let plan = self.resolve_columns(plan).await.map_err(pg)?;
-        let column_types = self.column_types(&plan).await.map_err(pg)?;
+        let keys = self.load_table_keys(&plan).await.map_err(pg)?;
+        // `DISTINCT` and `UNION` compare values with `=`, so the types of
+        // the columns they compare tell which need a key next to them.
+        let removes_duplicates = plan.distinct || plan.has_duplicates(keys.as_ref());
+        let column_types = self
+            .column_types(&plan, removes_duplicates)
+            .await
+            .map_err(pg)?;
         let plan = match &column_types {
             Some(types) if plan.branches.len() > 1 => Cow::Owned(plan.with_union_types(types)?),
             _ => plan,
         };
         let plan = plan.as_ref();
-        let keys = self.load_table_keys(plan).await.map_err(pg)?;
         let options = RenderOptions {
             text_params: &[],
+            keyed_params: &[],
             column_types: column_types.as_ref(),
             keys: keys.as_ref(),
             non_utf8: !self.utf8,
@@ -146,8 +153,10 @@ impl Database {
             .await
             .map_err(pg)?;
         // The projected columns, then the sort keys, then the row count.
+        // A query that selects neither selects a constant in their place.
         let data_columns = plan.columns.len();
-        let count_column = data_columns + rendered.order_by.len();
+        let placeholder = usize::from(data_columns == 0 && rendered.order_by.is_empty());
+        let count_column = data_columns + rendered.order_by.len() + placeholder;
         let decoders: Vec<Option<Decoder>> = statement.columns()[..data_columns]
             .iter()
             .map(|c| Decoder::for_type(c.type_()))
@@ -161,10 +170,19 @@ impl Database {
             .filter(|(_, ty)| Decoder::for_type(ty).is_none())
             .map(|(i, _)| i)
             .collect();
+        // `=` finds a zero constant equal to `-0` and a `bpchar` constant
+        // equal to values with more padding, which are other terms.
+        let keyed_params: Vec<(usize, TermKey)> = statement.params()[..rendered.params.len()]
+            .iter()
+            .zip(&rendered.params)
+            .enumerate()
+            .filter_map(|(i, (ty, value))| term_key(ty, value).map(|key| (i, key)))
+            .collect();
         let cast_columns = decoders.iter().any(Option::is_none);
-        let rendered = if cast_columns || !text_params.is_empty() {
+        let rendered = if cast_columns || !text_params.is_empty() || !keyed_params.is_empty() {
             let rendered = plan.to_sql_with(&RenderOptions {
                 text_params: &text_params,
+                keyed_params: &keyed_params,
                 ..options
             })?;
             let cast = cast_columns.then_some(decoders.as_slice());
@@ -318,14 +336,21 @@ impl Database {
     }
 
     /// Types of the columns the plan compares as RDF terms or combines
-    /// with `UNION`, read by preparing a statement that selects them.
+    /// with `UNION`, and of every selected column when the query removes
+    /// duplicates, read by preparing a statement that selects them.
     /// `None` when there are none.
     async fn column_types(
         &self,
         plan: &SqlPlan,
+        removes_duplicates: bool,
     ) -> Result<Option<ColumnTypes>, tokio_postgres::Error> {
         let mut columns = plan.term_columns();
-        for column in plan.union_columns() {
+        let selected = if removes_duplicates {
+            plan.selected_columns()
+        } else {
+            plan.union_columns()
+        };
+        for column in selected {
             if !columns.contains(&column) {
                 columns.push(column);
             }
@@ -626,7 +651,7 @@ mod tests {
         .unwrap();
         let plan = unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping)).unwrap();
         let database = Database::connect(&url, Limits::default()).await.unwrap();
-        let types = database.column_types(&plan).await.unwrap();
+        let types = database.column_types(&plan, false).await.unwrap();
         let keys = database.load_table_keys(&plan).await.unwrap();
         let rendered = plan
             .to_sql_with(&RenderOptions {

@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# The same simple literals from rr:datatype xsd:string and a literal template count once.
+SELECT DISTINCT ?x WHERE { { ?s ex:text ?x } UNION { ?s ex:tpl ?x } }
