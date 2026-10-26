@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# The canonical xsd:double form of 0.5.
+SELECT ?s WHERE { ?s ex:ratio 5.0E-1 }

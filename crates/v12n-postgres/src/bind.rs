@@ -7,6 +7,7 @@ use std::error::Error as StdError;
 use bytes::BytesMut;
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use v12n_core::solution::{SqlValue, canonical_decimal};
+use v12n_core::sql::TermKey;
 
 use crate::decode::{Decoder, MICROS_PER_DAY, PG_EPOCH_DAYS};
 
@@ -128,6 +129,23 @@ pub(crate) fn bind(ty: &Type, value: &str, datatype: Option<&str>) -> Bound {
         return Bound::NoMatch;
     }
     bound
+}
+
+/// The key a comparison of a parameter of type `ty` holding `value` with a
+/// column also compares (see [`TermKey`]): the sign of a floating point
+/// zero, since `-0 = 0` holds while `-0.0E0` and `0.0E0` are different
+/// terms, and the length of a `bpchar`, whose `=` ignores trailing spaces.
+/// Other floating point values are equal exactly when their terms are, so
+/// their comparisons stay as they are.
+pub(crate) fn term_key(ty: &Type, value: &str) -> Option<TermKey> {
+    match *ty {
+        Type::FLOAT4 | Type::FLOAT8 => value
+            .parse::<f64>()
+            .is_ok_and(|v| v == 0.0)
+            .then_some(TermKey::Text),
+        Type::BPCHAR => Some(TermKey::OctetLength),
+        _ => None,
+    }
 }
 
 /// Binary format of `value` read as the decoder's type, `None` when it is
@@ -413,6 +431,21 @@ mod tests {
             bind(&Type::INTERVAL, "1 day", None),
             Bound::Text("1 day".into())
         );
+    }
+
+    #[test]
+    fn zeros_and_padded_strings_compare_a_key_too() {
+        for value in ["0.0E0", "-0.0E0"] {
+            assert_eq!(term_key(&Type::FLOAT8, value), Some(TermKey::Text));
+            assert_eq!(term_key(&Type::FLOAT4, value), Some(TermKey::Text));
+        }
+        // Other values are equal exactly when their terms are.
+        for value in ["1.5E0", "NaN", "INF", "abc"] {
+            assert_eq!(term_key(&Type::FLOAT8, value), None, "{value}");
+        }
+        assert_eq!(term_key(&Type::BPCHAR, "a"), Some(TermKey::OctetLength));
+        assert_eq!(term_key(&Type::TEXT, "a"), None);
+        assert_eq!(term_key(&Type::INT4, "0"), None);
     }
 
     #[test]

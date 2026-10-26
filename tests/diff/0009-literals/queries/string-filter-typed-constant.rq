@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# xsd:string and simple literals compare as strings.
+SELECT ?s WHERE { ?s ex:plain ?x FILTER(?x = "Hund"^^xsd:string) }

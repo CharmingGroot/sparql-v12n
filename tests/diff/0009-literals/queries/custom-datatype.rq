@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A datatype no term map produces matches nothing.
+SELECT ?s WHERE { ?s ex:plain "chat"^^ex:custom }

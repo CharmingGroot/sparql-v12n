@@ -1,0 +1,6 @@
+# Ontop writes an xsd:double as PostgreSQL text output ("0.5") and matches
+# constants against that form; v12n writes and matches the XSD canonical
+# form ("5.0E-1"), as decided in Discussion #35 (#25).
+[query.double-canonical]
+expect = "mismatch"
+issue = 25

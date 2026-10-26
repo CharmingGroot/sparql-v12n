@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A double is not the decimal 1.5.
+SELECT ?s WHERE { ?s ex:price "1.5E0"^^xsd:double }

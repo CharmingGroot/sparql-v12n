@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A simple literal is not a language-tagged one.
+SELECT ?s WHERE { ?s ex:labelEn "chat" }

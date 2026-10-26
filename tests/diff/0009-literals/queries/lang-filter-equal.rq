@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# RDFterm-equal with a tag in another case.
+SELECT ?s WHERE { ?s ex:labelEn ?l FILTER(?l = "chat"@en-US) }

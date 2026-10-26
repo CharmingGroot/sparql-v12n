@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Literals with different tags never join.
+SELECT ?s ?t WHERE { ?s ex:labelEn ?l . ?t ex:labelDe ?l }

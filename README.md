@@ -180,6 +180,15 @@ differences (issue #25).
 One exception: a `time` value of `24:00:00` is written as is, although the
 XSD 1.1 canonical form is `00:00:00` (issue #37).
 
+Two values that SQL `=` finds equal can still be different terms: `-0`
+and `0` in `real` and `double precision` columns give `"-0.0E0"` and
+`"0.0E0"`, and a `char(n)` value keeps its padding (`'a'::char(3)` gives
+`"a  "`), which `=` on `char(n)` ignores. Wherever the engine compares
+such columns as terms (constants, joins, `sameTerm`, and the duplicates
+`DISTINCT` and `UNION` remove), it also compares the text of the value
+(for a zero) or its length (for `char(n)`), next to `=` so that an index
+on the column still finds the rows.
+
 ## Constants in a query
 
 Constants in triple patterns are matched as RDF terms, as SPARQL requires:
@@ -208,6 +217,29 @@ column's own type, so its indexes are used. For column types without a
 natural datatype (such as `interval`), results carry the column cast to
 text, and constants are compared with that same text (`col::text = $1`),
 which cannot use an index on the column.
+
+## Literals
+
+Literals are compared as RDF 1.1 terms everywhere: in triple patterns,
+joins, `sameTerm` and `=` in `FILTER` where it means RDFterm-equal,
+`DISTINCT`, and the results.
+
+- **Language tags** compare without regard to case (RDF 1.1 Concepts
+  §3.3), so the engine keeps them in lower case: `rr:language "EN-us"`
+  gives `"chat"@en-us`, which the constant `"chat"@EN-US` matches, and
+  two term maps that differ only in the case of their tags give one term.
+  A tag that is not a valid BCP 47 language tag is a mapping error
+  (R2RML §7.5), and so is `rr:datatype rdf:langString`, the datatype of
+  tagged strings only.
+- **`xsd:string`**: a simple literal is an `xsd:string` literal. `"x"` and
+  `"x"^^xsd:string`, a text column, a column with `rr:datatype
+  xsd:string` and a literal template give the same term, and results
+  write it without a datatype. `DATATYPE` returns `xsd:string`.
+- **Datatypes no term map produces** never match in a triple pattern:
+  an integer column gives `xsd:integer` terms, so `"5"^^xsd:int` and
+  `"5"^^xsd:decimal` match nothing there, and neither does a custom
+  datatype. In `FILTER`, where numbers compare by value, `xsd:float` and
+  the derived integer types are rejected (see `FILTER`).
 
 Value comparisons across datatypes, such as `FILTER(?amount = 7.0)` on an
 integer column, belong to `FILTER` (see below).
@@ -458,8 +490,6 @@ that extend SPARQL:
   is a numeric, boolean or dateTime datatype other than the column's
   natural one, `xsd:float` and the derived integer types, and dateTime
   constants outside the years 1 to 9999 or finer than a microsecond;
-- `sameTerm` over `real` or `double precision` columns (PostgreSQL finds
-  `-0` and `0` equal);
 - other functions, arithmetic, `IN`, `EXISTS`, and expressions other
   than terms (variables, constants, and `STR`, `LANG` or `DATATYPE` of
   them) as operands;

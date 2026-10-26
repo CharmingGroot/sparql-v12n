@@ -93,8 +93,6 @@ pub(super) struct Operand<'v> {
     /// A `date`, `timestamp` or `timestamptz` column, whose infinite
     /// values are plain literals (`"infinity"`, see the decoder).
     pub(super) infinite: bool,
-    /// A column whose SQL type is `real` or `double precision`.
-    pub(super) float: bool,
 }
 
 /// The value of `numeric` columns that is not an `xsd:decimal`: `NaN` and
@@ -167,16 +165,15 @@ impl<'a> Renderer<'a> {
                 right,
                 same_term,
             } => {
-                let (l, r) = (self.operand(left), self.operand(right));
-                if l.float || r.float {
-                    return Err(unsupported(
-                        "sameTerm on literals from real or double precision columns, \
-                         whose -0 and 0 PostgreSQL compares as equal",
-                    ));
-                }
+                // As in a triple pattern: a database adapter keys the
+                // comparisons that `=` alone would get wrong, such as a
+                // zero constant against `-0` (`TermKey`).
                 match same_term {
                     Some(same_term) => self.term_match(same_term, mode)?,
-                    None => self.same_strings(&l, &r)?,
+                    None => {
+                        let (l, r) = (self.operand(left), self.operand(right));
+                        self.same_strings(&l, &r)?
+                    }
                 }
             }
             Filter::Regex { text, pattern } => self.regex(text, pattern)?,
@@ -207,7 +204,6 @@ impl<'a> Renderer<'a> {
             column: None,
             constant: None,
             infinite: false,
-            float: false,
         };
         match value {
             FilterValue::Constant(Term::NamedNode(iri)) => {
@@ -250,7 +246,6 @@ impl<'a> Renderer<'a> {
                 if let Some(ty) = ty {
                     operand.infinite =
                         matches!(ty.name.as_str(), "date" | "timestamp" | "timestamptz");
-                    operand.float = ty.group == "double";
                 }
                 operand.kind = match (term.term_type, &term.language, &term.term.datatype) {
                     (TermType::Iri, ..) => Kind::Iri,
@@ -305,7 +300,6 @@ impl<'a> Renderer<'a> {
             column: None,
             constant: None,
             infinite: false,
-            float: false,
         };
         let error = Operand {
             kind: Kind::Error,
@@ -990,6 +984,7 @@ pub(super) mod tests {
     use super::super::{ColumnTypes, Comparison, Lexical, RenderOptions, SqlPlan};
     use super::*;
     use crate::mapping::{LogicalTable, Mapping, MappingIndex};
+    use crate::sql::TermKey;
     use crate::{sparql, unfold};
 
     /// One column per SQL type under test, each with its own predicate.
@@ -1066,6 +1061,11 @@ pub(super) mod tests {
             group: group.to_owned(),
             comparison,
             lexical,
+            term_key: match sql {
+                "float8" | "float4" => Some(TermKey::Text),
+                "bpchar" => Some(TermKey::OctetLength),
+                _ => None,
+            },
         }
     }
 
@@ -1296,7 +1296,8 @@ pub(super) mod tests {
     fn same_term_and_term_tests() {
         assert_eq!(x("i4", "sameTerm(?x, 5)"), "(t0.\"i4\" = $1)");
         assert_eq!(x("i4", "sameTerm(?x, \"5\")"), "(t0.\"i4\" = $1)");
-        assert!(rejected("?s ex:f8 ?x", "sameTerm(?x, 0e0)").contains("-0"));
+        // The adapter adds the sign of a zero to the comparison.
+        assert_eq!(x("f8", "sameTerm(?x, 0e0)"), "(t0.\"f8\" = $1)");
         assert_eq!(
             x("link", "isIRI(?x) && !isBlank(?x) && !isLiteral(?x)"),
             "((true AND NOT (false)) AND NOT (false))"

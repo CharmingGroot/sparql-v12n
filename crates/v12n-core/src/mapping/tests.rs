@@ -249,6 +249,25 @@ _:people rr:logicalTable [ rr:tableName "people" ] ;
 }
 
 #[test]
+fn from_turtle_language_tags_are_kept_in_lower_case() {
+    // RDF 1.1 compares language tags case-insensitively, and query
+    // constants and results carry them in lower case.
+    let mapping = parse(
+        r#"
+<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ;
+    rr:objectMap [ rr:column "x" ; rr:language "EN-us" ] ] .
+"#,
+    )
+    .unwrap();
+    match &mapping.triples_maps()[0].predicate_object_maps[0].object_maps[..] {
+        [ObjectMap::Term(t)] => assert_eq!(t.language.as_deref(), Some("en-us")),
+        other => panic!("unexpected object maps {other:?}"),
+    }
+}
+
+#[test]
 fn from_turtle_repeated_triples_do_not_duplicate_classes() {
     let mapping = parse(
         r#"
@@ -358,6 +377,14 @@ fn from_turtle_invalid_constructs_error() {
   rr:subjectMap [ rr:template "http://ex/{id}" ] ;
   rr:predicateObjectMap [ rr:predicate ex:p ;
     rr:objectMap [ rr:column "x" ; rr:datatype xsd:string ; rr:language "en" ] ] ."#,
+        r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ;
+    rr:objectMap [ rr:column "x" ; rr:language "not a tag" ] ] ."#,
+        r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
+  rr:subjectMap [ rr:template "http://ex/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:p ;
+    rr:objectMap [ rr:column "x" ; rr:datatype <http://www.w3.org/1999/02/22-rdf-syntax-ns#langString> ] ] ."#,
         r#"<#A> rr:logicalTable [ rr:tableName "a" ] ;
   rr:subjectMap [ rr:template "http://ex/{id}" ] ;
   rr:predicateObjectMap [ rr:objectMap [ rr:column "x" ] ] ."#,

@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# sameTerm with a tag in another case.
+SELECT ?s WHERE { ?s ex:labelEn ?l FILTER(sameTerm(?l, "Hund"@EN-us)) }

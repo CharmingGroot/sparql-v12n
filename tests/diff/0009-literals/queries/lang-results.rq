@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Tags compare case-insensitively (RDF 1.1); results carry them in lower case.
+SELECT ?s ?l WHERE { ?s ex:labelEn ?l }

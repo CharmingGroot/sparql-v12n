@@ -546,6 +546,34 @@ pub struct ColumnType {
     pub comparison: Comparison,
     /// How SQL computes the natural lexical form, when it can.
     pub lexical: Option<Lexical>,
+    /// For a type whose `=` finds some values equal that give different
+    /// terms, what tells them apart.
+    pub term_key: Option<TermKey>,
+}
+
+/// SQL that tells apart values that `=` finds equal but whose natural
+/// RDF terms differ (R2RML §10.2), so that comparing terms stays exact
+/// while `=` still lets an index find the candidates: `col = $1 AND
+/// key(col) = key($1)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermKey {
+    /// `x::text`: floating point, where `-0 = 0` holds but `-0.0E0` and
+    /// `0.0E0` are different `xsd:double` terms (XML Schema 1.1
+    /// `doubleCanonicalMap`).
+    Text,
+    /// `octet_length(x)`: `bpchar`, whose `=` ignores trailing spaces,
+    /// while its values keep the padding (`'a  '::char(3)`) and so do
+    /// their literals.
+    OctetLength,
+}
+
+impl TermKey {
+    fn sql(self, expr: &str) -> String {
+        match self {
+            Self::Text => format!("{expr}::text"),
+            Self::OctetLength => format!("octet_length({expr})"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -586,6 +614,11 @@ pub type TableKeys = HashMap<LogicalTable, Vec<Vec<String>>>;
 pub struct RenderOptions<'a> {
     /// Parameters (0-based) whose compared column is cast to text.
     pub text_params: &'a [usize],
+    /// Parameters (0-based) whose comparison with a column also compares
+    /// this key of both, because a value of the parameter's type that `=`
+    /// finds equal to the constant may still give a different term (a
+    /// zero `float8` constant against `-0`, see [`TermKey`]).
+    pub keyed_params: &'a [(usize, TermKey)],
     /// Types of the columns that [`SqlPlan::term_columns`] lists.
     pub column_types: Option<&'a ColumnTypes>,
     /// Unique keys of the tables that [`SqlPlan::key_tables`] lists.
@@ -785,6 +818,7 @@ impl SqlPlan {
             typed_text_from: None,
             slots: Vec::new(),
             collate_slots: false,
+            term_keys: Vec::new(),
         };
         if dedup {
             select.aliases.extend(self.hidden_columns.iter().cloned());
@@ -797,7 +831,13 @@ impl SqlPlan {
                 select.typed_text_from = Some(self.columns.len());
             }
         }
+        if (self.distinct || dedup)
+            && let Some(types) = options.column_types
+        {
+            select.term_keys = self.term_keys(&select, types);
+        }
         let subquery = select.aliases.len() > self.columns.len()
+            || !select.term_keys.is_empty()
             || select.order.iter().enumerate().any(|(i, &o)| i != o);
         let layouts = if self.order.is_empty() || self.branches.is_empty() {
             Vec::new()
@@ -813,7 +853,12 @@ impl SqlPlan {
         let direct = ordered && self.branches.len() == 1 && !subquery && !groups[0].1;
         let wrapped = subquery || (ordered && !direct);
         if ordered {
-            let used: HashSet<&str> = select.aliases.iter().map(String::as_str).collect();
+            let used: HashSet<&str> = select
+                .aliases
+                .iter()
+                .chain(select.term_keys.iter().map(|(alias, _)| alias))
+                .map(String::as_str)
+                .collect();
             let mut names = Vec::new();
             for (k, layout) in layouts.iter().enumerate() {
                 for &slot in &layout.slots {
@@ -927,6 +972,34 @@ impl SqlPlan {
             param_alternatives: r.param_alternatives,
             order_by,
         })
+    }
+
+    /// The [`TermKey`] columns to select next to the entries of `select`
+    /// whose duplicates are removed: one per entry that some branch reads
+    /// from a column whose type has a key.
+    fn term_keys(&self, select: &Select, types: &ColumnTypes) -> Vec<(String, usize)> {
+        let mut used: HashSet<String> = select.aliases.iter().cloned().collect();
+        let mut out = Vec::new();
+        for &entry in &select.order {
+            let keyed = self.branches.iter().any(|branch| {
+                matches!(
+                    &branch.select[entry],
+                    SqlExpr::Column { table, name }
+                        if types
+                            .get(&(branch.from[*table].clone(), name.clone()))
+                            .is_some_and(|ty| ty.term_key.is_some())
+                )
+            });
+            if keyed {
+                let mut alias = format!("{}_key", select.aliases[entry]);
+                while used.contains(&alias) {
+                    alias.push('_');
+                }
+                used.insert(alias.clone());
+                out.push((alias, entry));
+            }
+        }
+        out
     }
 
     /// The branches of each arm (see [`SqlBranch::arm`]), in order.
@@ -1062,10 +1135,18 @@ impl SqlPlan {
     /// appearance; empty with fewer than two branches. Their types go into
     /// [`with_union_types`](Self::with_union_types).
     pub fn union_columns(&self) -> Vec<(LogicalTable, String)> {
-        let mut out: Vec<(LogicalTable, String)> = Vec::new();
         if self.branches.len() < 2 {
-            return out;
+            return Vec::new();
         }
+        self.selected_columns()
+    }
+
+    /// The columns that branches select, each once, in order of
+    /// appearance. Where duplicates are removed (under `DISTINCT`, or when
+    /// [`has_duplicates`](Self::has_duplicates)), their types tell which
+    /// need a [`TermKey`] next to them.
+    pub fn selected_columns(&self) -> Vec<(LogicalTable, String)> {
+        let mut out: Vec<(LogicalTable, String)> = Vec::new();
         for branch in &self.branches {
             for expr in &branch.select {
                 if let SqlExpr::Column { table, name } = expr {
@@ -1555,6 +1636,12 @@ struct Select {
     /// Whether the sort keys compared by code point are selected with
     /// `COLLATE "C"`, for sorting by their names.
     collate_slots: bool,
+    /// Keys selected after the entries where duplicates are removed, each
+    /// alias and the entry whose column it tells apart (see [`TermKey`]):
+    /// `DISTINCT` and `UNION` compare values with `=`, which would merge
+    /// `-0` and `0`, or `char(n)` values of different padding, all
+    /// different terms.
+    term_keys: Vec<(String, usize)>,
 }
 
 #[derive(Default)]
@@ -1596,6 +1683,7 @@ impl<'a> Renderer<'a> {
         if select.order.is_empty() && select.slots.is_empty() {
             self.sql.push('1');
         }
+        let mut selected = 0;
         for (i, &entry) in select.order.iter().enumerate() {
             if i > 0 {
                 self.sql.push_str(", ");
@@ -1618,11 +1706,36 @@ impl<'a> Renderer<'a> {
             }
             self.sql.push_str(" AS ");
             self.sql.push_str(&quote_identifier(&select.aliases[entry]));
+            selected += 1;
         }
-        for (i, (alias, key, slot)) in select.slots.iter().enumerate() {
-            if i > 0 || !select.order.is_empty() {
+        for (alias, entry) in &select.term_keys {
+            if selected > 0 {
                 self.sql.push_str(", ");
             }
+            // Text in every branch, so that `UNION` combines them.
+            match &branch.select[*entry] {
+                SqlExpr::Column { table, name } => {
+                    match self.column_type(*table, name).and_then(|ty| ty.term_key) {
+                        Some(TermKey::Text) => self
+                            .sql
+                            .push_str(&TermKey::Text.sql(&column_sql(*table, name))),
+                        Some(key) => self
+                            .sql
+                            .push_str(&format!("({})::text", key.sql(&column_sql(*table, name)))),
+                        None => self.sql.push_str("NULL::text"),
+                    }
+                }
+                _ => self.sql.push_str("NULL::text"),
+            }
+            self.sql.push_str(" AS ");
+            self.sql.push_str(&quote_identifier(alias));
+            selected += 1;
+        }
+        for (alias, key, slot) in &select.slots {
+            if selected > 0 {
+                self.sql.push_str(", ");
+            }
+            selected += 1;
             self.order_slot(branch, *key, &layouts[*key], *slot)?;
             if select.collate_slots && slot.collated() {
                 self.sql.push_str(" COLLATE \"C\"");
@@ -1772,11 +1885,19 @@ impl<'a> Renderer<'a> {
                 Condition::Eq(left, right) => {
                     // A column side holds no parameter, so the parameter
                     // on the other side is the next one either way.
-                    let as_text = matches!(
-                        (left, right),
-                        (SqlExpr::Column { .. }, SqlExpr::Param(_))
-                            | (SqlExpr::Param(_), SqlExpr::Column { .. })
-                    ) && self.options.text_params.contains(&self.params.len());
+                    let param = self.params.len();
+                    let column = match (left, right) {
+                        (SqlExpr::Column { table, name }, SqlExpr::Param(_))
+                        | (SqlExpr::Param(_), SqlExpr::Column { table, name }) => {
+                            Some(column_sql(*table, name))
+                        }
+                        _ => None,
+                    };
+                    let as_text = column.is_some() && self.options.text_params.contains(&param);
+                    let key = column.as_ref().and_then(|_| self.param_key(param));
+                    if key.is_some() {
+                        self.sql.push('(');
+                    }
                     self.expr(left);
                     if as_text && matches!(left, SqlExpr::Column { .. }) {
                         self.sql.push_str("::text");
@@ -1786,10 +1907,30 @@ impl<'a> Renderer<'a> {
                     if as_text && matches!(right, SqlExpr::Column { .. }) {
                         self.sql.push_str("::text");
                     }
+                    if let (Some(key), Some(column)) = (key, column) {
+                        // `=` came first, so PostgreSQL has typed the
+                        // parameter as the column before the key reads it.
+                        self.sql.push_str(&format!(
+                            " AND {} = {})",
+                            key.sql(&column),
+                            key.sql(&format!("${}", param + 1))
+                        ));
+                    }
                 }
                 Condition::EqAny(left, right) => {
-                    let as_text = matches!(left, SqlExpr::Column { .. })
-                        && self.options.text_params.contains(&self.params.len());
+                    let first = self.params.len();
+                    let column = match left {
+                        SqlExpr::Column { table, name } => Some(column_sql(*table, name)),
+                        _ => None,
+                    };
+                    let as_text = column.is_some() && self.options.text_params.contains(&first);
+                    // Every alternative is one parameter of the column's type.
+                    let key = column
+                        .as_ref()
+                        .and_then(|_| (first..first + right.len()).find_map(|p| self.param_key(p)));
+                    if key.is_some() {
+                        self.sql.push('(');
+                    }
                     self.expr(left);
                     if as_text {
                         self.sql.push_str("::text");
@@ -1808,6 +1949,16 @@ impl<'a> Renderer<'a> {
                         }
                     }
                     self.sql.push(')');
+                    if let (Some(key), Some(column)) = (key, column) {
+                        let keys: Vec<String> = (first..self.params.len())
+                            .map(|p| key.sql(&format!("${}", p + 1)))
+                            .collect();
+                        self.sql.push_str(&format!(
+                            " AND {} IN ({}))",
+                            key.sql(&column),
+                            keys.join(", ")
+                        ));
+                    }
                 }
                 Condition::IsNotNull(expr) => {
                     self.expr(expr);
@@ -1850,6 +2001,16 @@ impl<'a> Renderer<'a> {
         Ok(())
     }
 
+    /// The key that the comparison with parameter `param` (0-based) also
+    /// compares, see [`RenderOptions::keyed_params`].
+    fn param_key(&self, param: usize) -> Option<TermKey> {
+        self.options
+            .keyed_params
+            .iter()
+            .find(|(p, _)| *p == param)
+            .map(|&(_, key)| key)
+    }
+
     fn same_term(&mut self, left: &TermSql, right: &TermSql) -> Result<(), Error> {
         let Some(types) = self.options.column_types else {
             self.term_side(left, None, false)?;
@@ -1875,15 +2036,16 @@ impl<'a> Renderer<'a> {
             && let (Some(a), Some(b)) = (self.column_type(*lt, ln), self.column_type(*rt, rn))
             && a.group == b.group
         {
-            let cast = match a.comparison {
-                Comparison::Value => "",
-                Comparison::Text => "::text",
-            };
-            self.sql.push_str(&format!(
-                "{}{cast} = {}{cast}",
-                column_sql(*lt, ln),
-                column_sql(*rt, rn)
-            ));
+            let (l, r) = (column_sql(*lt, ln), column_sql(*rt, rn));
+            match (a.comparison, a.term_key.or(b.term_key)) {
+                (Comparison::Value, Some(key)) => self.sql.push_str(&format!(
+                    "({l} = {r} AND {} = {})",
+                    key.sql(&l),
+                    key.sql(&r)
+                )),
+                (Comparison::Value, None) => self.sql.push_str(&format!("{l} = {r}")),
+                (Comparison::Text, _) => self.sql.push_str(&format!("{l}::text = {r}::text")),
+            }
             return Ok(());
         }
         self.term_side(left, Some(types), false)?;
@@ -2669,6 +2831,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keyed_params_also_compare_the_key_after_the_value() {
+        let branch = SqlBranch {
+            order: Vec::new(),
+            arm: 0,
+            from: vec![LogicalTable::TableName("t".into())],
+            select: vec![column(0, "id")],
+            conditions: vec![
+                Condition::Eq(column(0, "f"), SqlExpr::Param("0.0E0".into())),
+                Condition::EqAny(
+                    column(0, "g"),
+                    vec![SqlExpr::Param("a".into()), SqlExpr::Param("b".into())],
+                ),
+                Condition::Eq(column(0, "h"), SqlExpr::Param("1.5E0".into())),
+            ],
+            left_joins: Vec::new(),
+            fixed_columns: Vec::new(),
+        };
+        let plan = SqlPlan {
+            order: Vec::new(),
+            offset: 0,
+            limit: None,
+            columns: vec!["x".into()],
+            hidden_columns: Vec::new(),
+            distinct_order: Vec::new(),
+            split_columns: Vec::new(),
+            lexical_hidden_columns: Default::default(),
+            projection: Vec::new(),
+            branches: vec![branch],
+            distinct: false,
+            base_iri: None,
+        };
+        let rendered = plan
+            .to_sql_with(&RenderOptions {
+                keyed_params: &[(0, TermKey::Text), (2, TermKey::OctetLength)],
+                ..RenderOptions::default()
+            })
+            .unwrap();
+        // The value comparison stays, so an index on the column finds the
+        // candidates; the key only filters them.
+        assert_eq!(
+            rendered.sql,
+            "SELECT DISTINCT t0.\"id\" AS \"x\"\n\
+             FROM \"t\" t0\n\
+             WHERE (t0.\"f\" = $1 AND t0.\"f\"::text = $1::text) \
+             AND (t0.\"g\" IN ($2, $3) AND octet_length(t0.\"g\") IN (octet_length($2), octet_length($3))) \
+             AND t0.\"h\" = $4"
+        );
+        assert_eq!(rendered.params, ["0.0E0", "a", "b", "1.5E0"]);
+    }
+
+    #[test]
+    fn removing_duplicates_also_compares_the_keys_of_keyed_columns() {
+        let table = LogicalTable::TableName("t".into());
+        let plan = SqlPlan {
+            order: Vec::new(),
+            offset: 0,
+            limit: None,
+            columns: vec!["x".into(), "n".into()],
+            hidden_columns: Vec::new(),
+            distinct_order: Vec::new(),
+            split_columns: Vec::new(),
+            lexical_hidden_columns: Default::default(),
+            projection: Vec::new(),
+            branches: vec![SqlBranch {
+                order: Vec::new(),
+                arm: 0,
+                from: vec![table.clone()],
+                select: vec![column(0, "f"), column(0, "n")],
+                conditions: Vec::new(),
+                left_joins: Vec::new(),
+                fixed_columns: vec![BTreeSet::new()],
+            }],
+            distinct: true,
+            base_iri: None,
+        };
+        let double = ColumnType {
+            term_key: Some(TermKey::Text),
+            ..ty("double", Comparison::Text, None)
+        };
+        let types: ColumnTypes = [
+            ((table.clone(), "f".to_owned()), double),
+            (
+                (table, "n".to_owned()),
+                ty("integer", Comparison::Value, Some(Lexical::Text)),
+            ),
+        ]
+        .into();
+        let rendered = plan
+            .to_sql_with(&RenderOptions {
+                column_types: Some(&types),
+                ..RenderOptions::default()
+            })
+            .unwrap();
+        // `DISTINCT` would merge -0 and 0; the key is compared too, and
+        // left out of the results.
+        assert_eq!(
+            rendered.sql,
+            "SELECT q.\"x\", q.\"n\"\n\
+             FROM (\n\
+             SELECT DISTINCT t0.\"f\" AS \"x\", t0.\"n\" AS \"n\", t0.\"f\"::text AS \"x_key\"\n\
+             FROM \"t\" t0\n\
+             ) q"
+        );
+        // Without the column types, as `v12n explain` shows it.
+        assert_eq!(
+            plan.to_sql().sql,
+            "SELECT DISTINCT t0.\"f\" AS \"x\", t0.\"n\" AS \"n\"\nFROM \"t\" t0"
+        );
+    }
+
     fn ty(group: &str, comparison: Comparison, lexical: Option<Lexical>) -> ColumnType {
         ColumnType {
             name: group.to_owned(),
@@ -2679,6 +2952,7 @@ mod tests {
             group: group.to_owned(),
             comparison,
             lexical,
+            term_key: None,
         }
     }
 
@@ -2755,6 +3029,15 @@ mod tests {
             same_term_sql(plain(0, "a"), plain(1, "b"), double(), double()).unwrap(),
             r#"t0."a"::text = t1."b"::text"#
         );
+        // bpchar's `=` ignores trailing spaces, which its terms keep.
+        let bpchar = || ColumnType {
+            term_key: Some(TermKey::OctetLength),
+            ..ty("bpchar", Comparison::Value, None)
+        };
+        assert_eq!(
+            same_term_sql(plain(0, "a"), plain(1, "b"), bpchar(), bpchar()).unwrap(),
+            r#"(t0."a" = t1."b" AND octet_length(t0."a") = octet_length(t1."b"))"#
+        );
         // Across groups: natural lexical forms, never an operator error.
         assert_eq!(
             same_term_sql(plain(0, "a"), plain(1, "b"), int(), text()).unwrap(),
@@ -2798,6 +3081,7 @@ mod tests {
             group: class.to_owned(),
             comparison: Comparison::Value,
             lexical,
+            term_key: None,
         }
     }
 
