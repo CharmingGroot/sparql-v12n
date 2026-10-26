@@ -2,7 +2,7 @@ name: Differential
 
 # L4: the same queries through this engine and Ontop (testenv/difftest.sh).
 # Pull requests run it only when they change what produces or checks the
-# results; the nightly run covers everything else.
+# results; the weekly run covers everything else.
 on:
   pull_request:
     paths:
@@ -18,13 +18,15 @@ on:
       - ".config/nextest.toml"
       - ".github/workflows/differential.yml"
   schedule:
-    - cron: "0 18 * * *"
+    # Mondays 03:00 KST.
+    - cron: "0 18 * * 0"
   workflow_dispatch:
 
 concurrency:
   group: differential-${{ github.head_ref || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Same CARGO_* variables as ci.yml, so the Rust cache key matches.
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -37,18 +39,17 @@ jobs:
   ontop:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    # Cases are split across jobs because every case needs its own Ontop
-    # JVM; a shard runs its cases in batches of DIFF_BATCH containers.
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4]
+    # One job compiles the tests once and runs every case in batches of
+    # DIFF_BATCH Ontop containers, one JVM per case.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # Restores the cache that CI saves on main, which already holds the
+      # v12n-difftest build; this workflow never saves it.
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: v12n
+          save-if: false
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
@@ -66,11 +67,10 @@ jobs:
       - run: testenv/difftest.sh
         env:
           DIFF_NEXTEST_PROFILE: ci
-          DIFF_SHARD: ${{ matrix.shard }}/4
           DIFF_BATCH: 10
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: junit-differential-${{ matrix.shard }}
+          name: junit-differential
           path: target/nextest/ci/junit-*.xml
           if-no-files-found: warn

@@ -1,7 +1,10 @@
 name: CI
 
-# Documentation-only pull requests still run every job. A paths-ignore filter
-# here would skip the whole workflow, including pr-conventions and dco.
+# Pull requests: `checks` always runs; `lint` and `test` run unless the
+# pull request changes documentation only. A paths-ignore filter would skip
+# the whole workflow, including the pull request checks.
+# Push to main: only `test`, the one thing a squash merge can change. It also
+# saves the shared Rust cache that every other job restores.
 on:
   pull_request:
   push:
@@ -13,6 +16,8 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# The Rust cache key hashes CARGO_* variables, so differential.yml must set
+# the same ones to share the cache.
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -22,111 +27,44 @@ permissions:
   contents: read
 
 jobs:
-  lint:
+  # Cheap pull request checks that need no Rust toolchain.
+  checks:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.paths.outputs.code }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # First, so the output is set even when a later check fails. Anything
+      # but Markdown, docs/, LICENSE and NOTICE counts as code; if the diff
+      # cannot be read, everything runs.
+      - name: Detect code changes
+        id: paths
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          docs='\.md$|^docs/|^(LICENSE|NOTICE)$'
+          if changed=$(git diff --name-only "$BASE...$HEAD") && ! printf '%s\n' "$changed" | grep -qvE "$docs"; then
+            code=false
+          else
+            code=true
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "code changed: $code"
       - name: Keep tool-specific agent guidance out of the repository
+        if: ${{ !cancelled() }}
         run: |
           if git ls-files | grep -E '(^|/)(AGENTS|CLAUDE|GEMINI)\.md$|(^|/)\.cursorrules$|(^|/)\.(claude|codex|cursor)/|^(worklog|plan|notes)/|^\.github/(copilot-instructions\.md$|instructions/|agents/)'; then
             echo '::error::Tool-specific agent guidance must stay local.'
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      # Only main saves the cache, so pull requests do not evict each other.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-      # --no-tests=pass: the workspace has no tests yet.
-      - run: cargo nextest run --workspace --locked --profile ci --no-tests=pass
-      # nextest does not run doctests.
-      - run: cargo test --workspace --doc --locked
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: junit
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: warn
-
-  # L3: tests that need PostgreSQL run against a service container with
-  # the shop example loaded. They skip themselves in the test job above.
-  postgres:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    services:
-      postgres:
-        # Same image as testenv/difftest.sh, pinned by digest.
-        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
-        env:
-          POSTGRES_USER: v12n
-          POSTGRES_PASSWORD: v12n-dev
-          POSTGRES_DB: shop
-        ports:
-          - 127.0.0.1:55432:5432
-        options: >-
-          --health-cmd "pg_isready -h 127.0.0.1 -U v12n -d shop"
-          --health-interval 2s --health-timeout 5s --health-retries 30
-    env:
-      V12N_TEST_DATABASE_URL: postgresql://v12n:v12n-dev@127.0.0.1:55432/shop
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-      - name: Load the shop example
-        env:
-          CONTAINER: ${{ job.services.postgres.id }}
-        run: cat examples/shop/schema.sql examples/shop/data.sql | docker exec -i "$CONTAINER" psql -q -v ON_ERROR_STOP=1 -U v12n -d shop
-      # Integration test binaries only; the differential tests have their
-      # own workflow.
-      - run: cargo nextest run --workspace --locked --profile ci -E 'kind(test) - package(v12n-difftest)'
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: junit-postgres
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: warn
-
-  msrv:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check --workspace --all-targets --locked
-
-  # PR title becomes the squash commit, so it must follow the commit convention.
-  pr-conventions:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
+      # PR title becomes the squash commit, so it must follow the commit convention.
       - name: Check PR title and linked issue
+        if: ${{ !cancelled() }}
         env:
           TITLE: ${{ github.event.pull_request.title }}
           BODY: ${{ github.event.pull_request.body }}
@@ -150,16 +88,8 @@ jobs:
             echo "::error::Branch must be '<type>/<issue>-<short-name>' (got: $HEAD_REF)"; fail=1
           fi
           exit $fail
-
-  dco:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - name: Check Signed-off-by
+        if: ${{ !cancelled() }}
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
@@ -177,9 +107,107 @@ jobs:
           done
           exit $missing
 
-  deny:
+  # L1: format, lints, dependency policy and the minimum supported Rust
+  # version. Pull requests only: main receives nothing that skipped them.
+  lint:
+    needs: checks
+    if: ${{ !cancelled() && needs.checks.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: v12n
+          save-if: false
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The cache key hashes every installed toolchain, so the MSRV
+      # toolchain is installed only after the cache is restored.
+      - name: MSRV
+        run: |
+          rustup toolchain install 1.88 --profile minimal --no-self-update
+          cargo +1.88 check --workspace --all-targets --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny --all-features check
+
+  # L2 + L3: unit, snapshot and doc tests, then the tests that need
+  # PostgreSQL, from one build.
+  test:
+    needs: checks
+    if: ${{ !cancelled() && (github.event_name == 'push' || needs.checks.outputs.code == 'true') }}
+    runs-on: ubuntu-latest
+    # 20, not 15: a main run that misses the cache builds for every job.
+    timeout-minutes: 20
+    services:
+      postgres:
+        # Same image as testenv/difftest.sh, pinned by digest.
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_USER: v12n
+          POSTGRES_PASSWORD: v12n-dev
+          POSTGRES_DB: shop
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U v12n -d shop"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # The one cache every job and workflow restores; only main saves it,
+      # so pull requests do not evict each other.
+      - uses: Swatinem/rust-cache@v2
+        id: cache
+        with:
+          shared-key: v12n
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      # Without V12N_TEST_DATABASE_URL the database tests skip themselves.
+      - run: cargo nextest run --workspace --locked --profile ci --no-tests=pass
+      - name: Keep the unit test report
+        if: always()
+        run: if [ -f target/nextest/ci/junit.xml ]; then mv target/nextest/ci/junit.xml target/nextest/ci/junit-unit.xml; fi
+      # nextest does not run doctests.
+      - run: cargo test --workspace --doc --locked
+      # The PostgreSQL tests report on their own even when a test above fails.
+      - name: Load the shop example
+        if: ${{ !cancelled() }}
+        env:
+          CONTAINER: ${{ job.services.postgres.id }}
+        run: cat examples/shop/schema.sql examples/shop/data.sql | docker exec -i "$CONTAINER" psql -q -v ON_ERROR_STOP=1 -U v12n -d shop
+      # Integration test binaries against PostgreSQL; reuses the build above.
+      # The differential tests have their own workflow.
+      - name: PostgreSQL tests
+        if: ${{ !cancelled() }}
+        env:
+          V12N_TEST_DATABASE_URL: postgresql://v12n:v12n-dev@127.0.0.1:55432/shop
+        run: cargo nextest run --workspace --locked --profile ci -E 'kind(test) - package(v12n-difftest)'
+      - name: Keep the PostgreSQL test report
+        if: always()
+        run: if [ -f target/nextest/ci/junit.xml ]; then mv target/nextest/ci/junit.xml target/nextest/ci/junit-postgres.xml; fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: junit
+          path: target/nextest/ci/junit-*.xml
+          if-no-files-found: warn
+      # When main is about to save a new cache, put the builds of the other
+      # jobs into it too: clippy reuses `cargo check` dependencies, the MSRV
+      # check needs its own toolchain, and the differential tests build
+      # v12n-difftest alone, which unifies features differently. The cache
+      # is not saved on an exact hit, so this runs only after a miss.
+      - name: Warm the shared cache for lint, MSRV and differential
+        if: github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo check --workspace --all-targets --locked
+          rustup toolchain install 1.88 --profile minimal --no-self-update
+          cargo +1.88 check --workspace --all-targets --locked
+          cargo nextest run -p v12n-difftest --locked --no-run
