@@ -167,6 +167,53 @@ async fn truncation_is_known_after_the_first_solution() {
     }
 }
 
+/// Discussion #22 at the edges of the row limit (3 here): exactly 3
+/// solutions are complete, a fourth one is truncation, and a query `LIMIT`
+/// at or below the row limit, which runs without the row count, is never
+/// truncated, with or without `ORDER BY`, `OFFSET`, `DISTINCT` or `UNION`.
+#[tokio::test]
+async fn truncation_at_the_edges_of_the_row_limit_and_a_query_limit() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        "SELECT n AS id, n % 2 AS k FROM generate_series(1, 5) n",
+        &["k"],
+    );
+    let limits = Limits {
+        row_limit: 3,
+        ..Limits::default()
+    };
+    let ordered = "SELECT ?row WHERE { ?row ex:k ?k } ORDER BY DESC(?row)";
+    let distinct = "SELECT DISTINCT ?row ?k WHERE { ?row ex:k ?k } ORDER BY DESC(?row)";
+    let union = "SELECT ?row WHERE { { ?row ex:k 0 } UNION { ?row ex:k 1 } } ORDER BY DESC(?row)";
+    for (body, modifiers, expected, truncated) in [
+        (ordered, "", &[5, 4, 3][..], true),
+        (ordered, "LIMIT 0", &[], false),
+        (ordered, "LIMIT 2", &[5, 4], false),
+        (ordered, "LIMIT 3", &[5, 4, 3], false),
+        (ordered, "LIMIT 4", &[5, 4, 3], true),
+        (ordered, "OFFSET 2", &[3, 2, 1], false),
+        (ordered, "LIMIT 3 OFFSET 1", &[4, 3, 2], false),
+        (ordered, "LIMIT 4 OFFSET 1", &[4, 3, 2], true),
+        (ordered, "LIMIT 4 OFFSET 2", &[3, 2, 1], false),
+        (ordered, "LIMIT 3 OFFSET 4", &[1], false),
+        (distinct, "LIMIT 3", &[5, 4, 3], false),
+        (distinct, "LIMIT 4", &[5, 4, 3], true),
+        (union, "LIMIT 3", &[5, 4, 3], false),
+        (union, "LIMIT 4", &[5, 4, 3], true),
+    ] {
+        let query = format!("{body} {modifiers}");
+        let (rows, cut) = ordered_rows(&url, &mapping, &query, limits).await;
+        assert_eq!((rows.as_slice(), cut), (expected, truncated), "{query}");
+    }
+    for (modifiers, rows, truncated) in [("LIMIT 3", 3, false), ("LIMIT 4", 3, true)] {
+        let query = format!(
+            "PREFIX ex: <http://example.org/>\nSELECT ?row WHERE {{ ?row ex:k ?k }} {modifiers}"
+        );
+        let (solutions, cut) = run(&url, limits, &plan(&mapping, &query)).await.unwrap();
+        assert_eq!((solutions.len(), cut), (rows, truncated), "{modifiers}");
+    }
+}
+
 fn sql_query_mapping(sql: &str, columns: &[&str]) -> String {
     let objects: String = columns
         .iter()

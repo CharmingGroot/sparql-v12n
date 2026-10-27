@@ -1,0 +1,16 @@
+---
+source: crates/v12n-postgres/src/lib.rs
+expression: "SELECT ?x WHERE { { ?x ex:name ?v } UNION { ?x ex:amount ?v } } ORDER BY ?v LIMIT 2"
+---
+SELECT q."x", q."x_1", q."o1_text"
+FROM (
+SELECT DISTINCT t0."id" AS "x", NULL AS "x_1", pg_typeof(t0."name")::text || ' ' || t0."name"::text AS "v", (t0."name"::text) AS "o1_text"
+FROM "customers" t0
+WHERE t0."id" IS NOT NULL AND t0."name" IS NOT NULL
+UNION ALL
+SELECT DISTINCT NULL AS "x", t0."id" AS "x_1", pg_typeof(t0."amount")::text || ' ' || t0."amount"::text AS "v", (t0."amount"::text) AS "o1_text"
+FROM "orders" t0
+WHERE t0."id" IS NOT NULL AND t0."amount" IS NOT NULL
+) q
+ORDER BY q."o1_text" COLLATE "C"
+LIMIT $1::int8
