@@ -132,7 +132,7 @@ fn unfold_constant_iri_outside_template_has_no_rows() {
     )
     .unwrap();
     assert!(plan.branches.is_empty());
-    assert_eq!(plan.to_sql().sql, "SELECT 1 WHERE false");
+    assert_eq!(plan.to_sql().unwrap().sql, "SELECT 1 WHERE false");
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn unfold_overlapping_shapes_share_a_computed_column() {
             .all(|b| matches!(&b.select[..], [SqlExpr::Term { guard: None, .. }])),
         "{plan:?}"
     );
-    let sql = plan.to_sql().sql;
+    let sql = plan.to_sql().unwrap().sql;
     assert!(
         sql.starts_with("SELECT ($1 || CASE WHEN t0.\"id\"::text ~ '^[")
             && sql.contains("\nUNION\nSELECT (t0.\"iri\"::text)::text AS \"x\""),
@@ -340,6 +340,7 @@ fn unfold_distinct_over_union_uses_union() {
     let sql = unfold_query(&mapping, "SELECT DISTINCT ?x WHERE { ?x a ex:Thing }")
         .unwrap()
         .to_sql()
+        .unwrap()
         .sql;
     assert_eq!(
         sql,
@@ -356,7 +357,7 @@ fn unfold_literal_constants_are_parameters_not_sql_text() {
         r#"SELECT ?c WHERE { ?c ex:tier "x'; DROP TABLE customers; --" }"#,
     )
     .unwrap();
-    let rendered = plan.to_sql();
+    let rendered = plan.to_sql().unwrap();
     assert!(!rendered.sql.contains("DROP"));
     assert_eq!(rendered.params, ["x'; DROP TABLE customers; --"]);
 }
@@ -719,7 +720,7 @@ fn unfold_optional_over_several_matching_triples_maps_splits_the_branch() {
     // ?v is unbound where no part matched; the choices share its column.
     assert_eq!(rest.select[1], SqlExpr::Unbound);
     assert_eq!(plan.projection[1].terms.len(), 1);
-    let sql = plan.to_sql().sql;
+    let sql = plan.to_sql().unwrap().sql;
     assert!(
         sql.contains(
             "LEFT JOIN \"a\" t1 ON t1.\"id\" = t0.\"id\" AND t1.\"v\" IS NOT NULL\n\
@@ -1020,7 +1021,7 @@ fn unfold_union_gives_each_arm_its_branches() {
     assert_eq!(plan.branches[1].select[1], SqlExpr::Unbound);
     // Bag union of the arms; duplicates are removed within each.
     assert_eq!(
-        plan.to_sql().sql,
+        plan.to_sql().unwrap().sql,
         "SELECT DISTINCT t0.\"id\" AS \"x\", t0.\"v\" AS \"v\", NULL AS \"w\"\n\
          FROM \"a\" t0\n\
          WHERE t0.\"id\" IS NOT NULL AND t0.\"v\" IS NOT NULL\n\
@@ -1031,10 +1032,10 @@ fn unfold_union_gives_each_arm_its_branches() {
     );
     // The same side twice counts twice; under DISTINCT once.
     let plan = union_query("SELECT ?x WHERE { { ?x ex:p ?v } UNION { ?x ex:p ?v } }").unwrap();
-    assert!(plan.to_sql().sql.contains("\nUNION ALL\n"));
+    assert!(plan.to_sql().unwrap().sql.contains("\nUNION ALL\n"));
     let plan =
         union_query("SELECT DISTINCT ?x WHERE { { ?x ex:p ?v } UNION { ?x ex:p ?v } }").unwrap();
-    let sql = plan.to_sql().sql;
+    let sql = plan.to_sql().unwrap().sql;
     assert!(
         sql.contains("\nUNION\n") && !sql.contains("UNION ALL"),
         "{sql}"
@@ -1046,7 +1047,7 @@ fn unfold_union_arm_with_several_branches_is_parenthesized() {
     let plan = union_query("SELECT ?x WHERE { { ?x a ex:Thing } UNION { ?x ex:p ?v } }").unwrap();
     let arms: Vec<usize> = plan.branches.iter().map(|b| b.arm).collect();
     assert_eq!(arms, [0, 0, 1]);
-    let sql = plan.to_sql().sql;
+    let sql = plan.to_sql().unwrap().sql;
     assert!(
         sql.starts_with("SELECT q.\"x\"\nFROM (\n(SELECT ")
             && sql.contains("\nUNION\nSELECT ")

@@ -203,6 +203,28 @@ fn explain_unsupported_feature_exits_one() {
 }
 
 #[test]
+fn explain_plan_that_cannot_be_rendered_exits_one() {
+    let case = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/diff/0006-filter");
+    let output = v12n(
+        &[
+            "explain",
+            &format!("{case}/mapping.ttl"),
+            &format!("{case}/queries/language-tag-not-equal.rq"),
+        ],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let error = stdout_json(&output);
+    assert_eq!(error["error"]["kind"], json!("unsupported"));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("under negation")
+    );
+}
+
+#[test]
 fn explain_query_syntax_error_exits_one() {
     let output = v12n(&["explain", SHOP, "-"], "SELECT ?x WHERE {");
     assert_eq!(output.status.code(), Some(1));

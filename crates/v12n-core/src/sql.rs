@@ -760,9 +760,11 @@ impl SqlPlan {
     /// Without column types, a [`Condition::SameTerm`] compares columns
     /// with `=` and template columns by their text output, which is what
     /// the database sees for text and integer columns.
-    pub fn to_sql(&self) -> RenderedSql {
+    ///
+    /// Rendering fails with [`Error::UnsupportedFeature`] for a plan whose
+    /// SQL would not follow SPARQL's semantics, even without column types.
+    pub fn to_sql(&self) -> Result<RenderedSql, Error> {
         self.to_sql_with(&RenderOptions::default())
-            .expect("rendering without column types does not fail")
     }
 
     /// Like [`to_sql`](Self::to_sql), with what a database adapter knows:
@@ -2683,7 +2685,7 @@ mod tests {
             ((view, "ID".to_owned()), "id".to_owned()),
         ]);
         assert_eq!(
-            plan.with_resolved_columns(&resolved).to_sql().sql,
+            plan.with_resolved_columns(&resolved).to_sql().unwrap().sql,
             "SELECT DISTINCT t0.\"id\" AS \"a\", t1.\"V\" AS \"b\"\n\
              FROM (SELECT 1 AS Id, 2 AS \"V\") t0\n\
              JOIN (SELECT 1 AS Id, 2 AS \"V\") t1 ON $1 || t0.\"id\"::text = $2 || t1.\"id\"::text\n\
@@ -2743,7 +2745,7 @@ mod tests {
             "SELECT ?c ?o ?a WHERE { ?c ex:tier \"VIP\" \
              OPTIONAL { ?o ex:placedBy ?c OPTIONAL { ?o ex:amount ?a } } }",
         );
-        let rendered = plan.to_sql();
+        let rendered = plan.to_sql().unwrap();
         assert_eq!(
             rendered.sql,
             "SELECT DISTINCT t0.\"id\" AS \"c\", t1.\"id\" AS \"o\", t2.\"amount\" AS \"a\"\n\
@@ -2763,7 +2765,7 @@ mod tests {
         let plan = optional_plan(
             "SELECT ?c ?o WHERE { ?c ex:tier \"VIP\" OPTIONAL { ?o ex:placedBy ?c ; ex:amount 100 } }",
         );
-        let rendered = plan.to_sql();
+        let rendered = plan.to_sql().unwrap();
         assert_eq!(rendered.params, ["100", "VIP"]);
         assert_eq!(rendered.param_required, [false, true]);
     }
@@ -2776,7 +2778,7 @@ mod tests {
             "SELECT ?o ?n WHERE { ?o ex:amount ?a OPTIONAL { ?o ex:placedBy ?c } ?c ex:name ?n }",
         );
         assert_eq!(
-            plan.to_sql().sql,
+            plan.to_sql().unwrap().sql,
             "SELECT q.\"o\", q.\"n\"\nFROM (\n\
              SELECT DISTINCT t0.\"id\" AS \"o\", t0.\"amount\" AS \"a\", t2.\"id\" AS \"c\", \
              t2.\"name\" AS \"n\"\n\
@@ -2794,10 +2796,11 @@ mod tests {
         let plan = optional_plan("SELECT ?c WHERE { OPTIONAL { ?c ex:tier ?t } }");
         assert!(
             plan.to_sql()
+                .unwrap()
                 .sql
                 .contains("FROM (SELECT) u0\nLEFT JOIN \"customers\" t0 ON "),
             "{}",
-            plan.to_sql().sql
+            plan.to_sql().unwrap().sql
         );
     }
 
@@ -2870,7 +2873,7 @@ mod tests {
             distinct: true,
             base_iri: None,
         };
-        let rendered = plan.to_sql();
+        let rendered = plan.to_sql().unwrap();
         assert_eq!(
             rendered.sql,
             "SELECT DISTINCT t0.\"id\" AS \"x\"\n\
@@ -2943,7 +2946,7 @@ mod tests {
         );
         assert_eq!(rendered.param_branches, [0, 0, 1, 1]);
         assert_eq!(
-            plan.to_sql().sql,
+            plan.to_sql().unwrap().sql,
             rendered.sql.replace("::text = $4", " = $4")
         );
     }
@@ -3054,7 +3057,7 @@ mod tests {
         );
         // Without the column types, as `v12n explain` shows it.
         assert_eq!(
-            plan.to_sql().sql,
+            plan.to_sql().unwrap().sql,
             "SELECT DISTINCT t0.\"f\" AS \"x\", t0.\"n\" AS \"n\"\nFROM \"t\" t0"
         );
     }
@@ -3341,7 +3344,7 @@ mod tests {
         assert_eq!(plan.split_columns, [["v", "v_1"]]);
         assert_eq!(plan.distinct_order, [2, 0, 1]);
         assert_eq!(
-            plan.to_sql().sql,
+            plan.to_sql().unwrap().sql,
             "SELECT q.\"v\", q.\"v_1\"\nFROM (\n\
              SELECT pg_typeof(t0.\"h\")::text || ' ' || t0.\"h\"::text AS \"h\", \
              t0.\"v\" AS \"v\", NULL::pg_catalog.text AS \"v_1\"\n\
@@ -3361,7 +3364,7 @@ mod tests {
         // Template values: 7 and 7.00 give the same IRI.
         let plan = with_union_types(&union_plan(false), numeric, int()).unwrap();
         assert!(plan.split_columns.is_empty());
-        let sql = plan.to_sql().sql;
+        let sql = plan.to_sql().unwrap().sql;
         assert!(
             sql.contains("trim_scale(t0.\"v\")::text AS \"v\"\nFROM \"a\"")
                 && sql.contains("t0.\"v\"::text AS \"v\"\nFROM \"b\""),
@@ -3407,6 +3410,7 @@ mod tests {
             .with_union_types(&types(int(), text()))
             .unwrap()
             .to_sql()
+            .unwrap()
             .sql;
         assert_eq!(
             sql.matches("pg_typeof(t0.\"h\"::text)::text || ' ' || t0.\"h\"::text::text AS \"h\"")
@@ -3490,21 +3494,21 @@ mod tests {
     #[test]
     fn duplicates_are_removed_over_all_variables_then_projected() {
         assert_eq!(
-            keyed_plan(&[], true).to_sql().sql,
+            keyed_plan(&[], true).to_sql().unwrap().sql,
             "SELECT q.\"s\"\nFROM (\n\
              SELECT DISTINCT t0.\"Id\" AS \"s\", t0.\"v\" AS \"o\"\n\
              FROM \"T\" t0\n\
              ) q"
         );
         assert_eq!(
-            keyed_plan(&[], false).to_sql().sql,
+            keyed_plan(&[], false).to_sql().unwrap().sql,
             "SELECT DISTINCT t0.\"Id\" AS \"s\"\nFROM \"T\" t0"
         );
         let mut no_columns = keyed_plan(&[], true);
         no_columns.columns.clear();
         no_columns.branches[0].select.remove(0);
         assert_eq!(
-            no_columns.to_sql().sql,
+            no_columns.to_sql().unwrap().sql,
             "SELECT 1\nFROM (\n\
              SELECT DISTINCT t0.\"v\" AS \"o\"\n\
              FROM \"T\" t0\n\
@@ -3552,7 +3556,7 @@ mod tests {
         assert!(distinct.key_tables().is_empty());
         assert!(!distinct.has_duplicates(None));
         assert_eq!(
-            distinct.to_sql().sql,
+            distinct.to_sql().unwrap().sql,
             "SELECT DISTINCT t0.\"Id\" AS \"s\"\nFROM \"T\" t0"
         );
     }
@@ -3581,6 +3585,6 @@ mod tests {
             distinct: false,
             base_iri: None,
         };
-        assert_eq!(plan.to_sql().sql, "SELECT 1 WHERE false");
+        assert_eq!(plan.to_sql().unwrap().sql, "SELECT 1 WHERE false");
     }
 }

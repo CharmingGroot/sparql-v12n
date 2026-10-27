@@ -818,7 +818,7 @@ mod tests {
         let mapping = Mapping::from_turtle(SHOP).unwrap();
         let query = sparql::parse(&format!("PREFIX ex: <http://example.org/>\n{query}")).unwrap();
         let plan = unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping)).unwrap();
-        let rendered = plan.to_sql();
+        let rendered = plan.to_sql().unwrap();
         let decoders: Vec<Option<Decoder>> = plan
             .columns
             .iter()

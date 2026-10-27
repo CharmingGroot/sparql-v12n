@@ -239,7 +239,12 @@ async fn answer(
     )
     .await?;
     let plan = plan(app, &query)?;
-    tracing::info!(query_id, sql = %plan.to_sql().sql, "unfolded");
+    // The adapter renders again with column types and reports a
+    // rendering error with the right status.
+    match plan.to_sql() {
+        Ok(rendered) => tracing::info!(query_id, sql = %rendered.sql, "unfolded"),
+        Err(_) => tracing::info!(query_id, "unfolded"),
+    }
 
     // Refusing at once instead of queueing keeps a burst from holding
     // client connections open with no bound.

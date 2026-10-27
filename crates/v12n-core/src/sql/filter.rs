@@ -1256,6 +1256,15 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn rendering_without_column_types_reports_an_unsupported_comparison() {
+        let plan = plan("SELECT ?s WHERE { ?s ex:label ?x FILTER(?x != \"a\"@en) }").unwrap();
+        match plan.to_sql() {
+            Err(Error::UnsupportedFeature(reason)) => assert!(reason.contains("under negation")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn literals_outside_the_operator_mapping_are_only_equal_as_terms() {
         assert_eq!(x("label", "?x = \"a\"@en"), "(t0.\"txt\" = $1)");
         assert!(rejected("?s ex:label ?x", "?x != \"a\"@en").contains("under negation"));

@@ -612,7 +612,10 @@ fn explain(
     output: Output,
 ) -> Result<(), Failure> {
     let plan = load_plan(mapping_path, query, base_iri)?;
-    let rendered = plan.to_sql();
+    // Rendering fails only for a plan that SQL cannot answer as SPARQL does.
+    let rendered = plan
+        .to_sql()
+        .map_err(|e| Failure::new(EXIT_INPUT, "unsupported", e.to_string()))?;
 
     match output.format {
         Format::Json => {
