@@ -1,0 +1,11 @@
+---
+source: crates/v12n-postgres/src/lib.rs
+expression: "SELECT ?o WHERE { ?o ex:amount ?a } LIMIT 2"
+---
+SELECT q."o"
+FROM (
+SELECT DISTINCT t0."id" AS "o", t0."amount" AS "a"
+FROM "orders" t0
+WHERE t0."id" IS NOT NULL AND t0."amount" IS NOT NULL
+) q
+LIMIT $1::int8

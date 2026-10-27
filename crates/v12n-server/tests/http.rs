@@ -250,6 +250,32 @@ async fn row_limit_truncation_is_200_with_the_truncated_header() {
         let json: Value = serde_json::from_str(&text(response).await).unwrap();
         assert_eq!(solutions(&json).len(), rows, "row limit {row_limit}");
     }
+    // A query LIMIT at or below the row limit cannot be truncated.
+    for (limit, row_limit, header, rows) in [
+        (2, 2, None, 2),
+        (3, 2, Some("2"), 2),
+        (3, 3, None, 3),
+        (4, 3, None, 3),
+    ] {
+        let app = new_app(SHOP, &url, limits(row_limit, Duration::from_secs(30)));
+        let query = format!("{CUSTOMERS} ORDER BY ?c LIMIT {limit}");
+        let response = send(&app, get(&query)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(TRUNCATED_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            header,
+            "LIMIT {limit}, row limit {row_limit}"
+        );
+        let json: Value = serde_json::from_str(&text(response).await).unwrap();
+        assert_eq!(
+            solutions(&json).len(),
+            rows,
+            "LIMIT {limit}, row limit {row_limit}"
+        );
+    }
 }
 
 fn sleeping_mapping(seconds: f64) -> String {

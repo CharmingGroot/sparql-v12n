@@ -1,0 +1,12 @@
+---
+source: crates/v12n-postgres/src/lib.rs
+expression: "SELECT DISTINCT ?a WHERE { ?o ex:amount ?a } ORDER BY ?a LIMIT 2"
+---
+SELECT q."a", q."o1_text"
+FROM (
+SELECT DISTINCT t0."amount" AS "a", (t0."amount"::text) AS "o1_text"
+FROM "orders" t0
+WHERE t0."id" IS NOT NULL AND t0."amount" IS NOT NULL
+) q
+ORDER BY q."o1_text" COLLATE "C"
+LIMIT $1::int8
