@@ -1,0 +1,13 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_merged(\"SELECT * WHERE { { ?a ex:hostname ?h ; ex:criticality ?c } \\\n         UNION { ?f ex:title ?t ; ex:severityId ?s } }\")"
+---
+SELECT t0."id" AS "a", t0."criticality" AS "c", NULL AS "f", t0."hostname" AS "h", NULL AS "s", NULL AS "t"
+FROM "assets" t0
+WHERE t0."hostname" IS NOT NULL AND t0."criticality" IS NOT NULL
+UNION ALL
+SELECT NULL AS "a", NULL AS "c", t0."id" AS "f", NULL AS "h", t0."severity_id" AS "s", t0."title" AS "t"
+FROM "alerts" t0
+WHERE t0."title" IS NOT NULL AND t0."severity_id" IS NOT NULL
+
+-- params

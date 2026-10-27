@@ -3,7 +3,7 @@
 
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
 use v12n_core::sql::{ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, TableKeys};
-use v12n_core::{sparql, unfold};
+use v12n_core::{optimize, sparql, unfold};
 
 const SHOP: &str = include_str!("../../../examples/shop/mapping.ttl");
 const VIP_ORDERS: &str = include_str!("../../../examples/shop/queries/vip-orders.rq");
@@ -517,5 +517,114 @@ fn limit_without_order_by_applies_to_the_whole_union() {
             "{PREFIXES}SELECT ?x WHERE {{ {{ ?x a ex:Client }} UNION {{ ?x a ex:Order }} }} LIMIT 3"
         ),
         Some(&union_keys())
+    ));
+}
+
+const MDR: &str = include_str!("../../../tests/diff/0001-mdr/mapping.ttl");
+
+/// The primary keys of the MDR tables, as the database adapter reads them.
+fn mdr_keys() -> TableKeys {
+    [
+        ("assets", vec!["id"]),
+        ("alerts", vec!["id"]),
+        ("links", vec!["src_id", "dst_id"]),
+    ]
+    .into_iter()
+    .map(|(table, key)| {
+        (
+            LogicalTable::TableName(table.into()),
+            vec![key.into_iter().map(str::to_owned).collect()],
+        )
+    })
+    .collect()
+}
+
+/// The SQL after merging the scans that the keys pin to one row (#28).
+fn explain_merged(query: &str) -> String {
+    let mapping = Mapping::from_turtle(MDR).unwrap();
+    let index = MappingIndex::new(&mapping);
+    let query = sparql::parse(&format!("{PREFIXES}{query}")).unwrap();
+    let plan = unfold::unfold(&query, &mapping, &index).unwrap();
+    let keys = mdr_keys();
+    let plan = optimize::eliminate_self_joins(&plan, &keys).unwrap_or(plan);
+    let rendered = plan
+        .to_sql_with(&RenderOptions {
+            keys: Some(&keys),
+            ..RenderOptions::default()
+        })
+        .unwrap();
+    let mut out = rendered.sql;
+    out.push_str("\n\n-- params\n");
+    for (i, p) in rendered.params.iter().enumerate() {
+        out.push_str(&format!("${} = {p:?}\n", i + 1));
+    }
+    out
+}
+
+/// bench q03: two properties of one asset read one row.
+#[test]
+fn self_join_star_reads_the_table_once() {
+    insta::assert_snapshot!(explain_merged(
+        r#"SELECT ?asset ?hostname WHERE { ?asset ex:criticality "High" ; ex:hostname ?hostname }"#
+    ));
+}
+
+/// bench q01: both properties come from the row the constant pins, so the
+/// `CROSS JOIN` of two key lookups is one lookup.
+#[test]
+fn self_join_constant_subject_is_one_lookup() {
+    insta::assert_snapshot!(explain_merged(
+        "SELECT ?title ?severity WHERE { \
+         <http://example.org/alert/4242> ex:title ?title ; ex:severityId ?severity }"
+    ));
+}
+
+/// bench q02 with a star on the joined asset: each table once, joined on
+/// the template columns.
+#[test]
+fn self_join_star_on_both_sides_of_a_join() {
+    insta::assert_snapshot!(explain_merged(
+        "SELECT ?finding ?hostname WHERE { ?finding ex:severityId 5 ; ex:onAsset ?asset ; \
+         ex:title ?title . ?asset a ex:Asset ; ex:hostname ?hostname ; ex:criticality ?c }"
+    ));
+}
+
+/// The parent of a referencing object map is the row that the hostname
+/// pattern reads.
+#[test]
+fn self_join_parent_of_a_referencing_object_map() {
+    insta::assert_snapshot!(explain_merged(
+        "SELECT ?a ?b ?h WHERE { ?a ex:connectsTo ?b . ?b ex:hostname ?h }"
+    ));
+}
+
+/// Two scans inside one `OPTIONAL` part merge; a scan on each side of it
+/// does not (bench q04): the part's columns are `NULL` where it does not
+/// match.
+#[test]
+fn self_join_inside_optional_merges_across_it_does_not() {
+    insta::assert_snapshot!(explain_merged(
+        "SELECT ?a ?c ?f ?t WHERE { ?a ex:hostname ?h \
+         OPTIONAL { ?a ex:criticality ?c } \
+         OPTIONAL { ?f ex:onAsset ?a ; ex:title ?t } }"
+    ));
+}
+
+/// Each arm of a `UNION` is its own `SELECT`, merged on its own.
+#[test]
+fn self_join_in_each_union_arm() {
+    insta::assert_snapshot!(explain_merged(
+        "SELECT * WHERE { { ?a ex:hostname ?h ; ex:criticality ?c } \
+         UNION { ?f ex:title ?t ; ex:severityId ?s } }"
+    ));
+}
+
+/// `ORDER BY` and `FILTER` read the merged scan, and one `SELECT` keeps
+/// sorting by the columns themselves.
+#[test]
+fn self_join_with_filter_order_and_limit() {
+    insta::assert_snapshot!(explain_merged(
+        "SELECT ?f ?t WHERE { ?f ex:severityId ?s ; ex:title ?t FILTER(?s >= 3) } \
+         ORDER BY DESC(?s) ?t LIMIT 10"
     ));
 }

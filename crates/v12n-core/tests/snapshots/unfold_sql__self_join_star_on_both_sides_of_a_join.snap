@@ -1,0 +1,11 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_merged(\"SELECT ?finding ?hostname WHERE { ?finding ex:severityId 5 ; ex:onAsset ?asset ; \\\n         ex:title ?title . ?asset a ex:Asset ; ex:hostname ?hostname ; ex:criticality ?c }\")"
+---
+SELECT t0."id" AS "finding", t1."hostname" AS "hostname"
+FROM "alerts" t0
+JOIN "assets" t1 ON t1."id" = t0."asset_id"
+WHERE t0."severity_id" = $1 AND t0."title" IS NOT NULL AND t1."hostname" IS NOT NULL AND t1."criticality" IS NOT NULL
+
+-- params
+$1 = "5"

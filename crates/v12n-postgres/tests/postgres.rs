@@ -2546,3 +2546,198 @@ async fn constant_terms_alone_are_projected() {
         }
     }
 }
+
+/// Keys that merge two scans of a table identify a row by SQL `=`: not
+/// `NULL`, the index's collation and default operator class as the
+/// column's, and a type whose `=` needs no cast or term key. The keys for
+/// removing duplicates stay as they were.
+#[tokio::test]
+async fn merge_keys_identify_one_row_by_equality() {
+    let Some(url) = database_url() else { return };
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            r#"DROP SCHEMA IF EXISTS v12n_merge CASCADE;
+            CREATE SCHEMA v12n_merge;
+            CREATE TABLE v12n_merge.pk (id int PRIMARY KEY, v text, w text);
+            CREATE TABLE v12n_merge.composite (a int, b bigint, v text, w text, PRIMARY KEY (a, b));
+            CREATE TABLE v12n_merge.unique_not_null (id int, v text NOT NULL UNIQUE, w text);
+            CREATE TABLE v12n_merge.nullable (id int, v text UNIQUE, w text);
+            CREATE TABLE v12n_merge.expression (id int NOT NULL, v text, w text);
+            CREATE UNIQUE INDEX ON v12n_merge.expression (id, lower(v));
+            CREATE TABLE v12n_merge.double (id float8 PRIMARY KEY, v text, w text);
+            CREATE TABLE v12n_merge.padded (id char(3) PRIMARY KEY, v text, w text);
+            CREATE TABLE v12n_merge.opclass (id int, v text NOT NULL, w text);
+            CREATE UNIQUE INDEX ON v12n_merge.opclass (v text_pattern_ops);
+            CREATE TABLE v12n_merge.collation (id int, v text COLLATE "C" NOT NULL, w text);
+            CREATE UNIQUE INDEX ON v12n_merge.collation (v COLLATE "POSIX");
+            CREATE TABLE v12n_merge.decimal (id numeric PRIMARY KEY, v text, w text);
+            CREATE TABLE v12n_merge.parent (id int PRIMARY KEY, v text, w text);
+            CREATE TABLE v12n_merge.child () INHERITS (v12n_merge.parent);
+            CREATE TABLE v12n_merge.partitioned (id int PRIMARY KEY, v text, w text) PARTITION BY RANGE (id);
+            CREATE TABLE v12n_merge.partition PARTITION OF v12n_merge.partitioned FOR VALUES FROM (0) TO (10);"#,
+        )
+        .await
+        .unwrap();
+    let database = Database::connect(&url, Limits::default()).await.unwrap();
+    let mut found = Vec::new();
+    for table in [
+        "pk",
+        "composite",
+        "unique_not_null",
+        "nullable",
+        "expression",
+        "double",
+        "padded",
+        "opclass",
+        "collation",
+        "decimal",
+        "parent",
+        "partitioned",
+    ] {
+        let mapping = format!(
+            "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
+             <#M> rr:logicalTable [ rr:tableName \"v12n_merge.{table}\" ] ;\n\
+               rr:subjectMap [ rr:template \"http://example.org/{{id}}\" ] ;\n\
+               rr:predicateObjectMap [ rr:predicate <http://example.org/v> ; rr:objectMap [ rr:column \"v\" ] ] ;\n\
+               rr:predicateObjectMap [ rr:predicate <http://example.org/w> ; rr:objectMap [ rr:column \"w\" ] ] ."
+        );
+        let plan = plan(
+            &mapping,
+            "SELECT ?s WHERE { ?s <http://example.org/v> ?v ; <http://example.org/w> ?w }",
+        );
+        let mut keys: Vec<Vec<String>> = database
+            .merge_keys(&plan)
+            .await
+            .unwrap()
+            .expect("the table is scanned twice")
+            .into_values()
+            .flatten()
+            .collect();
+        keys.sort();
+        found.push((table, keys));
+    }
+    client
+        .batch_execute("DROP SCHEMA v12n_merge CASCADE")
+        .await
+        .unwrap();
+    let k = |columns: &[&str]| vec![columns.iter().map(|c| c.to_string()).collect::<Vec<_>>()];
+    let none: Vec<Vec<String>> = Vec::new();
+    assert_eq!(
+        found,
+        [
+            ("pk", k(&["id"])),
+            ("composite", k(&["a", "b"])),
+            ("unique_not_null", k(&["v"])),
+            ("nullable", none.clone()),
+            ("expression", none.clone()),
+            ("double", none.clone()),
+            ("padded", none.clone()),
+            ("opclass", none.clone()),
+            ("collation", none.clone()),
+            ("decimal", k(&["id"])),
+            ("parent", none.clone()),
+            ("partitioned", k(&["id"])),
+        ]
+    );
+}
+
+const SELF_JOIN: &str = r#"@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+<#Asset> rr:logicalTable [ rr:tableName "v12n_self.assets" ] ;
+  rr:subjectMap [ rr:template "http://example.org/asset/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:hostname ; rr:objectMap [ rr:column "hostname" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:criticality ; rr:objectMap [ rr:column "criticality" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:site ; rr:objectMap [ rr:column "site" ] ] .
+<#Badge> rr:logicalTable [ rr:tableName "v12n_self.badges" ] ;
+  rr:subjectMap [ rr:template "http://example.org/badge/{code}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "label" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:holder ; rr:objectMap [ rr:column "holder" ] ] .
+<#Group> rr:logicalTable [ rr:tableName "v12n_self.groups" ] ;
+  rr:subjectMap [ rr:template "http://example.org/group/{grp}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:x ; rr:objectMap [ rr:column "x" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:y ; rr:objectMap [ rr:column "y" ] ] .
+"#;
+
+/// Merged scans return the same solutions, and scans that no key pins to
+/// one row stay: a nullable unique column (a row without a code has no
+/// subject), a unique index over an expression (two rows of one group),
+/// and the two sides of `OPTIONAL` (an asset with a criticality but no
+/// site binds neither).
+#[tokio::test]
+async fn merged_scans_give_the_same_solutions() {
+    let Some(url) = database_url() else { return };
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            r#"DROP SCHEMA IF EXISTS v12n_self CASCADE;
+            CREATE SCHEMA v12n_self;
+            CREATE TABLE v12n_self.assets (id int PRIMARY KEY, hostname text NOT NULL, criticality text, site text);
+            INSERT INTO v12n_self.assets VALUES (1, 'a', 'High', 'x'), (2, 'b', 'High', NULL), (3, 'c', NULL, 'y');
+            CREATE TABLE v12n_self.badges (code text UNIQUE, label text, holder text);
+            INSERT INTO v12n_self.badges VALUES ('k1', 'one', 'kim'), (NULL, 'none', 'lee');
+            CREATE TABLE v12n_self.groups (grp int NOT NULL, name text NOT NULL, x text, y text);
+            CREATE UNIQUE INDEX ON v12n_self.groups (grp, lower(name));
+            INSERT INTO v12n_self.groups VALUES (1, 'a', 'x1', 'y1'), (1, 'b', 'x2', 'y2');"#,
+        )
+        .await
+        .unwrap();
+    let database = Database::connect(&url, Limits::default()).await.unwrap();
+    let mut results = Vec::new();
+    for (body, scans) in [
+        (r#"?a ex:criticality "High" ; ex:hostname ?h"#, 1),
+        (
+            "<http://example.org/asset/2> ex:hostname ?h ; ex:criticality ?c",
+            1,
+        ),
+        (
+            "?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c ; ex:site ?s }",
+            2,
+        ),
+        ("?b ex:label ?l ; ex:holder ?h", 2),
+        ("?g ex:x ?x ; ex:y ?y", 2),
+    ] {
+        let plan = plan(
+            SELF_JOIN,
+            &format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {body} }}"),
+        );
+        let keys = database.merge_keys(&plan).await.unwrap().unwrap();
+        let merged = v12n_core::optimize::eliminate_self_joins(&plan, &keys);
+        assert_eq!(
+            merged.as_ref().unwrap_or(&plan).branches[0].from.len(),
+            scans,
+            "{body}"
+        );
+        let (rows, _) = run(&url, Limits::default(), &plan).await.unwrap();
+        results.push(rows);
+    }
+    client
+        .batch_execute("DROP SCHEMA v12n_self CASCADE")
+        .await
+        .unwrap();
+    let asset = |id: u32| format!("<http://example.org/asset/{id}>");
+    assert_eq!(
+        results,
+        [
+            vec![
+                format!("?a={} ?h=\"a\"", asset(1)),
+                format!("?a={} ?h=\"b\"", asset(2)),
+            ],
+            vec!["?c=\"High\" ?h=\"b\"".to_owned()],
+            vec![
+                format!("?a={} ?c=\"High\" ?h=\"a\" ?s=\"x\"", asset(1)),
+                format!("?a={} ?h=\"b\"", asset(2)),
+                format!("?a={} ?h=\"c\"", asset(3)),
+            ],
+            vec!["?b=<http://example.org/badge/k1> ?h=\"kim\" ?l=\"one\"".to_owned()],
+            vec![
+                "?g=<http://example.org/group/1> ?x=\"x1\" ?y=\"y1\"".to_owned(),
+                "?g=<http://example.org/group/1> ?x=\"x1\" ?y=\"y2\"".to_owned(),
+                "?g=<http://example.org/group/1> ?x=\"x2\" ?y=\"y1\"".to_owned(),
+                "?g=<http://example.org/group/1> ?x=\"x2\" ?y=\"y2\"".to_owned(),
+            ],
+        ]
+    );
+}
