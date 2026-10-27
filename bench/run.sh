@@ -18,8 +18,8 @@
 #   BENCH_ONTOP_JAVA_ARGS  Ontop JVM flags (default -Xmx256m, as testenv/difftest.sh)
 #   BENCH_OUT              output directory (default bench/results/<alerts>-<UTC time>)
 #   BENCH_PG_PORT, BENCH_ONTOP_PORT, BENCH_V12N_PORT
-#                          localhost ports (55434, 58090, 57890; Ontop and v12n
-#                          also use the next one)
+#                          localhost ports (55434, 58090, 57890; Ontop also
+#                          uses the next one, v12n the next two)
 #
 # Needs Docker with Compose v2, python3, a Rust toolchain, and
 # testenv/jdbc/ (testenv/fetch-jdbc.sh). Development credentials only;

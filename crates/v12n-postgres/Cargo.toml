@@ -18,7 +18,7 @@ tokio-postgres.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util"] }
 
 [lints]
 workspace = true

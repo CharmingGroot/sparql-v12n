@@ -3,9 +3,15 @@
 //! `V12N_TEST_DATABASE_URL` is set, e.g.
 //! `postgresql://v12n:v12n-dev@127.0.0.1:55432/shop`.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::NoTls;
+use tokio_postgres::config::Host;
 use tokio_postgres::types::Type;
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
 use v12n_core::solution::canonical_decimal;
@@ -2787,4 +2793,247 @@ async fn merged_scans_give_the_same_solutions() {
             ],
         ]
     );
+}
+
+/// Round trips between a client and PostgreSQL, counted by a proxy in
+/// front of the database ([`wire_counter`]) as `bench/bench.py` counts
+/// them: requests (frontend messages up to a Sync, or a simple Query) that
+/// the client sends while none of its earlier requests is waiting for its
+/// ReadyForQuery. Pipelined requests count once. A request of Close
+/// messages only, which tokio-postgres sends when a statement is dropped
+/// and never waits for, does not count.
+#[derive(Default)]
+struct Wire {
+    round_trips: usize,
+    /// Whether the client waits for each request still without its
+    /// ReadyForQuery.
+    pending: VecDeque<bool>,
+    /// Message types of the request being sent.
+    sending: Vec<u8>,
+}
+
+impl Wire {
+    fn request(&mut self, kinds: &[u8]) {
+        let waits = kinds.iter().any(|k| !matches!(k, b'C' | b'S'));
+        if waits && !self.pending.iter().any(|&w| w) {
+            self.round_trips += 1;
+        }
+        self.pending.push_back(waits);
+    }
+}
+
+/// A connection string for the database at `url` through a proxy that
+/// counts round trips.
+async fn wire_counter(url: &str) -> (String, Arc<Mutex<Wire>>) {
+    let config: tokio_postgres::Config = url.parse().unwrap();
+    let Host::Tcp(host) = &config.get_hosts()[0] else {
+        panic!("the test database is reached over TCP");
+    };
+    let target = (
+        host.clone(),
+        config.get_ports().first().copied().unwrap_or(5432),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let wire = Arc::new(Mutex::new(Wire::default()));
+    let shared = Arc::clone(&wire);
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let server = TcpStream::connect(target.clone()).await.unwrap();
+            client.set_nodelay(true).unwrap();
+            server.set_nodelay(true).unwrap();
+            let (client_read, client_write) = client.into_split();
+            let (server_read, server_write) = server.into_split();
+            tokio::spawn(pipe(client_read, server_write, Arc::clone(&shared), true));
+            tokio::spawn(pipe(server_read, client_write, Arc::clone(&shared), false));
+        }
+    });
+    let password = config
+        .get_password()
+        .map(|p| String::from_utf8(p.to_vec()).unwrap())
+        .unwrap_or_default();
+    let proxied = format!(
+        "host=127.0.0.1 port={port} user={} password={password} dbname={} sslmode=disable",
+        config.get_user().unwrap(),
+        config.get_dbname().unwrap(),
+    );
+    (proxied, wire)
+}
+
+/// Forwards one direction. A client request is counted before it is
+/// forwarded and a ReadyForQuery is taken off before it is forwarded, so
+/// a request sent after an answer arrived always counts.
+async fn pipe(
+    mut from: OwnedReadHalf,
+    mut to: OwnedWriteHalf,
+    wire: Arc<Mutex<Wire>>,
+    from_client: bool,
+) {
+    let mut buf = Vec::new();
+    let mut chunk = vec![0; 1 << 16];
+    // The startup message has no type byte; with `sslmode=disable` it is
+    // the client's first.
+    let mut startup = from_client;
+    loop {
+        let n = match from.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        {
+            let mut wire = wire.lock().unwrap();
+            loop {
+                let header = usize::from(!startup);
+                let Some(length) = buf
+                    .get(header..header + 4)
+                    .map(|b| u32::from_be_bytes(b.try_into().unwrap()) as usize)
+                else {
+                    break;
+                };
+                if buf.len() < header + length {
+                    break;
+                }
+                let kind = buf[0];
+                buf.drain(..header + length);
+                if startup {
+                    startup = false;
+                    wire.request(b"startup");
+                } else if !from_client {
+                    if kind == b'Z' {
+                        wire.pending.pop_front();
+                    }
+                } else if matches!(kind, b'S' | b'Q') {
+                    let mut kinds = std::mem::take(&mut wire.sending);
+                    kinds.push(kind);
+                    wire.request(&kinds);
+                } else if kind != b'X' {
+                    wire.sending.push(kind);
+                }
+            }
+        }
+        if to.write_all(&chunk[..n]).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// The solutions of `plan` on `database`, in the order they arrive.
+async fn solutions(database: &Database, plan: &SqlPlan) -> Vec<String> {
+    let mut solutions = database.execute(plan).await.unwrap();
+    let mut rows = Vec::new();
+    while let Some(solution) = solutions.try_next().await.unwrap() {
+        rows.push(format!("{:?}", solution.values()));
+    }
+    rows
+}
+
+/// The catalog query, the column probe and the statements prepared for
+/// the same plan before go to the database together, so a query whose
+/// plan the connection has run before takes two round trips (that and
+/// running the statement) and a new plan three. A plan that differs from
+/// one run before only by its constants is known too. A query whose
+/// constants cannot match skips running the statement.
+#[tokio::test]
+async fn known_plans_take_two_round_trips() {
+    let Some(url) = database_url() else { return };
+    let (proxied, wire) = wire_counter(&url).await;
+    let database = Database::connect(&proxied, Limits::default())
+        .await
+        .unwrap();
+    let name = |id: &str| {
+        format!(
+            "SELECT ?n WHERE {{ <http://example.org/customer/{id}> <http://example.org/name> ?n }}"
+        )
+    };
+    for (query, rows, first, again) in [
+        // Keys show that no duplicates need removing.
+        (name("7"), 1, 3, 2),
+        (name("8"), 1, 2, 2),
+        (VIP_ORDERS.to_owned(), 3, 3, 2),
+        // No keys to read: the column types tell how to remove duplicates.
+        (
+            "SELECT DISTINCT ?t WHERE { ?c <http://example.org/tier> ?t }".to_owned(),
+            2,
+            3,
+            2,
+        ),
+        (
+            "SELECT ?x WHERE { { ?x <http://example.org/name> ?v } UNION { ?x <http://example.org/amount> ?v } }"
+                .to_owned(),
+            7,
+            3,
+            2,
+        ),
+        // The plan of the first query, with a constant that cannot match.
+        (name("007"), 0, 1, 1),
+    ] {
+        let plan = plan(SHOP, &query);
+        let mut results = Vec::new();
+        for expected in [first, again] {
+            let before = wire.lock().unwrap().round_trips;
+            let found = solutions(&database, &plan).await;
+            let round_trips = wire.lock().unwrap().round_trips - before;
+            assert_eq!((found.len(), round_trips), (rows, expected), "{query}");
+            results.push(found);
+        }
+        assert_eq!(results[0], results[1], "{query}");
+    }
+}
+
+/// The statements prepared for a plan before are a guess only, checked
+/// against the keys read on every query: once the key that let the query
+/// keep every row is dropped and a row is duplicated, the statement that
+/// removes duplicates is prepared instead, and the row counts once.
+#[tokio::test]
+async fn a_known_plan_does_not_trust_a_dropped_key() {
+    let Some(url) = database_url() else { return };
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS v12n_known CASCADE;
+             CREATE SCHEMA v12n_known;
+             CREATE TABLE v12n_known.items (id int PRIMARY KEY, tag text NOT NULL);
+             INSERT INTO v12n_known.items VALUES (1, 'a'), (2, 'b');",
+        )
+        .await
+        .unwrap();
+    let mapping = "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
+         <#M> rr:logicalTable [ rr:tableName \"v12n_known.items\" ] ;\n\
+           rr:subjectMap [ rr:template \"http://example.org/item/{id}\" ] ;\n\
+           rr:predicateObjectMap [ rr:predicate <http://example.org/tag> ; \
+           rr:objectMap [ rr:column \"tag\" ] ] .";
+    let plan = plan(
+        mapping,
+        "SELECT ?i ?t WHERE { ?i <http://example.org/tag> ?t }",
+    );
+    let (proxied, wire) = wire_counter(&url).await;
+    let database = Database::connect(&proxied, Limits::default())
+        .await
+        .unwrap();
+    let round_trips = || wire.lock().unwrap().round_trips;
+    let first = solutions(&database, &plan).await;
+    let before = round_trips();
+    assert_eq!(solutions(&database, &plan).await, first);
+    assert_eq!(round_trips() - before, 2);
+
+    client
+        .batch_execute(
+            "ALTER TABLE v12n_known.items DROP CONSTRAINT items_pkey;
+             INSERT INTO v12n_known.items VALUES (1, 'a');",
+        )
+        .await
+        .unwrap();
+    let before = round_trips();
+    let mut after = solutions(&database, &plan).await;
+    let round_trips = round_trips() - before;
+    client
+        .batch_execute("DROP SCHEMA v12n_known CASCADE")
+        .await
+        .unwrap();
+    let mut first = first;
+    first.sort();
+    after.sort();
+    assert_eq!(after, first);
+    assert_eq!(round_trips, 3);
 }

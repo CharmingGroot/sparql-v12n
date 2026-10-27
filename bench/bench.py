@@ -20,7 +20,9 @@ import platform
 import re
 import shlex
 import signal
+import socket
 import statistics
+import struct
 import subprocess
 import sys
 import threading
@@ -272,6 +274,113 @@ class OntopContainer:
         logs = run(self.compose + ["logs", "--no-log-prefix", self.name])
         found = re.findall(r"Started \S+ in ([0-9.]+) seconds", logs)
         return float(found[-1]) if found else None
+
+
+class WireCounter:
+    """A TCP proxy in front of PostgreSQL that counts round trips: the
+    requests (frontend messages up to a Sync, or a simple Query) that a
+    client sends while none of its earlier requests is still waiting for
+    its ReadyForQuery. Requests sent together (pipelined) count once. A
+    request of Close messages only, which tokio-postgres sends when a
+    statement is dropped and never waits for, does not count.
+
+    A client message is counted before it is forwarded and a ReadyForQuery
+    after it is read and before it is forwarded, so a request that waits
+    for an answer is always counted as a new round trip."""
+
+    SSL_REQUEST = 80877103
+
+    def __init__(self, pg_port):
+        self.pg_port = pg_port
+        self.lock = threading.Lock()
+        self.round_trips = 0
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen()
+        self.port = self.listener.getsockname()[1]
+        threading.Thread(target=self.accept, daemon=True).start()
+
+    def accept(self):
+        while True:
+            try:
+                client, _ = self.listener.accept()
+            except OSError:
+                return
+            server = socket.create_connection(("127.0.0.1", self.pg_port))
+            for sock in (client, server):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            state = {"pending": collections.deque(), "request": [], "ssl": False}
+            threading.Thread(target=self.pipe, args=(client, server, state, True), daemon=True).start()
+            threading.Thread(target=self.pipe, args=(server, client, state, False), daemon=True).start()
+
+    def pipe(self, src, dst, state, from_client):
+        buf = b""
+        # The client's first message (startup, or an SSLRequest that the
+        # server answers with one byte) has no type byte.
+        startup = from_client
+        try:
+            while True:
+                chunk = src.recv(1 << 16)
+                if not chunk:
+                    break
+                buf += chunk
+                with self.lock:
+                    while True:
+                        if not from_client and state["ssl"]:
+                            if not buf:
+                                break
+                            state["ssl"] = False
+                            state["pending"].clear()
+                            buf = buf[1:]
+                        elif startup:
+                            if len(buf) < 8:
+                                break
+                            length, code = struct.unpack("!II", buf[:8])
+                            if len(buf) < length:
+                                break
+                            buf = buf[length:]
+                            state["ssl"] = startup = code == self.SSL_REQUEST
+                            self.request(state, ["startup"])
+                        else:
+                            if len(buf) < 5:
+                                break
+                            kind = chr(buf[0])
+                            (length,) = struct.unpack("!I", buf[1:5])
+                            if len(buf) < 1 + length:
+                                break
+                            buf = buf[1 + length:]
+                            if not from_client:
+                                if kind == "Z" and state["pending"]:
+                                    state["pending"].popleft()
+                            elif kind in "SQ":
+                                self.request(state, state["request"] + [kind])
+                                state["request"] = []
+                            elif kind != "X":
+                                state["request"].append(kind)
+                dst.sendall(chunk)
+        except OSError:
+            pass
+        finally:
+            for sock in (src, dst):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def request(self, state, kinds):
+        """Called with the lock held, for each complete request."""
+        waits = any(k not in ("C", "S") for k in kinds)
+        if waits and not any(state["pending"]):
+            self.round_trips += 1
+        state["pending"].append(waits)
+
+    def count(self):
+        with self.lock:
+            return self.round_trips
+
+    def close(self):
+        self.listener.close()
 
 
 def proc_status(text):
@@ -601,6 +710,34 @@ def main():
                 f"{e}={v['total_ms']['median']}ms" if v.get("total_ms") else f"{e}=n/a"
                 for e, v in entry["engines"].items()))
 
+        # Round trips to PostgreSQL per request, counted by a proxy in
+        # front of it for a separate `v12n serve`, so that the proxy adds
+        # nothing to the timings above. Requests run one at a time, so they
+        # reuse one pooled connection after the warm-up.
+        counter = WireCounter(args.pg_port)
+        v12n_wire = V12nServe(
+            "v12n-wire", args.v12n, args.v12n_port + 2,
+            "postgresql://bench_v12n:bench-dev@127.0.0.1:%d/mdr" % counter.port,
+            args.mapping, 0, args.out / "v12n-wire.log",
+        )
+        try:
+            v12n_wire.start()
+            wait_ready(v12n_wire, ready_query)
+            for name, text in queries.items():
+                counts = []
+                for i in range(args.warmup + 5):
+                    before = counter.count()
+                    r = post(v12n_wire.port, text)
+                    if r.status != 200:
+                        raise RuntimeError(f"v12n-wire {name}: HTTP {r.status}")
+                    if i >= args.warmup:
+                        counts.append(counter.count() - before)
+                results["queries"][name]["engines"]["v12n"]["round_trips"] = counts
+                log(f"{name}: round trips per request {counts}")
+        finally:
+            v12n_wire.stop()
+            counter.close()
+
         # The CLI: process start, mapping, connection and query per run.
         results["cli"] = {}
         for name, text in queries.items():
@@ -720,8 +857,8 @@ def markdown(r):
         "",
         "## Where the time goes (per request, median ms unless noted)",
         "",
-        "| Query | Translate (µs) | SQL render (µs) | v12n statements | v12n DB exec | Ontop statements | Ontop DB exec | CLI total | CLI first row |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Query | Translate (µs) | SQL render (µs) | v12n round trips | v12n statements | v12n DB exec | Ontop statements | Ontop DB exec | CLI total | CLI first row |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for name, q in r.get("queries", {}).items():
         t = r.get("translation", {}).get(name, {})
@@ -730,7 +867,7 @@ def markdown(r):
         c = r.get("cli", {}).get(name, {})
         lines.append(
             f"| {name} | {t.get('translate_us', {}).get('median', '-')} | {t.get('render_us', {}).get('median', '-')} | "
-            f"{vd.get('statements', '-')} | {vd.get('exec_ms', '-')} | {od.get('statements', '-')} | {od.get('exec_ms', '-')} | "
+            f"{statistics.median(v['round_trips']) if v.get('round_trips') else '-'} | {vd.get('statements', '-')} | {vd.get('exec_ms', '-')} | {od.get('statements', '-')} | {od.get('exec_ms', '-')} | "
             f"{fmt(c.get('total_ms'))} | {fmt(c.get('ttfr_ms'))} |"
         )
     load = r.get("load", {})

@@ -2,6 +2,8 @@
 //! Runs a query through this engine with library calls, as `v12n query`
 //! does, without the CLI or HTTP layers.
 
+use std::collections::HashMap;
+
 use v12n_core::mapping::{BaseIri, Mapping, MappingIndex};
 use v12n_core::sql::SqlPlan;
 use v12n_core::{sparql, unfold};
@@ -77,6 +79,11 @@ pub fn mapping_error(mapping: &str) -> Result<String, String> {
 
 /// All solutions, with no row limit so that a cut-off result cannot pass
 /// for a complete one.
+///
+/// The query runs twice on one connection and the second result is the
+/// one compared: the second run takes the statements prepared by the first
+/// as its guess (`Database::execute`), which a single run never does. Both
+/// runs must give the same bag of solutions.
 pub fn run(
     database_url: &str,
     mapping: &str,
@@ -100,18 +107,9 @@ pub fn run(
                 ..Limits::default()
             };
             let database = Database::connect(database_url, limits).await?;
-            let mut solutions = database.execute(&plan).await?;
-            let variables = solutions.variables().to_vec();
-            let mut rows = Vec::new();
-            while let Some(solution) = solutions.try_next().await? {
-                let row: Row = variables
-                    .iter()
-                    .zip(solution.values())
-                    .filter_map(|(v, t)| t.clone().map(|t| (v.clone(), t)))
-                    .collect();
-                rows.push(row);
-            }
-            Ok::<_, v12n_postgres::Error>(Results { variables, rows })
+            let first = solutions(&database, &plan).await?;
+            let second = solutions(&database, &plan).await?;
+            Ok::<_, v12n_postgres::Error>((first, second))
         })
         .map_err(|e| match e {
             v12n_postgres::Error::Core(v12n_core::Error::UnsupportedFeature(feature)) => {
@@ -119,4 +117,37 @@ pub fn run(
             }
             e => Failure::Other(e.to_string()),
         })
+        .and_then(|(first, second)| {
+            if first.variables == second.variables && bag(&first.rows) == bag(&second.rows) {
+                Ok(second)
+            } else {
+                Err(Failure::Other(format!(
+                    "a second run on the same connection differs from the first:\n  \
+                     first: {first:?}\n  second: {second:?}"
+                )))
+            }
+        })
+}
+
+async fn solutions(database: &Database, plan: &SqlPlan) -> Result<Results, v12n_postgres::Error> {
+    let mut solutions = database.execute(plan).await?;
+    let variables = solutions.variables().to_vec();
+    let mut rows = Vec::new();
+    while let Some(solution) = solutions.try_next().await? {
+        let row: Row = variables
+            .iter()
+            .zip(solution.values())
+            .filter_map(|(v, t)| t.clone().map(|t| (v.clone(), t)))
+            .collect();
+        rows.push(row);
+    }
+    Ok(Results { variables, rows })
+}
+
+fn bag(rows: &[Row]) -> HashMap<&Row, usize> {
+    let mut counts = HashMap::new();
+    for row in rows {
+        *counts.entry(row).or_default() += 1;
+    }
+    counts
 }
