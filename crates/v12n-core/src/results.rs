@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! SPARQL 1.1 Query Results JSON Format, written one solution at a time.
+//! SPARQL 1.1 Query Results JSON and CSV Formats, written one solution at a
+//! time.
 
 use std::io::{self, Write};
 
@@ -68,6 +69,82 @@ impl<W: Write> JsonResultsWriter<W> {
         self.out.write_all(b"\n]}}\n")?;
         Ok(self.out)
     }
+}
+
+/// Media type of the SPARQL 1.1 Query Results CSV Format.
+pub const CSV_RESULTS_MEDIA_TYPE: &str = "text/csv; charset=utf-8";
+
+/// Streams `SELECT` results as SPARQL 1.1 Query Results CSV: a header of
+/// variable names, then one record per solution. The format keeps only the
+/// lexical form of each term (no datatype or language tag) and writes an
+/// unbound variable like an empty string (SPARQL 1.1 Query Results CSV §2).
+pub struct CsvResultsWriter<W: Write> {
+    out: W,
+    fields: Vec<String>,
+}
+
+impl<W: Write> CsvResultsWriter<W> {
+    /// Writes the header record: the variable names without `?`.
+    pub fn start(mut out: W, variables: &[String]) -> io::Result<Self> {
+        write_csv_record(&mut out, variables)?;
+        Ok(Self {
+            out,
+            fields: Vec::with_capacity(variables.len()),
+        })
+    }
+
+    /// Writes one solution as one record.
+    pub fn write(&mut self, solution: &Solution) -> io::Result<()> {
+        self.fields.clear();
+        for value in solution.values() {
+            self.fields.push(match value {
+                None => String::new(),
+                Some(Term::NamedNode(n)) => n.as_str().to_owned(),
+                Some(Term::BlankNode(b)) => format!("_:{}", b.as_str()),
+                Some(Term::Literal(l)) => l.value().to_owned(),
+                #[allow(unreachable_patterns)]
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "quoted triples cannot be written as SPARQL 1.1 results",
+                    ));
+                }
+            });
+        }
+        write_csv_record(&mut self.out, &self.fields)
+    }
+
+    /// The underlying writer, e.g. to drain a buffer between solutions.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.out
+    }
+
+    /// Returns the writer, unflushed. CSV has no closing part.
+    pub fn finish(self) -> io::Result<W> {
+        Ok(self.out)
+    }
+}
+
+/// Writes one CSV record ending in CRLF, quoting a field that holds a
+/// comma, a double quote, CR or LF (RFC 4180 §2, as SPARQL 1.1 Query
+/// Results CSV §2 requires).
+pub fn write_csv_record<S: AsRef<str>>(out: &mut impl Write, fields: &[S]) -> io::Result<()> {
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            out.write_all(b",")?;
+        }
+        let field = field.as_ref();
+        // A record of one empty field would be a blank line, which many
+        // readers skip; quoting it keeps the record.
+        if field.contains([',', '"', '\r', '\n']) || (fields.len() == 1 && field.is_empty()) {
+            out.write_all(b"\"")?;
+            out.write_all(field.replace('"', "\"\"").as_bytes())?;
+            out.write_all(b"\"")?;
+        } else {
+            out.write_all(field.as_bytes())?;
+        }
+    }
+    out.write_all(b"\r\n")
 }
 
 fn write_term(out: &mut impl Write, term: &Term) -> io::Result<()> {
@@ -153,6 +230,78 @@ mod tests {
                     },
                 }]},
             })
+        );
+    }
+
+    fn write_csv(variables: &[&str], solutions: Vec<Solution>) -> String {
+        let variables: Vec<String> = variables.iter().map(|v| (*v).to_owned()).collect();
+        let mut writer = CsvResultsWriter::start(Vec::new(), &variables).unwrap();
+        for solution in &solutions {
+            writer.write(solution).unwrap();
+        }
+        String::from_utf8(writer.finish().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn csv_results_write_lexical_forms_and_unbound_as_empty() {
+        let iri = || Some(NamedNode::new_unchecked("http://example/x").into());
+        let solutions = vec![
+            Solution::new(vec![
+                iri(),
+                Some(Literal::new_simple_literal("String").into()),
+            ]),
+            Solution::new(vec![
+                iri(),
+                Some(Literal::new_simple_literal("String-with-dquote\"").into()),
+            ]),
+            Solution::new(vec![
+                Some(BlankNode::new_unchecked("b0").into()),
+                Some(Literal::new_simple_literal("Blank node").into()),
+            ]),
+            Solution::new(vec![None, Some(Literal::new_simple_literal("a,b").into())]),
+            Solution::new(vec![None, None]),
+            Solution::new(vec![
+                Some(BlankNode::new_unchecked("b1").into()),
+                Some(
+                    Literal::new_language_tagged_literal_unchecked("String-with-lang", "en").into(),
+                ),
+            ]),
+            Solution::new(vec![
+                iri(),
+                Some(
+                    Literal::new_typed_literal(
+                        "123",
+                        NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer"),
+                    )
+                    .into(),
+                ),
+            ]),
+            Solution::new(vec![
+                iri(),
+                Some(Literal::new_simple_literal("two\nlines").into()),
+            ]),
+        ];
+        // The example of SPARQL 1.1 Query Results CSV §2, plus a comma and
+        // a line break.
+        assert_eq!(
+            write_csv(&["x", "literal"], solutions),
+            "x,literal\r\n\
+             http://example/x,String\r\n\
+             http://example/x,\"String-with-dquote\"\"\"\r\n\
+             _:b0,Blank node\r\n\
+             ,\"a,b\"\r\n\
+             ,\r\n\
+             _:b1,String-with-lang\r\n\
+             http://example/x,123\r\n\
+             http://example/x,\"two\nlines\"\r\n"
+        );
+    }
+
+    #[test]
+    fn csv_record_of_one_empty_field_is_quoted() {
+        assert_eq!(
+            write_csv(&["x"], vec![Solution::new(vec![None])]),
+            "x\r\n\"\"\r\n"
         );
     }
 

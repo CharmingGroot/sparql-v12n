@@ -629,3 +629,293 @@ fn query_reads_the_statement_timeout_from_the_environment() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("soon"));
 }
+
+const WORKSPACE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+
+/// Asserts the JSON error shape on stdout: `ok`, `kind`, `message` and
+/// an `exit_code` equal to the process exit code.
+fn assert_json_error(output: &Output, code: i32, kind: &str) -> Value {
+    assert_eq!(
+        output.status.code(),
+        Some(code),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let error = stdout_json(output);
+    assert_eq!(error["ok"], json!(false), "{error}");
+    assert_eq!(error["error"]["kind"], json!(kind), "{error}");
+    assert_eq!(error["error"]["exit_code"], json!(code), "{error}");
+    assert!(error["error"]["message"].is_string(), "{error}");
+    error["error"].clone()
+}
+
+#[test]
+fn explain_query_text_option_matches_the_query_file() {
+    let text = std::fs::read_to_string(VIP_ORDERS).unwrap();
+    let from_file = v12n(&["explain", SHOP, VIP_ORDERS], "");
+    let from_text = v12n(&["explain", SHOP, "--query", &text], "");
+    assert_eq!(from_text.status.code(), Some(0));
+    assert_eq!(stdout_json(&from_text), stdout_json(&from_file));
+}
+
+#[test]
+fn explain_query_file_and_text_together_exit_one() {
+    let output = v12n(&["explain", SHOP, VIP_ORDERS, "--query", "SELECT * {}"], "");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--query"));
+}
+
+#[test]
+fn mapping_and_query_both_from_stdin_exit_one() {
+    let output = v12n(&["explain", "-", "-"], "");
+    assert_json_error(&output, 1, "input");
+}
+
+#[test]
+fn json_error_for_an_unreadable_file_names_the_path() {
+    let output = v12n(&["explain", SHOP, "does-not-exist.rq"], "");
+    let error = assert_json_error(&output, 1, "input");
+    assert_eq!(error["details"], json!({ "path": "does-not-exist.rq" }));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn csv_format_errors_go_to_stderr() {
+    let output = v12n(&["terms", "--format", "csv", "-"], "not turtle");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("error: mapping syntax error"));
+}
+
+#[test]
+fn check_csv_is_one_record_with_a_header() {
+    let output = v12n(&["check", "--format", "csv", SHOP], "");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "triples_maps,classes,properties\r\n2,2,4\r\n"
+    );
+}
+
+#[test]
+fn terms_csv_has_one_record_per_term() {
+    let output = v12n(&["terms", "--format", "csv", SHOP], "");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let records: Vec<&str> = stdout.split_terminator("\r\n").collect();
+    assert_eq!(records.len(), 7, "{stdout}");
+    assert_eq!(records[0], "kind,iri,prefixed_name,triples_maps");
+    assert_eq!(
+        records[1],
+        "class,http://example.org/Customer,ex:Customer,<#CustomerMap>"
+    );
+    assert_eq!(
+        records[6],
+        "property,http://example.org/placedBy,ex:placedBy,<#OrderMap>"
+    );
+}
+
+#[test]
+fn explain_csv_puts_sql_and_params_in_one_record() {
+    let output = v12n(&["explain", "--format", "csv", SHOP, VIP_ORDERS], "");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json = stdout_json(&v12n(&["explain", SHOP, VIP_ORDERS], ""));
+    let sql = json["sql"].as_str().unwrap();
+    // The SQL holds quotes and line breaks, so it is quoted (RFC 4180).
+    assert_eq!(
+        stdout,
+        format!("sql,$1\r\n\"{}\",VIP\r\n", sql.replace('"', "\"\""))
+    );
+}
+
+#[test]
+fn help_lists_two_or_three_examples_for_every_command() {
+    for command in ["check", "terms", "explain", "query", "serve"] {
+        let help = String::from_utf8(v12n(&[command, "--help"], "").stdout).unwrap();
+        let examples = help
+            .lines()
+            .skip_while(|l| !l.starts_with("Examples"))
+            .skip(1)
+            .take_while(|l| l.starts_with("  "))
+            .count();
+        assert!((2..=3).contains(&examples), "{command}: {examples}\n{help}");
+    }
+    let help = String::from_utf8(v12n(&["--help"], "").stdout).unwrap();
+    for needle in ["NO_COLOR", "\"exit_code\"", "  5  row limit reached"] {
+        assert!(help.contains(needle), "{needle}\n{help}");
+    }
+}
+
+/// The help examples of the commands that need no database run as they
+/// are from the repository root.
+#[test]
+fn help_examples_without_a_database_run() {
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_v12n"))
+        .parent()
+        .unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut ran = 0;
+    for command in ["check", "terms", "explain"] {
+        let help = String::from_utf8(v12n(&[command, "--help"], "").stdout).unwrap();
+        for example in help
+            .lines()
+            .skip_while(|l| !l.starts_with("Examples"))
+            .skip(1)
+            .take_while(|l| l.starts_with("  "))
+        {
+            let output = Command::new("sh")
+                .args(["-c", example.trim()])
+                .current_dir(WORKSPACE)
+                .env("PATH", &path)
+                .env_remove("V12N_BASE_IRI")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{example}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!output.stdout.is_empty(), "{example}");
+            ran += 1;
+        }
+    }
+    assert_eq!(ran, 8);
+}
+
+/// The loop an agent runs, all in JSON: `terms` to find the IRIs, `explain`
+/// to check the query, `query` to run it; then one case per exit code.
+/// Runs against the `testenv` PostgreSQL; skipped unless
+/// `V12N_TEST_DATABASE_URL` is set.
+#[test]
+fn agent_loop_terms_explain_query_in_json_and_every_exit_code() {
+    let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
+        eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    // terms: pick the IRIs by their prefixed names.
+    let terms = v12n(&["terms", "--format", "json", SHOP], "");
+    assert_eq!(terms.status.code(), Some(0));
+    let terms = stdout_json(&terms);
+    let iri = |list: &str, name: &str| -> String {
+        terms[list]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["prefixed_name"] == json!(name))
+            .and_then(|t| t["iri"].as_str())
+            .unwrap_or_else(|| panic!("{name} in {list}"))
+            .to_owned()
+    };
+    let sparql = format!(
+        "SELECT ?customer ?name WHERE {{ ?customer a <{}> ; <{}> ?name ; <{}> \"VIP\" }}",
+        iri("classes", "ex:Customer"),
+        iri("properties", "ex:name"),
+        iri("properties", "ex:tier"),
+    );
+
+    // explain: the SQL binds the constant and projects both variables.
+    let plan = v12n(
+        &["explain", "--format", "json", SHOP, "--query", &sparql],
+        "",
+    );
+    assert_eq!(plan.status.code(), Some(0));
+    let plan = stdout_json(&plan);
+    assert_eq!(plan["params"], json!(["VIP"]));
+    let names: Vec<&Value> = plan["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| &v["name"])
+        .collect();
+    assert_eq!(names, [&json!("customer"), &json!("name")]);
+
+    // query, exit 0: SPARQL 1.1 Query Results JSON, nothing on stderr.
+    let run = |args: &[&str], stdin: &str| {
+        let mut all = vec!["query", "--format", "json", "--db", &url];
+        all.extend_from_slice(args);
+        v12n(&all, stdin)
+    };
+    let output = run(&[SHOP, "--query", &sparql], "");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let results = stdout_json(&output);
+    assert_eq!(results["head"], json!({ "vars": ["customer", "name"] }));
+    let mut found: Vec<&str> = results["results"]["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"]["value"].as_str().unwrap())
+        .collect();
+    found.sort_unstable();
+    assert_eq!(found, ["Kim", "Park"]);
+
+    // The same query in CSV: lexical forms, CRLF line ends.
+    let csv = v12n(
+        &[
+            "query", "--format", "csv", "--db", &url, SHOP, "--query", &sparql,
+        ],
+        "",
+    );
+    assert_eq!(csv.status.code(), Some(0));
+    let csv = String::from_utf8(csv.stdout).unwrap();
+    let mut records: Vec<&str> = csv.split_terminator("\r\n").collect();
+    assert_eq!(records.remove(0), "customer,name");
+    records.sort_unstable();
+    assert_eq!(
+        records,
+        [
+            "http://example.org/customer/7,Kim",
+            "http://example.org/customer/9,Park"
+        ]
+    );
+
+    // 1: query syntax.
+    assert_json_error(
+        &run(&[SHOP, "--query", "SELECT ?x WHERE {"], ""),
+        1,
+        "query",
+    );
+    // 2: invalid mapping, read from stdin.
+    assert_json_error(&run(&["-", "--query", &sparql], "not turtle"), 2, "mapping");
+    // 3: the database rejects the SQL: the mapping names a missing table.
+    let missing = std::fs::read_to_string(SHOP)
+        .unwrap()
+        .replace("\"customers\"", "\"no_such_table\"");
+    let error = assert_json_error(&run(&["-", "--query", &sparql], &missing), 3, "database");
+    assert!(
+        error["message"].as_str().unwrap().contains("no_such_table"),
+        "{error}"
+    );
+    // 4: statement timeout before the first row: sorting a cross join of
+    // 13 scans of the 3 customers (1.6 million rows) takes far longer.
+    let patterns: String = (1..=13)
+        .map(|i| format!("?c{i} <http://example.org/name> ?n{i} . "))
+        .collect();
+    let slow = format!("SELECT ?n1 WHERE {{ {patterns}}} ORDER BY ?n1");
+    let output = run(
+        &[
+            SHOP,
+            "--query",
+            &slow,
+            "--timeout",
+            "100ms",
+            "--row-limit",
+            "0",
+        ],
+        "",
+    );
+    let error = assert_json_error(&output, 4, "timeout");
+    assert_eq!(error["details"], json!({ "timeout_ms": 100, "rows": 0 }));
+    // 5: row limit: a complete result of one solution, a warning on stderr.
+    let output = run(&[SHOP, "--query", &sparql, "--row-limit", "1"], "");
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(bindings(&output), 1);
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("warning: result truncated"));
+}

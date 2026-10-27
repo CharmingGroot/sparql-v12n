@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `v12n`: check mappings, list terms, explain and run SPARQL, serve HTTP.
 
+use std::ffi::OsStr;
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -9,7 +10,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use v12n_core::mapping::{BaseIri, Mapping, MappingIndex, TermType, TriplesMapId};
-use v12n_core::results::JsonResultsWriter;
+use v12n_core::results::{CsvResultsWriter, JsonResultsWriter, write_csv_record};
+use v12n_core::solution::Solution;
 use v12n_core::sql::SqlPlan;
 use v12n_core::{sparql, unfold};
 use v12n_postgres::{DEFAULT_ROW_LIMIT, Database, Limits, Solutions};
@@ -37,14 +39,71 @@ macro_rules! exit_codes_help {
     };
 }
 
-const QUERY_HELP: &str = concat!(
-    "Examples:
-  v12n query mapping.ttl query.rq --db postgresql://reader@localhost/shop
-  V12N_DATABASE_URL=postgresql://reader@localhost/shop v12n query mapping.ttl query.rq
-  echo 'SELECT ?c WHERE { ?c a <http://example.org/Customer> }' | v12n query mapping.ttl - --format table
+const MAIN_HELP: &str = concat!(
+    "Typical loop: `terms` lists what a mapping exposes, `explain` shows the
+SQL a query becomes without a database, `query` runs it. Every command runs
+non-interactively and never prompts.
 
-JSON output is SPARQL 1.1 Query Results JSON, written as rows arrive.
-The session is read-only; still, connect as a user that can only read.
+Output: --format json, csv or table; json when stdout is not a terminal,
+table when it is. Colours only on a terminal, and never with NO_COLOR set.
+
+Errors: with --format json, an error before any output is one JSON object
+on stdout, {\"ok\":false,\"error\":{\"kind\":...,\"message\":...,\"exit_code\":...}},
+with \"details\" for some kinds. In csv and table format, and once output has
+started, an error is one \"error: ...\" line on stderr.
+
+",
+    exit_codes_help!()
+);
+
+const CHECK_HELP: &str = "Examples (from the repository root):
+  v12n check examples/shop/mapping.ttl
+  cat examples/shop/mapping.ttl | v12n check - --format json
+
+JSON: {\"ok\":true,\"triples_maps\":N,\"classes\":N,\"properties\":N}.
+CSV: one record headed triples_maps,classes,properties.
+
+Exit codes: 0 valid, 1 invalid input, 2 invalid mapping.";
+
+const TERMS_HELP: &str = "Examples (from the repository root):
+  v12n terms examples/shop/mapping.ttl
+  v12n terms examples/shop/mapping.ttl --format json
+  cat examples/shop/mapping.ttl | v12n terms - --format csv
+
+JSON: {\"prefixes\":{prefix:namespace},\"classes\":[TERM],\"properties\":[TERM]}
+with TERM = {\"iri\":...,\"prefixed_name\":... or null,\"triples_maps\":[...]};
+the prefixes are those the prefixed names use.
+CSV: one record per term headed kind,iri,prefixed_name,triples_maps; kind is
+class or property, triples maps are separated by spaces.
+
+Exit codes: 0 success, 1 invalid input, 2 invalid mapping.";
+
+const EXPLAIN_HELP: &str = "Examples (from the repository root):
+  v12n explain examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq
+  v12n explain examples/shop/mapping.ttl --query 'SELECT ?c WHERE { ?c a <http://example.org/Customer> }' --format json
+  cat examples/shop/queries/customers.rq | v12n explain examples/shop/mapping.ttl - --format csv
+
+JSON: {\"sql\":...,\"params\":[...],\"variables\":[{\"name\":...,\"term_type\":...,\"columns\":[...]}]};
+term_type is iri, blank_node or literal, columns are the SQL output columns.
+CSV: one record, the SQL and then one field per bind parameter, headed
+sql,$1,$2,...
+
+Without a database the SQL keeps duplicate-removing steps that table keys
+would make unnecessary, so `query` may run simpler SQL.
+
+Exit codes: 0 success, 1 invalid input, query syntax or unsupported SPARQL,
+2 invalid mapping.";
+
+const QUERY_HELP: &str = concat!(
+    "Examples (from the repository root, with a database such as testenv/):
+  v12n query examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq --db postgresql://reader@localhost/shop
+  V12N_DATABASE_URL=postgresql://reader@localhost/shop v12n query examples/shop/mapping.ttl --query 'SELECT ?c WHERE { ?c a <http://example.org/Customer> }' --format csv
+  cat examples/shop/queries/customers.rq | v12n query examples/shop/mapping.ttl - --format table
+
+JSON output is SPARQL 1.1 Query Results JSON and CSV output is SPARQL 1.1
+Query Results CSV (lexical forms only, unbound as an empty field), both
+written as rows arrive. The session is read-only; still, connect as a user
+that can only read.
 
 When more rows exist than --row-limit, the first --row-limit solutions are
 printed as a complete result, a warning naming the limit goes to stderr,
@@ -53,17 +112,18 @@ truncated and exits with 0.
 
 When the statement timeout cancels the query, stderr names the timeout and
 the command exits with 4. Before the first row, the error is reported in
---format like other errors; after output has started, stdout is left
-incomplete so that it cannot pass for a complete result.
+--format like other errors; after output has started, JSON on stdout is
+left incomplete so that it cannot pass for a complete result. CSV has no
+end marker: check the exit code.
 
 ",
     exit_codes_help!()
 );
 
-const SERVE_HELP: &str = "Examples:
-  v12n serve --config v12n.toml
-  V12N_DATABASE_URL=postgresql://reader@localhost/shop V12N_MAPPING=mapping.ttl v12n serve
-  curl -H 'Accept: application/sparql-results+json' --data-urlencode query@query.rq http://127.0.0.1:7878/sparql
+const SERVE_HELP: &str = "Examples (from the repository root):
+  v12n serve --config testenv/v12n.toml
+  V12N_DATABASE_URL=postgresql://reader@localhost/shop V12N_MAPPING=examples/shop/mapping.ttl v12n serve
+  curl -H 'Accept: application/sparql-results+json' --data-urlencode query@examples/shop/queries/vip-orders.rq http://127.0.0.1:7878/sparql
 
 Settings (file key, environment variable, default):
   [server] address                  V12N_ADDRESS                  127.0.0.1
@@ -93,7 +153,7 @@ Exit codes: 1 invalid settings or address in use, 2 invalid mapping,
     name = "v12n",
     version,
     about = "Query PostgreSQL with SPARQL through R2RML mappings",
-    after_help = exit_codes_help!()
+    after_help = MAIN_HELP
 )]
 struct Cli {
     /// Output format [default: table on a terminal, json otherwise]
@@ -106,44 +166,47 @@ struct Cli {
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
     Json,
+    Csv,
     Table,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Check a mapping for syntax and reference errors
-    #[command(after_help = "Examples:\n  v12n check mapping.ttl\n  cat mapping.ttl | v12n check -")]
+    #[command(after_help = CHECK_HELP)]
     Check {
         /// R2RML mapping in Turtle, or `-` for stdin
         mapping: PathBuf,
     },
     /// List the classes and properties a mapping exposes
-    #[command(
-        after_help = "Examples:\n  v12n terms mapping.ttl\n  v12n terms mapping.ttl --format json"
-    )]
+    #[command(after_help = TERMS_HELP)]
     Terms {
         /// R2RML mapping in Turtle, or `-` for stdin
         mapping: PathBuf,
     },
     /// Print the SQL a SPARQL query unfolds to, without a database
-    #[command(after_help = "Examples:\n  v12n explain mapping.ttl query.rq\n  \
-                            echo 'SELECT ?c WHERE { ?c a <http://example.org/Customer> }' | v12n explain mapping.ttl -\n  \
-                            v12n explain mapping.ttl query.rq --format json")]
+    #[command(
+        after_help = EXPLAIN_HELP,
+        override_usage = "v12n explain [OPTIONS] <MAPPING> <QUERY|--query <SPARQL>>"
+    )]
     Explain {
         /// R2RML mapping in Turtle, or `-` for stdin
         mapping: PathBuf,
-        /// SPARQL SELECT query, or `-` for stdin
-        query: PathBuf,
+        #[command(flatten)]
+        query: QueryArg,
         #[command(flatten)]
         base_iri: BaseIriArg,
     },
     /// Run a SPARQL query on PostgreSQL and print the solutions
-    #[command(after_help = QUERY_HELP)]
+    #[command(
+        after_help = QUERY_HELP,
+        override_usage = "v12n query [OPTIONS] <MAPPING> <QUERY|--query <SPARQL>>"
+    )]
     Query {
         /// R2RML mapping in Turtle, or `-` for stdin
         mapping: PathBuf,
-        /// SPARQL SELECT query, or `-` for stdin
-        query: PathBuf,
+        #[command(flatten)]
+        query: QueryArg,
         /// PostgreSQL connection URL, e.g. postgresql://reader@localhost/shop
         #[arg(long, env = env::DATABASE_URL, hide_env_values = true)]
         db: Option<String>,
@@ -169,6 +232,18 @@ enum Command {
     },
 }
 
+/// The query, from a file, stdin or the command line; exactly one.
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct QueryArg {
+    /// SPARQL SELECT query file, or `-` for stdin
+    #[arg(value_name = "QUERY")]
+    file: Option<PathBuf>,
+    /// SPARQL SELECT query text, instead of a QUERY file
+    #[arg(long = "query", value_name = "SPARQL")]
+    text: Option<String>,
+}
+
 #[derive(clap::Args)]
 struct BaseIriArg {
     /// Base IRI that relative IRIs from columns and templates resolve
@@ -181,11 +256,22 @@ fn parse_base_iri(value: &str) -> Result<BaseIri, String> {
     BaseIri::new(value).map_err(|e| e.to_string())
 }
 
+/// How results go to stdout.
+#[derive(Clone, Copy)]
+struct Output {
+    format: Format,
+    /// Whether to use ANSI styles on stdout (table format only).
+    color: bool,
+}
+
 /// A failure to report: exit code, error kind for JSON output, message.
 struct Failure {
     code: u8,
     kind: &'static str,
     message: String,
+    /// Kind-specific fields for JSON output, such as the file that could
+    /// not be read or the timeout that was reached.
+    details: Option<Value>,
     /// Results were already written to stdout, so the error goes to stderr
     /// even in JSON format.
     after_output: bool,
@@ -200,9 +286,49 @@ impl Failure {
             code,
             kind,
             message: message.into(),
+            details: None,
             after_output: false,
             warning: false,
         }
+    }
+
+    fn to_json(&self) -> Value {
+        let mut error = json!({
+            "kind": self.kind,
+            "message": self.message,
+            "exit_code": self.code,
+        });
+        if let Some(details) = &self.details {
+            error["details"] = details.clone();
+        }
+        json!({ "ok": false, "error": error })
+    }
+}
+
+const BOLD: &str = "\x1b[1m";
+const RED: &str = "\x1b[1;31m";
+const YELLOW: &str = "\x1b[1;33m";
+const RESET: &str = "\x1b[0m";
+
+/// Colours only on a terminal, unless `NO_COLOR` is set to anything
+/// non-empty (no-color.org) or `TERM` is `dumb`.
+fn wants_color(is_terminal: bool, no_color: Option<&OsStr>, term: Option<&OsStr>) -> bool {
+    is_terminal && no_color.is_none_or(OsStr::is_empty) && term.is_none_or(|term| term != "dumb")
+}
+
+fn stream_color(is_terminal: bool) -> bool {
+    wants_color(
+        is_terminal,
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var_os("TERM").as_deref(),
+    )
+}
+
+fn paint(color: bool, style: &str, text: &str) -> String {
+    if color {
+        format!("{style}{text}{RESET}")
+    } else {
+        text.to_owned()
     }
 }
 
@@ -215,53 +341,53 @@ fn main() -> ExitCode {
             return ExitCode::from(if e.use_stderr() { EXIT_INPUT } else { 0 });
         }
     };
-    let format = cli.format.unwrap_or(if io::stdout().is_terminal() {
-        Format::Table
-    } else {
-        Format::Json
-    });
+    let stdout_is_terminal = io::stdout().is_terminal();
+    let output = Output {
+        format: cli.format.unwrap_or(if stdout_is_terminal {
+            Format::Table
+        } else {
+            Format::Json
+        }),
+        color: stream_color(stdout_is_terminal),
+    };
     let result = match &cli.command {
-        Command::Check { mapping } => check(mapping, format),
-        Command::Terms { mapping } => terms(mapping, format),
+        Command::Check { mapping } => check(mapping, output),
+        Command::Terms { mapping } => terms(mapping, output),
         Command::Explain {
             mapping,
             query,
             base_iri,
-        } => explain(mapping, query, base_iri.base_iri.as_ref(), format),
+        } => explain(mapping, query, base_iri.base_iri.as_ref(), output),
         Command::Query {
             mapping,
-            query: query_path,
+            query: query_arg,
             db,
             row_limit,
             timeout,
             base_iri,
         } => query(
             mapping,
-            query_path,
+            query_arg,
             base_iri.base_iri.as_ref(),
             db.as_deref(),
             Limits {
                 statement_timeout: *timeout,
                 row_limit: *row_limit,
             },
-            format,
+            output,
         ),
         Command::Serve { config, base_iri } => serve(config.as_deref(), base_iri.clone()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
-            match format {
-                _ if failure.warning => eprintln!("warning: {}", failure.message),
-                _ if failure.after_output => eprintln!("error: {}", failure.message),
-                Format::Json => println!(
-                    "{}",
-                    json!({
-                        "ok": false,
-                        "error": { "kind": failure.kind, "message": failure.message },
-                    })
-                ),
-                Format::Table => eprintln!("error: {}", failure.message),
+            let color = stream_color(io::stderr().is_terminal());
+            if failure.warning {
+                eprintln!("{} {}", paint(color, YELLOW, "warning:"), failure.message);
+            } else if failure.after_output || output.format != Format::Json {
+                eprintln!("{} {}", paint(color, RED, "error:"), failure.message);
+            } else {
+                println!("{}", failure.to_json());
             }
             ExitCode::from(failure.code)
         }
@@ -275,8 +401,9 @@ fn read_input(path: &Path) -> Result<String, Failure> {
     } else {
         std::fs::read_to_string(path).map(|t| text = t)
     };
-    read.map_err(|e| {
-        Failure::new(
+    read.map_err(|e| Failure {
+        details: Some(json!({ "path": path.display().to_string() })),
+        ..Failure::new(
             EXIT_INPUT,
             "input",
             format!("cannot read {}: {e}", path.display()),
@@ -290,13 +417,34 @@ fn load_mapping(path: &Path) -> Result<Mapping, Failure> {
     Mapping::from_turtle(&text).map_err(|e| Failure::new(EXIT_MAPPING, "mapping", e.to_string()))
 }
 
-fn check(path: &Path, format: Format) -> Result<(), Failure> {
+fn output_failure(error: io::Error) -> Failure {
+    Failure::new(
+        EXIT_INPUT,
+        "output",
+        format!("cannot write output: {error}"),
+    )
+}
+
+/// Writes CSV records to stdout; a reader that went away is not an error.
+fn print_csv<S: AsRef<str>>(records: &[Vec<S>]) -> Result<(), Failure> {
+    let mut out = BufWriter::new(io::stdout().lock());
+    let result = records
+        .iter()
+        .try_for_each(|record| write_csv_record(&mut out, record))
+        .and_then(|()| out.flush());
+    match result {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(output_failure(e)),
+        _ => Ok(()),
+    }
+}
+
+fn check(path: &Path, output: Output) -> Result<(), Failure> {
     let mapping = load_mapping(path)?;
     let index = MappingIndex::new(&mapping);
     let triples_maps = mapping.triples_maps().len();
     let classes = index.classes().count();
     let properties = index.properties().count();
-    match format {
+    match output.format {
         Format::Json => println!(
             "{}",
             json!({
@@ -306,6 +454,18 @@ fn check(path: &Path, format: Format) -> Result<(), Failure> {
                 "properties": properties,
             })
         ),
+        Format::Csv => print_csv(&[
+            vec![
+                "triples_maps".to_owned(),
+                "classes".into(),
+                "properties".into(),
+            ],
+            vec![
+                triples_maps.to_string(),
+                classes.to_string(),
+                properties.to_string(),
+            ],
+        ])?,
         Format::Table => {
             println!("ok: {triples_maps} triples maps, {classes} classes, {properties} properties")
         }
@@ -313,7 +473,7 @@ fn check(path: &Path, format: Format) -> Result<(), Failure> {
     Ok(())
 }
 
-fn terms(path: &Path, format: Format) -> Result<(), Failure> {
+fn terms(path: &Path, output: Output) -> Result<(), Failure> {
     let mapping = load_mapping(path)?;
     let index = MappingIndex::new(&mapping);
     let classes: Vec<(&str, Vec<&TriplesMapId>)> = index
@@ -338,18 +498,25 @@ fn terms(path: &Path, format: Format) -> Result<(), Failure> {
         }
     }
     used.sort_unstable();
+    let kinds = || {
+        classes
+            .iter()
+            .map(|t| ("class", t))
+            .chain(properties.iter().map(|t| ("property", t)))
+    };
+    let ids = |ids: &[&TriplesMapId]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
 
-    match format {
+    match output.format {
         Format::Json => {
             // `iri` stays absolute, so a reader needs no prefix handling.
             let entries = |terms: &[(&str, Vec<&TriplesMapId>)]| -> Vec<Value> {
                 terms
                     .iter()
-                    .map(|(iri, ids)| {
+                    .map(|(iri, triples_maps)| {
                         json!({
                             "iri": iri,
                             "prefixed_name": mapping.compact_iri(iri),
-                            "triples_maps": ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                            "triples_maps": ids(triples_maps),
                         })
                     })
                     .collect()
@@ -367,6 +534,20 @@ fn terms(path: &Path, format: Format) -> Result<(), Failure> {
                 })
             );
         }
+        Format::Csv => {
+            let header = ["kind", "iri", "prefixed_name", "triples_maps"].map(str::to_owned);
+            let records: Vec<Vec<String>> = std::iter::once(header.to_vec())
+                .chain(kinds().map(|(kind, (iri, triples_maps))| {
+                    vec![
+                        kind.to_owned(),
+                        (*iri).to_owned(),
+                        mapping.compact_iri(iri).unwrap_or_default(),
+                        ids(triples_maps).join(" "),
+                    ]
+                }))
+                .collect();
+            print_csv(&records)?;
+        }
         Format::Table => {
             for (prefix, namespace) in &used {
                 println!("PREFIX {prefix}: <{namespace}>");
@@ -374,19 +555,15 @@ fn terms(path: &Path, format: Format) -> Result<(), Failure> {
             if !used.is_empty() {
                 println!();
             }
-            let rows: Vec<[String; 3]> = classes
-                .iter()
-                .map(|t| ("class", t))
-                .chain(properties.iter().map(|t| ("property", t)))
-                .map(|(kind, (iri, ids))| {
-                    let ids: Vec<_> = ids.iter().map(|id| id.to_string()).collect();
+            let rows: Vec<[String; 3]> = kinds()
+                .map(|(kind, (iri, triples_maps))| {
                     let term = mapping
                         .compact_iri(iri)
                         .unwrap_or_else(|| format!("<{iri}>"));
-                    [kind.to_owned(), term, ids.join(", ")]
+                    [kind.to_owned(), term, ids(triples_maps).join(", ")]
                 })
                 .collect();
-            print_table(["KIND", "TERM", "TRIPLES MAPS"], &rows);
+            print_table(["KIND", "TERM", "TRIPLES MAPS"], &rows, output.color);
         }
     }
     Ok(())
@@ -395,11 +572,11 @@ fn terms(path: &Path, format: Format) -> Result<(), Failure> {
 /// Reads the mapping and the query and unfolds the query.
 fn load_plan(
     mapping_path: &Path,
-    query_path: &Path,
+    query: &QueryArg,
     base_iri: Option<&BaseIri>,
 ) -> Result<SqlPlan, Failure> {
     let stdin = Path::new("-");
-    if mapping_path == stdin && query_path == stdin {
+    if mapping_path == stdin && query.file.as_deref() == Some(stdin) {
         return Err(Failure::new(
             EXIT_INPUT,
             "input",
@@ -410,9 +587,14 @@ fn load_plan(
     if let Some(base) = base_iri {
         mapping = mapping.with_base_iri(base.clone());
     }
-    let query = read_input(query_path)?;
+    let text = match (&query.file, &query.text) {
+        (_, Some(text)) => text.clone(),
+        (Some(path), None) => read_input(path)?,
+        // clap requires one of them.
+        (None, None) => unreachable!("clap requires a query"),
+    };
     // Errors past this point are about the query, not the mapping.
-    sparql::parse(&query)
+    sparql::parse(&text)
         .and_then(|query| unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping)))
         .map_err(|e| {
             let kind = match e {
@@ -425,14 +607,14 @@ fn load_plan(
 
 fn explain(
     mapping_path: &Path,
-    query_path: &Path,
+    query: &QueryArg,
     base_iri: Option<&BaseIri>,
-    format: Format,
+    output: Output,
 ) -> Result<(), Failure> {
-    let plan = load_plan(mapping_path, query_path, base_iri)?;
+    let plan = load_plan(mapping_path, query, base_iri)?;
     let rendered = plan.to_sql();
 
-    match format {
+    match output.format {
         Format::Json => {
             let variables: Vec<Value> = plan
                 .projection
@@ -450,6 +632,16 @@ fn explain(
                 json!({ "sql": rendered.sql, "params": rendered.params, "variables": variables })
             );
         }
+        Format::Csv => {
+            let header: Vec<String> = std::iter::once("sql".to_owned())
+                .chain((1..=rendered.params.len()).map(|i| format!("${i}")))
+                .collect();
+            let record: Vec<&str> = std::iter::once(rendered.sql.as_str())
+                .chain(rendered.params.iter().map(String::as_str))
+                .collect();
+            let header: Vec<&str> = header.iter().map(String::as_str).collect();
+            print_csv(&[header, record])?;
+        }
         Format::Table => {
             println!("{}", rendered.sql);
             if !rendered.params.is_empty() {
@@ -465,13 +657,13 @@ fn explain(
 
 fn query(
     mapping_path: &Path,
-    query_path: &Path,
+    query_arg: &QueryArg,
     base_iri: Option<&BaseIri>,
     db: Option<&str>,
     limits: Limits,
-    format: Format,
+    output: Output,
 ) -> Result<(), Failure> {
-    let plan = load_plan(mapping_path, query_path, base_iri)?;
+    let plan = load_plan(mapping_path, query_arg, base_iri)?;
     let url = db.ok_or_else(|| {
         Failure::new(
             EXIT_INPUT,
@@ -492,9 +684,19 @@ fn query(
         // Waiting for the first row before printing anything means an error
         // in planning or early execution is still reported in `format`.
         let first = solutions.try_next().await.map_err(before_output)?;
-        match format {
-            Format::Json => print_json(&mut solutions, first).await?,
-            Format::Table => print_solutions_table(&mut solutions, first).await?,
+        let stdout = || BufWriter::new(io::stdout().lock());
+        match output.format {
+            Format::Json => {
+                let writer = JsonResultsWriter::start(stdout(), solutions.variables())
+                    .map_err(output_failure)?;
+                stream_solutions(&mut solutions, first, writer).await?
+            }
+            Format::Csv => {
+                let writer = CsvResultsWriter::start(stdout(), solutions.variables())
+                    .map_err(output_failure)?;
+                stream_solutions(&mut solutions, first, writer).await?
+            }
+            Format::Table => print_solutions_table(&mut solutions, first, output.color).await?,
         };
         if solutions.is_truncated() {
             return Err(row_limit_warning(limits.row_limit));
@@ -567,15 +769,21 @@ fn query_failure(error: v12n_postgres::Error, rows: u64) -> Failure {
                 0 => "before the first row".to_owned(),
                 n => format!("after {n} rows"),
             };
-            Failure::new(
-                EXIT_TIMEOUT,
-                "timeout",
-                format!(
-                    "statement timeout of {timeout:?} reached {progress}; the query was cancelled \
-                     (raise --timeout or {}, 0 disables it)",
-                    env::STATEMENT_TIMEOUT
-                ),
-            )
+            Failure {
+                details: Some(json!({
+                    "timeout_ms": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    "rows": rows,
+                })),
+                ..Failure::new(
+                    EXIT_TIMEOUT,
+                    "timeout",
+                    format!(
+                        "statement timeout of {timeout:?} reached {progress}; the query was cancelled \
+                         (raise --timeout or {}, 0 disables it)",
+                        env::STATEMENT_TIMEOUT
+                    ),
+                )
+            }
         }
         error => database_failure(error),
     }
@@ -597,42 +805,69 @@ fn row_limit_warning(row_limit: u64) -> Failure {
     }
 }
 
-/// Streams the solutions as SPARQL 1.1 Query Results JSON.
-async fn print_json(
+/// A results format written one solution at a time.
+trait ResultsSink {
+    fn put(&mut self, solution: &Solution) -> io::Result<()>;
+    fn flush(&mut self) -> io::Result<()>;
+    /// Writes what closes the document, if anything, and flushes.
+    fn end(self) -> io::Result<()>;
+}
+
+impl<W: Write> ResultsSink for JsonResultsWriter<W> {
+    fn put(&mut self, solution: &Solution) -> io::Result<()> {
+        self.write(solution)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.get_mut().flush()
+    }
+    fn end(self) -> io::Result<()> {
+        self.finish()?.flush()
+    }
+}
+
+impl<W: Write> ResultsSink for CsvResultsWriter<W> {
+    fn put(&mut self, solution: &Solution) -> io::Result<()> {
+        self.write(solution)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.get_mut().flush()
+    }
+    fn end(self) -> io::Result<()> {
+        self.finish()?.flush()
+    }
+}
+
+/// Streams the solutions into `sink` as they arrive.
+async fn stream_solutions(
     solutions: &mut Solutions,
-    first: Option<v12n_core::solution::Solution>,
+    first: Option<Solution>,
+    mut sink: impl ResultsSink,
 ) -> Result<(), Failure> {
-    let output_failure = |e: io::Error| Failure {
+    let after_output = |failure: Failure| Failure {
         after_output: true,
-        ..Failure::new(EXIT_INPUT, "output", format!("cannot write output: {e}"))
+        ..failure
     };
-    let stdout = BufWriter::new(io::stdout().lock());
-    let mut writer =
-        JsonResultsWriter::start(stdout, solutions.variables()).map_err(output_failure)?;
     let mut count: u64 = 0;
     let mut next = first;
     while let Some(solution) = next {
-        match writer.write(&solution) {
+        match sink.put(&solution) {
             Ok(()) => count += 1,
             // The reader went away, e.g. `| head`; nothing left to report to.
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
-            Err(e) => return Err(output_failure(e)),
+            Err(e) => return Err(after_output(output_failure(e))),
         }
         next = match solutions.try_next().await {
             Ok(next) => next,
             Err(e) => {
                 // Partial JSON stays unterminated so it cannot pass for a
                 // complete result.
-                let _ = io::stdout().flush();
-                return Err(Failure {
-                    after_output: true,
-                    ..query_failure(e, count)
-                });
+                let _ = sink.flush();
+                return Err(after_output(query_failure(e, count)));
             }
         };
     }
-    match writer.finish().and_then(|mut out| out.flush()) {
-        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(output_failure(e)),
+    match sink.end() {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(after_output(output_failure(e))),
         _ => Ok(()),
     }
 }
@@ -642,7 +877,8 @@ async fn print_json(
 /// row limit bounds how many that is.
 async fn print_solutions_table(
     solutions: &mut Solutions,
-    first: Option<v12n_core::solution::Solution>,
+    first: Option<Solution>,
+    color: bool,
 ) -> Result<(), Failure> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut next = first;
@@ -664,31 +900,10 @@ async fn print_solutions_table(
         .iter()
         .map(|v| format!("?{v}"))
         .collect();
-    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
-    for row in &rows {
-        for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.chars().count());
-        }
-    }
     let mut out = BufWriter::new(io::stdout().lock());
-    let mut result = Ok(());
-    for row in std::iter::once(&header).chain(&rows) {
-        let padded: Vec<String> = row
-            .iter()
-            .zip(&widths)
-            .map(|(cell, &width)| format!("{cell:<width$}"))
-            .collect();
-        result = writeln!(out, "{}", padded.join("  ").trim_end());
-        if result.is_err() {
-            break;
-        }
-    }
-    match result.and_then(|()| out.flush()) {
-        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(Failure::new(
-            EXIT_INPUT,
-            "output",
-            format!("cannot write output: {e}"),
-        )),
+    let result = write_table(&mut out, &header, &rows, color).and_then(|()| out.flush());
+    match result {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(output_failure(e)),
         _ => Ok(()),
     }
 }
@@ -713,23 +928,134 @@ fn dedup<'a>(ids: impl Iterator<Item = &'a TriplesMapId>) -> Vec<&'a TriplesMapI
     out
 }
 
-fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
-    let mut widths = header.map(str::len);
+fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]], color: bool) {
+    let header: Vec<String> = header.iter().map(|h| (*h).to_owned()).collect();
+    let mut out = BufWriter::new(io::stdout().lock());
+    // A reader that went away, e.g. `| head`, is not an error.
+    let _ = write_table(&mut out, &header, rows, color).and_then(|()| out.flush());
+}
+
+/// Writes left-aligned columns two spaces apart, the header in bold when
+/// `color` is set.
+fn write_table<R: AsRef<[String]>>(
+    out: &mut impl Write,
+    header: &[String],
+    rows: &[R],
+    color: bool,
+) -> io::Result<()> {
+    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
     for row in rows {
-        for (width, cell) in widths.iter_mut().zip(row) {
+        for (width, cell) in widths.iter_mut().zip(row.as_ref()) {
             *width = (*width).max(cell.chars().count());
         }
     }
-    let line = |cells: [&str; N]| {
-        let padded: Vec<_> = cells
+    let line = |cells: &[String]| {
+        let padded: Vec<String> = cells
             .iter()
-            .zip(widths)
-            .map(|(cell, width)| format!("{cell:<width$}"))
+            .zip(&widths)
+            .map(|(cell, &width)| format!("{cell:<width$}"))
             .collect();
-        println!("{}", padded.join("  ").trim_end());
+        padded.join("  ").trim_end().to_owned()
     };
-    line(header);
+    writeln!(out, "{}", paint(color, BOLD, &line(header)))?;
     for row in rows {
-        line(row.each_ref().map(String::as_str));
+        writeln!(out, "{}", line(row.as_ref()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn color_needs_a_terminal_and_no_no_color() {
+        let set = Some(OsStr::new("1"));
+        let empty = Some(OsStr::new(""));
+        let xterm = Some(OsStr::new("xterm-256color"));
+        assert!(wants_color(true, None, xterm));
+        assert!(wants_color(true, None, None));
+        assert!(!wants_color(false, None, xterm));
+        assert!(!wants_color(true, set, xterm));
+        // no-color.org: only a non-empty value disables colour.
+        assert!(wants_color(true, empty, xterm));
+        assert!(!wants_color(true, None, Some(OsStr::new("dumb"))));
+    }
+
+    /// Splits a shell command line on unquoted spaces and `|`, keeping the
+    /// last pipeline stage; enough for the examples in the help texts.
+    fn last_stage(line: &str) -> Vec<String> {
+        let mut stages: Vec<Vec<String>> = vec![Vec::new()];
+        let mut word: Option<String> = None;
+        let mut quote: Option<char> = None;
+        for c in line.chars() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), c) => word.get_or_insert_default().push(c),
+                (None, '\'' | '"') => {
+                    quote = Some(c);
+                    word.get_or_insert_default();
+                }
+                (None, ' ') => stages.last_mut().unwrap().extend(word.take()),
+                (None, '|') => {
+                    stages.last_mut().unwrap().extend(word.take());
+                    stages.push(Vec::new());
+                }
+                (None, c) => word.get_or_insert_default().push(c),
+            }
+        }
+        assert!(quote.is_none(), "unbalanced quotes: {line}");
+        stages.last_mut().unwrap().extend(word.take());
+        stages.pop().unwrap()
+    }
+
+    #[test]
+    fn every_help_example_parses() {
+        let mut command = Cli::command();
+        command.build();
+        let mut checked = 0;
+        for sub in command.get_subcommands().filter(|s| s.get_name() != "help") {
+            let help = sub
+                .get_after_help()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let examples: Vec<&str> = help
+                .lines()
+                .skip_while(|l| !l.starts_with("Examples"))
+                .skip(1)
+                .take_while(|l| l.starts_with("  "))
+                .collect();
+            assert!(
+                (2..=3).contains(&examples.len()),
+                "{}: {examples:?}",
+                sub.get_name()
+            );
+            for example in examples {
+                let words: Vec<String> = last_stage(example.trim())
+                    .into_iter()
+                    .skip_while(|w| w.contains('=') && !w.starts_with('-'))
+                    .collect();
+                if words.first().map(String::as_str) != Some("v12n") {
+                    continue;
+                }
+                assert_eq!(words[1], sub.get_name(), "{example}");
+                if let Err(e) = Cli::try_parse_from(&words) {
+                    panic!("{example}\n{e}");
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 10, "{checked}");
+    }
+
+    #[test]
+    fn query_is_a_file_or_text_but_not_both() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|_| ());
+        assert!(parse(&["v12n", "explain", "m.ttl", "q.rq"]).is_ok());
+        assert!(parse(&["v12n", "explain", "m.ttl", "--query", "SELECT * {}"]).is_ok());
+        assert!(parse(&["v12n", "explain", "m.ttl"]).is_err());
+        assert!(parse(&["v12n", "explain", "m.ttl", "q.rq", "--query", "SELECT * {}"]).is_err());
     }
 }

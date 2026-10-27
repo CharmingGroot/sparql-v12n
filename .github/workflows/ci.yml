@@ -183,13 +183,15 @@ jobs:
         env:
           CONTAINER: ${{ job.services.postgres.id }}
         run: cat examples/shop/schema.sql examples/shop/data.sql | docker exec -i "$CONTAINER" psql -q -v ON_ERROR_STOP=1 -U v12n -d shop
-      # Integration test binaries against PostgreSQL; reuses the build above.
-      # The differential tests have their own workflow.
+      # Integration test binaries against PostgreSQL, plus the v12n-postgres
+      # library, whose unit tests include one that reads a query plan from
+      # PostgreSQL; reuses the build above. The differential tests have
+      # their own workflow.
       - name: PostgreSQL tests
         if: ${{ !cancelled() }}
         env:
           V12N_TEST_DATABASE_URL: postgresql://v12n:v12n-dev@127.0.0.1:55432/shop
-        run: cargo nextest run --workspace --locked --profile ci -E 'kind(test) - package(v12n-difftest)'
+        run: cargo nextest run --workspace --locked --profile ci -E '(kind(test) - package(v12n-difftest)) + (kind(lib) & package(v12n-postgres))'
       - name: Keep the PostgreSQL test report
         if: always()
         run: if [ -f target/nextest/ci/junit.xml ]; then mv target/nextest/ci/junit.xml target/nextest/ci/junit-postgres.xml; fi
