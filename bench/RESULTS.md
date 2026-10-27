@@ -122,6 +122,28 @@ ANALYZE` of both statements on 100,000 rows shows. Before, the same plan
 encoded the id of every row of that severity. The other queries stayed
 within the run-to-run variation. 1M was not re-run.
 
+## Row-limit window after #77
+
+[#77](https://github.com/CharmingGroot/sparql-v12n/issues/77) runs a
+query whose own `LIMIT` is at or below the row limit as the plan's own
+SQL, without `count(*) OVER ()` and the `LIMIT n+1` sub-selects, since
+such a result cannot be truncated. Two 100k runs on the same machine on
+2026-10-27, `8828ae3` (main) against the change, every result matching
+Ontop; milliseconds, median / p95 over 20 runs:
+
+| q07-order-limit | Before | After |
+|---|---:|---:|
+| `v12n-row-limit` | 3.4 / 3.9 | 3.5 / 4.2 |
+| `v12n-row-limit` SQL exec | 0.60 | 0.61 |
+| v12n (no row limit) | 3.6 / 4.2 | 3.7 / 4.7 |
+
+The statement `v12n-row-limit` runs for q07 is now the same as without
+a row limit. After #75 the window over q07's 100 sorted rows no longer
+cost anything measurable (the 63 → 81 ms of the issue was measured
+before #75), so the times stay within run-to-run variation. q07 is the
+only benchmark query with a `LIMIT`; the others still run with the
+window, unchanged.
+
 ## Self-joins after #28
 
 [#28](https://github.com/CharmingGroot/sparql-v12n/issues/28) merges two
@@ -189,12 +211,14 @@ resident memory about 40× smaller; v12n's peak stays at 12 MiB with
    query, so 4–5 round trips per request against Ontop's 2. q01's SQL runs
    for 0.05 ms but the request takes 2.6 ms, most of it waiting on the
    network.
-4. **Row-limit window** ([#77](https://github.com/CharmingGroot/sparql-v12n/issues/77)).
-   With the default row limit, `count(*) OVER ()` and, for ordered or
-   sliced queries, two more sorted sub-selects are added even when the
-   query's own `LIMIT` makes truncation impossible: q07 goes from 63 to
-   81 ms. On results under the limit the window also holds the first row
-   until all rows are computed (q04: 9.0 against 5.8 ms).
+4. **Row-limit window** ([#77](https://github.com/CharmingGroot/sparql-v12n/issues/77),
+   fixed for queries whose `LIMIT` fits, see above). With the default row
+   limit, `count(*) OVER ()` and, for ordered or sliced queries, two more
+   sorted sub-selects were added even when the query's own `LIMIT` made
+   truncation impossible: q07 went from 63 to 81 ms before #75. On
+   results under the limit without such a `LIMIT`, the window still holds
+   the first row until all rows are computed (q04: 9.0 against 5.8 ms);
+   that is the price of the truncation header.
 
 **What the correctness mechanisms cost.**
 

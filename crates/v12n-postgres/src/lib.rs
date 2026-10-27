@@ -160,10 +160,7 @@ impl Database {
             non_utf8: !self.utf8,
         };
         let rendered = plan.to_sql_with(&options)?;
-        // One row past the limit tells a cut-off result from one that
-        // happens to have exactly `row_limit` rows.
-        let fetch = (self.limits.row_limit > 0)
-            .then(|| i64::try_from(self.limits.row_limit.saturating_add(1)).unwrap_or(i64::MAX));
+        let fetch = row_fetch(self.limits.row_limit, plan.limit);
         let mut statement = self
             .client
             .prepare(&statement_sql(plan, &rendered, None, fetch.is_some()))
@@ -173,7 +170,7 @@ impl Database {
         // A query that selects neither selects a constant in their place.
         let data_columns = plan.columns.len();
         let placeholder = usize::from(data_columns == 0 && rendered.order_by.is_empty());
-        let count_column = data_columns + rendered.order_by.len() + placeholder;
+        let count_column = fetch.map(|_| data_columns + rendered.order_by.len() + placeholder);
         let decoders: Vec<Option<Decoder>> = statement.columns()[..data_columns]
             .iter()
             .map(|c| Decoder::for_type(c.type_()))
@@ -455,10 +452,22 @@ impl Database {
     }
 }
 
+/// How many rows the statement reads when the row limit can cut the
+/// result: one past `row_limit`, which tells a cut-off result from one
+/// with exactly `row_limit` rows (Discussion #22). `None` when nothing can
+/// be cut: without a row limit, or when the query's own `LIMIT` is at or
+/// below it, since Slice keeps at most `LIMIT` solutions (SPARQL 1.1
+/// §18.5) and each row is one solution. The statement is then the plan's
+/// own SQL, which ends in the plan's `ORDER BY`, `LIMIT` and `OFFSET`.
+fn row_fetch(row_limit: u64, query_limit: Option<usize>) -> Option<i64> {
+    let fits = query_limit.is_some_and(|limit| u64::try_from(limit).is_ok_and(|l| l <= row_limit));
+    (row_limit > 0 && !fits).then(|| i64::try_from(row_limit.saturating_add(1)).unwrap_or(i64::MAX))
+}
+
 /// The statement that runs `rendered`: with the columns that `decoders`
 /// has no decoder for cast to text, and with the row count when the
 /// results are `limited` (then `$n` after the plan's parameters is the
-/// row limit plus one).
+/// row limit plus one, see [`row_fetch`]).
 fn statement_sql(
     plan: &SqlPlan,
     rendered: &RenderedSql,
@@ -485,10 +494,10 @@ fn statement_sql(
 /// buffers the limited rows for the window; the client still streams.
 /// An empty `OVER ()` adds no sort, so the order of `sql` is kept.
 ///
-/// A query `LIMIT` at or below the row limit leaves at most that many
-/// rows, so the result is never reported as truncated. When `sql` has its
-/// own `LIMIT` or `OFFSET` (`sliced`), or its own `ORDER BY`, it is read
-/// as a subquery, since one `SELECT` takes only one `LIMIT`.
+/// Only used when the result can exceed the row limit ([`row_fetch`]).
+/// When `sql` has its own `LIMIT` or `OFFSET` (`sliced`), or its own
+/// `ORDER BY`, it is read as a subquery, since one `SELECT` takes only
+/// one `LIMIT`.
 ///
 /// SQL keeps no order through a subquery, so with `ORDER BY` both the
 /// limited subquery and the outermost query sort again by the sort keys
@@ -554,8 +563,9 @@ pub struct Solutions {
     decoders: Vec<Decoder>,
     row_limit: u64,
     /// The row count's column, after the projected columns and the sort
-    /// keys, which are never read.
-    count_column: usize,
+    /// keys, which are never read; `None` when the statement has none
+    /// because the row limit cannot cut the result ([`row_fetch`]).
+    count_column: Option<usize>,
     returned: u64,
     truncated: bool,
     timeout: Duration,
@@ -584,10 +594,10 @@ impl Solutions {
                 return Err(Error::from_postgres(e, self.timeout));
             }
         };
-        if self.row_limit > 0 {
+        if let Some(count_column) = self.count_column {
             if self.returned == 0 {
                 let total: i64 = row
-                    .try_get(self.count_column)
+                    .try_get(count_column)
                     .map_err(|e| Error::Database(e.to_string()))?;
                 self.truncated = u64::try_from(total).unwrap_or(0) > self.row_limit;
             }
@@ -631,9 +641,10 @@ mod tests {
 
     const SHOP: &str = include_str!("../../../examples/shop/mapping.ttl");
 
-    /// The statement `execute` prepares for `query` over the shop, with a
-    /// column `decoders` cannot read when `cast`.
-    fn statement(query: &str, cast: bool) -> String {
+    /// The statement `execute` prepares for `query` over the shop under
+    /// `row_limit`, with a column `decoders` cannot read when `cast`, and
+    /// the plan's own SQL (cast when `cast`) that it may be.
+    fn statements(query: &str, cast: bool, row_limit: u64) -> (String, String) {
         let mapping = Mapping::from_turtle(SHOP).unwrap();
         let query = sparql::parse(&format!("PREFIX ex: <http://example.org/>\n{query}")).unwrap();
         let plan = unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping)).unwrap();
@@ -644,7 +655,37 @@ mod tests {
             .enumerate()
             .map(|(i, _)| (i > 0).then_some(Decoder::Text))
             .collect();
-        statement_sql(&plan, &rendered, cast.then_some(decoders.as_slice()), true)
+        let decoders = cast.then_some(decoders.as_slice());
+        let limited = row_fetch(row_limit, plan.limit).is_some();
+        (
+            statement_sql(&plan, &rendered, decoders, limited),
+            statement_sql(&plan, &rendered, decoders, false),
+        )
+    }
+
+    fn statement(query: &str, cast: bool, row_limit: u64) -> String {
+        statements(query, cast, row_limit).0
+    }
+
+    #[test]
+    fn row_fetch_reads_one_past_the_limit_only_when_it_can_cut() {
+        for (row_limit, query_limit, fetch) in [
+            (0, None, None),
+            (0, Some(5), None),
+            (2, None, Some(3)),
+            (2, Some(0), None),
+            (2, Some(1), None),
+            (2, Some(2), None),
+            (2, Some(3), Some(3)),
+            (2, Some(usize::MAX), Some(3)),
+            (u64::MAX, None, Some(i64::MAX)),
+        ] {
+            assert_eq!(
+                row_fetch(row_limit, query_limit),
+                fetch,
+                "row limit {row_limit}, LIMIT {query_limit:?}"
+            );
+        }
     }
 
     /// SQL keeps no order through a subquery, so every query around one
@@ -680,7 +721,71 @@ mod tests {
             ),
             ("plain", "SELECT ?o WHERE { ?o ex:amount ?a }", false),
         ] {
-            let sql = statement(query, cast);
+            // Every query `LIMIT` here is above the row limit.
+            let sql = statement(query, cast, 1);
+            insta::assert_snapshot!(name, sql, query);
+        }
+    }
+
+    /// A query `LIMIT` at or below the row limit leaves no row to cut, so
+    /// the statement is the plan's own SQL, without the row count; its
+    /// outermost query still sorts. One more than the row limit keeps the
+    /// row count.
+    #[test]
+    fn limit_within_the_row_limit_runs_the_plans_own_sql() {
+        for (name, query, cast, row_limit) in [
+            (
+                "fits_sliced",
+                "SELECT ?o WHERE { ?o ex:amount ?a } LIMIT 2",
+                false,
+                2,
+            ),
+            (
+                "fits_ordered_and_sliced",
+                "SELECT ?o ?a WHERE { ?o ex:amount ?a } ORDER BY DESC(?a) LIMIT 2 OFFSET 1",
+                false,
+                2,
+            ),
+            (
+                "fits_ordered_cast",
+                "SELECT ?o ?a WHERE { ?o ex:amount ?a } ORDER BY DESC(?a) LIMIT 2",
+                true,
+                10_000,
+            ),
+            (
+                "fits_ordered_distinct",
+                "SELECT DISTINCT ?a WHERE { ?o ex:amount ?a } ORDER BY ?a LIMIT 2",
+                false,
+                2,
+            ),
+            (
+                "fits_ordered_union",
+                "SELECT ?x WHERE { { ?x ex:name ?v } UNION { ?x ex:amount ?v } } ORDER BY ?v LIMIT 2",
+                false,
+                2,
+            ),
+        ] {
+            let (sql, own) = statements(query, cast, row_limit);
+            assert_eq!(sql, own, "{query}");
+            assert!(!sql.contains("OVER ()"), "{sql}");
+            if query.contains("ORDER BY") {
+                let outermost = sql.rfind("\n)").map_or(sql.as_str(), |i| &sql[i..]);
+                assert!(outermost.contains("\nORDER BY "), "{sql}");
+            }
+            insta::assert_snapshot!(name, sql, query);
+        }
+        for (name, query) in [
+            (
+                "over_ordered_distinct",
+                "SELECT DISTINCT ?a WHERE { ?o ex:amount ?a } ORDER BY ?a LIMIT 3",
+            ),
+            (
+                "over_ordered_union",
+                "SELECT ?x WHERE { { ?x ex:name ?v } UNION { ?x ex:amount ?v } } ORDER BY ?v LIMIT 3",
+            ),
+        ] {
+            let sql = statement(query, false, 2);
+            assert!(sql.starts_with("SELECT q.*, count(*) OVER ()"), "{sql}");
             insta::assert_snapshot!(name, sql, query);
         }
     }

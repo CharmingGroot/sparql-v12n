@@ -432,6 +432,50 @@ fn query_with_exactly_row_limit_rows_is_not_truncated() {
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
 }
 
+/// A query `LIMIT` equal to the row limit is a complete result (exit 0);
+/// one above it is truncation when the rows exist (exit 5).
+#[test]
+fn query_limit_at_the_row_limit_exits_zero_and_above_it_five() {
+    let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
+        eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
+        return;
+    };
+    // vip-orders has three solutions.
+    let vip = std::fs::read_to_string(VIP_ORDERS).unwrap();
+    for (limit, row_limit, code, rows) in [
+        (2, "2", 0, 2),
+        (3, "2", 5, 2),
+        (3, "3", 0, 3),
+        (4, "3", 0, 3),
+    ] {
+        let query = format!("{vip} ORDER BY ?order LIMIT {limit}");
+        let output = v12n(
+            &[
+                "query",
+                SHOP,
+                "--query",
+                &query,
+                "--db",
+                &url,
+                "--row-limit",
+                row_limit,
+            ],
+            "",
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "LIMIT {limit}, row limit {row_limit}"
+        );
+        assert_eq!(
+            bindings(&output),
+            rows,
+            "LIMIT {limit}, row limit {row_limit}"
+        );
+        assert_eq!(output.stderr.is_empty(), code == 0, "{:?}", output.stderr);
+    }
+}
+
 /// A mapping over `rr:sqlQuery` rows of `id` and `pad`, plus a query file
 /// for `?s <http://example.org/pad> ?p`.
 fn slow_rows(sql: &str) -> (String, String) {
