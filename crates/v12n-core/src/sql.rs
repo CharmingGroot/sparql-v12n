@@ -1555,6 +1555,77 @@ impl SqlBranch {
             .iter()
             .chain(self.left_joins.iter().flat_map(|j| &j.conditions))
     }
+
+    /// Replaces every table alias the select list, the conditions and the
+    /// order values refer to by `f` of it. `from`, `fixed_columns` and
+    /// the ranges of `left_joins` are left to the caller.
+    pub(crate) fn rename_tables(&mut self, f: &impl Fn(usize) -> usize) {
+        fn expr(e: &mut SqlExpr, f: &impl Fn(usize) -> usize) {
+            match e {
+                SqlExpr::Column { table, .. } | SqlExpr::Lexical { table, .. } => {
+                    *table = f(*table)
+                }
+                SqlExpr::Param(_) | SqlExpr::Null(_) | SqlExpr::Unbound | SqlExpr::True => {}
+                SqlExpr::Concat(parts) => parts.iter_mut().for_each(|p| expr(p, f)),
+                SqlExpr::Matched(inner) => expr(inner, f),
+                SqlExpr::Term { term: t, guard } => {
+                    term(t, f);
+                    if let Some(guard) = guard {
+                        expr(guard, f);
+                    }
+                }
+            }
+        }
+        fn term(t: &mut TermSql, f: &impl Fn(usize) -> usize) {
+            match &mut t.value {
+                TermSqlValue::Column { table, .. } | TermSqlValue::Template { table, .. } => {
+                    *table = f(*table);
+                }
+                TermSqlValue::Param(_) => {}
+            }
+        }
+        fn condition(c: &mut Condition, f: &impl Fn(usize) -> usize) {
+            match c {
+                Condition::Eq(left, right) => {
+                    expr(left, f);
+                    expr(right, f);
+                }
+                Condition::EqAny(left, right) => {
+                    expr(left, f);
+                    right.iter_mut().for_each(|e| expr(e, f));
+                }
+                Condition::IsNotNull(e) | Condition::IsNull(e) => expr(e, f),
+                Condition::Or(alternatives) => alternatives
+                    .iter_mut()
+                    .flatten()
+                    .for_each(|c| condition(c, f)),
+                Condition::SameTerm(left, right) => {
+                    term(left, f);
+                    term(right, f);
+                }
+                Condition::Filter(filter) => filter.visit_mut(&mut |part| match part {
+                    PartMut::Condition(c) => condition(c, f),
+                    PartMut::Term(t) => term(t, f),
+                }),
+            }
+        }
+        for e in &mut self.select {
+            expr(e, f);
+        }
+        let conditions = self
+            .conditions
+            .iter_mut()
+            .chain(self.left_joins.iter_mut().flat_map(|j| &mut j.conditions));
+        for c in conditions {
+            condition(c, f);
+        }
+        for value in &mut self.order {
+            value.visit_mut(&mut |part| match part {
+                PartMut::Condition(c) => condition(c, f),
+                PartMut::Term(t) => term(t, f),
+            });
+        }
+    }
 }
 
 impl TermSql {

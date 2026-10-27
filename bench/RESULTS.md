@@ -144,6 +144,40 @@ before #75), so the times stay within run-to-run variation. q07 is the
 only benchmark query with a `LIMIT`; the others still run with the
 window, unchanged.
 
+## Self-joins after #28
+
+[#28](https://github.com/CharmingGroot/sparql-v12n/issues/28) merges two
+scans of one table when the query's conditions pin both to the same row
+by a `NOT NULL` unique key. q03's `assets t0 JOIN assets t1 ON t1.id =
+t0.id` is one scan of `assets`, q02 reads `alerts` once, and q01 is one
+key lookup instead of a `CROSS JOIN` of two. q04's `LEFT JOIN` of
+`assets` with itself is not merged: the optional side is `NULL` where
+the part does not match. Runs one after the other on 2026-10-27, `8828ae3`
+(main) against the change, every result matching Ontop; v12n SQL exec is
+the mean per request from `pg_stat_statements`, end to end the median /
+p95 (100k: 20 runs, 1M: 10 runs). The machine was faster than on
+2026-10-26, so compare within this table.
+
+| Query | Alerts | v12n SQL exec before | after | Ontop SQL exec (after run) | v12n end to end before | after |
+|---|---|---:|---:|---:|---:|---:|
+| q01-lookup | 100k | 0.047 | 0.046 | 0.006 | 2.3 / 3.1 | 2.3 / 3.9 |
+| | 1M | 0.049 | 0.048 | 0.007 | 2.1 / 2.8 | 2.4 / 3.7 |
+| q02-join | 100k | 4.75 | 1.50 | 1.69 | 9.9 / 11.8 | 5.5 / 7.8 |
+| | 1M | 32.0 | 18.4 | 24.6 | 33.4 / 40.1 | 26.8 / 38.4 |
+| q03-star | 100k | 0.86 | 0.34 | 0.34 | 4.1 / 7.2 | 4.1 / 7.8 |
+| | 1M | 9.5 | 4.3 | 4.6 | 15.3 / 17.5 | 18.2 / 21.7 |
+| q04-optional | 100k | 2.01 | 2.08 | 1.14 | 8.8 / 10.6 | 9.4 / 15.2 |
+| | 1M | 34.7 | 29.9 | 14.4 | 72.4 / 102.6 | 86.2 / 94.3 |
+
+PostgreSQL now runs q02 and q03 as long as Ontop's SQL or shorter
+(q03 0.34 ms both at 100k; q02 18 against 25 ms at 1M). End to end, q02
+is 45% faster at 100k; q03's request time is dominated by the round trips
+and moved within the run-to-run variation (its first row came at 3.1 ms
+against 3.2 at 100k, 4.2 against 5.1 at 1M). q01's two key lookups cost
+little either way. The other queries have no self-join and stayed within
+the variation. The number of statements per request is unchanged: the
+keys come from the catalog query that already ran.
+
 ## Analysis
 
 **Where v12n is faster.** On every query that returns many rows, by 7–8×
@@ -165,13 +199,12 @@ resident memory about 40× smaller; v12n's peak stays at 12 MiB with
    time in a correlated subquery per row; Ontop sorts by
    `prefix || CAST(id AS TEXT)`. The text of an integer never needs
    encoding.
-2. **Self-joins** ([#28](https://github.com/CharmingGroot/sparql-v12n/issues/28)).
-   Ontop merges scans of the same table on the primary key; v12n joins
-   `alerts` with `alerts` (q02) and `assets` with `assets` (q03, q04, and
-   q01 as a `CROSS JOIN` of two key lookups). PostgreSQL runs these 1.5–2.5×
-   longer (q02: 9.7 against 3.9 ms at 100k, 86 against 50 ms at 1M). It
-   does not show end to end only because Ontop loses more after the
-   database.
+2. **Self-joins** ([#28](https://github.com/CharmingGroot/sparql-v12n/issues/28),
+   fixed except `OPTIONAL`, see above). Ontop merges scans of the same
+   table on the primary key; v12n joined `alerts` with `alerts` (q02) and
+   `assets` with `assets` (q03, q04, and q01 as a `CROSS JOIN` of two key
+   lookups), which PostgreSQL ran 1.5–2.5× longer (q02: 9.7 against 3.9 ms
+   at 100k, 86 against 50 ms at 1M). q04's `LEFT JOIN` on the key remains.
 3. **Round trips before the first row** ([#76](https://github.com/CharmingGroot/sparql-v12n/issues/76)).
    Counted from the PostgreSQL log: the key lookup (prepare and execute),
    the column-type probe (prepare), the prepare and the execution of the

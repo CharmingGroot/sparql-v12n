@@ -1,0 +1,10 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_merged(r#\"SELECT ?asset ?hostname WHERE { ?asset ex:criticality \"High\" ; ex:hostname ?hostname }\"#)"
+---
+SELECT t0."id" AS "asset", t0."hostname" AS "hostname"
+FROM "assets" t0
+WHERE t0."criticality" = $1 AND t0."hostname" IS NOT NULL
+
+-- params
+$1 = "High"

@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?t ?x ?y WHERE { ?t ex:x ?x ; ex:y ?y }

@@ -12,13 +12,14 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Config, NoTls, RowStream, Statement};
 use v12n_core::mapping::LogicalTable;
+use v12n_core::optimize;
 use v12n_core::solution::{Solution, SolutionBuilder, SqlValue};
 use v12n_core::sql::{
-    ColumnTypes, RenderOptions, RenderedSql, SqlPlan, TableKeys, TermKey, column_name_probe,
-    column_type_probe, quote_identifier, quote_table_name,
+    ColumnTypes, Comparison, RenderOptions, RenderedSql, SqlPlan, TableKeys, TermKey,
+    column_name_probe, column_type_probe, quote_identifier, quote_table_name,
 };
 
 use bind::{Bound, bind, term_key};
@@ -31,6 +32,14 @@ pub const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_ROW_LIMIT: u64 = 10_000;
 /// Applied when the connection string sets no `connect_timeout`.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Unique keys of a plan's tables, see [`Database::load_keys`].
+struct Keys {
+    /// Every key that always holds, for removing duplicates.
+    unique: TableKeys,
+    /// Those that identify a row by SQL `=`, for merging scans.
+    mergeable: TableKeys,
+}
 
 /// Resource limits for every query run on a [`Database`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +131,15 @@ impl Database {
         let timeout = self.limits.statement_timeout;
         let pg = |e| Error::from_postgres(e, timeout);
         let plan = self.resolve_columns(plan).await.map_err(pg)?;
-        let keys = self.load_table_keys(&plan).await.map_err(pg)?;
+        let keys = self.load_keys(&plan).await.map_err(pg)?;
+        let plan = match keys
+            .as_ref()
+            .and_then(|k| optimize::eliminate_self_joins(&plan, &k.mergeable))
+        {
+            Some(merged) => Cow::Owned(merged),
+            None => plan,
+        };
+        let keys = keys.map(|k| k.unique);
         // `DISTINCT` and `UNION` compare values with `=`, so the types of
         // the columns they compare tell which need a key next to them.
         let removes_duplicates = plan.distinct || plan.has_duplicates(keys.as_ref());
@@ -250,9 +267,9 @@ impl Database {
     }
 
     /// Unique keys of the tables that can show the plan has no duplicate
-    /// solutions (`SqlPlan::key_tables`), read from the catalog on every
-    /// query so that a dropped key is never trusted. `None` when keys
-    /// cannot help.
+    /// solutions (`SqlPlan::key_tables`) or that a branch scans more than
+    /// once, read from the catalog on every query so that a dropped key is
+    /// never trusted. `None` when keys cannot help.
     ///
     /// Only keys that hold for every row at any time count: unique
     /// indexes that are valid, not deferrable, not partial, and on plain
@@ -267,11 +284,45 @@ impl Database {
             .map_err(|e| Error::from_postgres(e, timeout))
     }
 
+    /// The keys of [`table_keys`](Self::table_keys) of the tables that a
+    /// branch of the plan scans more than once (`self_join_tables`) and
+    /// that identify a row by SQL `=`, so that
+    /// `optimize::eliminate_self_joins` can merge such scans. `None` when
+    /// no table is scanned twice.
+    pub async fn merge_keys(&self, plan: &SqlPlan) -> Result<Option<TableKeys>, Error> {
+        let timeout = self.limits.statement_timeout;
+        let keys = self
+            .load_keys(plan)
+            .await
+            .map_err(|e| Error::from_postgres(e, timeout))?;
+        Ok(keys
+            .filter(|_| !optimize::self_join_tables(plan).is_empty())
+            .map(|k| k.mergeable))
+    }
+
     async fn load_table_keys(
         &self,
         plan: &SqlPlan,
     ) -> Result<Option<TableKeys>, tokio_postgres::Error> {
-        let tables = plan.key_tables();
+        Ok(self.load_keys(plan).await?.map(|k| k.unique))
+    }
+
+    /// The keys of the tables of `key_tables` and `self_join_tables`, in
+    /// one catalog query.
+    ///
+    /// A key merges two scans of its table only when equality on it is
+    /// exactly equality of rows: every column is `NOT NULL` (a unique
+    /// index allows several `NULL`s), the index compares with the column's
+    /// own collation and the type's default operator class, as the SQL
+    /// `=` the plan renders does, and the type compares by `=` without a
+    /// cast or a term key (`ColumnType::comparison`, `ColumnType::term_key`).
+    async fn load_keys(&self, plan: &SqlPlan) -> Result<Option<Keys>, tokio_postgres::Error> {
+        let mut tables = plan.key_tables();
+        for table in optimize::self_join_tables(plan) {
+            if !tables.contains(&table) {
+                tables.push(table);
+            }
+        }
         if tables.is_empty() {
             return Ok(None);
         }
@@ -279,18 +330,22 @@ impl Database {
             .iter()
             .map(|t| match t {
                 LogicalTable::TableName(name) => quote_table_name(name),
-                LogicalTable::SqlQuery(_) => unreachable!("key_tables lists tables only"),
+                LogicalTable::SqlQuery(_) => unreachable!("only tables have keys"),
             })
             .collect();
         let rows = self
             .client
             .query(
-                "SELECT t.n::int4, array_agg(a.attname::text ORDER BY c.ord)
+                "SELECT t.n::int4, array_agg(a.attname::text ORDER BY c.ord),
+                   bool_and(a.attnotnull AND c.coll = a.attcollation AND o.opcdefault),
+                   array_agg(a.atttypid ORDER BY c.ord)
                  FROM unnest($1::text[]) WITH ORDINALITY AS t(name, n)
                  JOIN pg_index i ON i.indrelid = to_regclass(t.name)
                  JOIN pg_class r ON r.oid = i.indrelid
-                 CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS c(attnum, ord)
+                 CROSS JOIN LATERAL unnest(i.indkey::int2[], i.indcollation::oid[],
+                   i.indclass::oid[]) WITH ORDINALITY AS c(attnum, coll, opclass, ord)
                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = c.attnum
+                 JOIN pg_opclass o ON o.oid = c.opclass
                  WHERE i.indisunique AND i.indimmediate AND i.indisvalid
                    AND i.indpred IS NULL AND i.indexprs IS NULL AND c.ord <= i.indnkeyatts
                    AND (r.relkind = 'p'
@@ -299,12 +354,29 @@ impl Database {
                 &[&names],
             )
             .await?;
-        let mut keys = TableKeys::new();
+        let mut keys = Keys {
+            unique: TableKeys::new(),
+            mergeable: TableKeys::new(),
+        };
         for row in rows {
             let position: i32 = row.get(0);
             let columns: Vec<String> = row.get(1);
-            let table = usize::try_from(position - 1).expect("ordinality starts at 1");
-            keys.entry(tables[table].clone()).or_default().push(columns);
+            let exact_index: bool = row.get(2);
+            let types: Vec<u32> = row.get(3);
+            let table = &tables[usize::try_from(position - 1).expect("ordinality starts at 1")];
+            let exact_types = types.into_iter().all(|oid| {
+                Type::from_oid(oid).is_some_and(|ty| {
+                    let ty = column_type(&ty);
+                    ty.comparison == Comparison::Value && ty.term_key.is_none()
+                })
+            });
+            if exact_index && exact_types {
+                keys.mergeable
+                    .entry(table.clone())
+                    .or_default()
+                    .push(columns.clone());
+            }
+            keys.unique.entry(table.clone()).or_default().push(columns);
         }
         Ok(Some(keys))
     }

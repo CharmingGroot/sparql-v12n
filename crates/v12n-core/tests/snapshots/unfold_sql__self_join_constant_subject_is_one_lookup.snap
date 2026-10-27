@@ -1,0 +1,10 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_merged(\"SELECT ?title ?severity WHERE { \\\n         <http://example.org/alert/4242> ex:title ?title ; ex:severityId ?severity }\")"
+---
+SELECT t0."title" AS "title", t0."severity_id" AS "severity"
+FROM "alerts" t0
+WHERE t0."id" = $1 AND t0."title" IS NOT NULL AND t0."severity_id" IS NOT NULL
+
+-- params
+$1 = "4242"
