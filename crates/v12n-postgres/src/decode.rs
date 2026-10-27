@@ -181,6 +181,23 @@ pub(crate) fn column_type(ty: &Type) -> ColumnType {
         Some(Decoder::Float4 | Decoder::Float8) | None => sql_type.clone(),
         Some(_) => group.to_owned(),
     };
+    // Characters of the lexical forms SQL computes: integer output is `-`
+    // and digits, uuid output lower-case hexadecimal digits and `-`,
+    // booleans `true` or `false`, binaries upper-case hexadecimal digits,
+    // and `trim_scale` of a numeric `-`, digits and `.`, or `NaN`,
+    // `Infinity` and `-Infinity`. All are in RFC 3987 `iunreserved`.
+    let lexical_unreserved = matches!(
+        Decoder::for_type(ty),
+        Some(
+            Decoder::Int2
+                | Decoder::Int4
+                | Decoder::Int8
+                | Decoder::Uuid
+                | Decoder::Bool
+                | Decoder::Bytea
+                | Decoder::Numeric
+        )
+    );
     let term_key = match Decoder::for_type(ty) {
         Some(Decoder::Float4 | Decoder::Float8) => Some(TermKey::Text),
         _ if *ty == Type::BPCHAR => Some(TermKey::OctetLength),
@@ -196,6 +213,7 @@ pub(crate) fn column_type(ty: &Type) -> ColumnType {
         group: group.to_owned(),
         comparison,
         lexical,
+        lexical_unreserved,
         term_key,
     }
 }
@@ -406,5 +424,35 @@ mod tests {
             SqlValue::String("abababab-abab-abab-abab-abababababab".into())
         );
         assert!(Decoder::Int8.decode(Some(&[0, 1])).is_err());
+    }
+
+    /// Only types whose lexical forms never hold a character outside
+    /// `iunreserved` skip the IRI-safe encoding in SQL.
+    #[test]
+    fn lexical_forms_of_numbers_uuids_booleans_and_binaries_are_unreserved() {
+        for ty in [
+            Type::INT2,
+            Type::INT4,
+            Type::INT8,
+            Type::UUID,
+            Type::BOOL,
+            Type::BYTEA,
+            Type::NUMERIC,
+        ] {
+            assert!(column_type(&ty).lexical_unreserved, "{ty}");
+        }
+        for ty in [
+            Type::TEXT,
+            Type::VARCHAR,
+            Type::BPCHAR,
+            Type::NAME,
+            Type::FLOAT4,
+            Type::FLOAT8,
+            Type::DATE,
+            Type::TIMESTAMP,
+            Type::INET,
+        ] {
+            assert!(!column_type(&ty).lexical_unreserved, "{ty}");
+        }
     }
 }

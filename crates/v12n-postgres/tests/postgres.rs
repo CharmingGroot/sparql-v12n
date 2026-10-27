@@ -1915,6 +1915,152 @@ async fn limit_and_offset_slice_after_order_and_distinct() {
     }
 }
 
+/// IRIs sort by their strings (SPARQL 1.1 §15.1), which SQL builds with
+/// the IRI-safe encoding of R2RML §7.3: as they are for types whose
+/// lexical forms only have `iunreserved` characters (integers with their
+/// sign, uuids, booleans, decimals with NaN and the infinities, binaries)
+/// and for text values made of them, encoded otherwise. All templates
+/// share one prefix, so the keys of every type are compared with each
+/// other.
+#[tokio::test]
+async fn iri_sort_keys_order_as_the_generated_iris() {
+    let Some(url) = database_url() else { return };
+    let rows = r"SELECT * FROM (VALUES
+        (1, 0::int8, NULL::text, NULL::uuid, NULL::bool, NULL::numeric, NULL::bytea, NULL::int4),
+        (2, -1, NULL, NULL, NULL, NULL, NULL, NULL),
+        (3, -9, NULL, NULL, NULL, NULL, NULL, NULL),
+        (4, -10, NULL, NULL, NULL, NULL, NULL, NULL),
+        (5, 9, NULL, NULL, NULL, NULL, NULL, NULL),
+        (6, 10, NULL, NULL, NULL, NULL, NULL, NULL),
+        (7, 100, NULL, NULL, NULL, NULL, NULL, NULL),
+        (8, 9223372036854775807, NULL, NULL, NULL, NULL, NULL, NULL),
+        (9, -9223372036854775808, NULL, NULL, NULL, NULL, NULL, NULL),
+        (10, NULL, 'a.b', NULL, NULL, NULL, NULL, NULL),
+        (11, NULL, 'a/b', NULL, NULL, NULL, NULL, NULL),
+        (12, NULL, 'a b', NULL, NULL, NULL, NULL, NULL),
+        (13, NULL, '', NULL, NULL, NULL, NULL, NULL),
+        (14, NULL, 'é', NULL, NULL, NULL, NULL, NULL),
+        (15, NULL, '가%', NULL, NULL, NULL, NULL, NULL),
+        (16, NULL, '-5', NULL, NULL, NULL, NULL, NULL),
+        (17, NULL, '~x_y', NULL, NULL, NULL, NULL, NULL),
+        (18, NULL, NULL, '00000000-0000-0000-0000-00000000000a', NULL, NULL, NULL, NULL),
+        (19, NULL, NULL, 'FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF', NULL, NULL, NULL, NULL),
+        (20, NULL, NULL, NULL, true, NULL, NULL, NULL),
+        (21, NULL, NULL, NULL, false, NULL, NULL, NULL),
+        (22, NULL, NULL, NULL, NULL, -12.50, NULL, NULL),
+        (23, NULL, NULL, NULL, NULL, 3.00, NULL, NULL),
+        (24, NULL, NULL, NULL, NULL, 0.000, NULL, NULL),
+        (25, NULL, NULL, NULL, NULL, NULL, '\\x0a0bff', NULL),
+        (26, -3, 'x/y', NULL, NULL, NULL, NULL, NULL),
+        (27, -3, 'x.y', NULL, NULL, NULL, NULL, NULL),
+        (28, NULL, NULL, NULL, NULL, NULL, NULL, -2147483648),
+        (29, NULL, NULL, NULL, NULL, NULL, NULL, 2147483647),
+        (30, NULL, NULL, NULL, NULL, 'NaN', NULL, NULL),
+        (31, NULL, NULL, NULL, NULL, '-Infinity', NULL, NULL)
+      ) AS v(id, i, t, u, b, d, x, i4)";
+    let templates = [
+        ("i", "{i}"),
+        ("t", "{t}"),
+        ("u", "{u}"),
+        ("b", "{b}"),
+        ("d", "{d}"),
+        ("x", "{x}"),
+        ("i4", "{i4}"),
+        ("pair", "{i}/{t}"),
+    ];
+    let objects: String = templates
+        .iter()
+        .map(|(p, t)| {
+            format!(
+                "  rr:predicateObjectMap [ rr:predicate ex:{p} ; \
+                 rr:objectMap [ rr:template \"http://example.org/v/{t}\" ] ] ;\n"
+            )
+        })
+        .collect();
+    let mapping = format!(
+        "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
+         @prefix ex: <http://example.org/> .\n\
+         <#Values> rr:logicalTable [ rr:sqlQuery \"\"\"{rows}\"\"\" ] ;\n\
+         {objects}  rr:subjectMap [ rr:template \"http://example.org/row/{{id}}\" ] .\n"
+    );
+    let all = templates
+        .iter()
+        .map(|(p, _)| format!("{{ ?row ex:{p} ?v }}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ");
+    let pair = "?row ex:pair ?v".to_owned();
+    for (pattern, count) in [
+        (all.clone(), 35),
+        (pair, 2),
+        ("?row ex:i ?v".to_owned(), 11),
+    ] {
+        for direction in ["", "DESC"] {
+            let query = format!(
+                "PREFIX ex: <http://example.org/> \
+                 SELECT ?v WHERE {{ {pattern} }} ORDER BY {direction}(?v)"
+            );
+            let (rows, _) = run_in_order(&url, Limits::default(), &plan(&mapping, &query))
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert_eq!(rows.len(), count, "{query}");
+            let iris: Vec<&str> = rows
+                .iter()
+                .map(|r| {
+                    r.strip_prefix("?v=<")
+                        .and_then(|r| r.strip_suffix('>'))
+                        .expect("an IRI")
+                })
+                .collect();
+            // The engine builds the IRIs; Rust orders strings by code point.
+            let mut expected = iris.clone();
+            expected.sort();
+            if direction == "DESC" {
+                expected.reverse();
+            }
+            assert_eq!(iris, expected, "{query}");
+        }
+    }
+    // The strings SQL builds are the IRIs: a FILTER compares them. `0` is
+    // both an integer and a decimal; `a b` is encoded.
+    for (iri, count) in [
+        ("-9223372036854775808", 1),
+        ("-10", 1),
+        ("0", 2),
+        ("a%2Fb", 1),
+        ("a.b", 1),
+        ("a%20b", 1),
+        ("a b", 0),
+        ("", 1),
+        ("%C3%A9", 0),
+        ("\u{e9}", 1),
+        ("\u{ac00}%25", 1),
+        ("00000000-0000-0000-0000-00000000000a", 1),
+        ("ffffffff-ffff-ffff-ffff-ffffffffffff", 1),
+        ("false", 1),
+        ("-12.5", 1),
+        ("3", 1),
+        ("0A0BFF", 1),
+        ("-3/x%2Fy", 1),
+        ("-2147483648", 1),
+        ("NaN", 1),
+        ("-Infinity", 1),
+    ] {
+        let query = format!(
+            "PREFIX ex: <http://example.org/> SELECT ?row ?v WHERE {{ {all} \
+             FILTER(STR(?v) = \"http://example.org/v/{iri}\") }}"
+        );
+        let (rows, _) = run(&url, Limits::default(), &plan(&mapping, &query))
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        assert_eq!(rows.len(), count, "{iri}: {rows:?}");
+        assert!(
+            rows.iter()
+                .all(|r| r.ends_with(&format!("?v=<http://example.org/v/{iri}>"))),
+            "{iri}: {rows:?}"
+        );
+    }
+}
+
 /// The order comes from the outermost query, through the row count, the
 /// cast of columns without a decoder (`inet`) and the subqueries of
 /// `UNION` and `DISTINCT`; the sort keys are not part of the solutions.
@@ -2025,6 +2171,7 @@ async fn order_by_a_column_keeps_its_index() {
             group: "integer".into(),
             comparison: Comparison::Value,
             lexical: Some(Lexical::Text),
+            lexical_unreserved: true,
             term_key: None,
         };
         let table = LogicalTable::TableName("v12n_order.items".into());

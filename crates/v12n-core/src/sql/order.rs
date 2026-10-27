@@ -627,7 +627,36 @@ mod tests {
             "(t0.\"txt\"::text) COLLATE \"C\" AS \"o1_text\", $1::text COLLATE \"C\" AS \
              \"o1_language\" | \"o1_text\", \"o1_language\""
         );
-        assert!(order_by("link", "?x").starts_with("($1 || CASE WHEN t0.\"i4\"::text IS NULL"));
+        assert_eq!(
+            order_by("link", "?x"),
+            "($1 || t0.\"i4\"::text) COLLATE \"C\" AS \"o1_text\" | \"o1_text\""
+        );
+    }
+
+    /// IRIs sort by their strings, built in SQL as the engine builds them
+    /// (R2RML §7.3). Integer and uuid text is made of `iunreserved`
+    /// characters, which IRI-safe encoding keeps, so it is used as it is;
+    /// a text value is encoded character by character only where the whole
+    /// value is not made of them.
+    #[test]
+    fn iri_sort_keys_encode_only_values_that_need_it() {
+        let keys = order_by("pairLink", "DESC(?x)");
+        let (text, rest) = keys.split_once(" | ").unwrap();
+        assert_eq!(rest, "\"o1_text\" DESC");
+        // After the columns of the template's values.
+        let text = text.split_once(" AS \"x_2\", ").unwrap().1;
+        let encoded = super::super::iri_safe_sql("t0.\"txt\"::text");
+        assert_eq!(
+            text,
+            format!(
+                "($1 || t0.\"i8\"::text || $2 || {encoded} || $3 || t0.\"u\"::text) \
+                 COLLATE \"C\" AS \"o1_text\""
+            )
+        );
+        assert_eq!(
+            order_by("textLink", "?x"),
+            format!("($1 || {encoded}) COLLATE \"C\" AS \"o1_text\" | \"o1_text\"")
+        );
     }
 
     #[test]
