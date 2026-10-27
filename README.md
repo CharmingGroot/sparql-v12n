@@ -644,6 +644,11 @@ and string forms SQL cannot compute.
 | `tests/diff` | Differential test cases (`examples/` are cases too), W3C R2RML cases in `tests/diff/w3c` |
 | `tests/w3c/rdb2rdf` | W3C RDB2RDF test files, unmodified subset (W3C Document License) |
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to propose a change, the
+commit convention and how to run the tests.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

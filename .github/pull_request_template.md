@@ -1,6 +1,7 @@
 <!--
 Title: <type>(<scope>): <subject>   e.g. feat(unfold): emit LEFT JOIN for OPTIONAL
 The title becomes the squash commit on main.
+See CONTRIBUTING.md for the conventions and how to test.
 -->
 
 Closes #
