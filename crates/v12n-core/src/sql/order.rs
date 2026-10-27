@@ -769,7 +769,7 @@ mod tests {
     fn limit_and_offset_follow_the_order() {
         let plan =
             plan("SELECT DISTINCT ?x WHERE { ?s ex:i4 ?x } ORDER BY ?x LIMIT 5 OFFSET 2").unwrap();
-        let rendered = plan.to_sql();
+        let rendered = plan.to_sql().unwrap();
         assert!(
             rendered.sql.ends_with(
                 ") q\nORDER BY q.\"o1_text\" COLLATE \"C\"\nLIMIT $1::int8\nOFFSET $2::int8"

@@ -46,12 +46,12 @@ fn main() {
         };
         let plan = translate();
         if !measure {
-            black_box(plan.to_sql());
+            black_box(plan.to_sql().expect("query renders"));
             continue;
         }
         // Warm-up, so that the first allocations do not count.
         for _ in 0..100 {
-            black_box(translate().to_sql());
+            black_box(translate().to_sql().expect("query renders"));
         }
         let mut translating = Vec::new();
         let mut rendering = Vec::new();
@@ -60,7 +60,7 @@ fn main() {
             let t0 = Instant::now();
             let plan = black_box(translate());
             let t1 = Instant::now();
-            black_box(plan.to_sql());
+            black_box(plan.to_sql().expect("query renders"));
             let t2 = Instant::now();
             translating.push(t1 - t0);
             rendering.push(t2 - t1);
