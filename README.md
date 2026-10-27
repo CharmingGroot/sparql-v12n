@@ -42,8 +42,11 @@ known differences from Ontop and why each rejected test query is rejected.
 ## `v12n query`
 
 `v12n query mapping.ttl query.rq --db postgresql://reader@localhost/shop`
-prints SPARQL 1.1 Query Results JSON (or a table with `--format table`).
-SPARQL results JSON has no place to mark a partial result, so limits are
+prints SPARQL 1.1 Query Results JSON, SPARQL 1.1 Query Results CSV with
+`--format csv` (lexical forms only, an unbound variable as an empty field),
+or a table with `--format table`. The query comes from a file, from stdin
+with `-`, or from the command line with `--query '<SPARQL>'`.
+None of these formats has a place to mark a partial result, so limits are
 reported outside it, on stderr and in the exit code:
 
 | Exit code | When |
@@ -52,12 +55,63 @@ reported outside it, on stderr and in the exit code:
 | `1` | Invalid input: arguments, files, query syntax, unsupported SPARQL |
 | `2` | Invalid mapping |
 | `3` | Database error, or a value that cannot become an RDF term |
-| `4` | Statement timeout (`--timeout`). Before the first row it is reported like other errors; after output has started, stdout is left unterminated |
+| `4` | Statement timeout (`--timeout`). Before the first row it is reported like other errors; after output has started, JSON on stdout is left unterminated (CSV has no end marker) |
 | `5` | Row limit reached (`--row-limit`): stdout holds the first `--row-limit` solutions as a complete result, and stderr has a warning |
 
 The stderr line names the cause and the limit, for example
 `warning: result truncated at the row limit of 10000; more rows exist ...` or
 `error: statement timeout of 30s reached after 120 rows; ...`.
+
+## CLI for agents
+
+The CLI is meant to be driven by a shell tool as well as by hand. It never
+prompts, prints JSON whenever stdout is not a terminal (`--format json`
+forces it), uses colour only on a terminal and never with `NO_COLOR` set,
+and keeps the exit codes above for every command. The loop goes from the
+mapping to an answer in three steps:
+
+1. `v12n terms mapping.ttl` lists the classes and properties the mapping
+   exposes; nothing else can match.
+
+   ```json
+   {"prefixes":{"ex":"http://example.org/"},
+    "classes":[{"iri":"http://example.org/Customer","prefixed_name":"ex:Customer","triples_maps":["<#CustomerMap>"]}, ...],
+    "properties":[{"iri":"http://example.org/name","prefixed_name":"ex:name","triples_maps":["<#CustomerMap>"]}, ...]}
+   ```
+
+2. `v12n explain mapping.ttl --query '<SPARQL>'` checks the query without a
+   database: a syntax error or an unsupported feature exits with 1, and on
+   success it prints the SQL, its bind parameters and the projected
+   variables.
+
+   ```json
+   {"sql":"SELECT DISTINCT t0.\"id\" AS \"customer\", ...","params":["VIP"],
+    "variables":[{"name":"customer","term_type":"iri","columns":["customer"]}, ...]}
+   ```
+
+3. `v12n query mapping.ttl --query '<SPARQL>'` runs it (`--db` or
+   `V12N_DATABASE_URL`) and prints SPARQL 1.1 Query Results JSON, with the
+   row limit, statement timeout and read-only session on by default.
+
+An error before any output is one JSON object on stdout in place of the
+result, so a caller checks the exit code and then reads stdout either way:
+
+```json
+{"ok":false,"error":{"kind":"query","message":"query syntax error: ...","exit_code":1}}
+```
+
+| `kind` | Exit code | `details` |
+|---|---|---|
+| `input`, `query`, `unsupported`, `output`, `runtime` | 1 | `{"path": ...}` when a file cannot be read |
+| `mapping` | 2 | |
+| `database`, `data` | 3 | |
+| `timeout` | 4 | `{"timeout_ms": ..., "rows": ...}` |
+
+Once results have started, an error cannot change stdout any more: it goes
+to stderr as one `error: ...` line, as does every error with `--format csv`
+or `table`, and the row-limit `warning: ...` (exit code 5) always goes to
+stderr. `v12n <command> --help` lists the JSON and CSV shapes of each
+command, with examples that run from the repository root.
 
 ## HTTP endpoint
 
