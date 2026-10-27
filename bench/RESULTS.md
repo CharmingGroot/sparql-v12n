@@ -94,6 +94,34 @@ Milliseconds, median over 10 runs (p95 in `results.json`).
 Start-up 11 ms against 7.4 s; memory 7.5 / 12.2 MiB against 322 / 527 MiB
 (idle / peak). Load: 28.5 against 9.5 requests/s.
 
+## IRI sort keys after #75
+
+[#75](https://github.com/CharmingGroot/sparql-v12n/issues/75) builds the
+IRI of a template without encoding values whose characters IRI-safe
+encoding keeps: the key of `alert/{id}` is now `$1 || t0."id"::text`, as
+in Ontop. Two 100k runs on the same machine, one after the other on
+2026-10-27, `52681cf` (main) against the change, every result matching
+Ontop; milliseconds, median / p95 over 20 runs:
+
+| q07-order-limit | Before | After |
+|---|---:|---:|
+| v12n | 62.0 / 76.8 | 3.6 / 4.6 |
+| Ontop | 15.4 / 22.9 | 12.9 / 14.1 |
+| Ontop ÷ v12n | 0.25 | 3.6 |
+| `v12n-row-limit` | 80.2 / 103.2 | 3.5 / 4.1 |
+| v12n SQL exec | 58.8 | 0.69 |
+| Ontop SQL exec | 11.2 | 9.7 |
+| `v12n query` CLI | 132.7 | 11.8 |
+
+v12n now runs below Ontop: its `ORDER BY "o1_exact" DESC, "o2_text"`
+reads the index on `severity_id` backwards and sorts only the rows of
+the highest severity by the key (`Incremental Sort` over `Index Scan
+Backward`), where Ontop's `DESC NULLS LAST` does not match the index
+order and sorts every row (`Seq Scan`, top-N heapsort), as `EXPLAIN
+ANALYZE` of both statements on 100,000 rows shows. Before, the same plan
+encoded the id of every row of that severity. The other queries stayed
+within the run-to-run variation. 1M was not re-run.
+
 ## Analysis
 
 **Where v12n is faster.** On every query that returns many rows, by 7–8×
@@ -109,11 +137,12 @@ resident memory about 40× smaller; v12n's peak stays at 12 MiB with
 
 **Where v12n is slower.**
 
-1. **IRI sort keys** ([#75](https://github.com/CharmingGroot/sparql-v12n/issues/75)).
-   q07 is 4× slower at 100k. To sort by the IRI of `alert/{id}`, v12n
-   percent-encodes the id text one character at a time in a correlated
-   subquery per row; Ontop sorts by `prefix || CAST(id AS TEXT)`. The
-   text of an integer never needs encoding.
+1. **IRI sort keys** ([#75](https://github.com/CharmingGroot/sparql-v12n/issues/75),
+   fixed, see above). q07 was 4× slower at 100k. To sort by the IRI of
+   `alert/{id}`, v12n percent-encoded the id text one character at a
+   time in a correlated subquery per row; Ontop sorts by
+   `prefix || CAST(id AS TEXT)`. The text of an integer never needs
+   encoding.
 2. **Self-joins** ([#28](https://github.com/CharmingGroot/sparql-v12n/issues/28)).
    Ontop merges scans of the same table on the primary key; v12n joins
    `alerts` with `alerts` (q02) and `assets` with `assets` (q03, q04, and
@@ -139,8 +168,8 @@ resident memory about 40× smaller; v12n's peak stays at 12 MiB with
 - Translation (parse, unfold, render) is 15–40 µs per query, below 1% of
   any request; the largest render is q07's encoding expression.
 - Term-key comparisons and computed term columns cost nothing measurable
-  in these queries except the IRI sort key above, the one place a term is
-  computed per row in SQL.
+  in these queries except the IRI sort key above (before #75), the one
+  place a term is computed per row in SQL.
 - Set semantics: reading the keys costs one catalog query (0.05–0.1 ms of
   execution, two round trips) and lets v12n drop `DISTINCT` on every query
   whose tables have keys (q01–q07 run without it). On the table without a

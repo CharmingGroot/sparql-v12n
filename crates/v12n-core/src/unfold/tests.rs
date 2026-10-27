@@ -234,7 +234,7 @@ fn unfold_overlapping_shapes_share_a_computed_column() {
     );
     let sql = plan.to_sql().sql;
     assert!(
-        sql.starts_with("SELECT ($1 || CASE WHEN t0.\"id\"::text IS NULL")
+        sql.starts_with("SELECT ($1 || CASE WHEN t0.\"id\"::text ~ '^[")
             && sql.contains("\nUNION\nSELECT (t0.\"iri\"::text)::text AS \"x\""),
         "{sql}"
     );

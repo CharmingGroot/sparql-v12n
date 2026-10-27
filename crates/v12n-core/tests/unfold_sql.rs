@@ -169,6 +169,7 @@ fn column_type(name: &str, natural: Option<&str>) -> ColumnType {
         group: group.to_owned(),
         comparison: Comparison::Value,
         lexical: Some(Lexical::Text),
+        lexical_unreserved: group == "integer",
         term_key: None,
     }
 }

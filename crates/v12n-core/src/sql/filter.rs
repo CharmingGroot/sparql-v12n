@@ -1020,6 +1020,8 @@ pub(super) mod tests {
                rr:predicateObjectMap [ rr:predicate ex:intInt ; rr:objectMap [ rr:column \"i4\" ; rr:datatype xsd:integer ] ] ;\n\
                rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column \"txt\" ; rr:language \"EN\" ] ] ;\n\
                rr:predicateObjectMap [ rr:predicate ex:link ; rr:objectMap [ rr:template \"http://example.org/r/{{i4}}\" ] ] ;\n\
+               rr:predicateObjectMap [ rr:predicate ex:textLink ; rr:objectMap [ rr:template \"http://example.org/t/{{txt}}\" ] ] ;\n\
+               rr:predicateObjectMap [ rr:predicate ex:pairLink ; rr:objectMap [ rr:template \"http://example.org/p/{{i8}}/{{txt}}/{{u}}\" ] ] ;\n\
                rr:subjectMap [ rr:template \"http://example.org/r/{{i4}}\" ] .\n"
         )
     }
@@ -1061,6 +1063,7 @@ pub(super) mod tests {
             group: group.to_owned(),
             comparison,
             lexical,
+            lexical_unreserved: matches!(group, "integer" | "numeric" | "boolean" | "uuid"),
             term_key: match sql {
                 "float8" | "float4" => Some(TermKey::Text),
                 "bpchar" => Some(TermKey::OctetLength),
@@ -1319,9 +1322,14 @@ pub(super) mod tests {
             x("txt", "STR(?x) = \"a\""),
             "((t0.\"txt\"::text) = $1::text)"
         );
-        let iri = x("link", "STR(?x) < \"b\"");
+        // An integer's lexical form needs no IRI-safe encoding.
+        assert_eq!(
+            x("link", "STR(?x) < \"b\""),
+            "($1 || t0.\"i4\"::text) COLLATE \"C\" < $2::text"
+        );
+        let iri = x("textLink", "STR(?x) < \"b\"");
         assert!(
-            iri.starts_with("($1 || CASE WHEN t0.\"i4\"::text IS NULL"),
+            iri.starts_with("($1 || CASE WHEN t0.\"txt\"::text ~ '^["),
             "{iri}"
         );
         assert!(iri.ends_with(" END) COLLATE \"C\" < $2::text"), "{iri}");

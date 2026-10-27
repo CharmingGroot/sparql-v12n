@@ -546,6 +546,10 @@ pub struct ColumnType {
     pub comparison: Comparison,
     /// How SQL computes the natural lexical form, when it can.
     pub lexical: Option<Lexical>,
+    /// Whether that lexical form only ever has characters of RFC 3987
+    /// `iunreserved`, which the IRI-safe version keeps as they are (R2RML
+    /// §7.3), so an IRI template uses it without encoding it in SQL.
+    pub lexical_unreserved: bool,
     /// For a type whose `=` finds some values equal that give different
     /// terms, what tells them apart.
     pub term_key: Option<TermKey>,
@@ -2150,11 +2154,17 @@ impl<'a> Renderer<'a> {
                             self.expr(&SqlExpr::Param(text.as_str().into()))
                         }
                         TemplatePart::Column(name) => {
-                            let value = match types {
-                                None => format!("{}::text", column_sql(*table, name)),
-                                Some(_) => self.lexical(*table, name)?,
+                            let (value, unreserved) = match types {
+                                None => (format!("{}::text", column_sql(*table, name)), false),
+                                Some(_) => (
+                                    self.lexical(*table, name)?,
+                                    self.column_type(*table, name)
+                                        .is_some_and(|ty| ty.lexical_unreserved),
+                                ),
                             };
-                            self.sql.push_str(&if *iri_safe {
+                            // IRI-safe encoding keeps a string of
+                            // `iunreserved` characters as it is.
+                            self.sql.push_str(&if *iri_safe && !unreserved {
                                 iri_safe_sql(&value)
                             } else {
                                 value
@@ -2301,8 +2311,13 @@ fn describe_table(table: &LogicalTable) -> String {
 /// R2RML §7.3 IRI-safe version of a text expression: every character
 /// outside `iunreserved` becomes `%XX` per UTF-8 byte, upper case, as the
 /// engine encodes template values when it builds IRIs. NULL stays NULL.
+///
+/// A value made only of `iunreserved` characters is its own IRI-safe
+/// version, so the whole value is matched against the same class first;
+/// only the other values pay for the subquery that encodes them character
+/// by character.
 pub fn iri_safe_sql(text: &str) -> String {
-    let mut class = String::from("^[-.0-9A-Z_a-z~");
+    let mut class = String::from("[-.0-9A-Z_a-z~");
     for &(from, to) in UCSCHAR {
         let escape = |c: u32| {
             if c <= 0xFFFF {
@@ -2313,10 +2328,11 @@ pub fn iri_safe_sql(text: &str) -> String {
         };
         class.push_str(&format!("{}-{}", escape(from), escape(to)));
     }
-    class.push_str("]$");
+    class.push(']');
     format!(
-        "CASE WHEN {text} IS NULL THEN NULL ELSE (SELECT coalesce(string_agg(\
-         CASE WHEN c ~ '{class}' THEN c \
+        "CASE WHEN {text} ~ '^{class}*$' THEN {text} \
+         WHEN {text} IS NOT NULL THEN (SELECT coalesce(string_agg(\
+         CASE WHEN c ~ '^{class}$' THEN c \
          ELSE regexp_replace(upper(encode(convert_to(c, 'UTF8'), 'hex')), '(..)', '%\\1', 'g') END, \
          '' ORDER BY n), '') \
          FROM generate_series(1, char_length({text})) AS n, substr({text}, n, 1) AS c) END"
@@ -2952,8 +2968,14 @@ mod tests {
             group: group.to_owned(),
             comparison,
             lexical,
+            lexical_unreserved: unreserved(group),
             term_key: None,
         }
+    }
+
+    /// The groups whose lexical forms the adapter marks as unreserved.
+    fn unreserved(group: &str) -> bool {
+        matches!(group, "integer" | "numeric" | "boolean" | "uuid" | "bytea")
     }
 
     fn side(table: usize, name: &str, datatype: Option<TermDatatype>) -> TermSql {
@@ -3081,6 +3103,7 @@ mod tests {
             group: class.to_owned(),
             comparison: Comparison::Value,
             lexical,
+            lexical_unreserved: unreserved(class),
             term_key: None,
         }
     }
@@ -3323,12 +3346,19 @@ mod tests {
     #[test]
     fn iri_safe_sql_keeps_nulls_and_uses_the_iunreserved_ranges() {
         let sql = iri_safe_sql("x");
+        // A value of `iunreserved` characters only is kept as it is; NULL
+        // matches neither case and stays NULL.
         assert!(
-            sql.starts_with("CASE WHEN x IS NULL THEN NULL ELSE"),
+            sql.starts_with(r"CASE WHEN x ~ '^[-.0-9A-Z_a-z~\u00A0-\uD7FF"),
             "{sql}"
         );
-        assert!(sql.contains(r"\u00A0-\uD7FF"), "{sql}");
-        assert!(sql.contains(r"\U000E1000-\U000EFFFD]$'"), "{sql}");
+        assert!(
+            sql.contains(r"\U000E1000-\U000EFFFD]*$' THEN x WHEN x IS NOT NULL THEN (SELECT"),
+            "{sql}"
+        );
+        assert!(sql.contains(r"\U000E1000-\U000EFFFD]$' THEN c"), "{sql}");
+        assert!(sql.ends_with(" END"), "{sql}");
+        assert!(!sql.contains("ELSE NULL"), "{sql}");
     }
 
     fn keyed_plan(fixed: &[&str], hidden: bool) -> SqlPlan {
