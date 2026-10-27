@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Two properties of the same table: a self-join on the key unless it is
+# eliminated (High is 20% of the assets).
+SELECT ?asset ?hostname WHERE {
+  ?asset ex:criticality "High" ; ex:hostname ?hostname .
+}

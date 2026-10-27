@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/>
+
+# Top 100 by severity, ties by finding IRI: a sort of every finding.
+SELECT ?finding ?severity WHERE {
+  ?finding ex:severityId ?severity .
+}
+ORDER BY DESC(?severity) ?finding
+LIMIT 100

@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# No DISTINCT, but the table without a key repeats rows: each triple counts
+# once (set semantics), so duplicates must be removed.
+SELECT ?finding ?value WHERE {
+  ?finding ex:severityId 5 ; ex:observable ?value .
+}

@@ -1,0 +1,38 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+# tests/diff/0001-mdr/mapping.ttl with ObservableMap added.
+
+<#AssetMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "assets" ] ;
+  rr:subjectMap [ rr:template "http://example.org/asset/{id}" ; rr:class ex:Asset ] ;
+  rr:predicateObjectMap [ rr:predicate ex:hostname ; rr:objectMap [ rr:column "hostname" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:criticality ; rr:objectMap [ rr:column "criticality" ] ] .
+
+<#FindingMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "alerts" ] ;
+  rr:subjectMap [ rr:template "http://example.org/alert/{id}" ; rr:class ex:DetectionFinding ] ;
+  rr:predicateObjectMap [ rr:predicate ex:title ; rr:objectMap [ rr:column "title" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:severityId ; rr:objectMap [ rr:column "severity_id" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:onAsset ;
+    rr:objectMap [ rr:template "http://example.org/asset/{asset_id}" ]
+  ] .
+
+<#LinkMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "links" ] ;
+  rr:subjectMap [ rr:template "http://example.org/asset/{src_id}" ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:connectsTo ;
+    rr:objectMap [
+      rr:parentTriplesMap <#AssetMap> ;
+      rr:joinCondition [ rr:child "dst_id" ; rr:parent "id" ]
+    ]
+  ] .
+
+# No key: a finding can record the same observable twice, which is one
+# triple in the RDF graph.
+<#ObservableMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "observables" ] ;
+  rr:subjectMap [ rr:template "http://example.org/alert/{alert_id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:observable ; rr:objectMap [ rr:column "value" ] ] .

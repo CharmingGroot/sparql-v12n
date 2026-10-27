@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# DISTINCT over the table without a key.
+SELECT DISTINCT ?value WHERE {
+  ?finding ex:observable ?value .
+}

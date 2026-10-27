@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Comparison filter on an integer column: severity 4 and 5 (10%).
+SELECT ?finding ?severity WHERE {
+  ?finding ex:severityId ?severity .
+  FILTER(?severity >= 4)
+}

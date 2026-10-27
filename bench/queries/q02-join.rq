@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/>
+
+# Join of findings and assets through the onAsset template, restricted to
+# severity 5 (2% of the findings).
+SELECT ?finding ?hostname WHERE {
+  ?finding ex:severityId 5 ; ex:onAsset ?asset .
+  ?asset ex:hostname ?hostname .
+}
