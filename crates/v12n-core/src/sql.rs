@@ -1665,6 +1665,21 @@ pub fn column_name_probe(columns: &[(LogicalTable, String)]) -> String {
     probe(columns, str::to_owned)
 }
 
+/// One statement that does the work of [`column_name_probe`] for the
+/// [`folded_identifier`]s among `columns` and of [`column_type_probe`] for
+/// the others: each result column has the type of its column, and those
+/// of folded names are named as the database resolved them. Each logical
+/// table appears once.
+pub fn column_probe(columns: &[(LogicalTable, String)]) -> String {
+    probe(columns, |name| {
+        if folded_identifier(name) {
+            name.to_owned()
+        } else {
+            quote_identifier(name)
+        }
+    })
+}
+
 fn probe(columns: &[(LogicalTable, String)], name_sql: impl Fn(&str) -> String) -> String {
     let mut tables: Vec<&LogicalTable> = Vec::new();
     let select: Vec<String> = columns
@@ -2592,6 +2607,21 @@ mod tests {
                 (view, "LABEL".into()),
             ]),
             "SELECT p0.Id, p1.Name, p0.LABEL\nFROM (SELECT 1 AS Id) p0\nCROSS JOIN \"t\" p1\nLIMIT 0"
+        );
+    }
+
+    #[test]
+    fn column_probe_quotes_all_but_folded_identifiers() {
+        let view = LogicalTable::SqlQuery("SELECT 1 AS Id".into());
+        let table = LogicalTable::TableName("t".into());
+        assert_eq!(
+            column_probe(&[
+                (view.clone(), "Id".into()),
+                (table.clone(), "a; DROP".into()),
+                (table, "name".into()),
+                (view, "\"V\"".into()),
+            ]),
+            "SELECT p0.Id, p1.\"a; DROP\", p1.\"name\", p0.\"V\"\nFROM (SELECT 1 AS Id) p0\nCROSS JOIN \"t\" p1\nLIMIT 0"
         );
     }
 

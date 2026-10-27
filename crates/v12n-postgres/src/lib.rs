@@ -9,9 +9,11 @@ mod error;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
+use futures_util::future::{join, join4};
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Config, NoTls, RowStream, Statement};
 use v12n_core::mapping::LogicalTable;
@@ -19,7 +21,8 @@ use v12n_core::optimize;
 use v12n_core::solution::{Solution, SolutionBuilder, SqlValue};
 use v12n_core::sql::{
     ColumnTypes, Comparison, RenderOptions, RenderedSql, SqlPlan, TableKeys, TermKey,
-    column_name_probe, column_type_probe, quote_identifier, quote_table_name,
+    column_name_probe, column_probe, column_type_probe, folded_identifier, quote_identifier,
+    quote_table_name,
 };
 
 use bind::{Bound, bind, term_key};
@@ -32,6 +35,25 @@ pub const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_ROW_LIMIT: u64 = 10_000;
 /// Applied when the connection string sets no `connect_timeout`.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Most plans whose statements a connection remembers ([`Database::recent`]).
+const RECENT_PLANS: usize = 64;
+
+/// The unique keys of the tables named in `$1`, see [`Database::load_keys`].
+const KEYS_SQL: &str = "SELECT t.n::int4, array_agg(a.attname::text ORDER BY c.ord),
+   bool_and(a.attnotnull AND c.coll = a.attcollation AND o.opcdefault),
+   array_agg(a.atttypid ORDER BY c.ord)
+ FROM unnest($1::text[]) WITH ORDINALITY AS t(name, n)
+ JOIN pg_index i ON i.indrelid = to_regclass(t.name)
+ JOIN pg_class r ON r.oid = i.indrelid
+ CROSS JOIN LATERAL unnest(i.indkey::int2[], i.indcollation::oid[],
+   i.indclass::oid[]) WITH ORDINALITY AS c(attnum, coll, opclass, ord)
+ JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = c.attnum
+ JOIN pg_opclass o ON o.oid = c.opclass
+ WHERE i.indisunique AND i.indimmediate AND i.indisvalid
+   AND i.indpred IS NULL AND i.indexprs IS NULL AND c.ord <= i.indnkeyatts
+   AND (r.relkind = 'p'
+     OR NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = r.oid))
+ GROUP BY t.n, i.indexrelid";
 
 /// Unique keys of a plan's tables, see [`Database::load_keys`].
 struct Keys {
@@ -66,6 +88,17 @@ pub struct Database {
     /// Whether the server encoding is UTF-8, where `COLLATE "C"` orders
     /// strings by code point.
     utf8: bool,
+    /// [`KEYS_SQL`], prepared with the connection. Its text never changes,
+    /// so only preparing it again would cost a round trip per query; it
+    /// still runs on every query, so keys are always read fresh.
+    keys_statement: Statement,
+    /// The statements [`execute`](Self::execute) prepared for recent plans,
+    /// by the plan's SQL rendered without database information. Only a
+    /// guess of what to prepare: the next query of that plan prepares them
+    /// in the same round trip that reads the catalog, and uses one only if
+    /// it is exactly the statement the fresh catalog information gives. A
+    /// stale guess costs a round trip, never a wrong result.
+    recent: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl Database {
@@ -104,20 +137,25 @@ impl Database {
         // request, so the task's own result adds nothing.
         tokio::spawn(connection);
         let timeout_ms = format!("{}ms", timeout.as_millis());
-        let row = client
-            .query_one(
+        let (row, keys_statement) = join(
+            client.query_one(
                 "SELECT set_config('statement_timeout', $1, false), \
                  set_config('default_transaction_read_only', 'on', false), \
                  current_setting('server_encoding')",
                 &[&timeout_ms],
-            )
-            .await
-            .map_err(|e| Error::from_postgres(e, timeout))?;
+            ),
+            client.prepare(KEYS_SQL),
+        )
+        .await;
+        let row = row.map_err(|e| Error::from_postgres(e, timeout))?;
+        let keys_statement = keys_statement.map_err(|e| Error::from_postgres(e, timeout))?;
         let encoding: String = row.get(2);
         Ok(Self {
             client,
             limits,
             utf8: encoding == "UTF8",
+            keys_statement,
+            recent: Mutex::new(HashMap::new()),
         })
     }
 
@@ -127,11 +165,95 @@ impl Database {
     }
 
     /// Runs a plan. Rows are fetched as the returned [`Solutions`] are read.
+    ///
+    /// Everything that depends on the plan alone is sent in one pipelined
+    /// round trip: the catalog query for keys, one statement that resolves
+    /// column names and reports column types, and the statements prepared
+    /// for the same plan last time. The statement is then prepared, unless
+    /// one of those is it, and run.
     pub async fn execute(&self, plan: &SqlPlan) -> Result<Solutions, Error> {
         let timeout = self.limits.statement_timeout;
         let pg = |e| Error::from_postgres(e, timeout);
-        let plan = self.resolve_columns(plan).await.map_err(pg)?;
-        let keys = self.load_keys(&plan).await.map_err(pg)?;
+        // Rendering without database information fails where only the
+        // column types tell whether a query is supported; such plans are
+        // not remembered.
+        let shape = plan
+            .to_sql_with(&RenderOptions::default())
+            .ok()
+            .map(|rendered| rendered.sql);
+        let guesses = shape
+            .as_ref()
+            .and_then(|shape| {
+                self.recent
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(shape)
+                    .cloned()
+            })
+            .unwrap_or_default();
+        let tables = keyed_tables(plan);
+        let folded = plan.folded_columns();
+        let mut probe_columns = folded.clone();
+        let term_columns = plan.term_columns();
+        // Whether the statement needs column types is known only after the
+        // keys when they are read, so then they are probed in any case,
+        // within the same round trip.
+        if !tables.is_empty()
+            || plan.distinct
+            || plan.branches.len() > 1
+            || plan.has_duplicates(None)
+            || !term_columns.is_empty()
+        {
+            for column in term_columns.into_iter().chain(plan.selected_columns()) {
+                if !probe_columns.contains(&column) {
+                    probe_columns.push(column);
+                }
+            }
+        }
+        let probe_sql = (!probe_columns.is_empty()).then(|| column_probe(&probe_columns));
+        let (keys, probe, first, second) = join4(
+            self.load_keys_of(&tables),
+            self.prepare_if(probe_sql.as_deref()),
+            self.prepare_if(guesses.first().map(String::as_str)),
+            self.prepare_if(guesses.get(1).map(String::as_str)),
+        )
+        .await;
+        let mut prepared: Vec<(&str, Statement)> = guesses
+            .iter()
+            .zip([first, second])
+            .filter_map(|(sql, statement)| Some((sql.as_str(), statement?.ok()?)))
+            .collect();
+        // A probe that fails is retried as the separate steps it combines,
+        // so that an error is reported by the step it belongs to.
+        let probe = probe.and_then(Result::ok);
+        let plan = match &probe {
+            _ if folded.is_empty() => Cow::Borrowed(plan),
+            Some(probe) => {
+                let resolved: HashMap<_, _> = folded
+                    .iter()
+                    .cloned()
+                    .zip(probe.columns())
+                    .map(|(column, c)| (column, c.name().to_owned()))
+                    .collect();
+                Cow::Owned(plan.with_resolved_columns(&resolved))
+            }
+            None => self.resolve_columns(plan).await.map_err(pg)?,
+        };
+        let probed_types: Option<ColumnTypes> = probe.map(|probe| {
+            probe_columns
+                .into_iter()
+                .zip(probe.columns())
+                .map(|((table, name), c)| {
+                    let name = if folded_identifier(&name) {
+                        quote_identifier(c.name())
+                    } else {
+                        name
+                    };
+                    ((table, name), column_type(c.type_()))
+                })
+                .collect()
+        });
+        let keys = keys.map_err(pg)?;
         let plan = match keys
             .as_ref()
             .and_then(|k| optimize::eliminate_self_joins(&plan, &k.mergeable))
@@ -143,10 +265,21 @@ impl Database {
         // `DISTINCT` and `UNION` compare values with `=`, so the types of
         // the columns they compare tell which need a key next to them.
         let removes_duplicates = plan.distinct || plan.has_duplicates(keys.as_ref());
-        let column_types = self
-            .column_types(&plan, removes_duplicates)
-            .await
-            .map_err(pg)?;
+        let typed = typed_columns(&plan, removes_duplicates);
+        let column_types = if typed.is_empty() {
+            None
+        } else if let Some(types) = probed_types.as_ref().and_then(|probed| {
+            typed
+                .iter()
+                .map(|column| Some((column.clone(), probed.get(column)?.clone())))
+                .collect::<Option<ColumnTypes>>()
+        }) {
+            Some(types)
+        } else {
+            self.column_types(&plan, removes_duplicates)
+                .await
+                .map_err(pg)?
+        };
         let plan = match &column_types {
             Some(types) if plan.branches.len() > 1 => Cow::Owned(plan.with_union_types(types)?),
             _ => plan,
@@ -161,9 +294,9 @@ impl Database {
         };
         let rendered = plan.to_sql_with(&options)?;
         let fetch = row_fetch(self.limits.row_limit, plan.limit);
+        let mut used = vec![statement_sql(plan, &rendered, None, fetch.is_some())];
         let mut statement = self
-            .client
-            .prepare(&statement_sql(plan, &rendered, None, fetch.is_some()))
+            .take_or_prepare(&mut prepared, &used[0])
             .await
             .map_err(pg)?;
         // The projected columns, then the sort keys, then the row count.
@@ -201,11 +334,24 @@ impl Database {
             })?;
             let cast = cast_columns.then_some(decoders.as_slice());
             let sql = statement_sql(plan, &rendered, cast, fetch.is_some());
-            statement = self.client.prepare(&sql).await.map_err(pg)?;
+            statement = self
+                .take_or_prepare(&mut prepared, &sql)
+                .await
+                .map_err(pg)?;
+            used.push(sql);
             rendered
         } else {
             rendered
         };
+        if let Some(shape) = shape
+            && guesses != used
+        {
+            let mut recent = self.recent.lock().unwrap_or_else(PoisonError::into_inner);
+            if recent.len() >= RECENT_PLANS {
+                recent.clear();
+            }
+            recent.insert(shape, used);
+        }
         let decoders = statement.columns()[..data_columns]
             .iter()
             .map(|c| Decoder::for_type(c.type_()).unwrap_or(Decoder::Text))
@@ -317,12 +463,13 @@ impl Database {
     /// `=` the plan renders does, and the type compares by `=` without a
     /// cast or a term key (`ColumnType::comparison`, `ColumnType::term_key`).
     async fn load_keys(&self, plan: &SqlPlan) -> Result<Option<Keys>, tokio_postgres::Error> {
-        let mut tables = plan.key_tables();
-        for table in optimize::self_join_tables(plan) {
-            if !tables.contains(&table) {
-                tables.push(table);
-            }
-        }
+        self.load_keys_of(&keyed_tables(plan)).await
+    }
+
+    async fn load_keys_of(
+        &self,
+        tables: &[LogicalTable],
+    ) -> Result<Option<Keys>, tokio_postgres::Error> {
         if tables.is_empty() {
             return Ok(None);
         }
@@ -333,27 +480,7 @@ impl Database {
                 LogicalTable::SqlQuery(_) => unreachable!("only tables have keys"),
             })
             .collect();
-        let rows = self
-            .client
-            .query(
-                "SELECT t.n::int4, array_agg(a.attname::text ORDER BY c.ord),
-                   bool_and(a.attnotnull AND c.coll = a.attcollation AND o.opcdefault),
-                   array_agg(a.atttypid ORDER BY c.ord)
-                 FROM unnest($1::text[]) WITH ORDINALITY AS t(name, n)
-                 JOIN pg_index i ON i.indrelid = to_regclass(t.name)
-                 JOIN pg_class r ON r.oid = i.indrelid
-                 CROSS JOIN LATERAL unnest(i.indkey::int2[], i.indcollation::oid[],
-                   i.indclass::oid[]) WITH ORDINALITY AS c(attnum, coll, opclass, ord)
-                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = c.attnum
-                 JOIN pg_opclass o ON o.oid = c.opclass
-                 WHERE i.indisunique AND i.indimmediate AND i.indisvalid
-                   AND i.indpred IS NULL AND i.indexprs IS NULL AND c.ord <= i.indnkeyatts
-                   AND (r.relkind = 'p'
-                     OR NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = r.oid))
-                 GROUP BY t.n, i.indexrelid",
-                &[&names],
-            )
-            .await?;
+        let rows = self.client.query(&self.keys_statement, &[&names]).await?;
         let mut keys = Keys {
             unique: TableKeys::new(),
             mergeable: TableKeys::new(),
@@ -413,17 +540,7 @@ impl Database {
         plan: &SqlPlan,
         removes_duplicates: bool,
     ) -> Result<Option<ColumnTypes>, tokio_postgres::Error> {
-        let mut columns = plan.term_columns();
-        let selected = if removes_duplicates {
-            plan.selected_columns()
-        } else {
-            plan.union_columns()
-        };
-        for column in selected {
-            if !columns.contains(&column) {
-                columns.push(column);
-            }
-        }
+        let columns = typed_columns(plan, removes_duplicates);
         if columns.is_empty() {
             return Ok(None);
         }
@@ -435,6 +552,29 @@ impl Database {
                 .map(|(column, c)| (column, column_type(c.type_())))
                 .collect(),
         ))
+    }
+
+    async fn prepare_if(
+        &self,
+        sql: Option<&str>,
+    ) -> Option<Result<Statement, tokio_postgres::Error>> {
+        match sql {
+            Some(sql) => Some(self.client.prepare(sql).await),
+            None => None,
+        }
+    }
+
+    /// The statement for `sql`: one of `prepared` if it has that text, which
+    /// was prepared within the same query, or a new one.
+    async fn take_or_prepare(
+        &self,
+        prepared: &mut Vec<(&str, Statement)>,
+        sql: &str,
+    ) -> Result<Statement, tokio_postgres::Error> {
+        match prepared.iter().position(|(text, _)| *text == sql) {
+            Some(i) => Ok(prepared.swap_remove(i).1),
+            None => self.client.prepare(sql).await,
+        }
     }
 
     async fn query(
@@ -450,6 +590,36 @@ impl Database {
         }
         self.client.query_raw(statement, bound).await
     }
+}
+
+/// The tables whose keys [`Database::load_keys`] reads for `plan`: those of
+/// `key_tables` and `self_join_tables`, each once.
+fn keyed_tables(plan: &SqlPlan) -> Vec<LogicalTable> {
+    let mut tables = plan.key_tables();
+    for table in optimize::self_join_tables(plan) {
+        if !tables.contains(&table) {
+            tables.push(table);
+        }
+    }
+    tables
+}
+
+/// The columns whose types [`Database::column_types`] reads: those the
+/// plan compares as RDF terms or combines with `UNION`, and every selected
+/// column when the query removes duplicates.
+fn typed_columns(plan: &SqlPlan, removes_duplicates: bool) -> Vec<(LogicalTable, String)> {
+    let mut columns = plan.term_columns();
+    let selected = if removes_duplicates {
+        plan.selected_columns()
+    } else {
+        plan.union_columns()
+    };
+    for column in selected {
+        if !columns.contains(&column) {
+            columns.push(column);
+        }
+    }
+    columns
 }
 
 /// How many rows the statement reads when the row limit can cut the

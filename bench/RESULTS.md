@@ -178,6 +178,48 @@ little either way. The other queries have no self-join and stayed within
 the variation. The number of statements per request is unchanged: the
 keys come from the catalog query that already ran.
 
+## Round trips after #76
+
+[#76](https://github.com/CharmingGroot/sparql-v12n/issues/76) sends
+everything that depends on the plan alone in one pipelined round trip:
+the key query (prepared once per connection), one statement that resolves
+column names and reports column types, and the statements prepared for
+the same plan last time on that connection, which are used only when they
+are exactly the statement the fresh keys and types give. Nothing read
+from the catalog is cached
+(Discussion [#87](https://github.com/CharmingGroot/sparql-v12n/discussions/87)). A
+request then takes two round trips: that one and running the statement;
+the first request of a plan on a connection takes three. Round trips are
+counted by a proxy in `bench.py` (see README.md); Ontop takes two (`BEGIN`
+with the query, then `COMMIT`).
+
+Two 100k runs one after the other on 2026-10-27, `ce8a9f1` (main) against
+the change, every result matching Ontop; milliseconds, median / p95 over
+20 runs (first row: median). `SELECT 1` from the host took 0.21 and
+0.19 ms in the two runs.
+
+| Query | Round trips | v12n before | after | First row before | after | Ontop before | after | `v12n query` CLI before | after |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| q01-lookup | 4 → 2 | 2.6 / 3.7 | 1.2 / 2.4 | 2.6 | 1.2 | 3.7 | 3.2 | 10.4 | 9.8 |
+| q02-join | 5 → 2 | 6.8 / 9.3 | 5.2 / 8.2 | 4.4 | 3.0 | 16.1 | 15.8 | 13.0 | 12.5 |
+| q03-star | 4 → 2 | 3.6 / 5.4 | 2.6 / 3.8 | 2.8 | 1.7 | 13.5 | 13.0 | 12.7 | 11.6 |
+| q04-optional | 5 → 2 | 9.7 / 12.9 | 8.1 / 14.8 | 4.2 | 2.5 | 59.4 | 60.6 | 17.8 | 17.3 |
+| q05-filter | 5 → 2 | 8.5 / 14.9 | 7.2 / 14.4 | 3.5 | 2.0 | 60.1 | 59.1 | 17.1 | 16.9 |
+| q06-union | 5 → 2 | 9.6 / 16.9 | 8.6 / 16.4 | 3.8 | 2.3 | 56.4 | 54.9 | 19.2 | 16.6 |
+| q07-order-limit | 5 → 2 | 4.2 / 5.4 | 2.6 / 3.2 | 4.2 | 2.5 | 13.2 | 12.3 | 12.0 | 11.4 |
+| q08-distinct-keyless | 3 → 2 | 22.0 / 23.1 | 21.4 / 23.9 | 19.1 | 18.5 | 29.4 | 29.2 | 28.4 | 28.1 |
+| q09-keyless-set | 5 → 2 | 15.0 / 16.6 | 15.9 / 16.9 | 12.0 | 10.5 | 32.1 | 31.0 | 23.9 | 23.4 |
+
+The first row now comes 0.6–1.7 ms earlier, and q01 takes half the time:
+its SQL runs for 0.07 ms, so the round trips were most of it. Queries that
+spend longer in the database or in streaming rows gain the same
+milliseconds, a smaller share. The SQL each engine runs and its execution
+time did not change (`pg_stat_statements`: v12n still runs two statements
+per request, the key query and the query; prepare-only steps do not show
+there). The CLI opens a new connection per query, so it has no earlier
+statements to reuse and takes three round trips instead of four or five;
+its time is mostly process start and connecting. 1M was not re-run.
+
 ## Analysis
 
 **Where v12n is faster.** On every query that returns many rows, by 7–8×
@@ -205,12 +247,12 @@ resident memory about 40× smaller; v12n's peak stays at 12 MiB with
    `assets` with `assets` (q03, q04, and q01 as a `CROSS JOIN` of two key
    lookups), which PostgreSQL ran 1.5–2.5× longer (q02: 9.7 against 3.9 ms
    at 100k, 86 against 50 ms at 1M). q04's `LEFT JOIN` on the key remains.
-3. **Round trips before the first row** ([#76](https://github.com/CharmingGroot/sparql-v12n/issues/76)).
-   Counted from the PostgreSQL log: the key lookup (prepare and execute),
-   the column-type probe (prepare), the prepare and the execution of the
-   query, so 4–5 round trips per request against Ontop's 2. q01's SQL runs
-   for 0.05 ms but the request takes 2.6 ms, most of it waiting on the
-   network.
+3. **Round trips before the first row** ([#76](https://github.com/CharmingGroot/sparql-v12n/issues/76),
+   fixed, see above). Counted from the PostgreSQL log: the key lookup
+   (prepare and execute), the column-type probe (prepare), the prepare and
+   the execution of the query, so 4–5 round trips per request against
+   Ontop's 2. q01's SQL runs for 0.05 ms but the request took 2.6 ms, most
+   of it waiting on the network. Now 2, as Ontop.
 4. **Row-limit window** ([#77](https://github.com/CharmingGroot/sparql-v12n/issues/77),
    fixed for queries whose `LIMIT` fits, see above). With the default row
    limit, `count(*) OVER ()` and, for ordered or sliced queries, two more
@@ -228,10 +270,12 @@ resident memory about 40× smaller; v12n's peak stays at 12 MiB with
   in these queries except the IRI sort key above (before #75), the one
   place a term is computed per row in SQL.
 - Set semantics: reading the keys costs one catalog query (0.05–0.1 ms of
-  execution, two round trips) and lets v12n drop `DISTINCT` on every query
+  execution, in the round trip shared with the column probe since #76) and
+  lets v12n drop `DISTINCT` on every query
   whose tables have keys (q01–q07 run without it). On the table without a
   key, both engines use `DISTINCT` and take the same time (q08, q09).
-- The column-type probe is one prepare-only round trip, part of #76.
+- The column-type probe was one prepare-only round trip; since #76 it
+  goes with the key query.
 
 **`v12n query` (CLI)** costs 16–22 ms for a one-row query: process start,
 mapping parsing, connecting and setting up the session, then the same
@@ -244,8 +288,8 @@ queries belong on `v12n serve`.
   v12n natively on macOS. Measured `SELECT 1` round trips (pgbench,
   extended protocol): 0.08 ms on the Compose network (Ontop), 0.44 ms from
   the host (v12n), 0.65 ms from a container through the published port.
-  v12n pays about 0.36 ms more per round trip than Ontop: with 4 round
-  trips, about 1.4 ms of q01's 2.6 ms. `ontop-host` (Ontop through the
+  v12n pays about 0.36 ms more per round trip than Ontop: with the 4
+  round trips before #76, about 1.4 ms of q01's 2.6 ms. `ontop-host` (Ontop through the
   published port, a slower path than v12n's) was 4.7 ms on q01 and 4–17%
   slower than `ontop` elsewhere, so the conclusions do not depend on the
   network path. Ontop's

@@ -75,6 +75,10 @@ filtered column, created after loading, followed by `VACUUM ANALYZE`.
 - **Database side**: `pg_stat_statements`, one login role per engine, gives
   the statements each request runs and their execution and planning time,
   and the most expensive statement (the SQL each engine generated).
+- **Round trips**: a third `v12n serve` reaches PostgreSQL through a
+  proxy in `bench.py` that counts the requests v12n waits on per HTTP
+  request (pipelined requests count once; prepare-only steps count too,
+  which `pg_stat_statements` does not show). It is not timed.
 - **Start-up**: from launching the process or starting the container to
   the first answered query, several times. For Ontop, its own
   "Started ... in" time is recorded too.
