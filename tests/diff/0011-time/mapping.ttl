@@ -1,0 +1,14 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#ShiftMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "shifts" ] ;
+  rr:subjectMap [ rr:template "http://example.org/shift/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:starts ; rr:objectMap [ rr:column "starts" ] ] .
+
+# Keyed by the time column: the two midnight rows give the same subject.
+<#AlarmMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "alarms" ] ;
+  rr:subjectMap [ rr:template "http://example.org/alarm/{at}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:at ; rr:objectMap [ rr:column "at" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .

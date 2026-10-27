@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Joining two time columns: 00:00:00 and 24:00:00 are the same term.
+SELECT ?s ?a WHERE { ?s ex:starts ?t . ?a ex:at ?t }

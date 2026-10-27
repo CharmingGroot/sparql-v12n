@@ -253,8 +253,14 @@ declared scale. Ontop writes PostgreSQL's text output instead (`12.50`,
 `"30"^^xsd:double`); the differential tests record these as known
 differences (issue #25).
 
-One exception: a `time` value of `24:00:00` is written as is, although the
-XSD 1.1 canonical form is `00:00:00` (issue #37).
+Two values that SQL `=` finds different can be one term: PostgreSQL keeps
+`time '24:00:00'` apart from `'00:00:00'`, while XSD 1.1 maps both to the
+same value, written `00:00:00`. Both give `"00:00:00"^^xsd:time`; the
+constant `"00:00:00"^^xsd:time` matches both, `"24:00:00"^^xsd:time` matches
+nothing, and joins, `DISTINCT`, `UNION` and `ORDER BY` treat the two as
+one value (`col + interval '0'`). A unique key on a `time` column is not
+used to prove that a query has no duplicates. Ontop writes `24:00:00` as
+is (issue #37).
 
 Two values that SQL `=` finds equal can still be different terms: `-0`
 and `0` in `real` and `double precision` columns give `"-0.0E0"` and

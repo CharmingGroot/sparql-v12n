@@ -1,0 +1,7 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_with_time_types(r#\"SELECT ?s WHERE { ?s ex:starts \"00:00:00\"^^xsd:time }\"#,\n&[(0, TermNormal::Time)])"
+---
+SELECT DISTINCT t0."id" AS "s"
+FROM "shifts" t0
+WHERE (t0."starts" = $1 OR ($1 IS NOT NULL AND t0."starts" = '24:00:00')) AND t0."id" IS NOT NULL

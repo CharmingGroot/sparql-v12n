@@ -1069,6 +1069,7 @@ pub(super) mod tests {
                 "bpchar" => Some(TermKey::OctetLength),
                 _ => None,
             },
+            term_normal: None,
         }
     }
 

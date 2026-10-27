@@ -466,7 +466,11 @@ impl<'a> Renderer<'a> {
             Slot::Date | Slot::Time => {
                 open(self, &finite);
                 let (table, name) = term_column(operand).expect("date and time slots for columns");
-                self.sql.push_str(&super::column_sql(table, name));
+                let column = super::column_sql(table, name);
+                match self.column_type(table, name).and_then(|ty| ty.term_normal) {
+                    Some(normal) => self.sql.push_str(&normal.sql(&column)),
+                    None => self.sql.push_str(&column),
+                }
                 close(self, &finite);
             }
             Slot::Text => match (&sort.infinite, &infinite) {

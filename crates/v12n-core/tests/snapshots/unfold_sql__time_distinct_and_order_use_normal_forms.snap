@@ -1,0 +1,11 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_with_time_types(\"SELECT DISTINCT ?t WHERE { ?s ex:starts ?t } ORDER BY ?t\",\n&[])"
+---
+SELECT q."t", q."o1_time"
+FROM (
+SELECT DISTINCT (t0."starts" + interval '0') AS "t", (t0."starts" + interval '0') AS "o1_time"
+FROM "shifts" t0
+WHERE t0."id" IS NOT NULL AND t0."starts" IS NOT NULL
+) q
+ORDER BY q."o1_time"

@@ -1,0 +1,35 @@
+# Ontop writes a PostgreSQL time as its text output, so midnight stored as
+# 24:00:00 stays "24:00:00" and is another term than "00:00:00"; v12n
+# writes the XSD 1.1 canonical form 00:00:00 for both and treats them as
+# one term in constants, joins, DISTINCT and ORDER BY (Discussion #91, #37).
+[query.time-results]
+expect = "mismatch"
+issue = 37
+
+[query.time-constant-midnight]
+expect = "mismatch"
+issue = 37
+
+[query.time-constant-24]
+expect = "mismatch"
+issue = 37
+
+[query.time-join]
+expect = "mismatch"
+issue = 37
+
+[query.time-distinct]
+expect = "mismatch"
+issue = 37
+
+[query.time-key-subject]
+expect = "mismatch"
+issue = 37
+
+[query.time-order]
+expect = "mismatch"
+issue = 37
+
+# SPARQL 1.1 leaves comparing xsd:time values with = to extensions.
+[query.time-filter-equal]
+expect = "rejected"
