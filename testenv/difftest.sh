@@ -134,7 +134,7 @@ start_postgres() {
     exit 1
   fi
   generate </dev/null
-  compose down -v --remove-orphans >/dev/null 2>&1 || true
+  down >/dev/null 2>&1 || true
   compose up -d --wait postgres
   log "postgres ready"
 }
@@ -154,8 +154,23 @@ load() {
   log "loaded $count cases"
 }
 
+# Removes the containers of the project whose service name starts with $1,
+# with their anonymous volumes. Compose removes orphaned containers (those
+# of the previous batch, or of an aborted run) without their anonymous
+# volumes, and both images declare one (Ontop /tmp, PostgreSQL its data
+# directory), so `--remove-orphans` alone leaves a volume per container.
+remove_containers() {
+  local ids=() id service
+  while read -r id service; do
+    if [[ "$service" == "$1"* ]]; then ids+=("$id"); fi
+  done < <(docker ps -a --filter "label=com.docker.compose.project=$project" \
+    --format '{{.ID}} {{.Label "com.docker.compose.service"}}')
+  if [ "${#ids[@]}" -gt 0 ]; then docker rm -f -v "${ids[@]}" >/dev/null; fi
+}
+
 # Starts the Ontop services of the cases on stdin, replacing earlier ones.
 start_ontop() {
+  remove_containers ontop- </dev/null
   generate
   compose up -d --remove-orphans
   log "ontop starting: $(grep -c . "$endpoints") containers"
@@ -226,6 +241,7 @@ cleanup() {
 
 down() {
   [ -f "$compose_file" ] || generate </dev/null
+  remove_containers ""
   compose down -v --remove-orphans
 }
 
