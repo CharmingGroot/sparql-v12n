@@ -16,7 +16,8 @@ use tokio_postgres::types::Type;
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
 use v12n_core::solution::canonical_decimal;
 use v12n_core::sql::{
-    ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, SqlPlan, TermKey,
+    ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, SqlPlan, TableKeys, TermKey,
+    TermNormal,
 };
 use v12n_core::{sparql, unfold};
 use v12n_postgres::{Database, Error, Limits};
@@ -2226,6 +2227,7 @@ async fn order_by_a_column_keeps_its_index() {
             lexical: Some(Lexical::Text),
             lexical_unreserved: true,
             term_key: None,
+            term_normal: None,
         };
         let table = LogicalTable::TableName("v12n_order.items".into());
         let types: ColumnTypes = [
@@ -2410,6 +2412,191 @@ async fn zero_constants_match_only_rows_of_their_sign() {
     );
     client
         .batch_execute("DROP SCHEMA v12n_zero CASCADE")
+        .await
+        .unwrap();
+}
+
+/// `time '24:00:00'` and `'00:00:00'` are different values in PostgreSQL
+/// but the same `xsd:time` value, whose canonical form is `00:00:00`
+/// (#37): both give that term, and constants, joins, removing duplicates
+/// and sorting treat them as one, while a midnight constant still finds
+/// its rows through the index.
+#[tokio::test]
+async fn midnight_as_24_00_is_the_term_00_00_00() {
+    let Some(url) = database_url() else { return };
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS v12n_time CASCADE;
+             CREATE SCHEMA v12n_time;
+             CREATE TABLE v12n_time.shifts (id int PRIMARY KEY, starts time NOT NULL);
+             INSERT INTO v12n_time.shifts VALUES (1, '00:00'), (2, '24:00'), (3, '12:30:00.5');
+             CREATE TABLE v12n_time.alarms (at time PRIMARY KEY, name text NOT NULL);
+             INSERT INTO v12n_time.alarms VALUES
+               ('00:00', 'midnight'), ('24:00', 'end of day'), ('12:30:00.5', 'noon');
+             CREATE TABLE v12n_time.breaks (id int PRIMARY KEY, at time NOT NULL);
+             INSERT INTO v12n_time.breaks VALUES (1, '24:00');
+             CREATE TABLE v12n_time.many (id int PRIMARY KEY, at time NOT NULL);
+             INSERT INTO v12n_time.many
+               SELECT n, time '00:00' + n * interval '1 second' FROM generate_series(1, 5000) n;
+             CREATE INDEX many_at ON v12n_time.many (at);
+             ANALYZE v12n_time.many;",
+        )
+        .await
+        .unwrap();
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#Shift> rr:logicalTable [ rr:tableName "v12n_time.shifts" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:starts ; rr:objectMap [ rr:column "starts" ] ] .
+        <#Alarm> rr:logicalTable [ rr:tableName "v12n_time.alarms" ] ;
+          rr:subjectMap [ rr:template "http://example.org/alarm/{at}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:at ; rr:objectMap [ rr:column "at" ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+        <#Break> rr:logicalTable [ rr:tableName "v12n_time.breaks" ] ;
+          rr:subjectMap [ rr:template "http://example.org/break/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:breakAt ; rr:objectMap [ rr:column "at" ] ] .
+        <#Many> rr:logicalTable [ rr:tableName "v12n_time.many" ] ;
+          rr:subjectMap [ rr:template "http://example.org/many/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:moment ; rr:objectMap [ rr:column "at" ] ] .
+    "#;
+    let time = |t: &str| format!("\"{t}\"^^<http://www.w3.org/2001/XMLSchema#time>");
+    let row = |id: u8| format!("?row=<http://example.org/row/{id}>");
+    let alarm = |t: &str| format!("<http://example.org/alarm/{}>", t.replace(':', "%3A"));
+    let query = |body: &str| {
+        plan(
+            mapping,
+            &format!(
+                "PREFIX ex: <http://example.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {body}"
+            ),
+        )
+    };
+    let rows = |plan: SqlPlan| {
+        let url = url.clone();
+        async move { run(&url, Limits::default(), &plan).await.unwrap().0 }
+    };
+
+    assert_eq!(
+        rows(query("SELECT ?row ?t WHERE { ?row ex:starts ?t }")).await,
+        [
+            format!("{} ?t={}", row(1), time("00:00:00")),
+            format!("{} ?t={}", row(2), time("00:00:00")),
+            format!("{} ?t={}", row(3), time("12:30:00.5")),
+        ]
+    );
+    for (object, expected) in [
+        (time("00:00:00"), vec![row(1), row(2)]),
+        (time("24:00:00"), vec![]),
+        (time("12:30:00.5"), vec![row(3)]),
+    ] {
+        assert_eq!(
+            subjects(&url, mapping, "starts", &object).await,
+            expected,
+            "{object}"
+        );
+    }
+    assert_eq!(
+        filtered_rows(
+            &url,
+            mapping,
+            "?row ex:starts ?t",
+            "sameTerm(?t, \"00:00:00\"^^xsd:time)"
+        )
+        .await,
+        ["1", "2"]
+    );
+    assert_eq!(
+        rows(query(
+            "SELECT ?row ?a WHERE { ?row ex:starts ?t . ?a ex:at ?t }"
+        ))
+        .await,
+        [
+            format!("{} ?a={}", row(1), alarm("00:00:00")),
+            format!("{} ?a={}", row(2), alarm("00:00:00")),
+            format!("{} ?a={}", row(3), alarm("12:30:00.5")),
+        ]
+    );
+    // A break only at 24:00 joins the shift at 00:00 too.
+    assert_eq!(
+        rows(query(
+            "SELECT ?row WHERE { ?row ex:starts ?t . ?b ex:breakAt ?t }"
+        ))
+        .await,
+        [row(1), row(2)]
+    );
+    assert_eq!(
+        rows(query("SELECT DISTINCT ?t WHERE { ?row ex:starts ?t }")).await,
+        [
+            format!("?t={}", time("00:00:00")),
+            format!("?t={}", time("12:30:00.5")),
+        ]
+    );
+    let (ordered, _) = run_in_order(
+        &url,
+        Limits::default(),
+        &query("SELECT ?row WHERE { ?row ex:starts ?t } ORDER BY DESC(?t) DESC(?row)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ordered, [row(3), row(2), row(1)]);
+    // The two midnight alarms are one subject; the key on `at` proves
+    // neither that their solutions differ nor that the two scans of the
+    // table read one row.
+    assert_eq!(
+        rows(query("SELECT ?a ?n WHERE { ?a ex:at ?t ; ex:name ?n }")).await,
+        [
+            format!("?a={} ?n=\"end of day\"", alarm("00:00:00")),
+            format!("?a={} ?n=\"midnight\"", alarm("00:00:00")),
+            format!("?a={} ?n=\"noon\"", alarm("12:30:00.5")),
+        ]
+    );
+    let database = Database::connect(&url, Limits::default()).await.unwrap();
+    let alarms = query("SELECT ?a ?n WHERE { ?a ex:at ?t ; ex:name ?n }");
+    assert_eq!(
+        database.table_keys(&alarms).await.unwrap(),
+        Some(TableKeys::new())
+    );
+    assert_eq!(
+        database.merge_keys(&alarms).await.unwrap(),
+        Some(TableKeys::new())
+    );
+
+    // The column is compared with the constant first, so the index finds
+    // the rows of both forms.
+    let sql = query(&format!(
+        "SELECT ?m WHERE {{ ?m ex:moment {} }}",
+        time("00:00:00")
+    ))
+    .to_sql_with(&RenderOptions {
+        normal_params: &[(0, TermNormal::Time)],
+        ..RenderOptions::default()
+    })
+    .unwrap()
+    .sql;
+    client
+        .batch_execute("SET enable_seqscan = off")
+        .await
+        .unwrap();
+    let explain: Vec<String> = client
+        .query(
+            &format!("EXPLAIN {}", sql.replace("$1", "time '00:00:00'")),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(
+        explain
+            .iter()
+            .any(|line| line.contains("Index Cond: (at = ")),
+        "{explain:#?}"
+    );
+    client
+        .batch_execute("DROP SCHEMA v12n_time CASCADE")
         .await
         .unwrap();
 }
@@ -2626,6 +2813,7 @@ async fn merge_keys_identify_one_row_by_equality() {
             CREATE TABLE v12n_merge.collation (id int, v text COLLATE "C" NOT NULL, w text);
             CREATE UNIQUE INDEX ON v12n_merge.collation (v COLLATE "POSIX");
             CREATE TABLE v12n_merge.decimal (id numeric PRIMARY KEY, v text, w text);
+            CREATE TABLE v12n_merge.clock (id time PRIMARY KEY, v text, w text);
             CREATE TABLE v12n_merge.parent (id int PRIMARY KEY, v text, w text);
             CREATE TABLE v12n_merge.child () INHERITS (v12n_merge.parent);
             CREATE TABLE v12n_merge.partitioned (id int PRIMARY KEY, v text, w text) PARTITION BY RANGE (id);
@@ -2646,6 +2834,7 @@ async fn merge_keys_identify_one_row_by_equality() {
         "opclass",
         "collation",
         "decimal",
+        "clock",
         "parent",
         "partitioned",
     ] {
@@ -2690,6 +2879,7 @@ async fn merge_keys_identify_one_row_by_equality() {
             ("opclass", none.clone()),
             ("collation", none.clone()),
             ("decimal", k(&["id"])),
+            ("clock", none.clone()),
             ("parent", none.clone()),
             ("partitioned", k(&["id"])),
         ]

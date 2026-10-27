@@ -20,12 +20,12 @@ use v12n_core::mapping::LogicalTable;
 use v12n_core::optimize;
 use v12n_core::solution::{Solution, SolutionBuilder, SqlValue};
 use v12n_core::sql::{
-    ColumnTypes, Comparison, RenderOptions, RenderedSql, SqlPlan, TableKeys, TermKey,
-    column_name_probe, column_probe, column_type_probe, folded_identifier, quote_identifier,
-    quote_table_name,
+    ColumnType, ColumnTypes, Comparison, RenderOptions, RenderedSql, SqlPlan, TableKeys, TermKey,
+    TermNormal, column_name_probe, column_probe, column_type_probe, folded_identifier,
+    quote_identifier, quote_table_name,
 };
 
-use bind::{Bound, bind, term_key};
+use bind::{Bound, bind, term_key, term_normal};
 use decode::{Decoder, Raw, column_type};
 pub use error::Error;
 
@@ -288,6 +288,7 @@ impl Database {
         let options = RenderOptions {
             text_params: &[],
             keyed_params: &[],
+            normal_params: &[],
             column_types: column_types.as_ref(),
             keys: keys.as_ref(),
             non_utf8: !self.utf8,
@@ -325,11 +326,23 @@ impl Database {
             .enumerate()
             .filter_map(|(i, (ty, value))| term_key(ty, value).map(|key| (i, key)))
             .collect();
+        // `=` finds a midnight constant different from `24:00:00`, the same term.
+        let normal_params: Vec<(usize, TermNormal)> = statement.params()[..rendered.params.len()]
+            .iter()
+            .zip(&rendered.params)
+            .enumerate()
+            .filter_map(|(i, (ty, value))| term_normal(ty, value).map(|normal| (i, normal)))
+            .collect();
         let cast_columns = decoders.iter().any(Option::is_none);
-        let rendered = if cast_columns || !text_params.is_empty() || !keyed_params.is_empty() {
+        let rendered = if cast_columns
+            || !text_params.is_empty()
+            || !keyed_params.is_empty()
+            || !normal_params.is_empty()
+        {
             let rendered = plan.to_sql_with(&RenderOptions {
                 text_params: &text_params,
                 keyed_params: &keyed_params,
+                normal_params: &normal_params,
                 ..options
             })?;
             let cast = cast_columns.then_some(decoders.as_slice());
@@ -462,6 +475,11 @@ impl Database {
     /// own collation and the type's default operator class, as the SQL
     /// `=` the plan renders does, and the type compares by `=` without a
     /// cast or a term key (`ColumnType::comparison`, `ColumnType::term_key`).
+    ///
+    /// A key with a column whose distinct values can give the same term
+    /// (`ColumnType::term_normal`) is left out entirely: two rows that
+    /// differ only there give the same terms, so the key proves neither
+    /// that the rows' solutions differ nor that a scan matches one row.
     async fn load_keys(&self, plan: &SqlPlan) -> Result<Option<Keys>, tokio_postgres::Error> {
         self.load_keys_of(&keyed_tables(plan)).await
     }
@@ -491,11 +509,16 @@ impl Database {
             let exact_index: bool = row.get(2);
             let types: Vec<u32> = row.get(3);
             let table = &tables[usize::try_from(position - 1).expect("ordinality starts at 1")];
-            let exact_types = types.into_iter().all(|oid| {
-                Type::from_oid(oid).is_some_and(|ty| {
-                    let ty = column_type(&ty);
-                    ty.comparison == Comparison::Value && ty.term_key.is_none()
-                })
+            let types: Vec<Option<ColumnType>> = types
+                .into_iter()
+                .map(|oid| Type::from_oid(oid).map(|ty| column_type(&ty)))
+                .collect();
+            if types.iter().flatten().any(|ty| ty.term_normal.is_some()) {
+                continue;
+            }
+            let exact_types = types.iter().all(|ty| {
+                ty.as_ref()
+                    .is_some_and(|ty| ty.comparison == Comparison::Value && ty.term_key.is_none())
             });
             if exact_index && exact_types {
                 keys.mergeable

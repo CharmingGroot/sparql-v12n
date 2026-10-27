@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Both midnight rows give 00:00:00.
+SELECT ?s ?t WHERE { ?s ex:starts ?t }

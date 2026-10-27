@@ -553,6 +553,9 @@ pub struct ColumnType {
     /// For a type whose `=` finds some values equal that give different
     /// terms, what tells them apart.
     pub term_key: Option<TermKey>,
+    /// For a type whose `=` finds some values different that give the
+    /// same term, what maps them to one value.
+    pub term_normal: Option<TermNormal>,
 }
 
 /// SQL that tells apart values that `=` finds equal but whose natural
@@ -576,6 +579,35 @@ impl TermKey {
         match self {
             Self::Text => format!("{expr}::text"),
             Self::OctetLength => format!("octet_length({expr})"),
+        }
+    }
+}
+
+/// SQL that maps values that `=` finds different but whose natural RDF
+/// terms are the same (R2RML §10.2) to one value, the one whose term it
+/// is, so that comparing, deduplicating and sorting terms in SQL treats
+/// them as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermNormal {
+    /// `x + interval '0'`: `time`, where `24:00:00` and `00:00:00` are
+    /// different values but the same `xsd:time` value, whose canonical
+    /// form is `00:00:00` (XML Schema 1.1 `timeCanonicalMap`).
+    Time,
+}
+
+impl TermNormal {
+    fn sql(self, expr: &str) -> String {
+        match self {
+            Self::Time => format!("({expr} + interval '0')"),
+        }
+    }
+
+    /// The values other than `x` itself that a column must also match to
+    /// match the term of a parameter `x` in normal form, for parameters
+    /// that [`RenderOptions::normal_params`] lists.
+    fn others(self) -> &'static str {
+        match self {
+            Self::Time => "'24:00:00'",
         }
     }
 }
@@ -623,6 +655,10 @@ pub struct RenderOptions<'a> {
     /// finds equal to the constant may still give a different term (a
     /// zero `float8` constant against `-0`, see [`TermKey`]).
     pub keyed_params: &'a [(usize, TermKey)],
+    /// Parameters (0-based) holding a value whose term other values of
+    /// the parameter's type also give, which the comparison with a column
+    /// also matches (`00:00:00` against `24:00:00`, see [`TermNormal`]).
+    pub normal_params: &'a [(usize, TermNormal)],
     /// Types of the columns that [`SqlPlan::term_columns`] lists.
     pub column_types: Option<&'a ColumnTypes>,
     /// Unique keys of the tables that [`SqlPlan::key_tables`] lists.
@@ -1987,7 +2023,8 @@ impl<'a> Renderer<'a> {
                     };
                     let as_text = column.is_some() && self.options.text_params.contains(&param);
                     let key = column.as_ref().and_then(|_| self.param_key(param));
-                    if key.is_some() {
+                    let normal = column.as_ref().and_then(|_| self.param_normal(param));
+                    if key.is_some() || normal.is_some() {
                         self.sql.push('(');
                     }
                     self.expr(left);
@@ -1999,13 +2036,21 @@ impl<'a> Renderer<'a> {
                     if as_text && matches!(right, SqlExpr::Column { .. }) {
                         self.sql.push_str("::text");
                     }
-                    if let (Some(key), Some(column)) = (key, column) {
+                    if let (Some(key), Some(column)) = (key, &column) {
                         // `=` came first, so PostgreSQL has typed the
                         // parameter as the column before the key reads it.
                         self.sql.push_str(&format!(
                             " AND {} = {})",
-                            key.sql(&column),
+                            key.sql(column),
                             key.sql(&format!("${}", param + 1))
+                        ));
+                    }
+                    if let (Some(normal), Some(column)) = (normal, column) {
+                        // A parameter bound to NULL matches nothing.
+                        self.sql.push_str(&format!(
+                            " OR (${} IS NOT NULL AND {column} = {}))",
+                            param + 1,
+                            normal.others()
                         ));
                     }
                 }
@@ -2103,6 +2148,16 @@ impl<'a> Renderer<'a> {
             .map(|&(_, key)| key)
     }
 
+    /// The normal form whose other values the comparison with parameter
+    /// `param` (0-based) also matches, see [`RenderOptions::normal_params`].
+    fn param_normal(&self, param: usize) -> Option<TermNormal> {
+        self.options
+            .normal_params
+            .iter()
+            .find(|(p, _)| *p == param)
+            .map(|&(_, normal)| normal)
+    }
+
     fn same_term(&mut self, left: &TermSql, right: &TermSql) -> Result<(), Error> {
         let Some(types) = self.options.column_types else {
             self.term_side(left, None, false)?;
@@ -2129,6 +2184,11 @@ impl<'a> Renderer<'a> {
             && a.group == b.group
         {
             let (l, r) = (column_sql(*lt, ln), column_sql(*rt, rn));
+            if let Some(normal) = a.term_normal.or(b.term_normal) {
+                self.sql
+                    .push_str(&format!("{} = {}", normal.sql(&l), normal.sql(&r)));
+                return Ok(());
+            }
             match (a.comparison, a.term_key.or(b.term_key)) {
                 (Comparison::Value, Some(key)) => self.sql.push_str(&format!(
                     "({l} = {r} AND {} = {})",
@@ -2285,6 +2345,14 @@ impl<'a> Renderer<'a> {
 
     /// An entry of a select list: [`SqlExpr::Term`] or any other.
     fn select_expr(&mut self, expr: &SqlExpr) -> Result<(), Error> {
+        if let SqlExpr::Column { table, name } = expr
+            && let Some(normal) = self.column_type(*table, name).and_then(|ty| ty.term_normal)
+        {
+            // Values with the same term are one value for `DISTINCT`,
+            // `UNION` and the decoder.
+            self.sql.push_str(&normal.sql(&column_sql(*table, name)));
+            return Ok(());
+        }
         let SqlExpr::Term { term, guard } = expr else {
             self.expr(expr);
             return Ok(());
@@ -3029,6 +3097,7 @@ mod tests {
         };
         let double = ColumnType {
             term_key: Some(TermKey::Text),
+            term_normal: None,
             ..ty("double", Comparison::Text, None)
         };
         let types: ColumnTypes = [
@@ -3074,6 +3143,7 @@ mod tests {
             lexical,
             lexical_unreserved: unreserved(group),
             term_key: None,
+            term_normal: None,
         }
     }
 
@@ -3158,6 +3228,7 @@ mod tests {
         // bpchar's `=` ignores trailing spaces, which its terms keep.
         let bpchar = || ColumnType {
             term_key: Some(TermKey::OctetLength),
+            term_normal: None,
             ..ty("bpchar", Comparison::Value, None)
         };
         assert_eq!(
@@ -3209,6 +3280,7 @@ mod tests {
             lexical,
             lexical_unreserved: unreserved(class),
             term_key: None,
+            term_normal: None,
         }
     }
 

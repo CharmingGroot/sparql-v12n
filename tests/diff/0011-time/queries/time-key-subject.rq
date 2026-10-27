@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# The two midnight alarms are one subject with two names.
+SELECT ?a ?n WHERE { ?a ex:at ?t ; ex:name ?n }

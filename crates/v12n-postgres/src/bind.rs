@@ -7,7 +7,7 @@ use std::error::Error as StdError;
 use bytes::BytesMut;
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use v12n_core::solution::{SqlValue, canonical_decimal};
-use v12n_core::sql::TermKey;
+use v12n_core::sql::{TermKey, TermNormal};
 
 use crate::decode::{Decoder, MICROS_PER_DAY, PG_EPOCH_DAYS};
 
@@ -148,6 +148,14 @@ pub(crate) fn term_key(ty: &Type, value: &str) -> Option<TermKey> {
     }
 }
 
+/// The normal form whose other values a comparison of a parameter of type
+/// `ty` holding `value` with a column also matches (see [`TermNormal`]):
+/// a `time` column holds midnight as `00:00:00` or `24:00:00`, both the
+/// term `"00:00:00"^^xsd:time`.
+pub(crate) fn term_normal(ty: &Type, value: &str) -> Option<TermNormal> {
+    (*ty == Type::TIME && value == "00:00:00").then_some(TermNormal::Time)
+}
+
 /// Binary format of `value` read as the decoder's type, `None` when it is
 /// not a value of that type. Lenient where the round trip in [`bind`]
 /// rejects non-canonical forms anyway, strict about ranges the server
@@ -186,7 +194,8 @@ fn encode(decoder: Decoder, value: &str) -> Option<Vec<u8>> {
         },
         Decoder::Time => {
             let micros = parse_time(value)?;
-            // 24:00:00 is a valid `time`.
+            // 24:00:00 is a valid `time`; its term is 00:00:00, so the
+            // round trip rejects it.
             if micros > MICROS_PER_DAY {
                 return None;
             }
@@ -388,7 +397,12 @@ mod tests {
             assert!(!matches(&Type::DATE, value), "{value}");
         }
         assert!(matches(&Type::TIME, "10:00:00.25"));
-        assert!(matches(&Type::TIME, "24:00:00"));
+        assert!(matches(&Type::TIME, "00:00:00"));
+        // The same value, in a form that is not canonical.
+        assert!(!matches(&Type::TIME, "24:00:00"));
+        assert_eq!(term_normal(&Type::TIME, "00:00:00"), Some(TermNormal::Time));
+        assert_eq!(term_normal(&Type::TIME, "12:00:00"), None);
+        assert_eq!(term_normal(&Type::TEXT, "00:00:00"), None);
         for value in ["10:00:00.250", "10:00", "10:00:00.", "25:00:00", "10:60:00"] {
             assert!(!matches(&Type::TIME, value), "{value}");
         }

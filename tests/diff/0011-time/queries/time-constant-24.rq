@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# 24:00:00 is not the canonical form of any term, so it matches nothing.
+SELECT ?s WHERE { ?s ex:starts "24:00:00"^^xsd:time }

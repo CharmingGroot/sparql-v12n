@@ -2,7 +2,9 @@
 //! Snapshots of the SQL generated for example queries.
 
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
-use v12n_core::sql::{ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, TableKeys};
+use v12n_core::sql::{
+    ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, TableKeys, TermNormal,
+};
 use v12n_core::{optimize, sparql, unfold};
 
 const SHOP: &str = include_str!("../../../examples/shop/mapping.ttl");
@@ -171,6 +173,7 @@ fn column_type(name: &str, natural: Option<&str>) -> ColumnType {
         lexical: Some(Lexical::Text),
         lexical_unreserved: group == "integer",
         term_key: None,
+        term_normal: None,
     }
 }
 
@@ -626,5 +629,72 @@ fn self_join_with_filter_order_and_limit() {
     insta::assert_snapshot!(explain_merged(
         "SELECT ?f ?t WHERE { ?f ex:severityId ?s ; ex:title ?t FILTER(?s >= 3) } \
          ORDER BY DESC(?s) ?t LIMIT 10"
+    ));
+}
+
+const TIMES: &str = include_str!("../../../tests/diff/0011-time/mapping.ttl");
+
+/// `time` columns, whose `24:00:00` and `00:00:00` give the same term
+/// (#37): compared, selected and sorted in normal form.
+fn explain_with_time_types(query: &str, normal_params: &[(usize, TermNormal)]) -> String {
+    let mapping = Mapping::from_turtle(TIMES).unwrap();
+    let index = MappingIndex::new(&mapping);
+    let query = sparql::parse(&format!(
+        "{PREFIXES}PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n{query}"
+    ))
+    .unwrap();
+    let plan = unfold::unfold(&query, &mapping, &index).unwrap();
+    let time = ColumnType {
+        name: "time".into(),
+        sql_type: "\"pg_catalog\".\"time\"".into(),
+        union_class: "time".into(),
+        natural_datatype: Some("http://www.w3.org/2001/XMLSchema#time".into()),
+        group: "time".into(),
+        comparison: Comparison::Value,
+        lexical: None,
+        lexical_unreserved: false,
+        term_key: None,
+        term_normal: Some(TermNormal::Time),
+    };
+    let types: ColumnTypes = [
+        (("shifts", "id"), column_type("int4", Some("integer"))),
+        (("shifts", "starts"), time.clone()),
+        (("alarms", "at"), time),
+        (("alarms", "name"), column_type("text", None)),
+    ]
+    .into_iter()
+    .map(|((table, column), ty)| ((LogicalTable::TableName(table.into()), column.into()), ty))
+    .collect();
+    plan.to_sql_with(&RenderOptions {
+        column_types: Some(&types),
+        normal_params,
+        ..RenderOptions::default()
+    })
+    .unwrap()
+    .sql
+}
+
+#[test]
+fn time_join_compares_normal_forms() {
+    insta::assert_snapshot!(explain_with_time_types(
+        "SELECT ?s ?a WHERE { ?s ex:starts ?t . ?a ex:at ?t }",
+        &[]
+    ));
+}
+
+#[test]
+fn time_distinct_and_order_use_normal_forms() {
+    insta::assert_snapshot!(explain_with_time_types(
+        "SELECT DISTINCT ?t WHERE { ?s ex:starts ?t } ORDER BY ?t",
+        &[]
+    ));
+}
+
+/// The comparison with the column stays, so an index on it is used.
+#[test]
+fn time_midnight_constant_also_matches_24_00() {
+    insta::assert_snapshot!(explain_with_time_types(
+        r#"SELECT ?s WHERE { ?s ex:starts "00:00:00"^^xsd:time }"#,
+        &[(0, TermNormal::Time)]
     ));
 }

@@ -5,7 +5,7 @@ use std::error::Error as StdError;
 
 use tokio_postgres::types::{FromSql, Type};
 use v12n_core::solution::SqlValue;
-use v12n_core::sql::{ColumnType, Comparison, Lexical, TermKey, quote_identifier};
+use v12n_core::sql::{ColumnType, Comparison, Lexical, TermKey, TermNormal, quote_identifier};
 
 type BoxError = Box<dyn StdError + Sync + Send>;
 
@@ -141,8 +141,10 @@ impl Decoder {
 /// forms, except for floating point (`-0 = 0`) and types without a
 /// decoder (`'1 day' = '24 hours'` for `interval`), whose text output is
 /// compared instead, and `bpchar`, whose `=` ignores trailing spaces and
-/// so also compares the lengths ([`TermKey`]). Constants and removing
-/// duplicates use the same keys. Across groups only the natural lexical forms can be
+/// so also compares the lengths ([`TermKey`]), and `time`, whose
+/// `24:00:00` and `00:00:00` are the same term, compared and deduplicated
+/// in normal form ([`TermNormal`]). Constants and removing duplicates use
+/// the same keys. Across groups only the natural lexical forms can be
 /// compared, and SQL computes them only where the text output already is
 /// that form, or for booleans, binaries and `numeric` (`trim_scale`).
 /// Floating point and date/time types are left out until an SQL
@@ -215,6 +217,7 @@ pub(crate) fn column_type(ty: &Type) -> ColumnType {
         lexical,
         lexical_unreserved,
         term_key,
+        term_normal: (*ty == Type::TIME).then_some(TermNormal::Time),
     }
 }
 
@@ -307,6 +310,9 @@ fn format_date(days: i64) -> String {
 /// `hh:mm:ss` with the fraction only when it is not zero, as the canonical
 /// `xsd:time` form has it.
 fn format_time(micros: i64) -> String {
+    // `24:00:00` is the same `xsd:time` value as `00:00:00`, whose
+    // canonical form that is (XML Schema 1.1 `timeCanonicalMap`).
+    let micros = micros % MICROS_PER_DAY;
     let seconds = micros / 1_000_000;
     let fraction = micros % 1_000_000;
     let mut out = format!(
@@ -378,6 +384,14 @@ mod tests {
         assert_eq!(format_date(0), "1970-01-01");
         assert_eq!(format_date(PG_EPOCH_DAYS + 8825), "2024-02-29");
         assert_eq!(format_date(-719_528), "0000-01-01");
+    }
+
+    #[test]
+    fn decode_time_writes_midnight_in_canonical_form() {
+        let decode = |micros: i64| Decoder::Time.decode(Some(&micros.to_be_bytes())).unwrap();
+        assert_eq!(decode(45_000_500_000), SqlValue::Time("12:30:00.5".into()));
+        assert_eq!(decode(0), SqlValue::Time("00:00:00".into()));
+        assert_eq!(decode(MICROS_PER_DAY), SqlValue::Time("00:00:00".into()));
     }
 
     #[test]

@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# The canonical midnight constant matches both midnight rows.
+SELECT ?s WHERE { ?s ex:starts "00:00:00"^^xsd:time }
