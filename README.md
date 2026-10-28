@@ -2,23 +2,35 @@
 
 English | [한국어](README.ko.md) | [简体中文](README.zh-CN.md)
 
-Query PostgreSQL with SPARQL through R2RML mappings, without copying the data.
+<p align="center"><b>Query PostgreSQL with SPARQL through an R2RML mapping, without copying the data.</b></p>
 
-sparql-v12n is a virtual knowledge graph engine written in Rust.
-It rewrites a SPARQL query into SQL using an R2RML mapping, runs the SQL on the
-source database, and returns SPARQL results. The mapping also defines exactly
-which tables and columns can be queried. There is no ontology reasoning yet:
-a query matches the classes and properties the mapping states.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
+    <img alt="A SPARQL query and an R2RML mapping go into v12n, which translates the query into one SQL query for PostgreSQL. PostgreSQL returns rows, and v12n returns them as SPARQL results in JSON or CSV." src="docs/images/how-it-works-light.svg" width="760">
+  </picture>
+</p>
 
-> Status: Experimental. The MVP SPARQL subset is implemented and checked against Ontop and the W3C R2RML tests; APIs and output may change before 1.0.
+- sparql-v12n translates each SPARQL query into one SQL query and runs it on
+  PostgreSQL. The data stays in PostgreSQL.
+- The R2RML mapping decides which tables and columns become which classes and
+  properties. Data outside the mapping cannot be queried.
+- There is no ontology reasoning yet. A query for a class finds only what the
+  mapping states for that class. See the [roadmap](#roadmap).
+- sparql-v12n is written in Rust. One binary, `v12n`, provides both a command
+  line tool and a SPARQL 1.1 Protocol HTTP endpoint.
+
+> Status: experimental. The supported subset below is tested against Ontop and
+> the W3C R2RML test cases. Commands, output and APIs may change before 1.0.
 
 ## Supported SPARQL
 
-`SELECT` queries over one R2RML mapping and one PostgreSQL database. Each
-supported feature below is compared with [Ontop](https://ontop-vkg.org/) by
-the differential tests (`tests/diff`). The rejected forms, and anything not
-listed, fail as unsupported (`v12n query` exit code 1, HTTP 501) rather
-than give different answers.
+The engine answers `SELECT` queries over one R2RML mapping and one
+PostgreSQL database. The table lists what is supported and what is rejected.
+A rejected query, or any form not listed, fails with an error (`v12n query`
+exits with 1, the HTTP endpoint answers 501). It never returns a different
+answer. Each supported feature is compared with
+[Ontop](https://ontop-vkg.org/) in the differential tests (`tests/diff`).
 
 | Feature | Notes | Rejected |
 |---|---|---|
