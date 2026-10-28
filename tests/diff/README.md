@@ -106,8 +106,7 @@ testenv/difftest.sh      # up, test, down
 ```
 
 Every case needs its own Ontop JVM, so the script starts at most
-`DIFF_BATCH` (8) at a time and `DIFF_SHARD=i/N` runs every Nth case, which
-CI uses to split the cases over four jobs. `DIFF_CASES="0001-mdr shop"`
+`DIFF_BATCH` (8) at a time and `DIFF_SHARD=i/N` runs every Nth case. `DIFF_CASES="0001-mdr shop"`
 picks cases by name. `testenv/difftest.sh up`, `test` and `down` run the
 steps separately for the selected cases, for example to rerun the tests
 while editing a case.
