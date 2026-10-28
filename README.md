@@ -25,6 +25,30 @@ English | [한국어](README.ko.md) | [简体中文](README.zh-CN.md)
 > Status: experimental. The supported subset below is tested against Ontop and
 > the W3C R2RML test cases. Commands, output and APIs may change before 1.0.
 
+## Install
+
+Download the archive for your platform from the
+[releases](https://github.com/CharmingGroot/sparql-v12n/releases) page and
+put `v12n` on your `PATH`. Archives are built for Linux (x86_64 and aarch64,
+static binaries), macOS (Apple silicon) and Windows (x86_64).
+
+Each release has a `SHA256SUMS` file and a build provenance attestation.
+Check a download with either of these commands (on macOS, use
+`shasum -a 256 -c` for the first):
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS
+gh attestation verify v12n-<version>-<target>.tar.gz -R CharmingGroot/sparql-v12n
+```
+
+To build from source with Rust 1.88 or later:
+
+```sh
+cargo install --locked --git https://github.com/CharmingGroot/sparql-v12n v12n-cli
+```
+
+`v12n --version` prints the version and the commit it was built from.
+
 ## Supported SPARQL
 
 The engine answers `SELECT` queries over one R2RML mapping and one
