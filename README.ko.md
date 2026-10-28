@@ -2,14 +2,14 @@
 
 [English](README.md) | 한국어 | [简体中文](README.zh-CN.md)
 
-> 이 문서는 [README.md](README.md)(커밋 f98a763)의 번역이다. 내용이 다르면 영어 원문을 따른다.
+> 이 문서는 [README.md](README.md)(커밋 8e6fa66)의 번역이다. 내용이 다르면 영어 원문을 따른다.
 
 <p align="center"><b>Rust로 작성한 가상 지식 그래프 엔진이다. R2RML 매핑에 따라 SPARQL 쿼리를 SQL로 변환해 원본 데이터베이스에서 실행하며, 데이터를 복사하지 않는다.</b></p>
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
-    <img alt="SPARQL 쿼리와 R2RML 매핑을 입력하면 v12n이 쿼리를 SQL 쿼리 하나로 변환해 PostgreSQL에 보낸다. PostgreSQL이 행을 돌려주면 v12n은 이를 JSON이나 CSV 형식의 SPARQL 결과로 반환한다." src="docs/images/how-it-works-light.svg" width="760">
+    <img alt="SPARQL 쿼리와 R2RML 매핑을 입력하면 v12n이 쿼리를 SQL 쿼리 하나로 변환해 PostgreSQL에 보낸다. PostgreSQL이 행을 돌려주면 v12n은 이를 JSON, XML, CSV, TSV 형식의 SPARQL 결과로 반환한다." src="docs/images/how-it-works-light.svg" width="760">
   </picture>
 </p>
 

@@ -2,7 +2,7 @@
 
 [English](semantics.md) | 한국어 | [简体中文](semantics.zh-CN.md)
 
-> 이 문서는 [semantics.md](semantics.md)(커밋 f98a763)의 번역이다. 내용이 다르면 영어 원문을 따른다.
+> 이 문서는 [semantics.md](semantics.md)(커밋 8e6fa66)의 번역이다. 내용이 다르면 영어 원문을 따른다.
 
 이 문서는 sparql-v12n이 SPARQL 쿼리를 SQL로 변환하는 방법과 쿼리 결과를 결정하는 규칙을 설명한다. 다루는 항목은 컬럼 이름, IRI, 리터럴(literal), 상수, 조인, 중복, `OPTIONAL`, `UNION`, `FILTER`, 정렬이다. 전체 개요와 지원 기능 표는 [README](../README.ko.md)에 있다.
 
