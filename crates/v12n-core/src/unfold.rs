@@ -14,10 +14,12 @@ use crate::Error;
 use crate::mapping::{
     BaseIri, LogicalTable, Mapping, MappingIndex, ObjectMap, TemplatePart, TermType, TriplesMap,
 };
-use crate::sparql::{Expression, Pattern, PatternTerm, RDF_TYPE, SelectQuery, TriplePattern};
+use crate::sparql::{
+    ArithOp, Expression, Pattern, PatternTerm, RDF_TYPE, SelectQuery, TriplePattern,
+};
 use crate::sql::{
     Condition, LeftJoin, OrderKey, ProjectedTerm, ResultTerm, ResultValue, SqlBranch, SqlExpr,
-    SqlPlan,
+    SqlPlan, ValueKind,
 };
 use term::{Equality, LiteralType, TermExpr, TermValue, is_injective, literal_type, term_eq};
 
@@ -31,6 +33,8 @@ pub const MAX_BRANCHES: usize = 64;
 const BOOLEAN: &str = "\"pg_catalog\".\"bool\"";
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+const XSD_DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
 
 /// Unfolds a query into a SQL plan over the mapping's logical tables.
 ///
@@ -928,7 +932,8 @@ fn collect_columns(expr: &SqlExpr, out: &mut HashSet<(usize, String)>) {
         | SqlExpr::Unbound
         | SqlExpr::Matched(_)
         | SqlExpr::True
-        | SqlExpr::Term { .. } => {}
+        | SqlExpr::Term { .. }
+        | SqlExpr::Value { .. } => {}
         SqlExpr::Concat(parts) => parts.iter().for_each(|p| collect_columns(p, out)),
     }
 }
@@ -1174,6 +1179,29 @@ fn check_computable<'t, 'a: 't>(
     )))
 }
 
+/// A projected variable that `BIND` or `SELECT (expr AS ?v)` computes.
+enum Computed<'q> {
+    /// The term of another variable.
+    Copy(&'q str),
+    Constant(&'q Term),
+    /// A number: entry `index` of [`SqlBranch::values`], with one result
+    /// column per class of number it can be.
+    Value {
+        index: usize,
+        kinds: Vec<ValueKind>,
+    },
+}
+
+/// The classes of number an arithmetic expression can give: a division
+/// always gives a decimal (op:numeric-divide).
+fn value_kinds(expression: &Expression) -> Vec<ValueKind> {
+    match expression {
+        Expression::Arith(ArithOp::Divide, ..) => vec![ValueKind::Decimal],
+        Expression::Negate(inner) => value_kinds(inner),
+        _ => vec![ValueKind::Integer, ValueKind::Decimal],
+    }
+}
+
 fn plan(
     query: &SelectQuery,
     mut branches: Vec<Branch<'_>>,
@@ -1234,12 +1262,42 @@ fn plan(
         .chain(hidden.iter().copied())
         .collect();
 
+    // Bindings of variables that are not projected change no result.
+    let mut computed: HashMap<&str, Computed<'_>> = HashMap::new();
+    let mut values: Vec<&Expression> = Vec::new();
+    for binding in &query.bindings {
+        let variable = binding.variable.as_str();
+        if !query.variables.iter().any(|v| v == variable) {
+            continue;
+        }
+        let entry = match &binding.expression {
+            Expression::Variable(source) => Computed::Copy(source),
+            Expression::Constant(term) => Computed::Constant(term),
+            expression => {
+                values.push(expression);
+                Computed::Value {
+                    index: values.len() - 1,
+                    kinds: value_kinds(expression),
+                }
+            }
+        };
+        computed.insert(variable, entry);
+    }
+
     // The result rows do not say which branch they came from, so each
     // alternative is built the same way in every branch that has it.
     let mut alternatives: Vec<Vec<Alternative<'_>>> = Vec::with_capacity(variables.len());
     for &variable in &variables {
+        let source = match computed.get(variable) {
+            Some(Computed::Copy(source)) => *source,
+            Some(_) => {
+                alternatives.push(Vec::new());
+                continue;
+            }
+            None => variable,
+        };
         let per_branch: Vec<Vec<(usize, Source<'_>)>> =
-            branches.iter().map(|b| b.alternatives(variable)).collect();
+            branches.iter().map(|b| b.alternatives(source)).collect();
         let list = alternatives_of(variable, &per_branch, &arms, query.distinct)?;
         if query.distinct {
             check_distinct(variable, &list)?;
@@ -1250,6 +1308,7 @@ fn plan(
     let reserved: HashSet<&str> = variables.iter().copied().collect();
     let mut used: HashSet<String> = HashSet::new();
     let mut aliases: Vec<Vec<Vec<String>>> = Vec::with_capacity(variables.len());
+    let mut value_aliases: HashMap<&str, Vec<String>> = HashMap::new();
     for (&variable, list) in variables.iter().zip(&alternatives) {
         let mut slot = 0;
         let mut per_alternative = Vec::with_capacity(list.len());
@@ -1264,6 +1323,18 @@ fn plan(
                 .collect();
             per_alternative.push(names);
         }
+        if let Some(Computed::Value { kinds, .. }) = computed.get(variable) {
+            let names = kinds
+                .iter()
+                .map(|_| {
+                    let alias = column_alias(variable, slot, &reserved, &used);
+                    used.insert(alias.clone());
+                    slot += 1;
+                    alias
+                })
+                .collect();
+            value_aliases.insert(variable, names);
+        }
         aliases.push(per_alternative);
     }
 
@@ -1275,6 +1346,39 @@ fn plan(
         for (alternative, names) in list.iter().zip(names) {
             columns.extend(names.iter().cloned());
             terms.push(result_term(alternative, names));
+        }
+        match computed.get(variable.as_str()) {
+            Some(Computed::Constant(term)) => terms.push(ResultTerm {
+                term_type: match term {
+                    Term::NamedNode(_) => TermType::Iri,
+                    Term::BlankNode(_) => TermType::BlankNode,
+                    _ => TermType::Literal,
+                },
+                value: ResultValue::Constant((*term).clone()),
+                datatype: None,
+                language: None,
+                guard: None,
+            }),
+            Some(Computed::Value { kinds, .. }) => {
+                let names = &value_aliases[variable.as_str()];
+                columns.extend(names.iter().cloned());
+                for (kind, name) in kinds.iter().zip(names) {
+                    terms.push(ResultTerm {
+                        term_type: TermType::Literal,
+                        value: ResultValue::Column(name.clone()),
+                        datatype: Some(
+                            match kind {
+                                ValueKind::Integer => XSD_INTEGER,
+                                ValueKind::Decimal => XSD_DECIMAL,
+                            }
+                            .to_owned(),
+                        ),
+                        language: None,
+                        guard: None,
+                    });
+                }
+            }
+            Some(Computed::Copy(_)) | None => {}
         }
         projection.push(ProjectedTerm {
             variable: variable.clone(),
@@ -1306,7 +1410,8 @@ fn plan(
     let mut entries: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut next = 0;
     for (&variable, list) in variables.iter().zip(&alternatives) {
-        let width: usize = list.iter().map(Alternative::width).sum();
+        let width = list.iter().map(Alternative::width).sum::<usize>()
+            + value_aliases.get(variable).map_or(0, Vec::len);
         entries.insert(variable, (next..next + width).collect());
         next += width;
     }
@@ -1320,46 +1425,62 @@ fn plan(
             }
         }
     }
+    // Computed values, which no triple pattern holds, come last.
+    if !distinct_order.is_empty() {
+        for variable in &variables {
+            if let Some(slots) = entries.remove(variable) {
+                distinct_order.extend(slots);
+            }
+        }
+    }
 
     let mut sql_branches = Vec::with_capacity(branches.len());
     for (b, branch) in branches.iter().enumerate() {
         let mut select = Vec::new();
-        for alternative in alternatives.iter().flatten() {
-            match (alternative.sources[b], alternative.flagged()) {
-                (Some(source), _) if alternative.computed => {
-                    // A constant is a string in every row, also where its
-                    // `OPTIONAL` part did not match.
-                    let guard = match (source.term.columns().is_empty(), source.scope) {
-                        (true, Some(_)) => {
-                            let (table, name) = branch.witness(source.scope)?;
-                            Some(Box::new(column(table, name)))
-                        }
-                        _ => None,
-                    };
-                    select.push(SqlExpr::Term {
-                        term: source.term.to_term_sql(),
-                        guard,
-                    });
-                }
-                (Some(source), true) => match source.scope {
-                    None => select.push(SqlExpr::True),
-                    Some(_) => {
-                        let (table, name) = branch.witness(source.scope)?;
-                        select.push(SqlExpr::Matched(Box::new(column(table, name))));
+        for (variable, list) in variables.iter().zip(&alternatives) {
+            if let Some(Computed::Value { index, kinds, .. }) = computed.get(variable) {
+                select.extend(kinds.iter().map(|&kind| SqlExpr::Value {
+                    value: *index,
+                    kind,
+                }));
+            }
+            for alternative in list {
+                match (alternative.sources[b], alternative.flagged()) {
+                    (Some(source), _) if alternative.computed => {
+                        // A constant is a string in every row, also where its
+                        // `OPTIONAL` part did not match.
+                        let guard = match (source.term.columns().is_empty(), source.scope) {
+                            (true, Some(_)) => {
+                                let (table, name) = branch.witness(source.scope)?;
+                                Some(Box::new(column(table, name)))
+                            }
+                            _ => None,
+                        };
+                        select.push(SqlExpr::Term {
+                            term: source.term.to_term_sql(),
+                            guard,
+                        });
                     }
-                },
-                (Some(source), false) => {
-                    select.extend(
-                        source
-                            .term
-                            .columns()
-                            .into_iter()
-                            .map(|(table, name)| column(table, name)),
-                    );
-                }
-                (None, true) => select.push(SqlExpr::Null(BOOLEAN.to_owned())),
-                (None, false) => {
-                    select.extend(std::iter::repeat_n(SqlExpr::Unbound, alternative.width()));
+                    (Some(source), true) => match source.scope {
+                        None => select.push(SqlExpr::True),
+                        Some(_) => {
+                            let (table, name) = branch.witness(source.scope)?;
+                            select.push(SqlExpr::Matched(Box::new(column(table, name))));
+                        }
+                    },
+                    (Some(source), false) => {
+                        select.extend(
+                            source
+                                .term
+                                .columns()
+                                .into_iter()
+                                .map(|(table, name)| column(table, name)),
+                        );
+                    }
+                    (None, true) => select.push(SqlExpr::Null(BOOLEAN.to_owned())),
+                    (None, false) => {
+                        select.extend(std::iter::repeat_n(SqlExpr::Unbound, alternative.width()));
+                    }
                 }
             }
         }
@@ -1382,6 +1503,10 @@ fn plan(
                 .order_by
                 .iter()
                 .map(|c| branch.order_value(&c.expression))
+                .collect::<Result<_, _>>()?,
+            values: values
+                .iter()
+                .map(|e| branch.value(e))
                 .collect::<Result<_, _>>()?,
         });
     }

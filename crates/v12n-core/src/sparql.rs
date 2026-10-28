@@ -21,12 +21,31 @@ pub struct SelectQuery {
     pub variables: Vec<String>,
     pub distinct: bool,
     pub pattern: Pattern,
+    /// The variables that `BIND` and `SELECT (expr AS ?v)` compute, in
+    /// the order they are written.
+    pub bindings: Vec<Binding>,
     /// The order comparators of `ORDER BY`, in order; empty without one.
     pub order_by: Vec<OrderCondition>,
     /// Solutions skipped from the start (`OFFSET`), 0 without one.
     pub offset: usize,
     /// Most solutions returned (`LIMIT`).
     pub limit: Option<usize>,
+}
+
+/// `Extend(P, ?v, expr)` from `BIND(expr AS ?v)` or `SELECT (expr AS ?v)`
+/// (SPARQL 1.1 §18.2.1, §18.2.4.1, §18.5 Extend): `?v` is the value of the
+/// expression, or unbound where it is an error.
+///
+/// It is evaluated over the solutions of the whole pattern rather than of
+/// the group it is written in. The parser accepts it only where both give
+/// the same value: the variables of the expression that the rest of the
+/// pattern binds are bound in every solution of the group, and nothing
+/// else in the query reads `?v`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    pub variable: String,
+    /// A variable, a constant, or arithmetic.
+    pub expression: Expression,
 }
 
 /// One order comparator of `ORDER BY` (SPARQL 1.1 §15.1).
@@ -290,6 +309,52 @@ impl Pattern {
         }
     }
 
+    /// The variables that every solution of the pattern binds: those of
+    /// its triple patterns outside `OPTIONAL` parts, of both sides of a
+    /// `UNION`.
+    fn certain_variables(&self) -> Vec<&str> {
+        match self {
+            Self::Bgp(patterns) => patterns.iter().flat_map(|p| p.variables()).collect(),
+            Self::Join(left, right) => {
+                let mut out = left.certain_variables();
+                out.extend(right.certain_variables());
+                out
+            }
+            Self::LeftJoin(inner, _, _) | Self::Filter(inner, _) => inner.certain_variables(),
+            Self::Union(left, right) => {
+                let right = right.certain_variables();
+                left.certain_variables()
+                    .into_iter()
+                    .filter(|v| right.contains(v))
+                    .collect()
+            }
+        }
+    }
+
+    /// The variables of the `FILTER` expressions, those of `OPTIONAL`
+    /// included.
+    fn filter_variables(&self) -> Vec<&str> {
+        match self {
+            Self::Bgp(_) => Vec::new(),
+            Self::Join(left, right) | Self::Union(left, right) => {
+                let mut out = left.filter_variables();
+                out.extend(right.filter_variables());
+                out
+            }
+            Self::LeftJoin(left, right, expression) => {
+                let mut out = left.filter_variables();
+                out.extend(right.filter_variables());
+                out.extend(expression.iter().flat_map(Expression::variables));
+                out
+            }
+            Self::Filter(inner, expression) => {
+                let mut out = inner.filter_variables();
+                out.extend(expression.variables());
+                out
+            }
+        }
+    }
+
     /// Number of `LeftJoin` nodes in the pattern.
     pub fn left_joins(&self) -> usize {
         match self {
@@ -309,6 +374,17 @@ pub struct TriplePattern {
     pub subject: PatternTerm,
     pub predicate: String,
     pub object: PatternTerm,
+}
+
+impl TriplePattern {
+    fn variables(&self) -> impl Iterator<Item = &str> {
+        [&self.subject, &self.object]
+            .into_iter()
+            .filter_map(|term| match term {
+                PatternTerm::Variable(name) => Some(name.as_str()),
+                PatternTerm::Constant(_) => None,
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -364,18 +440,120 @@ pub fn parse(query: &str) -> Result<SelectQuery, Error> {
         }
         other => (Vec::new(), other),
     };
-    let pattern = group(&inner)?;
+    let mut extends = Vec::new();
+    let pattern = group(&inner, Place::Required, &mut extends)?;
     if pattern.triple_patterns().is_empty() {
         return Err(unsupported("empty graph patterns"));
     }
+    let bindings = check_extends(&pattern, extends, &order_by)?;
     Ok(SelectQuery {
         variables: variables.iter().map(|v| v.as_str().to_owned()).collect(),
         distinct,
         pattern,
+        bindings,
         order_by,
         offset,
         limit,
     })
+}
+
+/// A `BIND` or `SELECT (expr AS ?v)` with the group it extends.
+struct Extend {
+    binding: Binding,
+    group: Pattern,
+}
+
+/// The bindings of `extends`, evaluated over the solutions of `pattern`
+/// (see [`Binding`]), or an error for one whose value would differ there,
+/// or whose variable the query reads.
+fn check_extends(
+    pattern: &Pattern,
+    extends: Vec<Extend>,
+    order_by: &[OrderCondition],
+) -> Result<Vec<Binding>, Error> {
+    let computed: Vec<&str> = extends
+        .iter()
+        .map(|e| e.binding.variable.as_str())
+        .collect();
+    let occurrences = |p: &Pattern, v: &str| {
+        p.triple_patterns()
+            .iter()
+            .filter(|t| t.variables().any(|u| u == v))
+            .count()
+    };
+    let filters = pattern.filter_variables();
+    for extend in &extends {
+        let variable = extend.binding.variable.as_str();
+        let certain = extend.group.certain_variables();
+        for used in extend.binding.expression.variables() {
+            if computed.contains(&used) {
+                return Err(unsupported(&format!(
+                    "an expression over ?{used}, which BIND or SELECT computes"
+                )));
+            }
+            // Joined with the rest of the pattern, a solution of the group
+            // that leaves the variable unbound can get a value for it.
+            if !certain.contains(&used)
+                && occurrences(pattern, used) > occurrences(&extend.group, used)
+            {
+                return Err(unsupported(&format!(
+                    "BIND over ?{used}, which its group may leave unbound and a later part of \
+                     the pattern binds"
+                )));
+            }
+        }
+        if occurrences(pattern, variable) > 0 {
+            return Err(unsupported(&format!(
+                "a triple pattern over ?{variable}, which BIND computes"
+            )));
+        }
+        if filters.contains(&variable) {
+            return Err(unsupported(&format!(
+                "FILTER over ?{variable}, which BIND or SELECT computes"
+            )));
+        }
+        if order_by
+            .iter()
+            .any(|c| c.expression.variables().contains(&variable))
+        {
+            return Err(unsupported(&format!(
+                "ORDER BY over ?{variable}, which BIND or SELECT computes"
+            )));
+        }
+    }
+    Ok(extends.into_iter().map(|e| e.binding).collect())
+}
+
+/// Where a group is written, for the `BIND`s it may hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// Outside `OPTIONAL` and `UNION`.
+    Required,
+    Optional,
+    Union,
+}
+
+/// The expression of a `BIND` or `SELECT (expr AS ?v)`: a variable, a
+/// constant or arithmetic.
+fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> {
+    let expression = expression_in(expression, Site::Bind)?;
+    let what = match &expression {
+        Expression::Constant(_)
+        | Expression::Variable(_)
+        | Expression::Arith(..)
+        | Expression::Negate(_) => return Ok(expression),
+        Expression::Or(..) | Expression::And(..) | Expression::Not(_) => "logical operators",
+        Expression::Compare(..) | Expression::SameTerm(..) => "comparisons",
+        Expression::Bound(_) => "BOUND",
+        Expression::Test(..) => "isIRI, isBlank and isLiteral",
+        Expression::Str(_) => "STR",
+        Expression::Lang(_) => "LANG",
+        Expression::Datatype(_) => "DATATYPE",
+        Expression::Regex(..) => "REGEX",
+    };
+    Err(unsupported(&format!(
+        "{what} as the value of BIND and SELECT expressions"
+    )))
 }
 
 /// An order comparator: a term, compared as SPARQL 1.1 §15.1 orders them,
@@ -391,7 +569,20 @@ fn order_condition(condition: &OrderExpression) -> Result<OrderCondition, Error>
     })
 }
 
-fn group(pattern: &GraphPattern) -> Result<Pattern, Error> {
+fn group(
+    pattern: &GraphPattern,
+    place: Place,
+    extends: &mut Vec<Extend>,
+) -> Result<Pattern, Error> {
+    // A group inside `OPTIONAL` or `UNION` stays there.
+    let mut nested = |p: &GraphPattern, inside: Place| {
+        let inside = if place == Place::Required {
+            inside
+        } else {
+            place
+        };
+        group(p, inside, extends)
+    };
     match pattern {
         GraphPattern::Bgp { patterns } => {
             let mut out = Vec::with_capacity(patterns.len());
@@ -410,21 +601,23 @@ fn group(pattern: &GraphPattern) -> Result<Pattern, Error> {
         // A join of basic graph patterns is the basic graph pattern of all
         // their triples: blank node labels cannot be shared across them
         // (SPARQL 1.1 §4.1.4), so nothing is captured by merging.
-        GraphPattern::Join { left, right } => Ok(match (group(left)?, group(right)?) {
-            (Pattern::Bgp(mut left), Pattern::Bgp(right)) => {
-                left.extend(right);
-                Pattern::Bgp(left)
-            }
-            // Join(Z, P) = P for the empty pattern Z, whose one solution
-            // binds nothing.
-            (Pattern::Bgp(empty), other) | (other, Pattern::Bgp(empty)) if empty.is_empty() => {
-                other
-            }
-            (left, right) => Pattern::Join(Box::new(left), Box::new(right)),
-        }),
+        GraphPattern::Join { left, right } => {
+            Ok(match (nested(left, place)?, nested(right, place)?) {
+                (Pattern::Bgp(mut left), Pattern::Bgp(right)) => {
+                    left.extend(right);
+                    Pattern::Bgp(left)
+                }
+                // Join(Z, P) = P for the empty pattern Z, whose one solution
+                // binds nothing.
+                (Pattern::Bgp(empty), other) | (other, Pattern::Bgp(empty)) if empty.is_empty() => {
+                    other
+                }
+                (left, right) => Pattern::Join(Box::new(left), Box::new(right)),
+            })
+        }
         GraphPattern::Union { left, right } => Ok(Pattern::Union(
-            Box::new(group(left)?),
-            Box::new(group(right)?),
+            Box::new(nested(left, Place::Union)?),
+            Box::new(nested(right, Place::Union)?),
         )),
         GraphPattern::LeftJoin {
             left,
@@ -435,8 +628,8 @@ fn group(pattern: &GraphPattern) -> Result<Pattern, Error> {
                 .as_ref()
                 .map(|e| expression_in(e, Site::Filter))
                 .transpose()?;
-            let left = group(left)?;
-            Ok(match group(right)? {
+            let left = nested(left, place)?;
+            Ok(match nested(right, Place::Optional)? {
                 // `{ }` has one solution that binds nothing, which extends
                 // every solution unchanged whether the expression holds
                 // or not.
@@ -457,9 +650,29 @@ fn group(pattern: &GraphPattern) -> Result<Pattern, Error> {
             })
         }
         GraphPattern::Filter { expr, inner } => Ok(Pattern::Filter(
-            Box::new(group(inner)?),
+            Box::new(nested(inner, place)?),
             expression_in(expr, Site::Filter)?,
         )),
+        GraphPattern::Extend {
+            inner,
+            variable,
+            expression,
+        } if !has_group(inner) => {
+            match place {
+                Place::Required => {}
+                Place::Optional => return Err(unsupported("BIND inside OPTIONAL")),
+                Place::Union => return Err(unsupported("BIND inside UNION")),
+            }
+            let inner = nested(inner, place)?;
+            extends.push(Extend {
+                binding: Binding {
+                    variable: variable.as_str().to_owned(),
+                    expression: bound_expression(expression)?,
+                },
+                group: inner.clone(),
+            });
+            Ok(inner)
+        }
         other => Err(unsupported(describe(other))),
     }
 }
@@ -469,6 +682,7 @@ fn group(pattern: &GraphPattern) -> Result<Pattern, Error> {
 enum Site {
     Filter,
     OrderBy,
+    Bind,
 }
 
 impl Site {
@@ -476,6 +690,7 @@ impl Site {
         match self {
             Self::Filter => "FILTER",
             Self::OrderBy => "ORDER BY",
+            Self::Bind => "BIND and SELECT expressions",
         }
     }
 }
@@ -1029,8 +1244,98 @@ mod tests {
     }
 
     #[test]
+    fn parse_bind_and_select_expressions_in_the_order_written() {
+        let q = parse_ok(
+            "SELECT ?c (?a + 1 AS ?b) ?d WHERE { ?c ex:amount ?a BIND(?a AS ?d) ?c ex:name ?n }",
+        );
+        assert_eq!(q.variables, ["c", "b", "d"]);
+        assert_eq!(q.pattern.triple_patterns().len(), 2);
+        assert_eq!(
+            q.bindings,
+            [
+                Binding {
+                    variable: "d".to_owned(),
+                    expression: *variable("a"),
+                },
+                Binding {
+                    variable: "b".to_owned(),
+                    expression: Expression::Arith(
+                        ArithOp::Add,
+                        variable("a"),
+                        Box::new(Expression::Constant(
+                            Literal::new_typed_literal(
+                                "1",
+                                NamedNode::new_unchecked(
+                                    "http://www.w3.org/2001/XMLSchema#integer"
+                                )
+                            )
+                            .into()
+                        )),
+                    ),
+                },
+            ]
+        );
+    }
+
+    /// A `BIND` is evaluated over the whole pattern, which gives the same
+    /// value when the rest of the pattern binds nothing its group may leave
+    /// unbound.
+    #[test]
+    fn parse_bind_over_variables_its_group_binds() {
+        for body in [
+            "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a } \
+             BIND(?a + 1 AS ?b) }",
+            "SELECT * WHERE { ?o ex:amount ?a BIND(?a + 1 AS ?b) OPTIONAL { ?o ex:amount ?a } }",
+            "SELECT * WHERE { { ?o ex:amount ?a BIND(-?a AS ?b) } ?o ex:placedBy ?c }",
+            "SELECT ?b WHERE { ?c ex:name ?n BIND(?x * 2 AS ?b) }",
+        ] {
+            assert_eq!(parse_ok(body).bindings.len(), 1, "{body}");
+        }
+    }
+
+    #[test]
     fn parse_unsupported_features_are_rejected_by_name() {
         let cases = [
+            (
+                "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t BIND(?t AS ?u) } }",
+                "BIND inside OPTIONAL",
+            ),
+            (
+                "SELECT * WHERE { { ?c ex:name ?n BIND(?n AS ?m) } UNION { ?c ex:tier ?m } }",
+                "BIND inside UNION",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n BIND(?a + 1 AS ?b) ?o ex:amount ?a }",
+                "BIND over ?a, which its group may leave unbound",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n BIND(?n AS ?m) ?d ex:name ?m }",
+                "a triple pattern over ?m, which BIND computes",
+            ),
+            (
+                "SELECT * WHERE { ?o ex:amount ?a BIND(?a * 2 AS ?b) FILTER(?b > 10) }",
+                "FILTER over ?b",
+            ),
+            (
+                "SELECT ?o (?a * 2 AS ?b) WHERE { ?o ex:amount ?a } ORDER BY ?b",
+                "ORDER BY over ?b",
+            ),
+            (
+                "SELECT (?a * 2 AS ?b) (?b + 1 AS ?c) WHERE { ?o ex:amount ?a }",
+                "an expression over ?b",
+            ),
+            (
+                "SELECT (STR(?n) AS ?s) WHERE { ?c ex:name ?n }",
+                "STR as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?o ex:amount ?a BIND(?a > 1 AS ?big) }",
+                "comparisons as the value",
+            ),
+            (
+                "SELECT (IF(BOUND(?n), 1, 0) AS ?x) WHERE { ?c ex:name ?n }",
+                "IF in BIND and SELECT expressions",
+            ),
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(?t IN (1, 2)) }",
                 "IN",

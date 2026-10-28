@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A variable bound to another variable has its term.
+SELECT ?r ?m ?s WHERE { ?r ex:name ?n ; ex:a ?a BIND(?n AS ?m) BIND(?r AS ?s) }

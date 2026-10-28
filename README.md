@@ -116,7 +116,8 @@ answer. Each supported feature is compared with
 | Feature | Notes | Rejected |
 |---|---|---|
 | Basic graph patterns | Constant predicates and `rdf:type`; constants and shared variables match RDF terms, across column types; a triple counts once however many rows give it | Variable predicates, property paths, `GRAPH`, `FROM` and `FROM NAMED` |
-| `SELECT`, `SELECT *`, `DISTINCT` | Bag semantics over the solutions | `REDUCED`, expressions in `SELECT`, `BIND`, subqueries, `GROUP BY` and aggregates |
+| `SELECT`, `SELECT *`, `DISTINCT` | Bag semantics over the solutions | `REDUCED`, subqueries, `GROUP BY` and aggregates |
+| `BIND`, `SELECT (expr AS ?v)` | A variable, a constant, or `+`, `-`, `*`, `/` on integers and decimals; an error leaves the variable unbound | Other expressions; `BIND` inside `OPTIONAL` or `UNION`; a computed variable used in a triple pattern, `FILTER`, `ORDER BY` or another expression |
 | `OPTIONAL` | Nested and sequential, `FILTER` inside, unbound variables | `SELECT DISTINCT` over a variable that only several `OPTIONAL` parts bind; a `FILTER` inside `OPTIONAL` around a `UNION` with an empty side |
 | `UNION` | Bag union of its sides, inside `OPTIONAL` too; term maps of different shapes for one variable | Removing duplicates across a column of natural datatype and another literal shape of the same variable |
 | `FILTER` | `=`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `\|\|`, `!`, `BOUND`, `sameTerm`, `isIRI`, `isBlank`, `isLiteral`, `STR`, `LANG`, `DATATYPE`, `REGEX`, `+`, `-`, `*`, `/` on integers and decimals, with SPARQL's error semantics | Other functions, arithmetic on `xsd:double`, `IN`, `EXISTS`; comparisons SPARQL 1.1 leaves to extensions (ordering `xsd:date`, `!=` on language-tagged literals, dateTimes with and without a time zone); comparisons over `real` columns; `REGEX` with `\d`, `\w`, `\p{..}` and back-references |
@@ -127,6 +128,7 @@ answer. Each supported feature is compared with
 [docs/semantics.md](docs/semantics.md) gives the rules behind the table:
 [constants](docs/semantics.md#constants-in-a-query), [joins](docs/semantics.md#variables-shared-across-columns), [duplicates](docs/semantics.md#duplicate-triples),
 [`OPTIONAL`](docs/semantics.md#optional), [`UNION`](docs/semantics.md#union), [`FILTER`](docs/semantics.md#filter),
+[`BIND` and `SELECT` expressions](docs/semantics.md#bind-and-select-expressions),
 [ordering](docs/semantics.md#order-by-limit-and-offset) and [literals](docs/semantics.md#literals). `tests/diff/README.md` lists
 the known differences from Ontop and why each rejected test query is
 rejected.

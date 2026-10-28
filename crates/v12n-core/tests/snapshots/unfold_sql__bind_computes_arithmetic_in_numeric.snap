@@ -1,0 +1,11 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"SELECT ?o ?total WHERE { ?o ex:amount ?a BIND(?a * 2 + 1 AS ?total) }\")"
+---
+SELECT t0."id" AS "o", ((t0."amount"::numeric * $1::numeric) + $2::numeric) AS "total", NULL::numeric AS "total_1"
+FROM "orders" t0
+WHERE t0."id" IS NOT NULL AND t0."amount" IS NOT NULL
+
+-- params
+$1 = "2"
+$2 = "1"

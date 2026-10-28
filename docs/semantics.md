@@ -525,6 +525,36 @@ differently from engines that extend SPARQL:
   them) as operands;
 - string ordering and `REGEX` in a database whose encoding is not UTF-8.
 
+## BIND and SELECT expressions
+
+`BIND(expr AS ?v)` and `SELECT (expr AS ?v)` give `?v` the value of the
+expression in each solution (SPARQL 1.1 §18.5, Extend). The expression is
+a variable, a constant, or arithmetic as in [`FILTER`](#filter):
+
+- A variable gives its term, and a constant gives itself.
+- Arithmetic gives a number whose datatype follows XPath's type
+  promotion, written in canonical form (see [Literals](#literals)). Over
+  an integer column, `?qty * 2` is an `xsd:integer` and `?qty / 4` is an
+  `xsd:decimal`. The precision of a decimal division, which XPath leaves
+  to the implementation, is that of PostgreSQL's `numeric` division.
+- An error, such as a division by zero or an operand that is not a
+  number, leaves `?v` unbound. The solution is kept.
+
+SPARQL evaluates a `BIND` over the solutions of the group it is written
+in. v12n computes it over the solutions of the whole pattern, after the
+joins. Both give the same value when the rest of the pattern binds none
+of the variables of the expression that the group may leave unbound.
+
+The following are rejected as unsupported:
+
+- expressions other than variables, constants and arithmetic, such as
+  `STR`, comparisons, `IF` and `COALESCE`;
+- `BIND` inside `OPTIONAL` or `UNION`;
+- `BIND` over a variable that its group may leave unbound and a later
+  part of the pattern binds;
+- a variable that `BIND` or `SELECT` computes, used in a triple pattern,
+  in `FILTER`, in `ORDER BY` or in another expression.
+
 ## ORDER BY, LIMIT and OFFSET
 
 The solution modifiers apply in the order that the algebra defines

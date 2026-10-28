@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Integer arithmetic gives an integer.
+SELECT ?r ?total WHERE { ?r ex:a ?a ; ex:b ?b BIND(?a * ?b + 1 AS ?total) }

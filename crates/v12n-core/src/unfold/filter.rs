@@ -6,7 +6,7 @@ use oxrdf::Term;
 
 use crate::Error;
 use crate::sparql::Expression;
-use crate::sql::{Condition, Filter, FilterTerm, FilterValue, OrderValue, TermMatch};
+use crate::sql::{Condition, Filter, FilterTerm, FilterValue, OrderValue, TermMatch, ValueCases};
 use crate::xpath_regex::{Untranslated, translate};
 
 use super::term::{Equality, TermExpr, TermValue, term_eq};
@@ -61,6 +61,21 @@ impl<'a> Branch<'a> {
                 .map(|(guards, leaf)| (guards, leaf.value))
                 .collect(),
         ))
+    }
+
+    /// The value of a `BIND` or `SELECT` expression over the branch's
+    /// solutions, by cases as for a term of `ORDER BY`.
+    pub(super) fn value(&self, expression: &'a Expression) -> Result<ValueCases, Error> {
+        let context = Context {
+            branch: self,
+            env: &self.env,
+            certain: &[None],
+        };
+        Ok(context
+            .operand(expression)?
+            .into_iter()
+            .map(|(guards, leaf)| (guards, leaf.value))
+            .collect())
     }
 
     /// A condition that holds exactly when `source` is bound.

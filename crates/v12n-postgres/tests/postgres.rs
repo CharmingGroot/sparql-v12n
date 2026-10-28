@@ -268,6 +268,76 @@ async fn filter_arithmetic_follows_xpath_numbers() {
     assert_eq!(rows("?a + ?b - 9").await, ["2", "3"]);
 }
 
+/// `BIND` and `SELECT (expr AS ?v)` (#100): numbers in canonical form, of
+/// the class XPath gives them; an error, such as a division by zero or a
+/// `numeric` NaN, leaves the variable unbound and keeps the solution.
+#[tokio::test]
+async fn bind_and_select_expressions_follow_xpath_numbers() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        "SELECT * FROM (VALUES \
+           (1, 7::int4, 2::int8, 1.50::numeric), \
+           (2, -3::int4, 0::int8, 'NaN'::numeric), \
+           (3, 4::int4, 9223372036854775807::int8, 2.25::numeric)) v(id, a, b, d)",
+        &["a", "b", "d"],
+    );
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?row (?a / ?b AS ?q) (?b + 1 AS ?next) (?d * 2 AS ?dd) ?copy ?k
+        WHERE { ?row ex:a ?a ; ex:b ?b ; ex:d ?d BIND(?a AS ?copy) BIND(\"k\" AS ?k) }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    let xsd = |lexical: &str, datatype: &str| {
+        format!("\"{lexical}\"^^<http://www.w3.org/2001/XMLSchema#{datatype}>")
+    };
+    let row = |id: u8, terms: &[(&str, String)]| {
+        let mut out = format!("?row=<http://example.org/row/{id}>");
+        for (variable, term) in terms {
+            out.push_str(&format!(" ?{variable}={term}"));
+        }
+        out
+    };
+    assert_eq!(
+        rows,
+        [
+            row(
+                1,
+                &[
+                    ("q", xsd("3.5", "decimal")),
+                    ("next", xsd("3", "integer")),
+                    ("dd", xsd("3", "decimal")),
+                    ("copy", xsd("7", "integer")),
+                    ("k", "\"k\"".to_owned()),
+                ]
+            ),
+            row(
+                2,
+                &[
+                    ("next", xsd("1", "integer")),
+                    ("copy", xsd("-3", "integer")),
+                    ("k", "\"k\"".to_owned()),
+                ]
+            ),
+            row(
+                3,
+                &[
+                    // The precision of a decimal division is up to the
+                    // implementation (XPath op:numeric-divide); PostgreSQL
+                    // picks the scale of `numeric` division.
+                    (
+                        "q",
+                        xsd("0.000000000000000000433680868994201774", "decimal")
+                    ),
+                    ("next", xsd("9223372036854775808", "integer")),
+                    ("dd", xsd("4.5", "decimal")),
+                    ("copy", xsd("4", "integer")),
+                    ("k", "\"k\"".to_owned()),
+                ]
+            ),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn natural_mapping_covers_postgres_types() {
     let Some(url) = database_url() else { return };

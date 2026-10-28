@@ -1,0 +1,9 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(r#\"SELECT ?d ?k WHERE { ?c ex:name ?n BIND(?c AS ?d) BIND(\"x\" AS ?k) }\"#)"
+---
+SELECT t0."id" AS "d"
+FROM "customers" t0
+WHERE t0."id" IS NOT NULL AND t0."name" IS NOT NULL
+
+-- params

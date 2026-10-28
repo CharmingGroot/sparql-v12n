@@ -119,6 +119,25 @@ pub struct SqlBranch {
     pub fixed_columns: Vec<BTreeSet<String>>,
     /// The value of each of [`SqlPlan::order`] in the rows of the branch.
     pub order: Vec<OrderValue>,
+    /// The values of the expressions that `BIND` and `SELECT (expr AS ?v)`
+    /// compute, which [`SqlExpr::Value`] entries select: the value of the
+    /// first case whose conditions all hold, as in [`OrderValue::Term`].
+    pub values: Vec<ValueCases>,
+}
+
+/// An expression's value in the rows of a branch, by cases (see
+/// [`SqlBranch::values`]).
+pub type ValueCases = Vec<(Vec<Condition>, FilterValue)>;
+
+/// The class of number a result column of a computed value holds. The
+/// class of an arithmetic result depends on the SQL types of its
+/// operands, known only when rendering, so each class has its own column,
+/// and terms of different datatypes never compare equal when duplicates
+/// are removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    Integer,
+    Decimal,
 }
 
 /// An `OPTIONAL` part of a branch: `LEFT JOIN (tables) ON conditions`, so
@@ -176,6 +195,10 @@ pub enum SqlExpr {
         term: TermSql,
         guard: Option<Box<SqlExpr>>,
     },
+    /// Entry `value` of [`SqlBranch::values`] as `numeric` where it is a
+    /// number of class `kind`, `NULL` where it is another class or an
+    /// error.
+    Value { value: usize, kind: ValueKind },
 }
 
 /// A constant of the query and what it has to match.
@@ -476,29 +499,35 @@ impl OrderValue {
     /// map's term.
     fn visit<'f>(&'f self, f: &mut dyn FnMut(Part<'f>)) {
         match self {
-            Self::Term(cases) => {
-                for (guards, value) in cases {
-                    guards.iter().for_each(|c| f(Part::Condition(c)));
-                    for t in value.terms() {
-                        f(Part::Term(&t.term));
-                    }
-                }
-            }
+            Self::Term(cases) => visit_cases(cases, f),
             Self::Boolean(filter) => filter.visit(f),
         }
     }
 
     fn visit_mut(&mut self, f: &mut dyn FnMut(PartMut<'_>)) {
         match self {
-            Self::Term(cases) => {
-                for (guards, value) in cases {
-                    guards.iter_mut().for_each(|c| f(PartMut::Condition(c)));
-                    for t in value.terms_mut() {
-                        f(PartMut::Term(&mut t.term));
-                    }
-                }
-            }
+            Self::Term(cases) => visit_cases_mut(cases, f),
             Self::Boolean(filter) => filter.visit_mut(f),
+        }
+    }
+}
+
+/// Every guard of the cases, not recursing into them, and every term map's
+/// term of their values.
+fn visit_cases<'f>(cases: &'f ValueCases, f: &mut dyn FnMut(Part<'f>)) {
+    for (guards, value) in cases {
+        guards.iter().for_each(|c| f(Part::Condition(c)));
+        for t in value.terms() {
+            f(Part::Term(&t.term));
+        }
+    }
+}
+
+fn visit_cases_mut(cases: &mut ValueCases, f: &mut dyn FnMut(PartMut<'_>)) {
+    for (guards, value) in cases {
+        guards.iter_mut().for_each(|c| f(PartMut::Condition(c)));
+        for t in value.terms_mut() {
+            f(PartMut::Term(&mut t.term));
         }
     }
 }
@@ -1115,8 +1144,9 @@ impl SqlPlan {
         out
     }
 
-    /// The columns [`Condition::SameTerm`]s and [`SqlExpr::Term`]s read,
-    /// each once, in order of appearance. Their types go into
+    /// The columns [`Condition::SameTerm`]s, [`SqlExpr::Term`]s, filters,
+    /// order values and computed values read, each once, in order of
+    /// appearance. Their types go into
     /// [`RenderOptions::column_types`].
     pub fn term_columns(&self) -> Vec<(LogicalTable, String)> {
         fn collect(
@@ -1167,13 +1197,27 @@ impl SqlPlan {
             for condition in branch.all_conditions() {
                 collect(condition, &branch.from, &mut out);
             }
+            // One list of parts per order value and per computed value.
+            let mut values: Vec<Vec<Part<'_>>> = Vec::new();
             for value in &branch.order {
+                let mut parts = Vec::new();
+                value.visit(&mut |part| parts.push(part));
+                values.push(parts);
+            }
+            for cases in &branch.values {
+                let mut parts = Vec::new();
+                visit_cases(cases, &mut |part| parts.push(part));
+                values.push(parts);
+            }
+            for parts in values {
                 let mut conditions = Vec::new();
                 let mut terms = Vec::new();
-                value.visit(&mut |part| match part {
-                    Part::Condition(c) => conditions.push(c),
-                    Part::Term(t) => terms.push(t),
-                });
+                for part in parts {
+                    match part {
+                        Part::Condition(c) => conditions.push(c),
+                        Part::Term(t) => terms.push(t),
+                    }
+                }
                 for c in conditions {
                     collect(c, &branch.from, &mut out);
                 }
@@ -1513,7 +1557,11 @@ impl SqlPlan {
                 SqlExpr::Column { table, name } | SqlExpr::Lexical { table, name, .. } => {
                     f(&from[*table], name);
                 }
-                SqlExpr::Param(_) | SqlExpr::Null(_) | SqlExpr::Unbound | SqlExpr::True => {}
+                SqlExpr::Param(_)
+                | SqlExpr::Null(_)
+                | SqlExpr::Unbound
+                | SqlExpr::True
+                | SqlExpr::Value { .. } => {}
                 SqlExpr::Concat(parts) => parts.iter_mut().for_each(|p| expr(p, from, f)),
                 SqlExpr::Matched(inner) => expr(inner, from, f),
                 SqlExpr::Term { term: t, guard } => {
@@ -1588,6 +1636,12 @@ impl SqlPlan {
                     PartMut::Term(t) => term(t, from, &mut f),
                 });
             }
+            for cases in &mut branch.values {
+                visit_cases_mut(cases, &mut |part| match part {
+                    PartMut::Condition(c) => condition(c, from, &mut f),
+                    PartMut::Term(t) => term(t, from, &mut f),
+                });
+            }
             for (table, fixed) in from.iter().zip(&mut branch.fixed_columns) {
                 *fixed = std::mem::take(fixed)
                     .into_iter()
@@ -1618,7 +1672,11 @@ impl SqlBranch {
                 SqlExpr::Column { table, .. } | SqlExpr::Lexical { table, .. } => {
                     *table = f(*table)
                 }
-                SqlExpr::Param(_) | SqlExpr::Null(_) | SqlExpr::Unbound | SqlExpr::True => {}
+                SqlExpr::Param(_)
+                | SqlExpr::Null(_)
+                | SqlExpr::Unbound
+                | SqlExpr::True
+                | SqlExpr::Value { .. } => {}
                 SqlExpr::Concat(parts) => parts.iter_mut().for_each(|p| expr(p, f)),
                 SqlExpr::Matched(inner) => expr(inner, f),
                 SqlExpr::Term { term: t, guard } => {
@@ -1674,6 +1732,12 @@ impl SqlBranch {
         }
         for value in &mut self.order {
             value.visit_mut(&mut |part| match part {
+                PartMut::Condition(c) => condition(c, f),
+                PartMut::Term(t) => term(t, f),
+            });
+        }
+        for cases in &mut self.values {
+            visit_cases_mut(cases, &mut |part| match part {
                 PartMut::Condition(c) => condition(c, f),
                 PartMut::Term(t) => term(t, f),
             });
@@ -1839,13 +1903,13 @@ impl<'a> Renderer<'a> {
                 // (`numeric` 1.0 and 1.00, or `varchar` and `text`), which
                 // only keeps a duplicate.
                 let start = self.sql.len();
-                self.select_expr(&branch.select[entry])?;
+                self.select_expr(branch, &branch.select[entry])?;
                 let column = self.sql.split_off(start);
                 self.sql.push_str(&format!(
                     "pg_typeof({column})::text || ' ' || {column}::text"
                 ));
             } else {
-                self.select_expr(&branch.select[entry])?;
+                self.select_expr(branch, &branch.select[entry])?;
             }
             self.sql.push_str(" AS ");
             self.sql.push_str(&quote_identifier(&select.aliases[entry]));
@@ -2358,8 +2422,12 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// An entry of a select list: [`SqlExpr::Term`] or any other.
-    fn select_expr(&mut self, expr: &SqlExpr) -> Result<(), Error> {
+    /// An entry of a select list of `branch`: [`SqlExpr::Term`],
+    /// [`SqlExpr::Value`] or any other.
+    fn select_expr(&mut self, branch: &SqlBranch, expr: &SqlExpr) -> Result<(), Error> {
+        if let SqlExpr::Value { value, kind } = expr {
+            return self.value(&branch.values[*value], *kind);
+        }
         if let SqlExpr::Column { table, name } = expr
             && let Some(normal) = self.column_type(*table, name).and_then(|ty| ty.term_normal)
         {
@@ -2428,7 +2496,9 @@ impl<'a> Renderer<'a> {
                 self.sql.push_str(" IS NOT NULL THEN true END");
             }
             SqlExpr::True => self.sql.push_str("true"),
-            SqlExpr::Term { .. } => unreachable!("only select lists hold terms"),
+            SqlExpr::Term { .. } | SqlExpr::Value { .. } => {
+                unreachable!("only select lists hold terms and values")
+            }
         }
     }
 }
@@ -2517,7 +2587,11 @@ fn condition_tables(condition: &Condition) -> Vec<usize> {
             SqlExpr::Column { table, .. } | SqlExpr::Lexical { table, .. } => {
                 out.insert(*table);
             }
-            SqlExpr::Param(_) | SqlExpr::Null(_) | SqlExpr::Unbound | SqlExpr::True => {}
+            SqlExpr::Param(_)
+            | SqlExpr::Null(_)
+            | SqlExpr::Unbound
+            | SqlExpr::True
+            | SqlExpr::Value { .. } => {}
             SqlExpr::Concat(parts) => parts.iter().for_each(|p| collect(p, out)),
             SqlExpr::Matched(inner) => collect(inner, out),
             SqlExpr::Term { term, guard } => {
@@ -2743,6 +2817,7 @@ mod tests {
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 order: Vec::new(),
+                values: Vec::new(),
                 arm: 0,
                 from: vec![view.clone(), view.clone()],
                 select: vec![column(0, "Id"), column(1, "\"V\"")],
@@ -2791,6 +2866,7 @@ mod tests {
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 order: Vec::new(),
+                values: Vec::new(),
                 arm: 0,
                 from: vec![table.clone()],
                 select: vec![column(0, "ID")],
@@ -2935,6 +3011,7 @@ mod tests {
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 order: Vec::new(),
+                values: Vec::new(),
                 arm: 0,
                 from: vec![
                     LogicalTable::TableName("a".into()),
@@ -2973,6 +3050,7 @@ mod tests {
     fn to_sql_with_text_params_casts_the_compared_column() {
         let branch = |value: &str, datatype: Option<&str>| SqlBranch {
             order: Vec::new(),
+            values: Vec::new(),
             arm: 0,
             from: vec![LogicalTable::TableName("t".into())],
             select: vec![column(0, "id")],
@@ -3038,6 +3116,7 @@ mod tests {
     fn keyed_params_also_compare_the_key_after_the_value() {
         let branch = SqlBranch {
             order: Vec::new(),
+            values: Vec::new(),
             arm: 0,
             from: vec![LogicalTable::TableName("t".into())],
             select: vec![column(0, "id")],
@@ -3100,6 +3179,7 @@ mod tests {
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 order: Vec::new(),
+                values: Vec::new(),
                 arm: 0,
                 from: vec![table.clone()],
                 select: vec![column(0, "f"), column(0, "n")],
@@ -3202,6 +3282,7 @@ mod tests {
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 order: Vec::new(),
+                values: Vec::new(),
                 arm: 0,
                 from: vec![l.clone(), r.clone()],
                 select: Vec::new(),
@@ -3304,6 +3385,7 @@ mod tests {
     fn union_plan(natural: bool) -> SqlPlan {
         let branch = |t: &str| SqlBranch {
             order: Vec::new(),
+            values: Vec::new(),
             arm: 0,
             from: vec![LogicalTable::TableName(t.into())],
             select: vec![column(0, "v"), column(0, "h")],
@@ -3566,6 +3648,7 @@ mod tests {
             projection: Vec::new(),
             branches: vec![SqlBranch {
                 order: Vec::new(),
+                values: Vec::new(),
                 arm: 0,
                 from: vec![LogicalTable::TableName("\"T\"".into())],
                 select: vec![column(0, "\"Id\""), column(0, "v")],

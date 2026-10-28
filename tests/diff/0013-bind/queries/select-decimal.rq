@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A decimal operand makes the result a decimal.
+SELECT ?r (?d - ?a AS ?diff) (?a * 0.5 AS ?half) WHERE { ?r ex:a ?a ; ex:d ?d }
