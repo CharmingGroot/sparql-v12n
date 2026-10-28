@@ -58,7 +58,7 @@ impl<'a> Branch<'a> {
             context
                 .operand(expression)?
                 .into_iter()
-                .map(|(guard, leaf)| (guard.into_iter().collect(), leaf.value))
+                .map(|(guards, leaf)| (guards, leaf.value))
                 .collect(),
         ))
     }
@@ -140,27 +140,46 @@ impl<'a> Context<'_, 'a> {
     fn operand(
         &self,
         expression: &'a Expression,
-    ) -> Result<Vec<(Option<Condition>, Leaf<'a>)>, Error> {
+    ) -> Result<Vec<(Vec<Condition>, Leaf<'a>)>, Error> {
         let derived = |a: &'a Expression, f: fn(Box<FilterValue>) -> FilterValue| {
             Ok(self
                 .operand(a)?
                 .into_iter()
-                .map(|(guard, leaf)| {
+                .map(|(guards, leaf)| {
                     let value = f(Box::new(leaf.value));
-                    (guard, Leaf { value, term: None })
+                    (guards, Leaf { value, term: None })
                 })
                 .collect())
         };
         match expression {
-            Expression::Constant(term) => Ok(vec![(None, leaf(TermExpr::constant(term)))]),
+            Expression::Constant(term) => Ok(vec![(Vec::new(), leaf(TermExpr::constant(term)))]),
             Expression::Variable(name) => Ok(self
                 .operand_of(name)?
                 .into_iter()
-                .map(|(guard, term)| (guard, leaf(term)))
+                .map(|(guard, term)| (guard.into_iter().collect(), leaf(term)))
                 .collect()),
             Expression::Str(a) => derived(a, FilterValue::Str),
             Expression::Lang(a) => derived(a, FilterValue::Lang),
             Expression::Datatype(a) => derived(a, FilterValue::Datatype),
+            Expression::Negate(a) => derived(a, FilterValue::Negate),
+            // One case per pair of ways the operands are bound, as for a
+            // comparison.
+            Expression::Arith(op, a, b) => {
+                let right = self.operand(b)?;
+                let mut out = Vec::new();
+                for (left_guards, left) in self.operand(a)? {
+                    for (right_guards, right) in &right {
+                        let guards = left_guards.iter().chain(right_guards).cloned().collect();
+                        let value = FilterValue::Arith(
+                            *op,
+                            Box::new(left.value.clone()),
+                            Box::new(right.value.clone()),
+                        );
+                        out.push((guards, Leaf { value, term: None }));
+                    }
+                }
+                Ok(out)
+            }
             _ => Err(Error::UnsupportedFeature(
                 "expressions other than terms as arguments in FILTER".to_owned(),
             )),
@@ -171,7 +190,7 @@ impl<'a> Context<'_, 'a> {
         Ok(cases(
             self.operand(a)?
                 .into_iter()
-                .map(|(guard, leaf)| (guard.into_iter().collect(), f(&leaf)))
+                .map(|(guards, leaf)| (guards, f(&leaf)))
                 .collect(),
         ))
     }

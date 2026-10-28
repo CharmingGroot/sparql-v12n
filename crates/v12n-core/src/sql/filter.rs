@@ -11,7 +11,7 @@ use super::{
 use crate::Error;
 use crate::mapping::TermType;
 use crate::solution::canonical_double;
-use crate::sparql::{CompareOp, TermTest};
+use crate::sparql::{ArithOp, CompareOp, TermTest};
 use crate::xsd::{self, Num, Number, Value, XSD};
 
 const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
@@ -95,6 +95,11 @@ pub(super) struct Operand<'v> {
     pub(super) infinite: bool,
 }
 
+/// Whether the value is computed by arithmetic.
+fn is_arith(value: &FilterValue) -> bool {
+    matches!(value, FilterValue::Arith(..) | FilterValue::Negate(_))
+}
+
 /// The value of `numeric` columns that is not an `xsd:decimal`: `NaN` and
 /// the infinities have no decimal lexical form, so their literals are
 /// ill-typed.
@@ -172,13 +177,23 @@ impl<'a> Renderer<'a> {
                     Some(same_term) => self.term_match(same_term, mode)?,
                     None => {
                         let (l, r) = (self.operand(left), self.operand(right));
+                        if is_arith(left) || is_arith(right) {
+                            return Err(unsupported(
+                                "sameTerm of an arithmetic result, whose lexical form SQL does \
+                                 not compute yet",
+                            ));
+                        }
                         self.same_strings(&l, &r)?
                     }
                 }
             }
             Filter::Regex { text, pattern } => self.regex(text, pattern)?,
             Filter::Test(test, value) => {
-                let Some(term_type) = self.operand(value).term_type else {
+                let operand = self.operand(value);
+                if let Kind::Unsupported(reason) = &operand.kind {
+                    return Err(unsupported(reason));
+                }
+                let Some(term_type) = operand.term_type else {
                     self.sql.push_str("NULL::bool");
                     return Ok(());
                 };
@@ -235,6 +250,10 @@ impl<'a> Renderer<'a> {
             FilterValue::Str(inner) | FilterValue::Lang(inner) | FilterValue::Datatype(inner) => {
                 return self.derived(value, self.operand(inner));
             }
+            FilterValue::Arith(op, a, b) => {
+                return self.arith(value, Some(*op), &[self.operand(a), self.operand(b)]);
+            }
+            FilterValue::Negate(a) => return self.arith(value, None, &[self.operand(a)]),
             FilterValue::Term(term) => {
                 operand.term_type = Some(term.term_type);
                 operand.text = Text::Term(&term.term);
@@ -306,6 +325,14 @@ impl<'a> Renderer<'a> {
             term_type: None,
             ..operand.clone()
         };
+        if is_arith(inner.value) && inner.kind != Kind::Error {
+            return Operand {
+                kind: Kind::Unsupported(
+                    "STR, LANG and DATATYPE of an arithmetic result".to_owned(),
+                ),
+                ..operand
+            };
+        }
         let literal = inner.term_type == Some(TermType::Literal);
         match value {
             FilterValue::Str(_) if literal || inner.term_type == Some(TermType::Iri) => {
@@ -325,6 +352,112 @@ impl<'a> Renderer<'a> {
             _ => return error,
         }
         operand
+    }
+
+    /// The result of `op` over `operands`, or of negation without `op`:
+    /// a number whose class follows XPath's type promotion (an integer
+    /// divided by an integer is a decimal, op:numeric-divide), and a type
+    /// error when an operand is not a number (SPARQL 1.1 §17.3).
+    fn arith<'v>(
+        &self,
+        value: &'v FilterValue,
+        op: Option<ArithOp>,
+        operands: &[Operand<'v>],
+    ) -> Operand<'v> {
+        let mut operand = Operand {
+            value,
+            kind: Kind::Error,
+            term_type: None,
+            text: Text::Unknown,
+            column: None,
+            constant: None,
+            infinite: false,
+        };
+        let mut class = Num::Integer;
+        for o in operands {
+            match &o.kind {
+                Kind::Numeric(c) => class = class.max(*c),
+                // Without column types, as if the column held integers,
+                // which shows the SQL of the common case.
+                Kind::Unknown => {}
+                Kind::Unsupported(reason) => {
+                    operand.kind = Kind::Unsupported(reason.clone());
+                    return operand;
+                }
+                _ => return operand,
+            }
+        }
+        if class == Num::Double {
+            operand.term_type = Some(TermType::Literal);
+            operand.kind = Kind::Unsupported(
+                "arithmetic on xsd:double values, whose NaN and infinities SQL computes \
+                 differently"
+                    .to_owned(),
+            );
+            return operand;
+        }
+        if op == Some(ArithOp::Divide) {
+            class = Num::Decimal;
+        }
+        operand.kind = Kind::Numeric(class);
+        operand.term_type = Some(TermType::Literal);
+        operand
+    }
+
+    /// An arithmetic expression, or one of its operands, as `numeric`.
+    /// Integers are computed in `numeric` too, since `xsd:integer` has no
+    /// bound and `int8` would overflow. A division by zero is an error
+    /// (op:numeric-divide), so its divisor is `NULLIF(…, 0)`; an operand
+    /// that is an error is `NULL`, and so is the result.
+    fn numeric_value(&mut self, value: &FilterValue) -> Result<(), Error> {
+        match value {
+            FilterValue::Arith(op, a, b) => {
+                self.sql.push('(');
+                self.numeric_value(a)?;
+                self.sql.push_str(&format!(" {} ", op.sql()));
+                if *op == ArithOp::Divide {
+                    self.sql.push_str("NULLIF(");
+                    self.numeric_value(b)?;
+                    self.sql.push_str(", 0)");
+                } else {
+                    self.numeric_value(b)?;
+                }
+                self.sql.push(')');
+            }
+            FilterValue::Negate(a) => {
+                self.sql.push_str("(-");
+                self.numeric_value(a)?;
+                self.sql.push(')');
+            }
+            _ => {
+                let operand = self.operand(value);
+                if let Some(Value::Numeric(n)) = &operand.constant {
+                    let decimal = n
+                        .decimal
+                        .clone()
+                        .expect("integer and decimal constants have a decimal value");
+                    self.expr(&super::SqlExpr::Param(decimal.into()));
+                    self.sql.push_str("::numeric");
+                    return Ok(());
+                }
+                let Some((table, name)) = operand.column else {
+                    // A type error: an operand that is not a number.
+                    self.sql.push_str("NULL::numeric");
+                    return Ok(());
+                };
+                let column = super::column_sql(table, name);
+                match operand.kind {
+                    // NaN and the infinities of a numeric column are not
+                    // xsd:decimal values: an error.
+                    Kind::Numeric(Num::Decimal) => self.sql.push_str(&format!(
+                        "CASE WHEN {} THEN {column} END",
+                        decimal_guard(&column)
+                    )),
+                    _ => self.sql.push_str(&format!("{column}::numeric")),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The datatype IRI of a literal operand.
@@ -392,6 +525,17 @@ impl<'a> Renderer<'a> {
             if let Kind::Unsupported(reason) = &side.kind {
                 return Err(unsupported(reason));
             }
+        }
+        // A number compared with another kind of literal is a type error
+        // (SPARQL 1.1 §17.3); an arithmetic result has no lexical form to
+        // compare as a term.
+        if (is_arith(l.value) || is_arith(r.value))
+            && !matches!((&l.kind, &r.kind), (Kind::Numeric(_), Kind::Numeric(_)))
+            && l.kind.is_literal()
+            && r.kind.is_literal()
+        {
+            self.sql.push_str("NULL::bool");
+            return Ok(());
         }
         match (&l.kind, &r.kind) {
             (Kind::Numeric(_), Kind::Numeric(_)) => self.numeric(op, &l, &r, mode),
@@ -574,6 +718,9 @@ impl<'a> Renderer<'a> {
     /// is a type error.
     fn regex(&mut self, text: &FilterValue, pattern: &str) -> Result<(), Error> {
         let operand = self.operand(text);
+        if let Kind::Unsupported(reason) = &operand.kind {
+            return Err(unsupported(reason));
+        }
         if !matches!(operand.kind, Kind::String | Kind::Lang(_) | Kind::Unknown) {
             self.sql.push_str("NULL::bool");
             return Ok(());
@@ -730,6 +877,15 @@ impl<'a> Renderer<'a> {
         class: Num,
         ty: Num,
     ) -> Result<(), Error> {
+        if is_arith(operand.value) {
+            // Compared as `numeric` (or `float8` against a double), which
+            // PostgreSQL compares exactly with the other side's type.
+            self.numeric_value(operand.value)?;
+            if ty == Num::Double {
+                self.sql.push_str("::float8");
+            }
+            return Ok(());
+        }
         if let Some(number) = number {
             let value = match ty {
                 Num::Integer => number
@@ -857,6 +1013,16 @@ impl<'a> Renderer<'a> {
         let operand = self.operand(value);
         if operand.kind == Kind::Error {
             self.sql.push_str("NULL::bool");
+            return Ok(());
+        }
+        if is_arith(value) {
+            if let Kind::Unsupported(reason) = &operand.kind {
+                return Err(unsupported(reason));
+            }
+            // A number is true unless it is zero (SPARQL 1.1 §17.2.2).
+            self.sql.push('(');
+            self.numeric_value(value)?;
+            self.sql.push_str(" <> 0)");
             return Ok(());
         }
         if let Some(constant) = &operand.constant {
@@ -1134,6 +1300,68 @@ pub(super) mod tests {
             Err(Error::UnsupportedFeature(reason)) => reason,
             other => panic!("{filter}: {other:?}"),
         }
+    }
+
+    #[test]
+    fn arithmetic_is_computed_in_numeric_and_compared_exactly() {
+        // Integers are added in numeric, so int8 cannot overflow; the
+        // comparison with the integer constant stays exact.
+        assert_eq!(
+            x("i4", "?x + 1 > 5"),
+            "(t0.\"i4\"::numeric + $1::numeric) > $2::int8"
+        );
+        assert_eq!(
+            x("i8", "?x * ?x >= 9223372036854775807"),
+            "(t0.\"i8\"::numeric * t0.\"i8\"::numeric) >= $1::int8"
+        );
+        // An integer divided by an integer is a decimal, and a division
+        // by zero is an error (op:numeric-divide).
+        assert_eq!(
+            x("i4", "?x / 2 = 1.5"),
+            "(t0.\"i4\"::numeric / NULLIF($1::numeric, 0)) = $2::numeric"
+        );
+        assert_eq!(x("i4", "-?x < 0"), "(-t0.\"i4\"::numeric) < $1::int8");
+        assert_eq!(
+            x("i4", "+?x = 3"),
+            "(t0.\"i4\"::numeric + $1::numeric) = $2::int8"
+        );
+    }
+
+    #[test]
+    fn arithmetic_over_a_numeric_column_treats_nan_as_an_error() {
+        assert_eq!(
+            x("dec", "?x - 1 > 0"),
+            "(CASE WHEN t0.\"dec\"::text NOT IN ('NaN', 'Infinity', '-Infinity') THEN \
+             t0.\"dec\" END - $1::numeric) > $2::numeric"
+        );
+    }
+
+    #[test]
+    fn arithmetic_over_anything_but_numbers_is_a_type_error() {
+        assert_eq!(x("txt", "?x + 1 > 0"), "NULL::bool");
+        assert_eq!(x("i4", "?x + \"1\" = 2"), "NULL::bool");
+        assert_eq!(x("i4", "?x + 1 = \"2\""), "NULL::bool");
+        assert_eq!(x("b", "-?x = 0"), "NULL::bool");
+        // A literal and an IRI are never the same term.
+        assert_eq!(x("i4", "?x + 1 = <http://example.org/r/2>"), "false");
+    }
+
+    #[test]
+    fn arithmetic_has_an_effective_boolean_value() {
+        assert_eq!(
+            x("i4", "?x - 3"),
+            "((t0.\"i4\"::numeric - $1::numeric) <> 0)"
+        );
+        assert_eq!(x("txt", "?x - 3"), "NULL::bool");
+    }
+
+    #[test]
+    fn arithmetic_that_sql_cannot_answer_exactly_is_rejected() {
+        assert!(rejected("?s ex:f8 ?x", "?x + 1 > 0").contains("xsd:double"));
+        assert!(rejected("?s ex:i4 ?x", "?x + 1e0 > 0").contains("xsd:double"));
+        assert!(rejected("?s ex:i4 ?x", "STR(?x + 1) = \"2\"").contains("STR, LANG"));
+        assert!(rejected("?s ex:i4 ?x", "sameTerm(?x + 1, 2)").contains("sameTerm"));
+        assert!(rejected("?s ex:f8 ?x", "isLiteral(?x * 2)").contains("xsd:double"));
     }
 
     #[test]

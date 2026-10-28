@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Adding one to the largest int8 value does not overflow.
+SELECT ?r WHERE { ?r ex:a ?a ; ex:b ?b ; ex:d ?d ; ex:big ?big ; ex:name ?n FILTER(?big + 1 > 9223372036854775807) }

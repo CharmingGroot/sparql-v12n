@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Arithmetic over a string is a type error.
+SELECT ?r WHERE { ?r ex:a ?a ; ex:b ?b ; ex:d ?d ; ex:big ?big ; ex:name ?n FILTER(?n + 1 > 0) }
