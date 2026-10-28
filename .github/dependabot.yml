@@ -4,7 +4,7 @@ version: 2
 # are not limited by this schedule.
 #
 # The pull request title becomes the squash commit, so it must pass the
-# pr-conventions check in ci.yml: the "build(deps)" prefix gives titles such
+# title check of the checks job in ci.yml: the "build(deps)" prefix gives titles such
 # as "build(deps): bump the minor group across 1 directory with 5 updates".
 # Group names stay short to keep such titles within 72 characters.
 updates:
