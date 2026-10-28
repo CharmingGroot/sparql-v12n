@@ -1,11 +1,14 @@
 # sparql-v12n
 
+English | [한국어](README.ko.md) | [简体中文](README.zh-CN.md)
+
 Query PostgreSQL with SPARQL through R2RML mappings, without copying the data.
 
-sparql-v12n is a virtualization (virtual knowledge graph, OBDA) engine written in Rust.
+sparql-v12n is a virtual knowledge graph engine written in Rust.
 It rewrites a SPARQL query into SQL using an R2RML mapping, runs the SQL on the
 source database, and returns SPARQL results. The mapping also defines exactly
-which tables and columns can be queried.
+which tables and columns can be queried. There is no ontology reasoning yet:
+a query matches the classes and properties the mapping states.
 
 > Status: Experimental. The MVP SPARQL subset is implemented and checked against Ontop and the W3C R2RML tests; APIs and output may change before 1.0.
 
@@ -31,13 +34,12 @@ than give different answers.
 The sections below give the details, and `tests/diff/README.md` lists the
 known differences from Ontop and why each rejected test query is rejected.
 
-## Planned interfaces
+## Interfaces
 
 | Interface | Use |
 |---|---|
 | `v12n` CLI | `check`, `terms`, `explain`, `query`, `serve` |
 | HTTP | SPARQL 1.1 Protocol endpoint at `/sparql` |
-| MCP | tools for AI agents (later) |
 
 ## `v12n query`
 
@@ -636,6 +638,35 @@ time zone, over `real` columns, or over strings in a database whose
 encoding is not UTF-8; and, as in `FILTER`, other functions, arithmetic
 and string forms SQL cannot compute.
 
+## Roadmap
+
+The supported subset grows in the order below. Each step is a
+[milestone](https://github.com/CharmingGroot/sparql-v12n/milestones), and
+an arrow means the later step builds on the earlier one.
+
+```mermaid
+flowchart LR
+  R1["1. Value expressions"] --> R2["3. Operators and query forms"] --> R3["4. Aggregates"]
+  M["2. Catalog metadata"] --> O1["5. RDFS ontologies"] --> O2["7. OWL 2 QL ontologies"]
+  M --> R4["6. Graph patterns and paths"]
+  O1 --> R4
+  D["8. More databases"]
+```
+
+1. Value expressions: `BIND`, expressions in `SELECT`, arithmetic and the
+   SPARQL 1.1 functions
+2. Catalog metadata loaded once and refreshed, with optimizations from
+   NOT NULL and foreign key constraints
+3. `VALUES`, `MINUS`, `EXISTS`, subqueries, `ASK`, `CONSTRUCT`,
+   `DESCRIBE`, and more result formats
+4. `GROUP BY` and aggregates
+5. Ontologies: RDFS entailment
+6. Variable predicates, named graphs and property paths
+7. Ontologies: OWL 2 QL
+8. Databases other than PostgreSQL
+
+An MCP server for AI agents is planned after these.
+
 ## Layout
 
 | Path | Contents |
@@ -646,6 +677,7 @@ and string forms SQL cannot compute.
 | `crates/v12n-cli` | The `v12n` command |
 | `crates/v12n-difftest` | Differential tests against Ontop, one test per case query |
 | `examples/shop` | Example schema, data, mapping and queries |
+| `bench` | Benchmark against Ontop on generated data, and its results |
 | `testenv` | Local PostgreSQL and the Ontop reference endpoint for tests |
 | `tests/diff` | Differential test cases (`examples/` are cases too), W3C R2RML cases in `tests/diff/w3c` |
 | `tests/w3c/rdb2rdf` | W3C RDB2RDF test files, unmodified subset (W3C Document License) |
