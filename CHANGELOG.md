@@ -8,6 +8,14 @@ Design decisions are recorded in the `Decision:` Discussions.
 
 ## [Unreleased]
 
+### Added
+
+- TLS for database connections through rustls: `sslmode` (`disable`,
+  `prefer`, `require`, `verify-ca`, `verify-full`) and `sslrootcert` in
+  the database URL, with libpq's meaning and its default `prefer`.
+  Certificates are checked against the system's root certificates or a CA
+  file.
+
 ## [0.0.1] - 2026-10-28
 
 First public version: a SPARQL-to-SQL virtualization engine over R2RML

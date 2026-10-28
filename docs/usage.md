@@ -104,6 +104,70 @@ The row-limit `warning: ...` (exit code 5) always goes to stderr.
 `v12n <command> --help` lists the JSON and CSV shapes of each command. Its
 examples run from the repository root.
 
+## Database connection
+
+`--db`, `V12N_DATABASE_URL` and `[database] url` take a libpq connection
+URI, such as `postgresql://reader@db.example.com:5432/shop?sslmode=verify-full`,
+or a `key=value` connection string, such as
+`host=db.example.com dbname=shop user=reader sslmode=verify-full`.
+
+### TLS
+
+The `sslmode` parameter sets whether the connection uses TLS and how the
+server certificate is checked. The values have the meaning libpq gives
+them:
+
+| `sslmode` | TLS | Certificate check |
+|---|---|---|
+| `disable` | Never | None |
+| `prefer` (default) | When the server supports it | None, or the chain when `sslrootcert` names a file |
+| `require` | Always | None, or the chain when `sslrootcert` names a file |
+| `verify-ca` | Always | The certificate chains to a trusted CA |
+| `verify-full` | Always | As `verify-ca`, and the certificate holds the host name from `host` |
+
+`prefer` and `require` encrypt the connection but accept any certificate
+unless `sslrootcert` names a file, so they protect against eavesdropping
+but not against a server that impersonates the database. Use
+`verify-full` over a network you do not control.
+
+The `sslrootcert` parameter names the trusted CAs:
+
+- Not set: the operating system's root certificates. On Linux these are
+  the files OpenSSL uses, and the `SSL_CERT_FILE` and `SSL_CERT_DIR`
+  environment variables replace them.
+- A path: a PEM file with one or more CA certificates, for a service with
+  its own CA. The file is read when the connection is opened.
+- `system`: the operating system's root certificates. `sslmode` then
+  defaults to `verify-full`, and weaker modes are rejected, as in libpq.
+
+```sh
+# A managed service whose certificate chains to a public CA
+v12n query mapping.ttl query.rq \
+  --db 'postgresql://reader@db.example.com/shop?sslmode=verify-full'
+
+# A server with its own CA
+v12n query mapping.ttl query.rq \
+  --db 'postgresql://reader@db.internal/shop?sslmode=verify-full&sslrootcert=/etc/v12n/db-ca.pem'
+```
+
+When the server offers `SCRAM-SHA-256-PLUS`, password authentication is
+bound to the TLS session. Add `channel_binding=require` to refuse a server
+that does not offer it.
+
+A failed TLS connection is a database error (exit code 3, kind `database`).
+Its message names the cause, for example `invalid peer certificate:
+UnknownIssuer` when the certificate does not chain to a trusted CA, or
+`certificate not valid for name "..."` when it does not hold the host name.
+
+The behavior differs from libpq in these points:
+
+- Without `sslrootcert`, libpq reads `~/.postgresql/root.crt`. v12n uses
+  the operating system's root certificates instead.
+- With `prefer`, libpq retries without TLS when the TLS handshake fails.
+  v12n reports the error.
+- `sslmode=allow`, client certificates (`sslcert`, `sslkey`) and the
+  `PGSSLMODE` and other `PG*` environment variables are not supported.
+
 ## HTTP endpoint
 
 `v12n serve --config v12n.toml` serves the SPARQL 1.1 Protocol at
@@ -195,5 +259,6 @@ The database URL and the password are never logged. Request logs go to
 stderr, at the level set by `RUST_LOG`. They carry the generated SQL and
 timings, but not result values.
 
-TLS, authentication and CORS belong to a reverse proxy in front of the
-server.
+TLS for HTTP clients, authentication and CORS belong to a reverse proxy
+in front of the server. TLS to the database is set in the database URL
+(see [TLS](#tls)).

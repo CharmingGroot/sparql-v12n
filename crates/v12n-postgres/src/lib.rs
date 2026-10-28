@@ -5,6 +5,7 @@
 mod bind;
 mod decode;
 mod error;
+mod tls;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -14,6 +15,7 @@ use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use futures_util::future::{join, join4};
+use tls::Tls;
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Config, NoTls, RowStream, Statement};
 use v12n_core::mapping::LogicalTable;
@@ -106,10 +108,14 @@ impl Database {
     /// session: the statement timeout, and read-only transactions so that
     /// an `rr:sqlQuery` cannot change data even through a function call.
     ///
+    /// TLS follows libpq's `sslmode` (`prefer` when unset) and
+    /// `sslrootcert`. Without `sslrootcert`, `verify-ca` and `verify-full`
+    /// check the certificate against the system's root certificates.
+    ///
     /// Must be called inside a Tokio runtime, which drives the connection.
     pub async fn connect(url: &str, limits: Limits) -> Result<Self, Error> {
-        let config: Config = url.parse().map_err(Error::config)?;
-        Self::connect_config(config, limits).await
+        let (config, tls) = tls::parse(url)?;
+        Self::connect_config(config, &tls, limits).await
     }
 
     /// Like [`connect`](Self::connect), with a password kept out of the
@@ -119,23 +125,31 @@ impl Database {
         password: &str,
         limits: Limits,
     ) -> Result<Self, Error> {
-        let mut config: Config = url.parse().map_err(Error::config)?;
+        let (mut config, tls) = tls::parse(url)?;
         config.password(password);
-        Self::connect_config(config, limits).await
+        Self::connect_config(config, &tls, limits).await
     }
 
-    async fn connect_config(mut config: Config, limits: Limits) -> Result<Self, Error> {
+    async fn connect_config(mut config: Config, tls: &Tls, limits: Limits) -> Result<Self, Error> {
         if config.get_connect_timeout().is_none() {
             config.connect_timeout(DEFAULT_CONNECT_TIMEOUT);
         }
         let timeout = limits.statement_timeout;
-        let (client, connection) = config
-            .connect(NoTls)
-            .await
-            .map_err(|e| Error::from_postgres(e, timeout))?;
+        let failed = |e| Error::from_postgres(e, timeout);
         // Connection failures also surface as errors on the client's next
         // request, so the task's own result adds nothing.
-        tokio::spawn(connection);
+        let client = match tls.connector()? {
+            None => {
+                let (client, connection) = config.connect(NoTls).await.map_err(failed)?;
+                tokio::spawn(connection);
+                client
+            }
+            Some(connector) => {
+                let (client, connection) = config.connect(connector).await.map_err(failed)?;
+                tokio::spawn(connection);
+                client
+            }
+        };
         let timeout_ms = format!("{}ms", timeout.as_millis());
         let (row, keys_statement) = join(
             client.query_one(

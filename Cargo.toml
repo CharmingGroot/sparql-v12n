@@ -23,12 +23,17 @@ form_urlencoded = "1.2"
 futures-util = { version = "0.3.31", default-features = false }
 oxrdf = "0.3.5"
 oxttl = "0.2.5"
+percent-encoding = "2.3.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 spargebra = "0.4.8"
 thiserror = "2.0"
 tokio = { version = "1.47", default-features = false }
 tokio-postgres = "0.7.18"
+# ring, not aws-lc-rs: it builds for the musl release targets without cmake.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
+tokio-postgres-rustls = "0.14.0"
 toml = { version = "1.1", default-features = false, features = ["parse", "serde", "std"] }
 tower = { version = "0.5.3", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }

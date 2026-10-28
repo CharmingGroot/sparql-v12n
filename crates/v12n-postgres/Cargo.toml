@@ -12,9 +12,13 @@ publish.workspace = true
 v12n-core.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+percent-encoding.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
