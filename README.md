@@ -56,12 +56,21 @@ known differences from Ontop and why each rejected test query is rejected.
 ## `v12n query`
 
 `v12n query mapping.ttl query.rq --db postgresql://reader@localhost/shop`
-prints SPARQL 1.1 Query Results JSON, SPARQL 1.1 Query Results CSV with
-`--format csv` (lexical forms only, an unbound variable as an empty field),
-or a table with `--format table`. The query comes from a file, from stdin
-with `-`, or from the command line with `--query '<SPARQL>'`.
-None of these formats has a place to mark a partial result, so limits are
-reported outside it, on stderr and in the exit code:
+runs a SPARQL query and prints its result in one of three formats:
+
+- SPARQL 1.1 Query Results JSON.
+- SPARQL 1.1 Query Results CSV, with `--format csv`. The CSV holds lexical
+  forms only, and an unbound variable is an empty field.
+- A table, with `--format table`.
+
+The query can come from three places:
+
+- a file, such as `query.rq` in the example above;
+- stdin, with `-` in place of the file name;
+- the command line, with `--query '<SPARQL>'`.
+
+None of these formats has a place to mark a result as partial. The command
+therefore reports limits outside the result, on stderr and in the exit code:
 
 | Exit code | When |
 |---|---|
@@ -69,23 +78,30 @@ reported outside it, on stderr and in the exit code:
 | `1` | Invalid input: arguments, files, query syntax, unsupported SPARQL |
 | `2` | Invalid mapping |
 | `3` | Database error, or a value that cannot become an RDF term |
-| `4` | Statement timeout (`--timeout`). Before the first row it is reported like other errors; after output has started, JSON on stdout is left unterminated (CSV has no end marker) |
-| `5` | Row limit reached (`--row-limit`): stdout holds the first `--row-limit` solutions as a complete result, and stderr has a warning |
+| `4` | Statement timeout (`--timeout`). A timeout before the first row is reported like other errors. A timeout after output has started leaves the JSON on stdout unterminated (CSV has no end marker) |
+| `5` | Row limit reached (`--row-limit`). Stdout holds the first `--row-limit` solutions as a complete result, and stderr has a warning |
 
-The stderr line names the cause and the limit, for example
-`warning: result truncated at the row limit of 10000; more rows exist ...` or
+The stderr line names the cause and the limit. For example, a truncated
+result prints
+`warning: result truncated at the row limit of 10000; more rows exist ...`,
+and a timeout prints
 `error: statement timeout of 30s reached after 120 rows; ...`.
 
 ## CLI for agents
 
-The CLI is meant to be driven by a shell tool as well as by hand. It never
-prompts, prints JSON whenever stdout is not a terminal (`--format json`
-forces it), uses colour only on a terminal and never with `NO_COLOR` set,
-and keeps the exit codes above for every command. The loop goes from the
-mapping to an answer in three steps:
+The CLI is meant to be driven by a shell tool as well as by hand. It
+follows these rules:
 
-1. `v12n terms mapping.ttl` lists the classes and properties the mapping
-   exposes; nothing else can match.
+- It never prompts for input.
+- It prints JSON whenever stdout is not a terminal. `--format json` forces
+  JSON output.
+- It uses colour only on a terminal, and never when `NO_COLOR` is set.
+- Every command uses the exit codes listed above.
+
+A caller goes from a mapping to an answer in three steps.
+
+1. `v12n terms mapping.ttl` lists the classes and properties that the
+   mapping exposes. No other class or property can match.
 
    ```json
    {"prefixes":{"ex":"http://example.org/"},
@@ -94,8 +110,8 @@ mapping to an answer in three steps:
    ```
 
 2. `v12n explain mapping.ttl --query '<SPARQL>'` checks the query without a
-   database: a syntax error or an unsupported feature exits with 1, and on
-   success it prints the SQL, its bind parameters and the projected
+   database. A syntax error or an unsupported feature makes it exit with 1.
+   On success, it prints the SQL, its bind parameters and the projected
    variables.
 
    ```json
@@ -103,16 +119,21 @@ mapping to an answer in three steps:
     "variables":[{"name":"customer","term_type":"iri","columns":["customer"]}, ...]}
    ```
 
-3. `v12n query mapping.ttl --query '<SPARQL>'` runs it (`--db` or
-   `V12N_DATABASE_URL`) and prints SPARQL 1.1 Query Results JSON, with the
-   row limit, statement timeout and read-only session on by default.
+3. `v12n query mapping.ttl --query '<SPARQL>'` runs the query and prints
+   SPARQL 1.1 Query Results JSON. The database comes from `--db` or
+   `V12N_DATABASE_URL`. The row limit, the statement timeout and the
+   read-only session are on by default.
 
-An error before any output is one JSON object on stdout in place of the
-result, so a caller checks the exit code and then reads stdout either way:
+An error before any output is printed as one JSON object on stdout, in
+place of the result. A caller therefore checks the exit code and then reads
+stdout in both cases:
 
 ```json
 {"ok":false,"error":{"kind":"query","message":"query syntax error: ...","exit_code":1}}
 ```
+
+The table below lists each error `kind`, its exit code and its `details`,
+if any.
 
 | `kind` | Exit code | `details` |
 |---|---|---|
@@ -121,40 +142,53 @@ result, so a caller checks the exit code and then reads stdout either way:
 | `database`, `data` | 3 | |
 | `timeout` | 4 | `{"timeout_ms": ..., "rows": ...}` |
 
-Once results have started, an error cannot change stdout any more: it goes
-to stderr as one `error: ...` line, as does every error with `--format csv`
-or `table`, and the row-limit `warning: ...` (exit code 5) always goes to
-stderr. `v12n <command> --help` lists the JSON and CSV shapes of each
-command, with examples that run from the repository root.
+Some errors go to stderr as one `error: ...` line instead of to stdout:
+
+- an error after results have started, because it cannot change stdout any
+  more;
+- every error with `--format csv` or `--format table`.
+
+The row-limit `warning: ...` (exit code 5) always goes to stderr.
+
+`v12n <command> --help` lists the JSON and CSV shapes of each command. Its
+examples run from the repository root.
 
 ## HTTP endpoint
 
-`v12n serve --config v12n.toml` serves the SPARQL 1.1 Protocol at `/sparql`
-(and `/healthz` for liveness):
+`v12n serve --config v12n.toml` serves the SPARQL 1.1 Protocol at
+`/sparql`. It also serves `/healthz` for liveness checks.
 
-- `GET /sparql?query=...`, `POST` with `application/x-www-form-urlencoded`
-  (`query=...`), or `POST` with `application/sparql-query` and the query as
-  the body.
-- Results are SPARQL 1.1 Query Results JSON (`application/sparql-results+json`),
-  streamed as rows arrive from PostgreSQL. Other formats get `406`.
-- `default-graph-uri` and `named-graph-uri` get `400`: the dataset is the one
-  the mapping defines.
+A request sends the query in one of three ways:
+
+- `GET /sparql?query=...`;
+- `POST` with `application/x-www-form-urlencoded` (`query=...`);
+- `POST` with `application/sparql-query` and the query as the body.
+
+Results are SPARQL 1.1 Query Results JSON
+(`application/sparql-results+json`). They are streamed as rows arrive from
+PostgreSQL. A request for any other format gets `406`.
+
+The parameters `default-graph-uri` and `named-graph-uri` get `400`, because
+the dataset is the one that the mapping defines.
 
 | Status | When |
 |---|---|
-| `200` | Results. With a row limit, a cut-off result carries `V12N-Truncated: <row limit>` and holds exactly that many solutions (`v12n query` exits with 5 in the same case) |
-| `400` | Query syntax, a missing or repeated `query`, dataset parameters, a query that unfolds into too many SQL branches |
-| `406` / `413` / `414` / `415` | Format not offered / query over `max_query_bytes` in a `POST` / in a `GET` / other content type |
-| `501` | A SPARQL feature not supported yet |
-| `503` | Statement timeout before the first row (`v12n query` exits with 4), or `max_concurrent_requests` reached (with `Retry-After`) |
-| `500` | Database or other internal errors |
+| `200` | Results. When a row limit applies and the result is cut off, the response carries `V12N-Truncated: <row limit>` and holds exactly that many solutions. In the same case, `v12n query` exits with 5 |
+| `400` | A query syntax error, a missing or repeated `query`, dataset parameters, or a query that unfolds into too many SQL branches |
+| `406` / `413` / `414` / `415` | `406`: a format that is not offered. `413`: a query over `max_query_bytes` in a `POST`. `414`: a query over `max_query_bytes` in a `GET`. `415`: any other content type |
+| `501` | A SPARQL feature that is not supported yet |
+| `503` | A statement timeout before the first row (`v12n query` exits with 4 in this case), or `max_concurrent_requests` reached (the response carries `Retry-After`) |
+| `500` | A database error or another internal error |
 
-The status is sent before the body, so an error after the first row cannot
-change it: the server aborts the response (the JSON stays unterminated) and
-logs the error. Whether a result is truncated is known before the first row,
-because PostgreSQL counts the rows up to the limit before sending them.
+The status is sent before the body. An error after the first row therefore
+cannot change the status. In that case, the server aborts the response and
+logs the error, and the JSON stays unterminated.
 
-Settings come from a TOML file (`--config`); environment variables override it:
+Whether a result is truncated is known before the first row. PostgreSQL
+counts the rows up to the limit before it sends them.
+
+Settings come from a TOML file given with `--config`, such as the
+following:
 
 ```toml
 [server]
@@ -176,6 +210,9 @@ max_query_bytes = 65536
 max_concurrent_requests = 16        # more are refused with 503, not queued
 ```
 
+Environment variables override the settings in the file. The table lists
+each setting with its environment variable and its default.
+
 | Setting | Environment variable | Default |
 |---|---|---|
 | `[server] address` | `V12N_ADDRESS` | `127.0.0.1` |
@@ -189,407 +226,532 @@ max_concurrent_requests = 16        # more are refused with 503, not queued
 | `[limits] max_query_bytes` | `V12N_MAX_QUERY_BYTES` | `65536` |
 | `[limits] max_concurrent_requests` | `V12N_MAX_CONCURRENT_REQUESTS` | `16` |
 
-`v12n query` reads the same `V12N_DATABASE_URL`, `V12N_ROW_LIMIT`,
-`V12N_STATEMENT_TIMEOUT` and `V12N_BASE_IRI`, below its command-line options;
-`v12n explain` reads `V12N_BASE_IRI`, and `--base-iri` also overrides the
-setting for `serve`. `serve` ignores other
-`V12N_*` variables and logs a warning for each, so a misspelled name is
-visible.
+The other commands read some of the same variables:
 
-Connect as a database user that can only read; sessions are also set to
-read-only transactions. The database URL and password are never logged. Request
-logs (stderr, level from `RUST_LOG`) carry the generated SQL and timings, not
-result values. TLS, authentication and CORS belong to a reverse proxy in front.
+- `v12n query` reads `V12N_DATABASE_URL`, `V12N_ROW_LIMIT`,
+  `V12N_STATEMENT_TIMEOUT` and `V12N_BASE_IRI`. Its command-line options
+  take precedence over these variables.
+- `v12n explain` reads `V12N_BASE_IRI`.
+
+For `serve`, the `--base-iri` option also overrides the base IRI setting.
+`serve` ignores other `V12N_*` variables. It logs a warning for each one,
+so a misspelled name is visible.
+
+Connect as a database user that can only read. The engine also sets
+sessions to read-only transactions.
+
+The database URL and the password are never logged. Request logs go to
+stderr, at the level set by `RUST_LOG`. They carry the generated SQL and
+timings, but not result values.
+
+TLS, authentication and CORS belong to a reverse proxy in front of the
+server.
 
 ## Column names
 
-Column names in `rr:column`, templates and join conditions are SQL
-identifiers (R2RML §5). A delimited name (`"\"Name\""`) is taken as
-written. A regular name is resolved as PostgreSQL resolves it unquoted,
-which folds it to lower case: `rr:column "StudentId"` reads the column
-that `SELECT ... AS StudentId` produces (`studentid`), and `rr:column
-"Name"` does not match a column created as `"Name"`. Before running a
-query that uses such a name, the engine prepares a probe statement in
-which PostgreSQL resolves it, and then quotes the resolved name in the
-generated SQL. Names of lower-case letters, digits and `_` need no probe.
+Column names in `rr:column`, in templates and in join conditions are SQL
+identifiers (R2RML §5). They are resolved in one of two ways:
+
+- A delimited name, such as `"\"Name\""`, is taken as written.
+- A regular name is resolved as PostgreSQL resolves an unquoted name. This
+  folds the name to lower case.
+
+For example, `rr:column "StudentId"` reads the column that
+`SELECT ... AS StudentId` produces, which is `studentid`. For the same
+reason, `rr:column "Name"` does not match a column created as `"Name"`.
+
+Before the engine runs a query that uses a regular name, it prepares a
+probe statement in which PostgreSQL resolves the name. It then quotes the
+resolved name in the generated SQL. Names made only of lower-case letters,
+digits and `_` need no probe.
 
 ## Relative IRIs
 
 A column or template with `rr:termType rr:IRI` can produce a relative IRI,
-such as `Carlos` or `person/7`. R2RML resolves it against a base IRI given
-to the processor (R2RML §4, §11.2), by plain string concatenation, not RFC
-3986 resolution: with the base `http://data.example.com/`, `Carlos` becomes
-`<http://data.example.com/Carlos>` and `../x` becomes
-`<http://data.example.com/../x>`. Template values are percent-encoded
-first (`Bob/Charles` gives `Bob%2FCharles`).
+such as `Carlos` or `person/7`. R2RML resolves a relative IRI against a
+base IRI given to the processor (R2RML §4, §11.2).
 
-There is no default base IRI. Without `base_iri` (`--base-iri`,
-`V12N_BASE_IRI`), a relative IRI is an R2RML data error that names the
-setting, so the engine never invents IRIs for the data. Set it to the
-namespace the data belongs to; it must be an absolute IRI.
+The resolution is plain string concatenation, not RFC 3986 resolution. For
+example, with the base `http://data.example.com/`:
 
-A string counts as absolute when it starts with a scheme (`http:`,
-`urn:`, ...); a fragment does not make it relative. A string with a
-scheme that is not a valid IRI is a data error, where R2RML would first try
-the base IRI in front of it; this only differs for values such as
-`http://host:port/` with a non-numeric port, and it lets the SQL
-comparisons below use the same rule as the results.
+- `Carlos` becomes `<http://data.example.com/Carlos>`;
+- `../x` becomes `<http://data.example.com/../x>`.
+
+Template values are percent-encoded first. For example, `Bob/Charles`
+gives `Bob%2FCharles`.
+
+There is no default base IRI. The base IRI is set with `base_iri`,
+`--base-iri` or `V12N_BASE_IRI`. Without it, a relative IRI is an R2RML
+data error, and the error names the setting. In this way, the engine never
+invents IRIs for the data. Set the base IRI to the namespace that the data
+belongs to. It must be an absolute IRI.
+
+A string counts as absolute when it starts with a scheme, such as `http:`
+or `urn:`. A fragment does not make a string relative.
+
+A string that has a scheme but is not a valid IRI is a data error. For
+such a string, R2RML would first try the base IRI in front of it. The two
+rules differ only for values such as `http://host:port/` with a
+non-numeric port. The engine's rule lets the SQL comparisons below use the
+same rule as the results.
 
 - A template whose text never yields a scheme, such as `{name}` or
   `person/{id}`, gets the base IRI in front of it when the mapping is
-  loaded. A constant like `<http://data.example.com/person/7>` is then
-  matched on the column as before (`id = $1`), with its index.
-- A column can hold either form, so a constant matches both:
-  `iri IN ($1, $2)` with `http://data.example.com/a` and `a`, which still
-  uses an index on the column.
-- A join on such a column, or on a template like `{scheme}:{rest}` whose
-  scheme depends on the values, compares the generated IRIs in SQL
-  (`CASE WHEN iri ~ '^scheme:' THEN iri ELSE $base || iri END`), which an
-  index on the column does not serve.
-- Duplicates are removed by column value, so a relative value and the
-  absolute IRI it resolves to (`a` and `http://data.example.com/a`) still
-  count twice, and `SELECT DISTINCT` over such a column is rejected as
-  unsupported when a base IRI is set.
+  loaded. A constant such as `<http://data.example.com/person/7>` is then
+  matched on the column as before (`id = $1`), using the column's index.
+- A column can hold either form, relative or absolute. A constant therefore
+  matches both forms, as in `iri IN ($1, $2)` with
+  `http://data.example.com/a` and `a`. This condition still uses an index
+  on the column.
+- A join on such a column compares the generated IRIs in SQL. The same
+  holds for a join on a template like `{scheme}:{rest}`, whose scheme
+  depends on the values. The comparison has the form
+  `CASE WHEN iri ~ '^scheme:' THEN iri ELSE $base || iri END`. An index on
+  the column does not serve this comparison.
+- Duplicates are removed by column value. A relative value and the absolute
+  IRI it resolves to, such as `a` and `http://data.example.com/a`, therefore
+  still count twice. For this reason, `SELECT DISTINCT` over such a column
+  is rejected as unsupported when a base IRI is set.
 
-Ontop 5.5.0 puts `http://example.com/base/` (the base IRI of the W3C test
-cases) in front of every template that does not start with an absolute
-IRI, with no setting to change it, and fails on relative IRIs from columns.
-
+For comparison, Ontop 5.5.0 puts `http://example.com/base/`, the base IRI
+of the W3C test cases, in front of every template that does not start with
+an absolute IRI. Ontop has no setting to change this base. It also fails
+on relative IRIs from columns.
 ## Lexical forms of column values
 
-Every non-string value is written in the canonical form of XML Schema 1.1
-Part 2, the version R2RML references, both in literals and in template
-values: `numeric` 12.50 and 3.00 become `"12.5"^^xsd:decimal` and
-`"3"^^xsd:decimal` (an integral decimal has no decimal point), `float8` 30
-becomes `"3.0E1"^^xsd:double`, `boolean` gives `true`/`false`, and `bytea`
-upper-case hexadecimal. Results therefore do not depend on a column's
-declared scale. Ontop writes PostgreSQL's text output instead (`12.50`,
-`"30"^^xsd:double`); the differential tests record these as known
+The engine writes every non-string value in its canonical form. The
+canonical form is the one that XML Schema 1.1 Part 2 defines, and this is
+the version that R2RML references. The rule applies both to literals and
+to template values:
+
+- `numeric` 12.50 and 3.00 become `"12.5"^^xsd:decimal` and
+  `"3"^^xsd:decimal`. An integral decimal has no decimal point.
+- `float8` 30 becomes `"3.0E1"^^xsd:double`.
+- `boolean` gives `true`/`false`.
+- `bytea` gives upper-case hexadecimal.
+
+Results therefore do not depend on a column's declared scale.
+
+Ontop writes PostgreSQL's text output instead (`12.50`,
+`"30"^^xsd:double`). The differential tests record these as known
 differences (issue #25).
 
-Two values that SQL `=` finds different can be one term: PostgreSQL keeps
-`time '24:00:00'` apart from `'00:00:00'`, while XSD 1.1 maps both to the
-same value, written `00:00:00`. Both give `"00:00:00"^^xsd:time`; the
-constant `"00:00:00"^^xsd:time` matches both, `"24:00:00"^^xsd:time` matches
-nothing, and joins, `DISTINCT`, `UNION` and `ORDER BY` treat the two as
-one value (`col + interval '0'`). A unique key on a `time` column is not
-used to prove that a query has no duplicates. Ontop writes `24:00:00` as
-is (issue #37).
+Two values that SQL `=` finds different can be one term. PostgreSQL keeps
+`time '24:00:00'` apart from `'00:00:00'`. XSD 1.1 maps both to the same
+value, written `00:00:00`. Both values give `"00:00:00"^^xsd:time`, with
+these effects:
 
-Two values that SQL `=` finds equal can still be different terms: `-0`
-and `0` in `real` and `double precision` columns give `"-0.0E0"` and
-`"0.0E0"`, and a `char(n)` value keeps its padding (`'a'::char(3)` gives
-`"a  "`), which `=` on `char(n)` ignores. Wherever the engine compares
-such columns as terms (constants, joins, `sameTerm`, and the duplicates
-`DISTINCT` and `UNION` remove), it also compares the text of the value
-(for a zero) or its length (for `char(n)`), next to `=` so that an index
-on the column still finds the rows.
+- The constant `"00:00:00"^^xsd:time` matches both.
+- The constant `"24:00:00"^^xsd:time` matches nothing.
+- Joins, `DISTINCT`, `UNION` and `ORDER BY` treat the two as one value
+  (`col + interval '0'`).
+
+A unique key on a `time` column is not used to prove that a query has no
+duplicates. Ontop writes `24:00:00` as is (issue #37).
+
+Two values that SQL `=` finds equal can still be different terms, as in
+these cases:
+
+- In `real` and `double precision` columns, `-0` and `0` give `"-0.0E0"`
+  and `"0.0E0"`.
+- A `char(n)` value keeps its padding, which `=` on `char(n)` ignores. For
+  example, `'a'::char(3)` gives `"a  "`.
+
+The engine compares such columns as terms in constants, joins, `sameTerm`,
+and the duplicates that `DISTINCT` and `UNION` remove. In those places it
+also compares the text of the value (for a zero) or its length (for
+`char(n)`). It does this next to `=`, so that an index on the column still
+finds the rows.
 
 ## Constants in a query
 
-Constants in triple patterns are matched as RDF terms, as SPARQL requires:
-the lexical form and the datatype must both be equal. A column value takes
-part through its R2RML natural mapping (`integer` columns give
-`xsd:integer` in canonical form, `numeric` gives canonical `xsd:decimal`,
-and so on). So, for an integer column holding 7:
+Constants in triple patterns are matched as RDF terms, as SPARQL requires.
+The lexical form and the datatype must both be equal. A column value takes
+part in the comparison through its R2RML natural mapping. For example,
+`integer` columns give `xsd:integer` in canonical form, `numeric` gives
+canonical `xsd:decimal`, and so on for other types.
+
+The following table shows which constants match an integer column holding
+7:
 
 | Constant | Matches | Why |
 |---|---|---|
 | `7`, `<…/customer/7>` | yes | |
-| `"7"`, `"7"^^xsd:decimal`, `7.0` | no | Different datatype |
-| `"07"^^xsd:integer`, `<…/customer/007>`, `<…/customer/+7>` | no | Not the canonical form the mapping produces |
-| `99999999999`, `<…/customer/99999999999>` | no | Out of range for the column, so no row holds it |
+| `"7"`, `"7"^^xsd:decimal`, `7.0` | no | The datatype is different |
+| `"07"^^xsd:integer`, `<…/customer/007>`, `<…/customer/+7>` | no | The constant is not the canonical form that the mapping produces |
+| `99999999999`, `<…/customer/99999999999>` | no | The value is out of range for the column, so no row holds it |
 
 Constants are sent to PostgreSQL as bound parameters, never inside the
-SQL text. Before binding, the engine checks each one against the
-parameter type PostgreSQL infers from the column: it reads the constant
-as that type and formats it back with the same code that builds result
-terms, and only an identical round trip is sent, in binary where the type
-allows. A constant that cannot match empties its own `UNION` branch
-instead of making PostgreSQL fail on input it cannot parse (inside an
-`OPTIONAL`, only that part does not match); the query skips the database
-when no branch is left. The comparison stays on the
-column's own type, so its indexes are used. For column types without a
-natural datatype (such as `interval`), results carry the column cast to
-text, and constants are compared with that same text (`col::text = $1`),
-which cannot use an index on the column.
+SQL text.
+
+Before binding, the engine checks each constant against the parameter
+type that PostgreSQL infers from the column. The check has these steps:
+
+1. The engine reads the constant as that type.
+2. It formats the value back with the same code that builds result terms.
+3. It sends the constant only if the round trip is identical. It sends
+   the constant in binary where the type allows.
+
+A constant that cannot match empties its own `UNION` branch. The engine
+does this instead of making PostgreSQL fail on input it cannot parse.
+Inside an `OPTIONAL` part, only that part does not match, and the
+solutions on its left side are kept. When no branch is left, the query
+skips the database.
+
+The comparison stays on the column's own type, so the column's indexes are
+used.
+
+Some column types have no natural datatype, such as `interval`. For these
+types, results carry the column cast to text. Constants are compared with
+that same text (`col::text = $1`). This comparison cannot use an index on
+the column.
 
 ## Literals
 
-Literals are compared as RDF 1.1 terms everywhere: in triple patterns,
-joins, `sameTerm` and `=` in `FILTER` where it means RDFterm-equal,
+Literals are compared as RDF 1.1 terms everywhere. This covers triple
+patterns, joins, `sameTerm`, `=` in `FILTER` where it means RDFterm-equal,
 `DISTINCT`, and the results.
 
-- **Language tags** compare without regard to case (RDF 1.1 Concepts
-  §3.3), so the engine keeps them in lower case: `rr:language "EN-us"`
-  gives `"chat"@en-us`, which the constant `"chat"@EN-US` matches, and
-  two term maps that differ only in the case of their tags give one term.
-  A tag that is not a valid BCP 47 language tag is a mapping error
-  (R2RML §7.5), and so is `rr:datatype rdf:langString`, the datatype of
-  tagged strings only.
-- **`xsd:string`**: a simple literal is an `xsd:string` literal. `"x"` and
-  `"x"^^xsd:string`, a text column, a column with `rr:datatype
-  xsd:string` and a literal template give the same term, and results
-  write it without a datatype. `DATATYPE` returns `xsd:string`.
-- **Datatypes no term map produces** never match in a triple pattern:
-  an integer column gives `xsd:integer` terms, so `"5"^^xsd:int` and
-  `"5"^^xsd:decimal` match nothing there, and neither does a custom
-  datatype. In `FILTER`, where numbers compare by value, `xsd:float` and
-  the derived integer types are rejected (see `FILTER`).
-- **`char(n)`** values keep their trailing pad spaces in RDF terms, as the
-  SQL standard and the W3C RDB2RDF expected output have them (D018:
+- Language tags compare without regard to case (RDF 1.1 Concepts §3.3).
+  The engine therefore keeps them in lower case. For example,
+  `rr:language "EN-us"` gives `"chat"@en-us`, and the constant
+  `"chat"@EN-US` matches it. Two term maps that differ only in the case of
+  their tags give one term. A tag that is not a valid BCP 47 language tag
+  is a mapping error (R2RML §7.5). `rr:datatype rdf:langString` is also a
+  mapping error, because `rdf:langString` is the datatype of tagged
+  strings only.
+- A simple literal is an `xsd:string` literal. The following all give the
+  same term: `"x"`, `"x"^^xsd:string`, a text column, a column with
+  `rr:datatype xsd:string`, and a literal template. Results write this
+  term without a datatype. `DATATYPE` returns `xsd:string`.
+- A datatype that no term map produces never matches in a triple pattern.
+  For example, an integer column gives `xsd:integer` terms, so
+  `"5"^^xsd:int` and `"5"^^xsd:decimal` match nothing there. A custom
+  datatype matches nothing there either. In `FILTER`, numbers compare by
+  value, and `xsd:float` and the derived integer types are rejected (see
+  `FILTER`).
+- `char(n)` values keep their trailing pad spaces in RDF terms. The SQL
+  standard and the W3C RDB2RDF expected output have them this way (D018:
   `"Venus          "`). For unpadded values, use `varchar` or `text`, or
   an R2RML view with `rtrim()`.
 
-Value comparisons across datatypes, such as `FILTER(?amount = 7.0)` on an
-integer column, belong to `FILTER` (see below).
+Value comparisons across datatypes belong to `FILTER` (see below). An
+example is `FILTER(?amount = 7.0)` on an integer column.
 
 ## Variables shared across columns
 
-A variable that occurs twice is a join, and it also compares RDF terms,
-not SQL values. Before running such a query, the engine asks PostgreSQL
-for the types of the columns involved (by preparing a probe statement)
-and then:
+A variable that occurs twice is a join. A join also compares RDF terms,
+not SQL values.
 
-- compares columns of the same kind (integers, text, dates, ...) with
-  `=`, so indexes are used;
-- compares other pairs through the natural lexical form computed in SQL
-  (`int_col::text = text_col::text`) after checking the natural datatypes:
-  an `integer` column holding 7 joins a text column only if that column
-  has `rr:datatype xsd:integer`, and never a `numeric` 7.0. A `numeric`
-  value's canonical form is computed with `trim_scale(col)::text`
-  (PostgreSQL 13 or later), which is tested to equal the engine's own
-  formatting;
-- percent-encodes template values as IRIs do (R2RML IRI-safe version)
-  when templates or IRI columns can only be compared as strings;
-- rejects the query as unsupported (exit code 1, HTTP 501) when the
-  lexical form cannot be computed in SQL, for example a `float8` or
-  date/time template value against a text column, instead of failing in
-  PostgreSQL or returning wrong rows.
+Before running such a query, the engine asks PostgreSQL for the types of
+the columns involved. It does this by preparing a probe statement. The
+engine then does the following:
+
+- It compares columns of the same kind (integers, text, dates, ...) with
+  `=`, so indexes are used.
+- It compares other pairs through the natural lexical form computed in
+  SQL (`int_col::text = text_col::text`). It first checks the natural
+  datatypes. For example, an `integer` column holding 7 joins a text
+  column only if that column has `rr:datatype xsd:integer`. It never joins
+  a `numeric` 7.0. The canonical form of a `numeric` value is computed
+  with `trim_scale(col)::text` (PostgreSQL 13 or later). A test checks
+  that this form equals the engine's own formatting.
+- When templates or IRI columns can only be compared as strings, it
+  percent-encodes template values as IRIs do (R2RML IRI-safe version).
+- When the lexical form cannot be computed in SQL, it rejects the query as
+  unsupported (exit code 1, HTTP 501). An example is a `float8` or
+  date/time template value against a text column. The engine rejects such
+  a query instead of failing in PostgreSQL or returning wrong rows.
 
 ## Variables over columns of different types
 
 The term maps of one pattern can read a variable from columns of
-different SQL types, such as an `integer` column in one triples map and a
-`text` column in another. `UNION` needs one type per result column, so
-for queries over several term maps the engine also asks PostgreSQL for
-the types of the selected columns and:
+different SQL types. For example, the variable can come from an `integer`
+column in one triples map and from a `text` column in another.
 
-- keeps one result column where the types combine without changing any
-  value (`int4` and `int8`, `text` and `varchar`);
-- splits a literal of natural datatype into one result column per
-  datatype; each branch fills its own and leaves the others `NULL`, so the
-  integer 120 stays `"120"^^xsd:integer` and the text `'120'` stays
-  `"120"`;
-- selects the natural lexical form, computed in SQL as for joins, where
-  two types can give the same term: template values (`item/{id}` over an
-  `integer` key and a `text` key both give `item/1`), IRI columns,
-  literals with `rr:datatype` or a language tag, and plain literals from
-  `text` and `uuid` columns. The same triple from two term maps then
-  still counts once;
-- rejects the query as unsupported when that form cannot be computed in
-  SQL (`float8`, `real` with `double precision`, date/time, `char(n)`).
+`UNION` needs one type per result column. For queries over several term
+maps, the engine therefore also asks PostgreSQL for the types of the
+selected columns. It then does the following:
+
+- Where the types combine without changing any value, it keeps one result
+  column. Examples are `int4` and `int8`, and `text` and `varchar`.
+- It splits a literal of natural datatype into one result column per
+  datatype. Each branch fills its own column and leaves the others `NULL`.
+  As a result, the integer 120 stays `"120"^^xsd:integer` and the text
+  `'120'` stays `"120"`.
+- Where two types can give the same term, it selects the natural lexical
+  form, computed in SQL as for joins. The same triple from two term maps
+  then still counts once. This applies to the following terms:
+  - template values (`item/{id}` over an `integer` key and a `text` key
+    both give `item/1`);
+  - IRI columns;
+  - literals with `rr:datatype` or a language tag;
+  - plain literals from `text` and `uuid` columns.
+- When that form cannot be computed in SQL, it rejects the query as
+  unsupported. This applies to `float8`, `real` with `double precision`,
+  date/time, and `char(n)`.
 
 ## Duplicate triples
 
-An RDF graph is a set of triples, so a triple counts once however many
-rows produce it: duplicate rows of a table without a key, an R2RML view
-that repeats rows, or two term maps that produce the same triple. A basic
-graph pattern has one solution per distinct binding of all its variables,
-and only then does `SELECT` project, so `SELECT ?city WHERE { ?p ex:city
-?city }` still returns a city once per person.
+An RDF graph is a set of triples. A triple therefore counts once, however
+many rows produce it. Several rows can produce the same triple in these
+cases:
 
-The generated SQL removes duplicates with `DISTINCT` (or `UNION` across
-term maps) over the columns of every variable of the pattern, in a
-subquery when some are not selected. Before running a query that reads
-tables (not views) through a single combination of term maps (in some
-side of a `UNION`), the engine reads their unique keys from the catalog;
-when every table has a key among the columns the solution fixes, no two
-rows can give the same solution and the SQL keeps all rows without
-`DISTINCT`. Otherwise
-PostgreSQL has to deduplicate, which costs a hash or sort over the rows
-and, unless an index delivers them in order, reads all of them before the
-first one is returned. `v12n explain` has no database and always shows the
-`DISTINCT`.
+- duplicate rows of a table without a key;
+- an R2RML view that repeats rows;
+- two term maps that produce the same triple.
 
-Duplicates are compared by column values, so two different values that a
-template renders as the same string (`{a}-{b}` with `x-`, `y` and `x`,
-`-y`) still count twice. A variable that is not selected is compared by
-its columns' type and text output, so equal terms from columns of
-different types also count twice where SQL cannot compute their lexical
-form, or when the types combine (`varchar` and `text`) or the text differs
-(`numeric` 1.0 and 1.00).
+A basic graph pattern has one solution per distinct binding of all its
+variables. Only after that does `SELECT` project. As a result,
+`SELECT ?city WHERE { ?p ex:city ?city }` still returns a city once per
+person.
 
+The generated SQL removes duplicates with `DISTINCT`, or with `UNION`
+across term maps. It does this over the columns of every variable of the
+pattern. When some of those variables are not selected, it does this in a
+subquery.
+
+Some queries read tables (not views) through a single combination of term
+maps (in some side of a `UNION`). Before running such a query, the engine
+reads the unique keys of these tables from the catalog. When every table
+has a key among the columns that the solution fixes, no two rows can give
+the same solution. The SQL then keeps all rows without `DISTINCT`.
+
+Otherwise, PostgreSQL has to deduplicate. This costs a hash or sort over
+the rows. Unless an index delivers the rows in order, PostgreSQL also
+reads all of them before it returns the first one.
+
+`v12n explain` has no database and always shows the `DISTINCT`.
+
+Duplicates are compared by column values. Two different values that a
+template renders as the same string therefore still count twice. For
+example, the template `{a}-{b}` renders the values `x-`, `y` and the
+values `x`, `-y` as the same string.
+
+A variable that is not selected is compared by the type and the text
+output of its columns. Equal terms can therefore still count twice:
+
+- columns of different types where SQL cannot compute the lexical form;
+- columns whose types combine, such as `varchar` and `text`;
+- values of one type whose text output differs, such as `numeric` 1.0 and
+  1.00.
 ## OPTIONAL
 
-`OPTIONAL` follows the SPARQL algebra's LeftJoin: every solution of the
-left side is kept, and extended by each compatible solution of the
-optional part where there are some. The SQL is a `LEFT JOIN` per optional
-part:
+`OPTIONAL` follows the LeftJoin of the SPARQL algebra. Every solution of
+the left side is kept. Where the optional part has compatible solutions,
+the left solution is extended by each of them. The SQL has one
+`LEFT JOIN` per optional part.
 
-- The part's tables are joined among themselves (in parentheses when
-  there are several), and the `ON` clause holds both the part's own
-  conditions and the link to the left side. A nested `OPTIONAL` is a
-  `LEFT JOIN` inside the outer one, and patterns written after an
-  `OPTIONAL` are joined after it.
-- Shared variables are compared as RDF terms, as in joins, so typed
-  columns and template decomposition work the same way and indexes are
+- The tables of a part are joined among themselves. When there are
+  several, they are in parentheses. The `ON` clause holds the conditions
+  of the part itself and the link to the left side.
+- A nested `OPTIONAL` is a `LEFT JOIN` inside the outer one. Patterns
+  written after an `OPTIONAL` are joined after it.
+- Shared variables are compared as RDF terms, as in joins. Typed columns
+  and template decomposition therefore work the same way. Indexes are
   used where both sides are plain columns.
-- An unbound variable is `NULL` in SQL and left out of the JSON binding.
-  Where a shared variable may be unbound on one side (bound only by an
-  earlier `OPTIONAL`, or by one nested in the part), it is compatible with
-  any value: the condition is `(left IS NULL OR left = right)`, which no
-  index on the column serves.
-- Each part is translated on its own first, as the algebra evaluates it,
-  so a condition that links a nested part to the outer left side is
-  checked in the outer part's `ON` clause, never inside the nested one.
+- An unbound variable is `NULL` in SQL and is left out of the JSON
+  binding.
+- A shared variable may be unbound on one side. This happens when it is
+  bound only by an earlier `OPTIONAL`, or only by an `OPTIONAL` nested in
+  the part. Such a variable is compatible with any value. The condition
+  is then `(left IS NULL OR left = right)`, which no index on the column
+  serves.
+- Each part is translated on its own first, as the algebra evaluates it.
+  A condition that links a nested part to the outer left side is
+  therefore checked in the `ON` clause of the outer part. It is never
+  checked inside the nested part.
 - A variable that only `OPTIONAL` parts bind gets columns from each of
-  them, and its value is the first one bound in the row. A constant term
-  of an optional part comes with a flag column that tells whether the
-  part matched.
+  those parts. Its value is the first one bound in the row.
+- A constant term of an optional part comes with a flag column. The flag
+  tells whether the part matched.
 - Duplicate triples count once inside each part, as in any basic graph
   pattern.
 
-- An optional part that more than one combination of triples maps, or
-  more than one side of a `UNION` inside it, can match is the union of
-  those choices, and LeftJoin(L, R1 ∪ R2) is Join(L, R1) ∪ Join(L, R2) ∪
-  Diff(L, R1 ∪ R2). The SQL branch splits into one branch per choice,
-  with its `LEFT JOIN` and `WHERE` its part matched (PostgreSQL turns this
-  into an inner join), and one branch with the `LEFT JOIN` of every
-  choice and `WHERE` none matched (an anti-join), which keeps the left
-  solutions that nothing extends. Each part keeps its `ON` clause, so
-  compatibility and the `FILTER` inside `OPTIONAL` decide whether it
-  matches as for a single part. Inside an outer part, the splits become
-  the outer part's choices. A `UNION` with an empty side extends every
-  left solution unchanged through that side.
+An optional part can match in more than one way. This happens when more
+than one combination of triples maps can match it, or when more than one
+side of a `UNION` inside it can match. The part is then the union of
+those choices, and the algebra gives the following identity.
 
-Not supported yet, and rejected as unsupported: `SELECT DISTINCT` over a
-variable that only several `OPTIONAL` parts bind; a `FILTER` inside
-`OPTIONAL` around a `UNION` with an empty side.
+LeftJoin(L, R1 ∪ R2) is Join(L, R1) ∪ Join(L, R2) ∪ Diff(L, R1 ∪ R2).
+
+The SQL branch splits accordingly:
+
+- One branch per choice. It has the `LEFT JOIN` of that choice and a
+  `WHERE` condition that its part matched. PostgreSQL turns this into an
+  inner join.
+- One branch with the `LEFT JOIN` of every choice and a `WHERE` condition
+  that none of them matched. This branch is an anti-join. It keeps the
+  left solutions that nothing extends.
+
+Each part keeps its `ON` clause. Compatibility and the `FILTER` inside
+`OPTIONAL` therefore decide whether a part matches, as for a single part.
+Inside an outer part, the splits become the choices of the outer part. A
+`UNION` with an empty side extends every left solution unchanged through
+that side.
+
+The following are not supported yet and are rejected as unsupported:
+
+- `SELECT DISTINCT` over a variable that only several `OPTIONAL` parts
+  bind;
+- a `FILTER` inside `OPTIONAL` around a `UNION` with an empty side.
 
 ## UNION
 
-`{ A } UNION { B }` has the solutions of both sides as a bag: a solution
-that both sides give counts twice, and once under `SELECT DISTINCT`. A
-variable that only one side binds is unbound in the other side's
-solutions.
+`{ A } UNION { B }` has the solutions of both sides as a bag. A solution
+that both sides give counts twice. Under `SELECT DISTINCT` it counts
+once. A variable that only one side binds is unbound in the solutions of
+the other side.
 
 - Joins, `FILTER`s and `OPTIONAL` distribute over a union on their left
-  side, so the engine unfolds each arm, a choice of one side of every
-  `UNION`, on its own, and combines the arms with `UNION ALL`. Each arm is
-  translated as any other pattern: duplicate triples count once inside
-  it (`DISTINCT`, or `UNION` across its term maps, or nothing when keys
-  prove there are no duplicates, now checked per arm), and the arms are
-  never compared with each other. The number of arms times the term map
-  combinations of each is limited to 64, like the branches of one
-  pattern.
-- A `FILTER` in one side applies to that side's solutions only, and a
-  `FILTER` of the group around the union to the solutions of both, where
-  a variable of the other side is unbound.
-- A `UNION` inside `OPTIONAL` does not distribute over the left join;
-  its sides are choices of the optional part (see `OPTIONAL`), and each
-  side's solutions stay in their own arm.
+  side. An **arm** is a choice of one side of every `UNION`. Because of
+  this distribution, the engine unfolds each arm on its own and combines
+  the arms with `UNION ALL`.
+- Each arm is translated as any other pattern. Duplicate triples count
+  once inside an arm. The arm uses `DISTINCT`, or `UNION` across its term
+  maps, or nothing when keys prove that there are no duplicates. Keys are
+  checked for each arm separately. The arms are never compared with each
+  other.
+- Each arm has one SQL branch per combination of term maps. The branches
+  of all arms together are limited to 64, the same limit as for the
+  branches of one pattern.
+- A `FILTER` in one side applies only to the solutions of that side. A
+  `FILTER` of the group around the union applies to the solutions of both
+  sides. In those solutions, a variable of the other side is unbound.
+- A `UNION` inside `OPTIONAL` does not distribute over the left join. Its
+  sides are choices of the optional part (see `OPTIONAL`). The solutions
+  of each side stay in their own arm.
 
-A variable can take its values from term maps of different shapes in
-different sides or term maps: a template in one and a column or another
-template in the other, constants, IRIs and literals, or literals of
-different datatypes or language tags. The results rebuild each value
-from the term map of the row's branch:
+A variable can take its values from term maps of different shapes. The
+shapes can differ between the sides of a union or between term maps:
+
+- a template in one, and a column or another template in the other;
+- constants, IRIs and literals;
+- literals of different datatypes or language tags.
+
+The results rebuild each value from the term map of the branch that
+produced the row. There are two cases.
 
 - Terms of shapes that can never be the same get separate result
-  columns, and each branch fills its own: `http://example.org/customer/{id}`
-  and `http://example.org/wholesale/{code}` (different fixed text, or text
-  that IRI-safe encoding always escapes in the other's values), an IRI and
-  a literal, two different constants, or two language tags. Removing
-  duplicates on the columns stays exact.
-- Shapes that can give the same term and whose duplicates are compared,
-  in one arm or under `SELECT DISTINCT`, share one result column with the
-  term's string, computed in SQL as for joins (the IRI-safe template, the
-  IRI resolved against the base IRI, the natural lexical form), so the
-  same triple from a template and from an IRI column counts once. Such a
-  column cannot use an index and computes the string for every row. It is
-  rejected as unsupported where SQL cannot compute the lexical form (as
-  for joins), and for literals where one of the shapes is a column of
-  natural datatype, whose datatype depends on the SQL type.
+  columns. Each branch fills its own columns. Removing duplicates on
+  these columns stays exact. Such shapes are:
+  - two templates such as `http://example.org/customer/{id}` and
+    `http://example.org/wholesale/{code}`, where the fixed text differs,
+    or where one has text that IRI-safe encoding always escapes in the
+    values of the other;
+  - an IRI and a literal;
+  - two different constants;
+  - two language tags.
+- Shapes that can give the same term share one result column when their
+  duplicates are compared, in one arm or under `SELECT DISTINCT`. The
+  column holds the string of the term. SQL computes it as for joins (the
+  IRI-safe template, the IRI resolved against the base IRI, the natural
+  lexical form). As a result, the same triple from a template and from an
+  IRI column counts once. Such a column cannot use an index, and the
+  string is computed for every row. This case is rejected as unsupported
+  in two situations:
+  - where SQL cannot compute the lexical form, as for joins;
+  - for literals where one of the shapes is a column of natural datatype,
+    whose datatype depends on the SQL type.
 
 ## FILTER
 
-`FILTER` follows SPARQL's evaluation rules, errors included. An error is
-neither true nor false: `error || true` is true, `error && false` is
-false, and `!error` is still an error. The SQL uses `NULL` for an error,
-which SQL's `AND`, `OR` and `NOT` treat the same way, and `WHERE` keeps a
-row only where the filter is true. A comparison that SPARQL makes an
-error is `NULL` in the SQL, never `false`, so `FILTER(!(?x = 5))` drops
-the rows where `?x` is unbound or a string.
+`FILTER` follows the evaluation rules of SPARQL, including errors. An
+error is neither true nor false. `error || true` is true,
+`error && false` is false, and `!error` is still an error.
+
+The SQL uses `NULL` for an error. SQL's `AND`, `OR` and `NOT` treat
+`NULL` the same way. `WHERE` keeps a row only where the filter is true.
+A comparison that SPARQL makes an error is `NULL` in the SQL, never
+`false`. As a result, `FILTER(!(?x = 5))` drops the rows where `?x` is
+unbound or a string.
 
 Where a filter applies:
 
 - A `FILTER` in a group applies to the whole group, wherever it is
-  written, and sees only the group's variables: in `{ ?s ex:name ?n {
-  ?s ex:qty ?q FILTER(?n = "x") } }` the filter is an error, since `?n`
-  is not bound inside the nested group.
-- A `FILTER` inside `OPTIONAL` goes into the `ON` clause of the part's
-  `LEFT JOIN`: it decides whether the part matches, never which rows of
-  the left side are kept, and it sees the left side's variables. Where
-  it is an error the part does not match, as SQL's `LEFT JOIN` does. A
-  `FILTER` after the `OPTIONAL` is in `WHERE` and drops rows.
-- An unbound variable is an error for every function except `BOUND`. A
-  variable that only `OPTIONAL` parts bind is read from the part that
+  written in the group. It sees only the variables of that group. For
+  example, in
+  `{ ?s ex:name ?n { ?s ex:qty ?q FILTER(?n = "x") } }` the filter is an
+  error, because `?n` is not bound inside the nested group.
+- A `FILTER` inside `OPTIONAL` goes into the `ON` clause of the
+  `LEFT JOIN` of the part. It decides whether the part matches. It never
+  decides which rows of the left side are kept. It sees the variables of
+  the left side. Where it is an error, the part does not match, as with
+  SQL's `LEFT JOIN`.
+- A `FILTER` after the `OPTIONAL` is in `WHERE` and drops rows.
+- An unbound variable is an error for every function except `BOUND`.
+- A variable that only `OPTIONAL` parts bind is read from the part that
   matched (`CASE WHEN part matched THEN ... END`).
 
-Comparisons follow the SPARQL operator mapping:
+Comparisons follow the SPARQL operator mapping.
 
 | Operands | `=`, `!=`, `<`, `<=`, `>`, `>=` |
 |---|---|
-| Numbers (`xsd:integer`, `xsd:decimal`, `xsd:double`) | By value, with XPath type promotion: `7.0` equals the integer 7, `-0` equals `0`, and NaN equals nothing. |
+| Numbers (`xsd:integer`, `xsd:decimal`, `xsd:double`) | By value, with XPath type promotion. `7.0` equals the integer 7, `-0` equals `0`, and NaN equals nothing. |
 | Strings (simple literals, `xsd:string`) | By code point (`COLLATE "C"`, which needs a UTF-8 database). |
 | `xsd:boolean` | `false` < `true`. |
-| `xsd:dateTime` | By instant when both have a time zone or neither has one; comparing one with a time zone and one without depends on an implicit time zone and is rejected. |
-| IRIs, blank nodes, and literals of other types | `=` and `!=` only, as RDF terms (RDFterm-equal); `<` and the others are an error. Two different literals are an error. |
+| `xsd:dateTime` | By instant when both values have a time zone or neither has one. Comparing a value with a time zone and a value without one depends on an implicit time zone, and is rejected. |
+| IRIs, blank nodes, and literals of other types | `=` and `!=` only, as RDF terms (RDFterm-equal). `<` and the other operators are an error. Two different literals are an error. |
 
-A constant compared with a column is converted to the column's type
-where that gives the same answer (`?qty > 5` is `qty > $1::int8`, `?qty =
-7.0` is `qty = $1::int8`), so an index on the column can be used.
-Otherwise the column is cast to the type XPath promotes to (`?qty < 5.5`
-casts the integer column to `numeric`, `?qty < 5.5e0` to `float8`), which
-no index on the column serves.
+A constant compared with a column is converted to the type of the column
+where that gives the same answer. An index on the column can then be
+used. For example, `?qty > 5` is `qty > $1::int8`, and `?qty = 7.0` is
+`qty = $1::int8`.
+
+Otherwise the column is cast to the type that XPath promotes to, and no
+index on the column serves the comparison. For example, `?qty < 5.5`
+casts the integer column to `numeric`, and `?qty < 5.5e0` casts it to
+`float8`.
 
 `sameTerm`, `BOUND`, `isIRI`, `isBlank`, `isLiteral`, `STR`, `LANG` and
-`DATATYPE` are supported, and a term where a boolean is expected stands
-for its effective boolean value (an empty string and zero are false).
+`DATATYPE` are supported. A term where a boolean is expected stands for
+its effective boolean value. An empty string and zero are false.
+
 `STR` and `DATATYPE` of a column work where its lexical form or natural
-datatype is known in SQL, as for joins; `date` and `timestamp` infinities
-are plain literals, so their `DATATYPE` is `xsd:string`.
+datatype is known in SQL, as for joins. The infinities of `date` and
+`timestamp` are plain literals, so their `DATATYPE` is `xsd:string`.
 
 `REGEX` translates the XPath regular expression into a PostgreSQL pattern
-with the same matches, applied with `~` under `COLLATE "C"`:
+with the same matches. The pattern is applied with `~` under
+`COLLATE "C"`.
 
 | XPath | PostgreSQL pattern |
 |---|---|
-| `.` (without `s`) | any character but newline and carriage return, `[^\u000A\u000D]` |
-| `^`, `$` | the start and end of the string, as PostgreSQL's defaults |
-| `^`, `$` with `m` | at line boundaries, but not after a final newline (XPath 3.1), with lookaround |
-| `i` | each character expanded to its case variants (`lower-case` or `upper-case` equal), so `i` also matches `ı` and `k` the Kelvin sign, whatever the database locale |
-| `\s` | exactly space, tab, newline, carriage return |
-| `x` | whitespace outside character classes removed |
-| other characters | written as `\uXXXX` escapes unless ASCII letters or digits |
+| `.` (without `s`) | Any character except newline and carriage return, `[^\u000A\u000D]`. |
+| `^`, `$` | The start and end of the string, which are PostgreSQL's defaults. |
+| `^`, `$` with `m` | Line boundaries, but not after a final newline (XPath 3.1), using lookaround. |
+| `i` | Each character is expanded to its case variants (characters with equal `lower-case` or `upper-case`). `i` therefore also matches `ı`, and `k` also matches the Kelvin sign, whatever the database locale. |
+| `\s` | Exactly space, tab, newline and carriage return. |
+| `x` | Whitespace outside character classes is removed. |
+| other characters | Written as `\uXXXX` escapes unless they are ASCII letters or digits. |
 
-Rejected as unsupported: `\d`, `\w`, `\i`, `\c`, `\p{..}` and their
-complements (Unicode classes that PostgreSQL only has through the locale),
-back-references, character class subtraction, counts above 255, `\S`
-inside a class, the `q` flag, and patterns or flags that are not
-constants. An invalid pattern or flag is an error, as in XPath.
+The following are rejected as unsupported:
 
-Rejected as unsupported rather than answered differently from engines
-that extend SPARQL:
+- `\d`, `\w`, `\i`, `\c`, `\p{..}` and their complements, which are
+  Unicode classes that PostgreSQL only has through the locale;
+- back-references;
+- character class subtraction;
+- counts above 255;
+- `\S` inside a class;
+- the `q` flag;
+- patterns or flags that are not constants.
 
-- ordering or comparing two literals of the same datatype outside the
-  table, such as `xsd:date`, and two language-tagged literals except with
-  `=` outside a negation;
-- comparisons over `real` columns, values of a column whose `rr:datatype`
-  is a numeric, boolean or dateTime datatype other than the column's
-  natural one, `xsd:float` and the derived integer types, and dateTime
-  constants outside the years 1 to 9999 or finer than a microsecond;
+An invalid pattern or flag is an error, as in XPath.
+
+The following are rejected as unsupported, rather than answered
+differently from engines that extend SPARQL:
+
+- ordering or comparing two literals of the same datatype when that
+  datatype is not in the table above, such as `xsd:date`;
+- ordering or comparing two language-tagged literals, except with `=`
+  outside a negation;
+- comparisons over any of the following:
+  - `real` columns;
+  - values of a column whose `rr:datatype` is a numeric, boolean or
+    dateTime datatype other than the natural datatype of the column;
+  - `xsd:float` and the derived integer types;
+  - dateTime constants outside the years 1 to 9999, or finer than a
+    microsecond;
 - other functions, arithmetic, `IN`, `EXISTS`, and expressions other
   than terms (variables, constants, and `STR`, `LANG` or `DATATYPE` of
   them) as operands;
@@ -597,58 +759,72 @@ that extend SPARQL:
 
 ## ORDER BY, LIMIT and OFFSET
 
-The solution modifiers apply in the algebra's order: `ORDER BY`, then
-projection, `DISTINCT`, `OFFSET` and `LIMIT` (SPARQL 1.1 §18.2.5), all in
-the SQL.
+The solution modifiers apply in the order that the algebra defines
+(SPARQL 1.1 §18.2.5). The order is `ORDER BY`, then projection,
+`DISTINCT`, `OFFSET` and `LIMIT`. All of them are applied in the SQL.
 
-`ORDER BY` takes variables and the expressions `FILTER` supports, each
-`ASC` (the default) or `DESC`. Solutions are in SPARQL's order (§15.1):
+`ORDER BY` takes variables and the expressions that `FILTER` supports.
+Each of these comparators is `ASC` (the default) or `DESC`. Solutions
+are sorted in SPARQL's order (§15.1), from first to last:
 
 1. no value (an unbound variable, or an expression that is an error)
 2. blank nodes
 3. IRIs, by code point
-4. literals: where the `<` operator orders two of them, by `<`, as in
-   `FILTER`: numbers by value with XPath type promotion, strings by code
-   point, `false` before `true`, dateTimes by instant.
+4. literals. Where the `<` operator orders two literals, they are sorted
+   by `<`, as in `FILTER`. Numbers sort by value with XPath type
+   promotion, strings by code point, `false` before `true`, and
+   dateTimes by instant.
 
 Where SPARQL leaves the order open, the engine uses a fixed order of its
-own, decided in Discussion #63:
+own. This order was decided in Discussion #63.
 
-- literals of different kinds: numbers, booleans, dateTimes, strings,
-  language-tagged literals, then other datatypes;
-- language-tagged literals by lexical form, then language tag; other
-  datatypes by datatype IRI, then by value for `date` and `time` columns,
-  by lexical form otherwise;
-- NaN after every number, and `numeric` NaN and infinities where
-  PostgreSQL puts them; equal numbers of different datatypes (`1` and
-  `1.0`) in no particular order;
-- the infinite values of `date` and `timestamp` columns are plain
+- Literals of different kinds sort in this order: numbers, booleans,
+  dateTimes, strings, language-tagged literals, then other datatypes.
+- Language-tagged literals sort by lexical form, then by language tag.
+- Literals of other datatypes sort by datatype IRI. After that they sort
+  by value for `date` and `time` columns, and by lexical form otherwise.
+- NaN sorts after every number. `numeric` NaN and infinities sort where
+  PostgreSQL puts them. Equal numbers of different datatypes (`1` and
+  `1.0`) are in no particular order.
+- The infinite values of `date` and `timestamp` columns are plain
   literals (`"infinity"`) and sort among the strings.
 
-`DESC` reverses all of it, so unbound values come last. Each comparator
-becomes a few SQL sort keys (the kind of term, then a value per kind), so
-values of different SQL types and of different `UNION` branches sort
-together. When one plain `SELECT` reads a comparator's column and nothing
-else can be in it (a required numeric, boolean or dateTime column), the SQL
-sorts by the column itself and an index on it delivers the rows in order;
-strings and IRIs sort under `COLLATE "C"`, which an index of another
-collation does not serve. The sort keys are selected as extra columns,
-never part of the results, and every query the engine wraps around
-another (the row count, the cast of columns to text) sorts again by them,
-since SQL keeps no order through a subquery: the outermost query decides
-the order the rows arrive in. `v12n explain` has no column types and shows
-every column sorted as a string.
+`DESC` reverses all of this order, so unbound values come last.
+
+Each comparator becomes a few SQL sort keys (the kind of term, then a
+value per kind). With these keys, values of different SQL types and of
+different `UNION` branches sort together.
+
+The SQL sorts by the column itself when one plain `SELECT` reads the
+column of a comparator and nothing else can be in that column (a
+required numeric, boolean or dateTime column). An index on the column
+then delivers the rows in order. Strings and IRIs sort under
+`COLLATE "C"`, which an index of another collation does not serve.
+
+The sort keys are selected as extra columns and are never part of the
+results. SQL keeps no order through a subquery, so the outermost query
+decides the order in which the rows arrive. Every query that the engine
+wraps around another (the row count, the cast of columns to text)
+therefore sorts again by the sort keys.
+
+`v12n explain` has no column types. It shows every column sorted as a
+string.
 
 `LIMIT` and `OFFSET` are bound parameters of the SQL. A query `LIMIT` at
 or below the row limit leaves at most that many solutions, so the result
-is never reported as truncated; above it the row limit still applies.
+is never reported as truncated. When the query `LIMIT` is above the row
+limit, the row limit still applies.
 
-Rejected as unsupported: `ORDER BY` over a variable that `SELECT DISTINCT`
-does not project (a projected solution may stand for several that it
-puts at different places); comparators over values with and without a
-time zone, over `real` columns, or over strings in a database whose
-encoding is not UTF-8; and, as in `FILTER`, other functions, arithmetic
-and string forms SQL cannot compute.
+The following are rejected as unsupported:
+
+- `ORDER BY` over a variable that `SELECT DISTINCT` does not project. A
+  projected solution may stand for several solutions that the
+  `ORDER BY` puts at different places.
+- comparators over values with and without a time zone;
+- comparators over `real` columns;
+- comparators over strings in a database whose encoding is not UTF-8;
+- as in `FILTER`, other functions, arithmetic and string forms that SQL
+  cannot compute.
 
 ## Roadmap
 
