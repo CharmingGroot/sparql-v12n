@@ -2,10 +2,13 @@
 
 All notable changes are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions
-will follow [Semantic Versioning](https://semver.org/) once released.
+follow [Semantic Versioning](https://semver.org/). Before 1.0, any release
+may change behavior; such changes are marked **Breaking**.
 Design decisions are recorded in the `Decision:` Discussions.
 
 ## [Unreleased]
+
+## [0.0.1] - 2026-10-28
 
 First public version: a SPARQL-to-SQL virtualization engine over R2RML
 mappings and PostgreSQL. See the README for the supported subset.
@@ -27,3 +30,9 @@ mappings and PostgreSQL. See the README for the supported subset.
   timeout, a row limit, a query size limit and a limit on concurrent
   requests, on by default.
 - Differential tests against Ontop and the W3C R2RML test cases.
+- Release binaries for Linux (x86_64 and aarch64), macOS (Apple silicon)
+  and Windows (x86_64), with SHA-256 checksums and build provenance
+  attestations; `v12n --version` names the commit of the build.
+
+[Unreleased]: https://github.com/CharmingGroot/sparql-v12n/compare/v0.0.1...HEAD
+[0.0.1]: https://github.com/CharmingGroot/sparql-v12n/releases/tag/v0.0.1
