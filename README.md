@@ -317,6 +317,7 @@ For comparison, Ontop 5.5.0 puts `http://example.com/base/`, the base IRI
 of the W3C test cases, in front of every template that does not start with
 an absolute IRI. Ontop has no setting to change this base. It also fails
 on relative IRIs from columns.
+
 ## Lexical forms of column values
 
 The engine writes every non-string value in its canonical form. The
@@ -535,6 +536,7 @@ output of its columns. Equal terms can therefore still count twice:
 - columns whose types combine, such as `varchar` and `text`;
 - values of one type whose text output differs, such as `numeric` 1.0 and
   1.00.
+
 ## OPTIONAL
 
 `OPTIONAL` follows the LeftJoin of the SPARQL algebra. Every solution of
