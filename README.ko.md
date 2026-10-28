@@ -2,7 +2,7 @@
 
 [English](README.md) | 한국어 | [简体中文](README.zh-CN.md)
 
-> 이 문서는 [README.md](README.md)(커밋 ffa5953)의 번역이다. 내용이 다르면 영어 원문을 따른다.
+> 이 문서는 [README.md](README.md)(커밋 7c1986f)의 번역이다. 내용이 다르면 영어 원문을 따른다.
 
 <p align="center"><b>Rust로 작성한 가상 지식 그래프 엔진이다. R2RML 매핑으로 SPARQL 질의를 SQL로 번역하고, 데이터를 복사하지 않고 원본 데이터베이스에서 실행한다.</b></p>
 
@@ -47,6 +47,59 @@ cargo install --locked --git https://github.com/CharmingGroot/sparql-v12n v12n-c
 ```
 
 `v12n --version`은 버전과 빌드한 커밋을 출력한다.
+
+## 빠른 시작
+
+`examples/shop`의 예제를 Docker로 띄운 로컬 PostgreSQL에서 실행한다. Compose v2가
+있는 Docker와 `v12n` 실행 파일([설치](#설치) 참고)이 필요하고, 이 저장소를 clone한
+디렉터리의 최상위에서 실행한다. 소스에서 빌드했다면 `v12n` 대신
+`./target/release/v12n`을 쓴다.
+
+```sh
+git clone https://github.com/CharmingGroot/sparql-v12n.git
+cd sparql-v12n
+```
+
+1. 예제 스키마와 데이터가 들어 있는 PostgreSQL을 시작한다. `testenv`의 `postgres`
+   서비스만 시작되고, 로컬 개발용 자격 증명으로 `127.0.0.1:55432`에서 접속을 받는다.
+
+   ```sh
+   docker compose -f testenv/docker-compose.yml up -d --wait postgres
+   ```
+
+2. 매핑을 검사한다.
+
+   ```sh
+   v12n check examples/shop/mapping.ttl --format table
+   ```
+
+   ```text
+   ok: 2 triples maps, 2 classes, 4 properties
+   ```
+
+3. VIP 고객이 낸 주문을 조회하는 쿼리를 실행한다.
+
+   ```sh
+   v12n query examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq \
+     --db postgresql://v12n:v12n-dev@127.0.0.1:55432/shop --format table
+   ```
+
+   ```text
+   ?order                           ?amount
+   <http://example.org/order/1001>  "120000"^^<http://www.w3.org/2001/XMLSchema#integer>
+   <http://example.org/order/1003>  "87000"^^<http://www.w3.org/2001/XMLSchema#integer>
+   <http://example.org/order/1004>  "15000"^^<http://www.w3.org/2001/XMLSchema#integer>
+   ```
+
+4. 데이터베이스를 멈추고 컨테이너와 네트워크를 지운다.
+
+   ```sh
+   docker compose -f testenv/docker-compose.yml down -v
+   ```
+
+같은 매핑과 쿼리로 `v12n explain`을 실행하면 DB 없이 생성된 SQL을 볼 수 있다.
+테스트 환경은 [testenv/README.md](testenv/README.md)에 있다. 차등 테스트가 쓰는
+Ontop 엔드포인트도 여기서 설명하며, 이 예제에는 필요하지 않다.
 
 ## 지원하는 SPARQL
 
