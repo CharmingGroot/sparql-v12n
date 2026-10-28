@@ -2,7 +2,7 @@
 
 English | [한국어](README.ko.md) | [简体中文](README.zh-CN.md)
 
-<p align="center"><b>Query PostgreSQL with SPARQL through an R2RML mapping, without copying the data.</b></p>
+<p align="center"><b>A virtual knowledge graph engine written in Rust. It translates SPARQL queries into SQL through R2RML mappings and runs them on the source database, without copying the data.</b></p>
 
 <p align="center">
   <picture>
@@ -11,14 +11,16 @@ English | [한국어](README.ko.md) | [简体中文](README.zh-CN.md)
   </picture>
 </p>
 
-- sparql-v12n translates each SPARQL query into one SQL query and runs it on
-  PostgreSQL. The data stays in PostgreSQL.
+- Each SPARQL query becomes one SQL query, which runs on the database that
+  holds the data. The data is not copied.
+- PostgreSQL is supported today. Other databases are on the
+  [roadmap](#roadmap).
 - The R2RML mapping decides which tables and columns become which classes and
   properties. Data outside the mapping cannot be queried.
 - There is no ontology reasoning yet. A query for a class finds only what the
   mapping states for that class. See the [roadmap](#roadmap).
-- sparql-v12n is written in Rust. One binary, `v12n`, provides both a command
-  line tool and a SPARQL 1.1 Protocol HTTP endpoint.
+- One binary, `v12n`, provides both a command line tool and a SPARQL 1.1
+  Protocol HTTP endpoint.
 
 > Status: experimental. The supported subset below is tested against Ontop and
 > the W3C R2RML test cases. Commands, output and APIs may change before 1.0.
