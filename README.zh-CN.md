@@ -2,7 +2,7 @@
 
 [English](README.md) | [한국어](README.ko.md) | 简体中文
 
-> 本文是 [README.md](README.md)（提交 d9e31c5）的翻译。如有出入，以英文原文为准。
+> 本文是 [README.md](README.md)（提交 7c1986f）的翻译。如有出入，以英文原文为准。
 
 <p align="center"><b>用 Rust 编写的虚拟知识图谱引擎。它通过 R2RML 映射将 SPARQL 查询翻译为 SQL，并在源数据库上执行，无需复制数据。</b></p>
 
