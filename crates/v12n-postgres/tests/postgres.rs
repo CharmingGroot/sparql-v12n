@@ -234,6 +234,40 @@ fn sql_query_mapping(sql: &str, columns: &[&str]) -> String {
     )
 }
 
+/// Arithmetic in FILTER (#99): computed in `numeric`, so `int8` cannot
+/// overflow; a division by zero and a `numeric` NaN are errors, which drop
+/// the row under `!` too.
+#[tokio::test]
+async fn filter_arithmetic_follows_xpath_numbers() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        "SELECT * FROM (VALUES \
+           (1, 7::int4, 2::int8, 1.5::numeric), \
+           (2, -3::int4, 0::int8, 'NaN'::numeric), \
+           (3, 4::int4, 9223372036854775807::int8, 2.25::numeric)) v(id, a, b, d)",
+        &["a", "b", "d"],
+    );
+    let rows = |filter: &'static str| {
+        let (url, mapping) = (url.clone(), mapping.clone());
+        async move { filtered_rows(&url, &mapping, "?row ex:a ?a ; ex:b ?b ; ex:d ?d", filter).await }
+    };
+    // 7 / 2 is the decimal 3.5, not the integer 3.
+    assert_eq!(rows("?a / ?b = 3.5").await, ["1"]);
+    // Row 2 divides by zero: an error, so neither the filter nor its
+    // negation keeps it.
+    assert_eq!(rows("?a / ?b > 0").await, ["1", "3"]);
+    assert_eq!(rows("!(?a / ?b > 0)").await, Vec::<String>::new());
+    // int8's largest value plus one does not overflow.
+    assert_eq!(rows("?b + 1 > 9223372036854775807").await, ["3"]);
+    assert_eq!(rows("?b * ?b > 0").await, ["1", "3"]);
+    // A numeric NaN is not an xsd:decimal: an error.
+    assert_eq!(rows("?d * 2 > 0").await, ["1", "3"]);
+    assert_eq!(rows("!(?d * 2 > 0)").await, Vec::<String>::new());
+    assert_eq!(rows("?d - ?a = -5.5").await, ["1"]);
+    // Effective boolean value: true unless zero.
+    assert_eq!(rows("?a + ?b - 9").await, ["2", "3"]);
+}
+
 #[tokio::test]
 async fn natural_mapping_covers_postgres_types() {
     let Some(url) = database_url() else { return };

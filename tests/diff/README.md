@@ -83,6 +83,7 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0006-filter/regex-digit-class` | `\d` is every Unicode decimal digit in XPath, which PostgreSQL has only through the database locale (Discussion #57). |
 | `0007-union/shapes-natural-and-template-literal` | A variable from a column of natural datatype and a literal template: removing duplicates would compare their datatypes, which depend on the column's SQL type (Discussion #60). |
 | `0011-time/time-filter-equal` | `=` on `xsd:time`: no row of the operator mapping (SPARQL 1.1 §17.3), so a type error, which engines that extend SPARQL compare as values (Discussion #57). |
+| `0012-arithmetic/double-rejected` | Arithmetic on `xsd:double` values: SQL's NaN and infinities differ from XPath's, and the first step of value expressions leaves them out (#99, Discussion #144). |
 | `0008-order/distinct-over-hidden` | `ORDER BY` over a variable that `SELECT DISTINCT` does not project: one solution stands for several that the order puts at different places (Discussion #63). |
 | `w3c/R2RMLTC0012e/type-ious` | A self-join on blank nodes from a template over a `float8` column: no SQL computes the canonical `xsd:double` form (Discussion #35). Removing self-joins on keys (#28, V6) would make the comparison unnecessary. |
 
@@ -93,6 +94,7 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0002-constants/prices`, `price-constant`, `price-integral-constant` | #25 | Ontop keeps the scale of `numeric` values (`12.50`); v12n writes XSD 1.1 canonical forms (`12.5`), as decided in Discussion #35. |
 | `w3c/R2RMLTC0005a/owes`, `R2RMLTC0005b/amount`, `R2RMLTC0005b/type-ious`, `R2RMLTC0012a/amount`, `R2RMLTC0012e/amount`, `0009-literals/double-canonical` | #25 | Ontop writes an `xsd:double` as PostgreSQL's text output (`30`) and matches constants against it; v12n writes and matches the canonical form (`3.0E1`). |
 | `0011-time/time-results`, `time-constant-midnight`, `time-constant-24`, `time-join`, `time-distinct`, `time-key-subject`, `time-order` | #37 | Ontop writes a `time` of `24:00:00` as is and treats it as another term than `00:00:00`; v12n writes the canonical form `00:00:00` for both and treats them as one term, as decided in Discussion #91. |
+| `0012-arithmetic/big-no-overflow` (Ontop error) | #99 | Ontop adds `bigint` values as `bigint` and fails with "bigint out of range"; `xsd:integer` has no bound, and v12n computes in `numeric`. |
 | `0002-constants/uuid-uppercase` | #26 | Ontop matches a `uuid` constant by value; the terms differ in case. |
 | `0006-filter/string-order-code-points`, `0008-order/string-accent`, `0008-order/string-hangul` | #26 | Ontop orders strings by the database collation; SPARQL orders them by code point. |
 | `0002-constants/date-non-canonical`, `date-invalid` (Ontop error) | #26 | Ontop refuses ill-typed `xsd:date` constants, which match nothing. |

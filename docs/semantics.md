@@ -452,6 +452,15 @@ Comparisons follow the SPARQL operator mapping.
 | `xsd:dateTime` | By instant when both values have a time zone or neither has one. Comparing a value with a time zone and a value without one depends on an implicit time zone, and is rejected. |
 | IRIs, blank nodes, and literals of other types | `=` and `!=` only, as RDF terms (RDFterm-equal). `<` and the other operators are an error. Two different literals are an error. |
 
+Arithmetic (`+`, `-`, `*`, `/` and unary minus) is supported on
+integers and decimals. The result follows XPath's type promotion: an
+integer divided by an integer is a decimal (`7 / 2` is `3.5`). SQL
+computes it in `numeric`, so a sum of large integers does not overflow
+`int8`. A division by zero, a `numeric` NaN or infinity, and an operand
+that is not a number are errors. Arithmetic on `xsd:double` values, and
+`STR`, `LANG`, `DATATYPE` or `sameTerm` of an arithmetic result, are
+rejected as unsupported for now (Discussion #144).
+
 A constant compared with a column is converted to the type of the column
 where that gives the same answer. An index on the column can then be
 used. For example, `?qty > 5` is `qty > $1::int8`, and `?qty = 7.0` is
@@ -511,8 +520,8 @@ differently from engines that extend SPARQL:
   - `xsd:float` and the derived integer types;
   - dateTime constants outside the years 1 to 9999, or finer than a
     microsecond;
-- other functions, arithmetic, `IN`, `EXISTS`, and expressions other
-  than terms (variables, constants, and `STR`, `LANG` or `DATATYPE` of
+- other functions, arithmetic on `xsd:double`, `IN`, `EXISTS`, and
+  expressions other than terms and arithmetic (variables, constants, and `STR`, `LANG` or `DATATYPE` of
   them) as operands;
 - string ordering and `REGEX` in a database whose encoding is not UTF-8.
 

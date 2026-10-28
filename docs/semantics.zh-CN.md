@@ -2,7 +2,7 @@
 
 [English](semantics.md) | [한국어](semantics.ko.md) | 简体中文
 
-> 本文是 [semantics.md](semantics.md)（提交 ffa5953）的翻译。如有出入，以英文原文为准。
+> 本文是 [semantics.md](semantics.md)（提交 f98a763）的翻译。如有出入，以英文原文为准。
 
 本文介绍 sparql-v12n 如何将 SPARQL 查询翻译为 SQL，以及决定答案的规则：列名、IRI、字面量、常量、连接、去重、`OPTIONAL`、`UNION`、`FILTER` 与排序。总体介绍与支持功能表见 [README](../README.zh-CN.md)。
 
@@ -240,6 +240,8 @@ SQL 以 `NULL` 表示错误。SQL 的 `AND`、`OR` 与 `NOT` 对 `NULL` 的处�
 | `xsd:dateTime` | 两个值都带时区或都不带时区时按时刻比较。带时区的值与不带时区的值之间的比较依赖隐式时区，因此被拒绝。 |
 | IRI、空白节点以及其他类型的字面量 | 仅支持 `=` 与 `!=`，作为 RDF term 比较（RDFterm-equal）。`<` 及其他运算符为错误。两个不同字面量之间的比较为错误。 |
 
+支持整数与 decimal 的算术（`+`、`-`、`*`、`/` 与一元负号）。结果类型遵循 XPath 的类型提升：整数除以整数得到 decimal（`7 / 2` 为 `3.5`）。SQL 以 `numeric` 计算，因此大整数之和不会使 `int8` 溢出。除以零、`numeric` 的 NaN 与无穷大，以及不是数字的操作数都是错误。`xsd:double` 值的算术，以及对算术结果使用 `STR`、`LANG`、`DATATYPE` 或 `sameTerm`，目前作为不支持的功能被拒绝（Discussion #144）。
+
 与列比较的常量，在能给出相同结果的情况下转换为列的类型。此时可以使用该列上的索引。例如，`?qty > 5` 即 `qty > $1::int8`，`?qty = 7.0` 即 `qty = $1::int8`。
 
 否则，将列转换为 XPath 类型提升后的类型，该列上的索引无法用于此比较。例如，`?qty < 5.5` 将整数列转换为 `numeric`，`?qty < 5.5e0` 将其转换为 `float8`。
@@ -281,7 +283,7 @@ SQL 以 `NULL` 表示错误。SQL 的 `AND`、`OR` 与 `NOT` 对 `NULL` 的处�
   - `rr:datatype` 为该列自然数据类型以外的数值、布尔或 dateTime 数据类型的列的值；
   - `xsd:float` 与派生整数类型；
   - 超出公元 1 至 9999 年范围或精度细于微秒的 dateTime 常量；
-- 其他函数、算术、`IN`、`EXISTS`，以及以 term（变量、常量，以及它们的 `STR`、`LANG` 或 `DATATYPE`）以外的表达式作为操作数；
+- 其他函数、`xsd:double` 的算术、`IN`、`EXISTS`，以及以 term（变量、常量，以及它们的 `STR`、`LANG` 或 `DATATYPE`）和算术以外的表达式作为操作数；
 - 在编码不是 UTF-8 的数据库中进行字符串排序和 `REGEX`。
 
 ## ORDER BY、LIMIT 与 OFFSET

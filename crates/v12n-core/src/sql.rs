@@ -9,7 +9,7 @@ use oxrdf::Term;
 use crate::Error;
 use crate::mapping::template::UCSCHAR;
 use crate::mapping::{BaseIri, LogicalTable, SCHEME_REGEX, TemplatePart, TermType};
-use crate::sparql::{CompareOp, TermTest};
+use crate::sparql::{ArithOp, CompareOp, TermTest};
 
 mod filter;
 mod order;
@@ -307,23 +307,38 @@ pub enum FilterValue {
     Lang(Box<FilterValue>),
     /// `DATATYPE`: a literal's datatype IRI (SPARQL 1.1 §17.4.2.7).
     Datatype(Box<FilterValue>),
+    /// `+`, `-`, `*` or `/` of two numbers (SPARQL 1.1 §17.3), an error
+    /// for anything else.
+    Arith(ArithOp, Box<FilterValue>, Box<FilterValue>),
+    /// The negation of a number (op:numeric-unary-minus).
+    Negate(Box<FilterValue>),
 }
 
 impl FilterValue {
-    /// The term map's term the value is built from, if any.
-    fn term(&self) -> Option<&FilterTerm> {
+    /// The term maps' terms the value is built from.
+    fn terms(&self) -> Vec<&FilterTerm> {
         match self {
-            Self::Term(t) => Some(t),
-            Self::Constant(_) => None,
-            Self::Str(v) | Self::Lang(v) | Self::Datatype(v) => v.term(),
+            Self::Term(t) => vec![t],
+            Self::Constant(_) => Vec::new(),
+            Self::Str(v) | Self::Lang(v) | Self::Datatype(v) | Self::Negate(v) => v.terms(),
+            Self::Arith(_, a, b) => {
+                let mut terms = a.terms();
+                terms.extend(b.terms());
+                terms
+            }
         }
     }
 
-    fn term_mut(&mut self) -> Option<&mut FilterTerm> {
+    fn terms_mut(&mut self) -> Vec<&mut FilterTerm> {
         match self {
-            Self::Term(t) => Some(t),
-            Self::Constant(_) => None,
-            Self::Str(v) | Self::Lang(v) | Self::Datatype(v) => v.term_mut(),
+            Self::Term(t) => vec![t],
+            Self::Constant(_) => Vec::new(),
+            Self::Str(v) | Self::Lang(v) | Self::Datatype(v) | Self::Negate(v) => v.terms_mut(),
+            Self::Arith(_, a, b) => {
+                let mut terms = a.terms_mut();
+                terms.extend(b.terms_mut());
+                terms
+            }
         }
     }
 }
@@ -365,7 +380,7 @@ impl Filter {
     /// map's term.
     fn visit<'f>(&'f self, f: &mut dyn FnMut(Part<'f>)) {
         fn value<'f>(v: &'f FilterValue, f: &mut dyn FnMut(Part<'f>)) {
-            if let Some(t) = v.term() {
+            for t in v.terms() {
                 f(Part::Term(&t.term));
             }
         }
@@ -406,7 +421,7 @@ impl Filter {
 
     fn visit_mut(&mut self, f: &mut dyn FnMut(PartMut<'_>)) {
         fn value(v: &mut FilterValue, f: &mut dyn FnMut(PartMut<'_>)) {
-            if let Some(t) = v.term_mut() {
+            for t in v.terms_mut() {
                 f(PartMut::Term(&mut t.term));
             }
         }
@@ -464,7 +479,7 @@ impl OrderValue {
             Self::Term(cases) => {
                 for (guards, value) in cases {
                     guards.iter().for_each(|c| f(Part::Condition(c)));
-                    if let Some(t) = value.term() {
+                    for t in value.terms() {
                         f(Part::Term(&t.term));
                     }
                 }
@@ -478,7 +493,7 @@ impl OrderValue {
             Self::Term(cases) => {
                 for (guards, value) in cases {
                     guards.iter_mut().for_each(|c| f(PartMut::Condition(c)));
-                    if let Some(t) = value.term_mut() {
+                    for t in value.terms_mut() {
                         f(PartMut::Term(&mut t.term));
                     }
                 }

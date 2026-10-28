@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A decimal times an integer is a decimal.
+SELECT ?r WHERE { ?r ex:a ?a ; ex:b ?b ; ex:d ?d ; ex:big ?big ; ex:name ?n FILTER(?d * 2 >= 4.5) }

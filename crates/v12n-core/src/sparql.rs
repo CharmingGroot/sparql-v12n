@@ -85,6 +85,12 @@ pub enum Expression {
     /// `REGEX(text, pattern, flags)` (SPARQL 1.1 §17.4.3.14), with the
     /// pattern and the flags constants.
     Regex(Box<Expression>, Term, Option<Term>),
+    /// `+`, `-`, `*` and `/` (SPARQL 1.1 §17.3, op:numeric-add and the
+    /// others).
+    Arith(ArithOp, Box<Expression>, Box<Expression>),
+    /// Unary minus of an expression that is not a numeric literal
+    /// (op:numeric-unary-minus).
+    Negate(Box<Expression>),
 }
 
 impl Expression {
@@ -99,7 +105,11 @@ impl Expression {
         match self {
             Self::Constant(_) => {}
             Self::Variable(v) | Self::Bound(v) => out.push(v),
-            Self::Or(a, b) | Self::And(a, b) | Self::Compare(_, a, b) | Self::SameTerm(a, b) => {
+            Self::Or(a, b)
+            | Self::And(a, b)
+            | Self::Compare(_, a, b)
+            | Self::SameTerm(a, b)
+            | Self::Arith(_, a, b) => {
                 a.collect_variables(out);
                 b.collect_variables(out);
             }
@@ -108,7 +118,8 @@ impl Expression {
             | Self::Str(a)
             | Self::Lang(a)
             | Self::Datatype(a)
-            | Self::Regex(a, _, _) => a.collect_variables(out),
+            | Self::Regex(a, _, _)
+            | Self::Negate(a) => a.collect_variables(out),
         }
     }
 
@@ -121,7 +132,30 @@ impl Expression {
                 | Self::Str(_)
                 | Self::Lang(_)
                 | Self::Datatype(_)
+                | Self::Arith(..)
+                | Self::Negate(_)
         )
+    }
+}
+
+/// The arithmetic operators of SPARQL 1.1 §17.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+impl ArithOp {
+    /// The SQL operator.
+    pub fn sql(self) -> &'static str {
+        match self {
+            Self::Add => "+",
+            Self::Subtract => "-",
+            Self::Multiply => "*",
+            Self::Divide => "/",
+        }
     }
 }
 
@@ -523,14 +557,41 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
             };
             Expression::Constant(Literal::new_typed_literal(lexical, datatype).into())
         }
+        // Expressions in ORDER BY come with #108.
         SparqlExpression::Add(..)
         | SparqlExpression::Subtract(..)
         | SparqlExpression::Multiply(..)
         | SparqlExpression::Divide(..)
         | SparqlExpression::UnaryPlus(_)
-        | SparqlExpression::UnaryMinus(_) => {
+        | SparqlExpression::UnaryMinus(_)
+            if matches!(site, Site::OrderBy) =>
+        {
             return Err(in_site("arithmetic"));
         }
+        SparqlExpression::Add(a, b) => Expression::Arith(ArithOp::Add, operand(a)?, operand(b)?),
+        SparqlExpression::Subtract(a, b) => {
+            Expression::Arith(ArithOp::Subtract, operand(a)?, operand(b)?)
+        }
+        SparqlExpression::Multiply(a, b) => {
+            Expression::Arith(ArithOp::Multiply, operand(a)?, operand(b)?)
+        }
+        SparqlExpression::Divide(a, b) => {
+            Expression::Arith(ArithOp::Divide, operand(a)?, operand(b)?)
+        }
+        SparqlExpression::UnaryMinus(a) => Expression::Negate(operand(a)?),
+        // op:numeric-unary-plus returns its operand, and is a type error
+        // for anything but a number, as adding zero is.
+        SparqlExpression::UnaryPlus(a) => Expression::Arith(
+            ArithOp::Add,
+            operand(a)?,
+            Box::new(Expression::Constant(
+                Literal::new_typed_literal(
+                    "0",
+                    NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer"),
+                )
+                .into(),
+            )),
+        ),
         SparqlExpression::If(..) => return Err(in_site("IF")),
         SparqlExpression::Coalesce(_) => return Err(in_site("COALESCE")),
     })
@@ -654,6 +715,33 @@ mod tests {
 
     fn var(name: &str) -> PatternTerm {
         PatternTerm::Variable(name.to_owned())
+    }
+
+    #[test]
+    fn parse_arithmetic_in_filter() {
+        let q = parse(
+            "SELECT * WHERE { ?c <http://example.org/age> ?a FILTER(-?a * 2 + +?a / 3 > 1) }",
+        )
+        .unwrap();
+        let Pattern::Filter(_, filter) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        let Expression::Compare(CompareOp::Greater, left, _) = filter else {
+            panic!("{filter:?}")
+        };
+        let Expression::Arith(ArithOp::Add, product, quotient) = left.as_ref() else {
+            panic!("{left:?}")
+        };
+        assert!(
+            matches!(product.as_ref(), Expression::Arith(ArithOp::Multiply, a, _)
+            if matches!(a.as_ref(), Expression::Negate(_)))
+        );
+        // Unary plus is adding zero.
+        assert!(
+            matches!(quotient.as_ref(), Expression::Arith(ArithOp::Divide, a, _)
+            if matches!(a.as_ref(), Expression::Arith(ArithOp::Add, ..)))
+        );
+        assert_eq!(filter.variables(), ["a", "a"]);
     }
 
     #[test]
@@ -946,10 +1034,6 @@ mod tests {
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(?t IN (1, 2)) }",
                 "IN",
-            ),
-            (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(?t + 1 > 2) }",
-                "arithmetic",
             ),
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(STRLEN(?t) > 2) }",

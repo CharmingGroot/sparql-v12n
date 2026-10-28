@@ -2,7 +2,7 @@
 
 [English](README.md) | 한국어 | [简体中文](README.zh-CN.md)
 
-> 이 문서는 [README.md](README.md)(커밋 7c1986f)의 번역이다. 내용이 다르면 영어 원문을 따른다.
+> 이 문서는 [README.md](README.md)(커밋 f98a763)의 번역이다. 내용이 다르면 영어 원문을 따른다.
 
 <p align="center"><b>Rust로 작성한 가상 지식 그래프 엔진이다. R2RML 매핑에 따라 SPARQL 쿼리를 SQL로 변환해 원본 데이터베이스에서 실행하며, 데이터를 복사하지 않는다.</b></p>
 
@@ -116,7 +116,7 @@ Ontop 엔드포인트도 여기서 설명하며, 이 예제에는 필요하지 �
 | `SELECT`, `SELECT *`, `DISTINCT` | 해(solution)에 대한 bag 의미론 | `REDUCED`, `SELECT` 안의 식, `BIND`, 하위 쿼리, `GROUP BY`와 집계 |
 | `OPTIONAL` | 중첩·연속 사용, 내부의 `FILTER`, 바인딩되지 않은 변수 | 여러 `OPTIONAL` 부분에서만 바인딩되는 변수에 대한 `SELECT DISTINCT`, 한쪽이 빈 `UNION`을 감싸는 `OPTIONAL` 안의 `FILTER` |
 | `UNION` | 양쪽의 bag 합집합(`OPTIONAL` 안에서도 지원). 한 변수에 형태가 다른 term map을 쓸 수 있다 | 같은 변수에서 자연 데이터타입 컬럼과 다른 리터럴 형태 사이의 중복 제거 |
-| `FILTER` | `=`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `\|\|`, `!`, `BOUND`, `sameTerm`, `isIRI`, `isBlank`, `isLiteral`, `STR`, `LANG`, `DATATYPE`, `REGEX`. SPARQL의 오류 의미론을 따른다 | 그 밖의 함수, 산술, `IN`, `EXISTS`. SPARQL 1.1이 확장에 맡긴 비교(`xsd:date`의 순서 비교, 언어 태그가 있는 리터럴에 대한 `!=`, 시간대가 있는 dateTime과 없는 dateTime의 비교). `real` 컬럼에 대한 비교. `\d`, `\w`, `\p{..}`, 역참조를 쓰는 `REGEX` |
+| `FILTER` | `=`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `\|\|`, `!`, `BOUND`, `sameTerm`, `isIRI`, `isBlank`, `isLiteral`, `STR`, `LANG`, `DATATYPE`, `REGEX`, 정수와 decimal의 `+`, `-`, `*`, `/`. SPARQL의 오류 의미론을 따른다 | 그 밖의 함수, `xsd:double`의 산술, `IN`, `EXISTS`. SPARQL 1.1이 확장에 맡긴 비교(`xsd:date`의 순서 비교, 언어 태그가 있는 리터럴에 대한 `!=`, 시간대가 있는 dateTime과 없는 dateTime의 비교). `real` 컬럼에 대한 비교. `\d`, `\w`, `\p{..}`, 역참조를 쓰는 `REGEX` |
 | `ORDER BY`, `LIMIT`, `OFFSET` | SPARQL 1.1의 순서. SPARQL이 정하지 않은 부분은 고정된 순서를 쓴다 | `SELECT DISTINCT`가 투영하지 않는 변수에 대한 `ORDER BY` |
 | 리터럴(literal) | RDF 1.1 term 동등성. 언어 태그는 소문자로, `xsd:string`은 simple literal로 다루고, 값은 XSD 1.1 정규 표기(canonical form)로 쓴다 | `FILTER`에서 `xsd:float`와 파생 정수 타입을 값으로 비교하는 것 |
 | 그 밖의 형식 | RDFS 추론 없음. `rdf:type`은 매핑에 명시된 클래스와만 일치한다 | `ASK`, `CONSTRUCT`, `DESCRIBE`, `MINUS`, `VALUES`, `SERVICE` |
