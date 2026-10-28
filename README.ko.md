@@ -2,23 +2,36 @@
 
 [English](README.md) | 한국어 | [简体中文](README.zh-CN.md)
 
-> 이 문서는 [README.md](README.md)(커밋 102a38b)의 번역이다. 내용이 다르면 영어 원문을 따른다.
+> 이 문서는 [README.md](README.md)(커밋 cd388de)의 번역이다. 내용이 다르면 영어 원문을 따른다.
 
-데이터를 복사하지 않고, R2RML 매핑으로 PostgreSQL을 SPARQL로 질의한다.
+<p align="center"><b>데이터를 복사하지 않고, R2RML 매핑을 통해 PostgreSQL을 SPARQL로 질의한다.</b></p>
 
-sparql-v12n은 Rust로 작성한 가상 지식 그래프 엔진이다.
-R2RML 매핑을 사용해 SPARQL 질의를 SQL로 다시 쓰고, 그 SQL을 원본 데이터베이스에서
-실행한 뒤 SPARQL 결과를 반환한다. 매핑은 질의할 수 있는 테이블과 컬럼도 정확히
-정한다. 온톨로지 추론은 아직 없다. 질의는 매핑이 명시한 클래스와 속성에 일치한다.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
+    <img alt="SPARQL 질의와 R2RML 매핑이 v12n에 들어가고, v12n은 질의를 SQL 하나로 번역해 PostgreSQL에 보낸다. PostgreSQL이 행을 돌려주면 v12n은 이를 JSON이나 CSV 형식의 SPARQL 결과로 반환한다." src="docs/images/how-it-works-light.svg" width="760">
+  </picture>
+</p>
 
-> 상태: 실험 단계. MVP SPARQL 부분집합을 구현했고 Ontop 및 W3C R2RML 테스트와 대조했다. 1.0 이전에 API와 출력이 바뀔 수 있다.
+- sparql-v12n은 SPARQL 질의 하나를 SQL 질의 하나로 번역해 PostgreSQL에서 실행한다.
+  데이터는 PostgreSQL에 그대로 있다.
+- 어떤 테이블과 컬럼이 어떤 클래스와 속성이 되는지는 R2RML 매핑이 정한다. 매핑에
+  없는 데이터는 질의할 수 없다.
+- 온톨로지 추론은 아직 없다. 클래스를 찾는 질의는 매핑이 그 클래스로 밝힌 것만
+  찾는다. [로드맵](#로드맵)을 참고한다.
+- sparql-v12n은 Rust로 작성했다. 실행 파일 `v12n` 하나가 명령줄 도구와 SPARQL 1.1
+  Protocol HTTP 엔드포인트를 모두 제공한다.
+
+> 상태: 실험 단계. 아래의 지원 범위는 Ontop 및 W3C R2RML 테스트 케이스와 대조해
+> 확인한다. 1.0 이전에 명령, 출력, API가 바뀔 수 있다.
 
 ## 지원하는 SPARQL
 
-R2RML 매핑 하나와 PostgreSQL 데이터베이스 하나에 대한 `SELECT` 질의를 지원한다.
-아래의 지원 기능은 모두 차등 테스트(`tests/diff`)로 [Ontop](https://ontop-vkg.org/)과
-비교한다. 거부 항목과 목록에 없는 모든 것은 다른 답을 내는 대신 미지원으로
-실패한다(`v12n query` 종료 코드 1, HTTP 501).
+엔진은 R2RML 매핑 하나와 PostgreSQL 데이터베이스 하나에 대한 `SELECT` 질의에
+답한다. 아래 표는 지원하는 것과 거부하는 것을 정리한다. 거부 항목이나 표에 없는
+형식의 질의는 오류로 끝난다(`v12n query`는 종료 코드 1, HTTP 엔드포인트는 501).
+다른 답을 반환하는 일은 없다. 지원 기능은 모두 차등 테스트(`tests/diff`)에서
+[Ontop](https://ontop-vkg.org/)과 비교한다.
 
 | 기능 | 비고 | 거부 |
 |---|---|---|

@@ -2,17 +2,27 @@
 
 [English](README.md) | [한국어](README.ko.md) | 简体中文
 
-> 本文是 [README.md](README.md)（提交 102a38b）的翻译。如有出入，以英文原文为准。
+> 本文是 [README.md](README.md)（提交 cd388de）的翻译。如有出入，以英文原文为准。
 
-通过 R2RML 映射以 SPARQL 查询 PostgreSQL，无需复制数据。
+<p align="center"><b>通过 R2RML 映射以 SPARQL 查询 PostgreSQL，无需复制数据。</b></p>
 
-sparql-v12n 是一个用 Rust 编写的虚拟知识图谱引擎。它使用 R2RML 映射将 SPARQL 查询改写为 SQL，在源数据库上执行该 SQL，并返回 SPARQL 结果。映射同时精确规定了哪些表和列可以被查询。目前尚不支持本体推理：查询只匹配映射中声明的类和属性。
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
+    <img alt="SPARQL 查询和 R2RML 映射输入 v12n，v12n 将查询翻译为一条 SQL 查询并发送给 PostgreSQL。PostgreSQL 返回行，v12n 再将其作为 JSON 或 CSV 格式的 SPARQL 结果返回。" src="docs/images/how-it-works-light.svg" width="760">
+  </picture>
+</p>
 
-> 状态：实验性。MVP 范围的 SPARQL 子集已经实现，并已与 Ontop 及 W3C R2RML 测试进行对照；在 1.0 之前，API 与输出可能发生变化。
+- sparql-v12n 将每条 SPARQL 查询翻译为一条 SQL 查询，并在 PostgreSQL 上执行。数据始终保留在 PostgreSQL 中。
+- 哪些表和列对应哪些类和属性，由 R2RML 映射决定。映射之外的数据无法查询。
+- 目前尚不支持本体推理。查询某个类时，只会得到映射中声明为该类的数据。参见[路线图](#路线图)。
+- sparql-v12n 使用 Rust 编写。单个可执行文件 `v12n` 同时提供命令行工具和 SPARQL 1.1 Protocol HTTP 端点。
+
+> 状态：实验性。下文所列的支持范围已与 Ontop 及 W3C R2RML 测试用例对照测试。1.0 之前，命令、输出与 API 可能发生变化。
 
 ## 支持的 SPARQL
 
-针对一个 R2RML 映射和一个 PostgreSQL 数据库的 `SELECT` 查询。下表中每项受支持的功能均通过差分测试（`tests/diff`）与 [Ontop](https://ontop-vkg.org/) 进行比较。被拒绝的形式以及未列出的任何内容，均作为不支持的功能报错（`v12n query` 退出码 1，HTTP 501），而不会给出不同的答案。
+引擎回答针对一个 R2RML 映射和一个 PostgreSQL 数据库的 `SELECT` 查询。下表列出支持与拒绝的内容。被拒绝的查询以及表中未列出的形式会以错误结束（`v12n query` 退出码为 1，HTTP 端点返回 501），不会返回不同的答案。每项受支持的功能都在差分测试（`tests/diff`）中与 [Ontop](https://ontop-vkg.org/) 进行比较。
 
 | 功能 | 说明 | 拒绝 |
 |---|---|---|
