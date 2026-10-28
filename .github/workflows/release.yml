@@ -2,8 +2,8 @@ name: Release
 
 # A pushed version tag builds the binaries and creates a draft release, which
 # a maintainer reviews and publishes. A pull request that changes this
-# workflow or the build script runs the builds only, so they can be checked
-# before a tag exists.
+# workflow, the build script or the dependencies runs the builds only, so
+# they can be checked on every target before a tag exists.
 on:
   push:
     tags: ["v*"]
@@ -11,6 +11,7 @@ on:
     paths:
       - .github/workflows/release.yml
       - crates/v12n-cli/build.rs
+      - Cargo.lock
 
 permissions:
   contents: read

@@ -464,6 +464,35 @@ fn query_with_exactly_row_limit_rows_is_not_truncated() {
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
 }
 
+/// Runs against the PostgreSQL that `testenv/tls.sh up` starts; skipped
+/// unless `V12N_TEST_TLS_DATABASE_URL` and `V12N_TEST_TLS_CERTS` are set.
+#[test]
+fn query_over_tls_checks_the_certificate_and_fails_with_exit_three() {
+    let (Ok(url), Ok(certs)) = (
+        std::env::var("V12N_TEST_TLS_DATABASE_URL"),
+        std::env::var("V12N_TEST_TLS_CERTS"),
+    ) else {
+        eprintln!("skipped: V12N_TEST_TLS_DATABASE_URL or V12N_TEST_TLS_CERTS is not set");
+        return;
+    };
+    let db = format!("{url}&sslmode=verify-full&sslrootcert={certs}/ca.pem");
+    let output = v12n(&["query", SHOP, VIP_ORDERS, "--db", &db], "");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(bindings(&output), 3);
+
+    let db = format!("{url}&sslmode=verify-full&sslrootcert={certs}/wrong-ca.pem");
+    let output = v12n(&["query", SHOP, VIP_ORDERS, "--db", &db], "");
+    assert_eq!(output.status.code(), Some(3));
+    let error = &stdout_json(&output)["error"];
+    assert_eq!(error["kind"], json!("database"));
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("TLS handshake"), "{message}");
+    // The URL holds a password; the message must not repeat it.
+    let credentials = url.split_once("://").unwrap().1.split_once('@').unwrap().0;
+    let password = credentials.split_once(':').unwrap().1;
+    assert!(!message.contains(password), "{message}");
+}
+
 /// A query `LIMIT` equal to the row limit is a complete result (exit 0);
 /// one above it is truncation when the rows exist (exit 5).
 #[test]
