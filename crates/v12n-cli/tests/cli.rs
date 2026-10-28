@@ -508,6 +508,96 @@ fn query_limit_at_the_row_limit_exits_zero_and_above_it_five() {
     }
 }
 
+#[test]
+fn query_writes_xml_and_tsv_results() {
+    let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
+        eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let query = "SELECT ?c ?name WHERE { ?c <http://example.org/name> ?name } ORDER BY ?name";
+    let run = |format: &str| {
+        let output = v12n(
+            &[
+                "query", "--format", format, "--db", &url, SHOP, "--query", query,
+            ],
+            "",
+        );
+        assert_eq!(output.status.code(), Some(0), "{format}");
+        assert!(output.stderr.is_empty(), "{format}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let customer = |id: u8, name: &str| {
+        format!(
+            "<result><binding name=\"c\"><uri>http://example.org/customer/{id}</uri></binding>\
+             <binding name=\"name\"><literal>{name}</literal></binding></result>"
+        )
+    };
+    assert_eq!(
+        run("xml"),
+        format!(
+            "<?xml version=\"1.0\"?>\n\
+             <sparql xmlns=\"http://www.w3.org/2005/sparql-results#\"><head>\
+             <variable name=\"c\"/><variable name=\"name\"/></head><results>\n\
+             {}\n{}\n{}\n</results></sparql>\n",
+            customer(7, "Kim"),
+            customer(8, "Lee"),
+            customer(9, "Park")
+        )
+    );
+    assert_eq!(
+        run("tsv"),
+        "?c\t?name\n\
+         <http://example.org/customer/7>\t\"Kim\"\n\
+         <http://example.org/customer/8>\t\"Lee\"\n\
+         <http://example.org/customer/9>\t\"Park\"\n"
+    );
+}
+
+/// Every streamed format holds a complete result of `--row-limit`
+/// solutions when the row limit cuts the answer off, and exits with 5.
+#[test]
+fn query_over_the_row_limit_exits_five_in_every_format() {
+    let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
+        eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
+        return;
+    };
+    for (format, complete) in [
+        ("json", "\n]}}\n"),
+        ("xml", "</result>\n</results></sparql>\n"),
+        ("csv", "\r\n"),
+        ("tsv", "\n"),
+    ] {
+        let output = v12n(
+            &[
+                "query",
+                "--format",
+                format,
+                SHOP,
+                VIP_ORDERS,
+                "--db",
+                &url,
+                "--row-limit",
+                "2",
+            ],
+            "",
+        );
+        assert_eq!(output.status.code(), Some(5), "{format}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.ends_with(complete), "{format}: {stdout}");
+        let solutions = match format {
+            "json" => stdout.matches("\n{").count(),
+            "xml" => stdout.matches("<result>").count(),
+            // The header line and one line per solution.
+            _ => stdout.lines().count() - 1,
+        };
+        assert_eq!(solutions, 2, "{format}: {stdout}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).starts_with("warning: result truncated"),
+            "{format}"
+        );
+    }
+}
+
 /// A mapping over `rr:sqlQuery` rows of `id` and `pad`, plus a query file
 /// for `?s <http://example.org/pad> ?p`.
 fn slow_rows(sql: &str) -> (String, String) {
@@ -566,35 +656,42 @@ fn query_timeout_after_output_started_exits_four_with_one_stderr_line() {
     std::fs::write(&query, format!("SELECT ?n1 WHERE {{ {patterns}}}")).unwrap();
     let query = query.to_str().unwrap().to_owned();
     let mapping = std::fs::read_to_string(SHOP).unwrap();
-    let output = v12n(
-        &[
-            "query",
-            "-",
-            &query,
-            "--db",
-            &url,
-            "--timeout",
-            "500ms",
-            "--row-limit",
-            "0",
-        ],
-        &mapping,
-    );
-    assert_eq!(output.status.code(), Some(4));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.starts_with("{\"head\""),
-        "{}",
-        &stdout[..stdout.len().min(80)]
-    );
-    assert!(serde_json::from_slice::<Value>(&output.stdout).is_err());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(stderr.lines().count(), 1, "{stderr}");
-    assert!(
-        stderr.starts_with("error: statement timeout of 500ms reached after ")
-            && stderr.contains(" rows;"),
-        "{stderr}"
-    );
+    for format in ["json", "xml"] {
+        let output = v12n(
+            &[
+                "query",
+                "--format",
+                format,
+                "-",
+                &query,
+                "--db",
+                &url,
+                "--timeout",
+                "500ms",
+                "--row-limit",
+                "0",
+            ],
+            &mapping,
+        );
+        assert_eq!(output.status.code(), Some(4), "{format}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let start = &stdout[..stdout.len().min(80)];
+        // Neither document is closed, so neither passes for a result.
+        if format == "json" {
+            assert!(stdout.starts_with("{\"head\""), "{start}");
+            assert!(serde_json::from_slice::<Value>(&output.stdout).is_err());
+        } else {
+            assert!(stdout.starts_with("<?xml "), "{start}");
+            assert!(!stdout.contains("</results>"), "{start}");
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stderr.lines().count(), 1, "{format}: {stderr}");
+        assert!(
+            stderr.starts_with("error: statement timeout of 500ms reached after ")
+                && stderr.contains(" rows;"),
+            "{stderr}"
+        );
+    }
 }
 
 /// Runs `v12n serve` with only the given `V12N_*` settings; every case
@@ -761,6 +858,23 @@ fn csv_format_errors_go_to_stderr() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).starts_with("error: mapping syntax error"));
+}
+
+#[test]
+fn results_only_formats_are_refused_outside_query() {
+    for (command, format) in [("check", "xml"), ("terms", "tsv"), ("explain", "xml")] {
+        let mut args = vec![command, "--format", format, SHOP];
+        if command == "explain" {
+            args.push(VIP_ORDERS);
+        }
+        let output = v12n(&args, "");
+        assert_eq!(output.status.code(), Some(1), "{command}");
+        assert!(output.stdout.is_empty(), "{command}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("error: --format {format} is for `query` only; use json, csv or table\n")
+        );
+    }
 }
 
 #[test]

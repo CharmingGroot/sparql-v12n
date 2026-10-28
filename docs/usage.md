@@ -7,12 +7,23 @@ This document describes the `v12n` commands, their output and exit codes, and th
 ## `v12n query`
 
 `v12n query mapping.ttl query.rq --db postgresql://reader@localhost/shop`
-runs a SPARQL query and prints its result in one of three formats:
+runs a SPARQL query and prints its result in one of five formats:
 
-- SPARQL 1.1 Query Results JSON.
+- SPARQL 1.1 Query Results JSON, with `--format json`.
+- SPARQL Query Results XML, with `--format xml`.
 - SPARQL 1.1 Query Results CSV, with `--format csv`. The CSV holds lexical
-  forms only, and an unbound variable is an empty field.
+  forms only, without datatypes or language tags.
+- SPARQL 1.1 Query Results TSV, with `--format tsv`. The TSV holds each term
+  in SPARQL syntax: IRIs in `<>`, literals quoted with their language tag or
+  datatype, and numbers such as `123` without quotes.
 - A table, with `--format table`.
+
+In CSV, TSV and the table, an unbound variable is an empty field. JSON and
+XML leave it out of the solution. All formats except the table are written
+as rows arrive. XML 1.0 cannot hold control characters other than tab,
+line feed and carriage return, so a literal with one, such as U+0001, ends
+XML output with an error. `--format xml` and `--format tsv` apply to
+`v12n query` only. The other commands refuse them with exit code 1.
 
 The query can come from three places:
 
@@ -29,7 +40,7 @@ therefore reports limits outside the result, on stderr and in the exit code:
 | `1` | Invalid input: arguments, files, query syntax, unsupported SPARQL |
 | `2` | Invalid mapping |
 | `3` | Database error, or a value that cannot become an RDF term |
-| `4` | Statement timeout (`--timeout`). A timeout before the first row is reported like other errors. A timeout after output has started leaves the JSON on stdout unterminated (CSV has no end marker) |
+| `4` | Statement timeout (`--timeout`). A timeout before the first row is reported like other errors. A timeout after output has started leaves JSON or XML on stdout unterminated (CSV and TSV have no end marker) |
 | `5` | Row limit reached (`--row-limit`). Stdout holds the first `--row-limit` solutions as a complete result, and stderr has a warning |
 
 The stderr line names the cause and the limit. For example, a truncated
@@ -97,7 +108,7 @@ Some errors go to stderr as one `error: ...` line instead of to stdout:
 
 - an error after results have started, because it cannot change stdout any
   more;
-- every error with `--format csv` or `--format table`.
+- every error in a format other than JSON.
 
 The row-limit `warning: ...` (exit code 5) always goes to stderr.
 
@@ -115,9 +126,23 @@ A request sends the query in one of three ways:
 - `POST` with `application/x-www-form-urlencoded` (`query=...`);
 - `POST` with `application/sparql-query` and the query as the body.
 
-Results are SPARQL 1.1 Query Results JSON
-(`application/sparql-results+json`). They are streamed as rows arrive from
-PostgreSQL. A request for any other format gets `406`.
+The `Accept` header selects the results format:
+
+| Format | Media type |
+|---|---|
+| SPARQL 1.1 Query Results JSON | `application/sparql-results+json` |
+| SPARQL Query Results XML | `application/sparql-results+xml` |
+| SPARQL 1.1 Query Results CSV | `text/csv` |
+| SPARQL 1.1 Query Results TSV | `text/tab-separated-values` |
+
+The format with the highest `q` value wins. Each format takes the `q` value
+of the most specific media range that matches it, so `*/*` does not
+override `text/csv;q=0`. When formats tie, the order of the table decides.
+A request without `Accept`, or with `*/*`, therefore gets JSON, and
+`text/*` gets CSV. A request that accepts none of these formats gets `406`.
+CSV and TSV responses carry `charset=utf-8`.
+
+Results in every format are streamed as rows arrive from PostgreSQL.
 
 The parameters `default-graph-uri` and `named-graph-uri` get `400`, because
 the dataset is the one that the mapping defines.
@@ -131,9 +156,11 @@ the dataset is the one that the mapping defines.
 | `503` | A statement timeout before the first row (`v12n query` exits with 4 in this case), or `max_concurrent_requests` reached (the response carries `Retry-After`) |
 | `500` | A database error or another internal error |
 
-The status is sent before the body. An error after the first row therefore
-cannot change the status. In that case, the server aborts the response and
-logs the error, and the JSON stays unterminated.
+The status is sent before the body. An error after the first row, such as
+a statement timeout or a value that XML cannot hold, therefore cannot
+change the status. In that case, the server aborts the response and logs
+the error. The response ends incomplete, and JSON and XML stay
+unterminated.
 
 Whether a result is truncated is known before the first row. PostgreSQL
 counts the rows up to the limit before it sends them.

@@ -5,7 +5,7 @@
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use futures_util::StreamExt;
-use v12n_core::results::JSON_RESULTS_MEDIA_TYPE;
+use v12n_core::results::ResultsFormat;
 
 use crate::Failure;
 
@@ -14,42 +14,59 @@ const SPARQL_QUERY: &str = "application/sparql-query";
 /// Percent-encoding at most triples the size of a query in a form body.
 const FORM_OVERHEAD: usize = 3;
 
-/// Whether the `Accept` header allows SPARQL 1.1 Query Results JSON, the
-/// only format served so far. The most specific matching media range
-/// decides (RFC 9110 §12.5.1), so `*/*` does not override an explicit
-/// `q=0`. No `Accept` header means any format.
-pub(crate) fn accepts_json_results(headers: &HeaderMap) -> bool {
-    let mut ranges = headers
+/// The results format for the `Accept` header, or `None` when it allows
+/// none of [`ResultsFormat::ALL`]. Each format gets the quality of the most
+/// specific media range that matches it (RFC 9110 §12.5.1), so `*/*` does
+/// not override an explicit `q=0`. The highest quality wins, and a tie goes
+/// to the earlier format, so `*/*` and a missing `Accept` give JSON.
+pub(crate) fn negotiate(headers: &HeaderMap) -> Option<ResultsFormat> {
+    let ranges: Vec<(String, f32)> = headers
         .get_all(header::ACCEPT)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
         .filter(|range| !range.trim().is_empty())
-        .peekable();
-    if ranges.peek().is_none() {
-        return true;
+        .map(|range| {
+            let mut parts = range.split(';');
+            let media = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+            let quality = parts
+                .filter_map(|p| p.split_once('='))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+                .map(|(_, q)| q.trim().parse::<f32>().unwrap_or(1.0))
+                .unwrap_or(1.0);
+            (media, quality)
+        })
+        .collect();
+    if ranges.is_empty() {
+        return Some(ResultsFormat::Json);
     }
-    let (kind, subtype) = JSON_RESULTS_MEDIA_TYPE.split_once('/').unwrap_or_default();
+    let mut best: Option<(ResultsFormat, f32)> = None;
+    for format in ResultsFormat::ALL {
+        let quality = quality(&ranges, format.media_type());
+        if quality > 0.0 && best.is_none_or(|(_, q)| quality > q) {
+            best = Some((format, quality));
+        }
+    }
+    best.map(|(format, _)| format)
+}
+
+/// The quality of the most specific range in `ranges` that matches
+/// `media_type`; 0 when none does.
+fn quality(ranges: &[(String, f32)], media_type: &str) -> f32 {
+    let (kind, subtype) = media_type.split_once('/').unwrap_or_default();
     let mut best: Option<(u8, f32)> = None;
-    for range in ranges {
-        let mut parts = range.split(';');
-        let media = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+    for (media, quality) in ranges {
         let specificity = match media.split_once('/') {
             Some(("*", "*")) => 1,
             Some((k, "*")) if k == kind => 2,
             Some((k, s)) if k == kind && s == subtype => 3,
             _ => continue,
         };
-        let quality = parts
-            .filter_map(|p| p.split_once('='))
-            .find(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
-            .map(|(_, q)| q.trim().parse::<f32>().unwrap_or(1.0))
-            .unwrap_or(1.0);
         if best.is_none_or(|(s, _)| specificity > s) {
-            best = Some((specificity, quality));
+            best = Some((specificity, *quality));
         }
     }
-    best.is_some_and(|(_, quality)| quality > 0.0)
+    best.map_or(0.0, |(_, quality)| quality)
 }
 
 /// The query text of a request, by the three methods of SPARQL 1.1
@@ -186,34 +203,82 @@ mod tests {
 
     use super::*;
 
-    fn accept(values: &[&str]) -> bool {
+    fn accept(values: &[&str]) -> Option<ResultsFormat> {
         let mut headers = HeaderMap::new();
         for value in values {
             headers.append(header::ACCEPT, HeaderValue::from_str(value).unwrap());
         }
-        accepts_json_results(&headers)
+        negotiate(&headers)
     }
 
     #[test]
-    fn accept_allows_json_results_through_exact_and_wildcard_ranges() {
-        assert!(accept(&[]));
-        assert!(accept(&["application/sparql-results+json"]));
-        assert!(accept(&["APPLICATION/SPARQL-RESULTS+JSON; charset=utf-8"]));
-        assert!(accept(&["*/*"]));
-        assert!(accept(&["application/*;q=0.5"]));
-        assert!(accept(&["text/html", "*/*;q=0.8"]));
-        assert!(accept(&[
-            "application/sparql-results+xml;q=1, application/sparql-results+json;q=0.9"
-        ]));
+    fn accept_without_a_preference_gives_json() {
+        let json = Some(ResultsFormat::Json);
+        assert_eq!(accept(&[]), json);
+        assert_eq!(accept(&[""]), json);
+        assert_eq!(accept(&["*/*"]), json);
+        assert_eq!(accept(&["application/*;q=0.5"]), json);
+        assert_eq!(accept(&["text/html", "*/*;q=0.8"]), json);
+        assert_eq!(accept(&["application/sparql-results+json"]), json);
+        assert_eq!(
+            accept(&["APPLICATION/SPARQL-RESULTS+JSON; charset=utf-8"]),
+            json
+        );
+    }
+
+    #[test]
+    fn accept_picks_each_format_by_its_media_type() {
+        assert_eq!(
+            accept(&["application/sparql-results+xml"]),
+            Some(ResultsFormat::Xml)
+        );
+        assert_eq!(accept(&["text/csv"]), Some(ResultsFormat::Csv));
+        assert_eq!(
+            accept(&["text/csv; charset=utf-8"]),
+            Some(ResultsFormat::Csv)
+        );
+        assert_eq!(
+            accept(&["Text/Tab-Separated-Values"]),
+            Some(ResultsFormat::Tsv)
+        );
+        // Among the text types CSV comes first.
+        assert_eq!(accept(&["text/*"]), Some(ResultsFormat::Csv));
+        assert_eq!(accept(&["text/*, text/csv;q=0"]), Some(ResultsFormat::Tsv));
+    }
+
+    #[test]
+    fn accept_follows_quality_values() {
+        assert_eq!(
+            accept(&["application/sparql-results+xml;q=1, application/sparql-results+json;q=0.9"]),
+            Some(ResultsFormat::Xml)
+        );
+        assert_eq!(
+            accept(&["text/csv;q=0.5, text/tab-separated-values;q=0.6"]),
+            Some(ResultsFormat::Tsv)
+        );
+        // A tie goes to the server's order.
+        assert_eq!(
+            accept(&["text/tab-separated-values, application/sparql-results+xml"]),
+            Some(ResultsFormat::Xml)
+        );
+        // The specific range overrides the wildcard, in both directions.
+        assert_eq!(
+            accept(&["application/sparql-results+json;q=0, */*"]),
+            Some(ResultsFormat::Xml)
+        );
+        assert_eq!(accept(&["*/*;q=0.1", "text/csv"]), Some(ResultsFormat::Csv));
     }
 
     #[test]
     fn accept_refuses_other_formats_and_explicit_zero_quality() {
-        assert!(!accept(&["application/sparql-results+xml"]));
-        assert!(!accept(&["text/csv, text/tab-separated-values"]));
-        assert!(!accept(&["application/json"]));
-        assert!(!accept(&["application/sparql-results+json;q=0, */*"]));
-        assert!(!accept(&["*/*;q=0"]));
+        assert_eq!(accept(&["application/json"]), None);
+        assert_eq!(accept(&["text/html, application/xml"]), None);
+        assert_eq!(accept(&["*/*;q=0"]), None);
+        assert_eq!(accept(&["text/csv;q=0"]), None);
+        assert_eq!(
+            accept(&["application/*;q=0, text/csv;q=0, text/tab-separated-values;q=0"]),
+            None
+        );
     }
 
     async fn read(
