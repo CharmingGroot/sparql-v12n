@@ -21,7 +21,7 @@ use axum::routing::get;
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use v12n_core::mapping::{Mapping, MappingIndex};
-use v12n_core::results::{JSON_RESULTS_MEDIA_TYPE, JsonResultsWriter};
+use v12n_core::results::{ResultsFormat, ResultsWriter};
 use v12n_core::solution::Solution;
 use v12n_core::sql::SqlPlan;
 use v12n_core::{sparql, unfold};
@@ -223,13 +223,14 @@ async fn answer(
     url_query: Option<String>,
     body: Body,
 ) -> Result<Response, Failure> {
-    if !protocol::accepts_json_results(headers) {
-        return Err(Failure::new(
+    let format = protocol::negotiate(headers).ok_or_else(|| {
+        let offered: Vec<&str> = ResultsFormat::ALL.iter().map(|f| f.media_type()).collect();
+        Failure::new(
             StatusCode::NOT_ACCEPTABLE,
             "not_acceptable",
-            format!("results are available as {JSON_RESULTS_MEDIA_TYPE} only"),
-        ));
-    }
+            format!("results are available as {}", offered.join(", ")),
+        )
+    })?;
     let query = protocol::read_query(
         method,
         headers,
@@ -273,7 +274,7 @@ async fn answer(
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static(JSON_RESULTS_MEDIA_TYPE),
+        HeaderValue::from_static(format.content_type()),
     );
     response_headers.insert(header::VARY, HeaderValue::from_static("accept"));
     if solutions.is_truncated() {
@@ -282,10 +283,12 @@ async fn answer(
             HeaderValue::from(app.limits.query.row_limit),
         );
     }
-    let writer = JsonResultsWriter::start(Vec::with_capacity(CHUNK_BYTES), solutions.variables())
-        .map_err(|e| {
-        Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
-    })?;
+    let writer = ResultsWriter::start(
+        format,
+        Vec::with_capacity(CHUNK_BYTES),
+        solutions.variables(),
+    )
+    .map_err(|e| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
     let stream = ResultStream {
         writer: Some(writer),
         truncated: solutions.is_truncated(),
@@ -341,8 +344,8 @@ fn database_failure(error: v12n_postgres::Error) -> Failure {
 /// Turns solutions into body chunks, holding the request permit and the
 /// connection until the last one is sent or the client goes away.
 struct ResultStream {
-    /// `None` once the closing bracket is written.
-    writer: Option<JsonResultsWriter<Vec<u8>>>,
+    /// `None` once the document is closed.
+    writer: Option<ResultsWriter<Vec<u8>>>,
     solutions: Solutions,
     next: Option<Solution>,
     lease: Option<Lease>,
@@ -361,8 +364,8 @@ impl ResultStream {
     ///
     /// An error here comes after the status line, so it cannot become an
     /// error status. Returning it makes the server abort the response
-    /// (no terminating chunk in HTTP/1.1), and the unterminated JSON
-    /// cannot pass for a complete result.
+    /// (no terminating chunk in HTTP/1.1), so the body cannot pass for a
+    /// complete result; JSON and XML also stay unterminated.
     async fn next_chunk(&mut self) -> Option<Result<Bytes, io::Error>> {
         let writer = self.writer.as_mut()?;
         while let Some(solution) = self.next.take() {

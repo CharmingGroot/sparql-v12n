@@ -10,7 +10,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use v12n_core::mapping::{BaseIri, Mapping, MappingIndex, TermType, TriplesMapId};
-use v12n_core::results::{CsvResultsWriter, JsonResultsWriter, write_csv_record};
+use v12n_core::results::{ResultsFormat, ResultsWriter, write_csv_record};
 use v12n_core::solution::Solution;
 use v12n_core::sql::SqlPlan;
 use v12n_core::{sparql, unfold};
@@ -44,12 +44,13 @@ const MAIN_HELP: &str = concat!(
 SQL a query becomes without a database, `query` runs it. Every command runs
 non-interactively and never prompts.
 
-Output: --format json, csv or table; json when stdout is not a terminal,
-table when it is. Colours only on a terminal, and never with NO_COLOR set.
+Output: --format json, csv or table, and for `query` also xml or tsv; json
+when stdout is not a terminal, table when it is. Colours only on a terminal,
+and never with NO_COLOR set.
 
 Errors: with --format json, an error before any output is one JSON object
 on stdout, {\"ok\":false,\"error\":{\"kind\":...,\"message\":...,\"exit_code\":...}},
-with \"details\" for some kinds. In csv and table format, and once output has
+with \"details\" for some kinds. In the other formats, and once output has
 started, an error is one \"error: ...\" line on stderr.
 
 ",
@@ -100,10 +101,11 @@ const QUERY_HELP: &str = concat!(
   V12N_DATABASE_URL=postgresql://reader@localhost/shop v12n query examples/shop/mapping.ttl --query 'SELECT ?c WHERE { ?c a <http://example.org/Customer> }' --format csv
   cat examples/shop/queries/customers.rq | v12n query examples/shop/mapping.ttl - --format table
 
-JSON output is SPARQL 1.1 Query Results JSON and CSV output is SPARQL 1.1
-Query Results CSV (lexical forms only, unbound as an empty field), both
-written as rows arrive. The session is read-only; still, connect as a user
-that can only read.
+Formats: json is SPARQL 1.1 Query Results JSON, xml the SPARQL Query
+Results XML Format, csv and tsv SPARQL 1.1 Query Results CSV and TSV. CSV
+holds lexical forms only, TSV holds terms in SPARQL syntax, and both write
+an unbound variable as an empty field. All four are written as rows arrive.
+The session is read-only; still, connect as a user that can only read.
 
 When more rows exist than --row-limit, the first --row-limit solutions are
 printed as a complete result, a warning naming the limit goes to stderr,
@@ -112,9 +114,9 @@ truncated and exits with 0.
 
 When the statement timeout cancels the query, stderr names the timeout and
 the command exits with 4. Before the first row, the error is reported in
---format like other errors; after output has started, JSON on stdout is
-left incomplete so that it cannot pass for a complete result. CSV has no
-end marker: check the exit code.
+--format like other errors; after output has started, JSON and XML on
+stdout are left incomplete so that they cannot pass for a complete result.
+CSV and TSV have no end marker: check the exit code.
 
 ",
     exit_codes_help!()
@@ -156,7 +158,8 @@ Exit codes: 1 invalid settings or address in use, 2 invalid mapping,
     after_help = MAIN_HELP
 )]
 struct Cli {
-    /// Output format [default: table on a terminal, json otherwise]
+    /// Output format; xml and tsv are for `query` only [default: table on a
+    /// terminal, json otherwise]
     #[arg(long, global = true, value_enum)]
     format: Option<Format>,
     #[command(subcommand)]
@@ -166,8 +169,23 @@ struct Cli {
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
     Json,
+    Xml,
     Csv,
+    Tsv,
     Table,
+}
+
+impl Format {
+    /// The SPARQL results format that `query` writes, if any.
+    fn results(self) -> Option<ResultsFormat> {
+        match self {
+            Format::Json => Some(ResultsFormat::Json),
+            Format::Xml => Some(ResultsFormat::Xml),
+            Format::Csv => Some(ResultsFormat::Csv),
+            Format::Tsv => Some(ResultsFormat::Tsv),
+            Format::Table => None,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -351,6 +369,20 @@ fn main() -> ExitCode {
         color: stream_color(stdout_is_terminal),
     };
     let result = match &cli.command {
+        // XML and TSV are formats for SPARQL results only.
+        Command::Check { .. } | Command::Terms { .. } | Command::Explain { .. }
+            if matches!(output.format, Format::Xml | Format::Tsv) =>
+        {
+            let name = output.format.to_possible_value().unwrap_or_default();
+            Err(Failure::new(
+                EXIT_INPUT,
+                "input",
+                format!(
+                    "--format {} is for `query` only; use json, csv or table",
+                    name.get_name()
+                ),
+            ))
+        }
         Command::Check { mapping } => check(mapping, output),
         Command::Terms { mapping } => terms(mapping, output),
         Command::Explain {
@@ -469,6 +501,7 @@ fn check(path: &Path, output: Output) -> Result<(), Failure> {
         Format::Table => {
             println!("ok: {triples_maps} triples maps, {classes} classes, {properties} properties")
         }
+        Format::Xml | Format::Tsv => unreachable!("refused in main"),
     }
     Ok(())
 }
@@ -565,6 +598,7 @@ fn terms(path: &Path, output: Output) -> Result<(), Failure> {
                 .collect();
             print_table(["KIND", "TERM", "TRIPLES MAPS"], &rows, output.color);
         }
+        Format::Xml | Format::Tsv => unreachable!("refused in main"),
     }
     Ok(())
 }
@@ -654,6 +688,7 @@ fn explain(
                 }
             }
         }
+        Format::Xml | Format::Tsv => unreachable!("refused in main"),
     }
     Ok(())
 }
@@ -687,19 +722,14 @@ fn query(
         // Waiting for the first row before printing anything means an error
         // in planning or early execution is still reported in `format`.
         let first = solutions.try_next().await.map_err(before_output)?;
-        let stdout = || BufWriter::new(io::stdout().lock());
-        match output.format {
-            Format::Json => {
-                let writer = JsonResultsWriter::start(stdout(), solutions.variables())
+        match output.format.results() {
+            Some(format) => {
+                let stdout = BufWriter::new(io::stdout().lock());
+                let writer = ResultsWriter::start(format, stdout, solutions.variables())
                     .map_err(output_failure)?;
                 stream_solutions(&mut solutions, first, writer).await?
             }
-            Format::Csv => {
-                let writer = CsvResultsWriter::start(stdout(), solutions.variables())
-                    .map_err(output_failure)?;
-                stream_solutions(&mut solutions, first, writer).await?
-            }
-            Format::Table => print_solutions_table(&mut solutions, first, output.color).await?,
+            None => print_solutions_table(&mut solutions, first, output.color).await?,
         };
         if solutions.is_truncated() {
             return Err(row_limit_warning(limits.row_limit));
@@ -808,43 +838,11 @@ fn row_limit_warning(row_limit: u64) -> Failure {
     }
 }
 
-/// A results format written one solution at a time.
-trait ResultsSink {
-    fn put(&mut self, solution: &Solution) -> io::Result<()>;
-    fn flush(&mut self) -> io::Result<()>;
-    /// Writes what closes the document, if anything, and flushes.
-    fn end(self) -> io::Result<()>;
-}
-
-impl<W: Write> ResultsSink for JsonResultsWriter<W> {
-    fn put(&mut self, solution: &Solution) -> io::Result<()> {
-        self.write(solution)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.get_mut().flush()
-    }
-    fn end(self) -> io::Result<()> {
-        self.finish()?.flush()
-    }
-}
-
-impl<W: Write> ResultsSink for CsvResultsWriter<W> {
-    fn put(&mut self, solution: &Solution) -> io::Result<()> {
-        self.write(solution)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.get_mut().flush()
-    }
-    fn end(self) -> io::Result<()> {
-        self.finish()?.flush()
-    }
-}
-
-/// Streams the solutions into `sink` as they arrive.
+/// Streams the solutions into `writer` as they arrive.
 async fn stream_solutions(
     solutions: &mut Solutions,
     first: Option<Solution>,
-    mut sink: impl ResultsSink,
+    mut writer: ResultsWriter<impl Write>,
 ) -> Result<(), Failure> {
     let after_output = |failure: Failure| Failure {
         after_output: true,
@@ -853,7 +851,7 @@ async fn stream_solutions(
     let mut count: u64 = 0;
     let mut next = first;
     while let Some(solution) = next {
-        match sink.put(&solution) {
+        match writer.write(&solution) {
             Ok(()) => count += 1,
             // The reader went away, e.g. `| head`; nothing left to report to.
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
@@ -862,14 +860,14 @@ async fn stream_solutions(
         next = match solutions.try_next().await {
             Ok(next) => next,
             Err(e) => {
-                // Partial JSON stays unterminated so it cannot pass for a
-                // complete result.
-                let _ = sink.flush();
+                // Partial JSON and XML stay unterminated so they cannot
+                // pass for a complete result.
+                let _ = writer.get_mut().flush();
                 return Err(after_output(query_failure(e, count)));
             }
         };
     }
-    match sink.end() {
+    match writer.finish().and_then(|mut out| out.flush()) {
         Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(after_output(output_failure(e))),
         _ => Ok(()),
     }

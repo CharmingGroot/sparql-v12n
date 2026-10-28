@@ -103,16 +103,44 @@ async fn syntax_error_is_400_and_unsupported_feature_is_501() {
     assert!(text(response).await.contains("ASK"));
 }
 
+fn get_as(query: &str, accept: &str) -> Request<Body> {
+    Request::get(format!("/sparql?query={}", encode(query)))
+        .header(header::ACCEPT, accept)
+        .body(Body::empty())
+        .unwrap()
+}
+
 #[tokio::test]
 async fn unacceptable_format_is_406_before_the_query_is_read() {
-    let request = Request::get("/sparql?query=x")
-        .header(header::ACCEPT, "application/sparql-results+xml")
-        .body(Body::empty())
-        .unwrap();
-    assert_eq!(
-        status(&offline(), request).await,
-        StatusCode::NOT_ACCEPTABLE
-    );
+    for accept in ["application/json", "text/html, */*;q=0", "text/csv;q=0"] {
+        let response = send(&offline(), get_as("x", accept)).await;
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE, "{accept}");
+        let body = text(response).await;
+        assert!(
+            body.contains("application/sparql-results+xml")
+                && body.contains("text/tab-separated-values"),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_offered_format_passes_negotiation() {
+    // A syntax error is found after negotiation, so 400 shows that the
+    // format was accepted.
+    for accept in [
+        "application/sparql-results+json",
+        "application/sparql-results+xml",
+        "text/csv",
+        "text/tab-separated-values",
+        "text/*;q=0.5, application/xml",
+    ] {
+        assert_eq!(
+            status(&offline(), get_as("SELECT ?x WHERE {", accept)).await,
+            StatusCode::BAD_REQUEST,
+            "{accept}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -275,6 +303,104 @@ async fn row_limit_truncation_is_200_with_the_truncated_header() {
             rows,
             "LIMIT {limit}, row limit {row_limit}"
         );
+    }
+}
+
+const XML: &str = "application/sparql-results+xml";
+const CSV: &str = "text/csv";
+const TSV: &str = "text/tab-separated-values";
+
+/// The data lines of a CSV or TSV body, sorted, without the header.
+fn sorted_lines(body: &str, eol: &str) -> Vec<String> {
+    let mut lines: Vec<String> = body
+        .strip_suffix(eol)
+        .unwrap()
+        .split(eol)
+        .skip(1)
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    lines
+}
+
+#[tokio::test]
+async fn each_format_answers_with_its_content_type_and_syntax() {
+    let Some(url) = database_url() else { return };
+    let app = new_app(SHOP, &url, ServerLimits::default());
+    let query = "PREFIX ex: <http://example.org/> \
+                 SELECT ?order ?amount WHERE { ?order ex:amount ?amount } \
+                 ORDER BY ?order LIMIT 2";
+
+    let response = send(&app, get_as(query, XML)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], XML);
+    assert_eq!(response.headers()[header::VARY], "accept");
+    let body = text(response).await;
+    assert!(
+        body.starts_with(
+            "<?xml version=\"1.0\"?>\n<sparql xmlns=\"http://www.w3.org/2005/sparql-results#\">\
+             <head><variable name=\"order\"/><variable name=\"amount\"/></head><results>\n<result>\
+             <binding name=\"order\"><uri>http://example.org/order/1001</uri></binding>\
+             <binding name=\"amount\"><literal datatype=\"http://www.w3.org/2001/XMLSchema#integer\">"
+        ) && body.ends_with("</result>\n</results></sparql>\n"),
+        "{body}"
+    );
+    assert_eq!(body.matches("<result>").count(), 2, "{body}");
+
+    let response = send(&app, get_as(query, "text/csv, */*;q=0.1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/csv; charset=utf-8"
+    );
+    let body = text(response).await;
+    assert!(body.starts_with("order,amount\r\n"), "{body}");
+    assert_eq!(
+        sorted_lines(&body, "\r\n"),
+        [
+            "http://example.org/order/1001,120000",
+            "http://example.org/order/1002,30000"
+        ]
+    );
+
+    let response = send(&app, get_as(query, TSV)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/tab-separated-values; charset=utf-8"
+    );
+    let body = text(response).await;
+    assert!(body.starts_with("?order\t?amount\n"), "{body}");
+    assert_eq!(
+        sorted_lines(&body, "\n"),
+        [
+            "<http://example.org/order/1001>\t120000",
+            "<http://example.org/order/1002>\t30000"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn truncation_header_is_the_same_in_every_format() {
+    let Some(url) = database_url() else { return };
+    let app = new_app(SHOP, &url, limits(2, Duration::from_secs(30)));
+    for (accept, rows) in [
+        (JSON, None),
+        (XML, Some("<result>")),
+        (CSV, Some("\r\n")),
+        (TSV, Some("\n")),
+    ] {
+        let response = send(&app, get_as(CUSTOMERS, accept)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{accept}");
+        assert_eq!(response.headers()[TRUNCATED_HEADER], "2", "{accept}");
+        let body = text(response).await;
+        let count = match rows {
+            None => solutions(&serde_json::from_str(&body).unwrap()).len(),
+            // CSV and TSV count the header line too.
+            Some(eol) if eol.contains('\n') => body.matches(eol).count() - 1,
+            Some(tag) => body.matches(tag).count(),
+        };
+        assert_eq!(count, 2, "{accept}: {body}");
     }
 }
 
