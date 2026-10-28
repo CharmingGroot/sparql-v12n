@@ -35,7 +35,7 @@ jobs:
     outputs:
       code: ${{ steps.paths.outputs.code }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       # First, so the output is set even when a later check fails. Anything
@@ -115,11 +115,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: v12n
           save-if: false
@@ -131,7 +132,7 @@ jobs:
         run: |
           rustup toolchain install 1.88 --profile minimal --no-self-update
           cargo +1.88 check --workspace --all-targets --locked
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-deny
       - run: cargo deny --all-features check
@@ -158,16 +159,18 @@ jobs:
           --health-cmd "pg_isready -h 127.0.0.1 -U v12n -d shop"
           --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
       # The one cache every job and workflow restores; only main saves it,
       # so pull requests do not evict each other.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         id: cache
         with:
           shared-key: v12n
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: nextest
       # Without V12N_TEST_DATABASE_URL the database tests skip themselves.
@@ -195,7 +198,7 @@ jobs:
       - name: Keep the PostgreSQL test report
         if: always()
         run: if [ -f target/nextest/ci/junit.xml ]; then mv target/nextest/ci/junit.xml target/nextest/ci/junit-postgres.xml; fi
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: junit
