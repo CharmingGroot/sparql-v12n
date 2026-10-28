@@ -34,6 +34,16 @@ fn stdout_json(output: &Output) -> Value {
 }
 
 #[test]
+fn version_names_the_commit() {
+    let output = v12n(&["--version"], "");
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    let expected = format!("v12n {} (", env!("CARGO_PKG_VERSION"));
+    assert!(text.starts_with(&expected), "{text}");
+    assert!(text.trim_end().ends_with(')'), "{text}");
+}
+
+#[test]
 fn check_valid_mapping_exits_zero_with_json_summary() {
     let output = v12n(&["check", SHOP], "");
     assert_eq!(output.status.code(), Some(0));

@@ -2,7 +2,7 @@
 
 [English](README.md) | [한국어](README.ko.md) | 简体中文
 
-> 本文是 [README.md](README.md)（提交 c9e8040）的翻译。如有出入，以英文原文为准。
+> 本文是 [README.md](README.md)（提交 2c670f9）的翻译。如有出入，以英文原文为准。
 
 <p align="center"><b>用 Rust 编写的虚拟知识图谱引擎。它通过 R2RML 映射将 SPARQL 查询翻译为 SQL，并在源数据库上执行，无需复制数据。</b></p>
 
@@ -20,6 +20,25 @@
 - 单个可执行文件 `v12n` 同时提供命令行工具和 SPARQL 1.1 Protocol HTTP 端点。
 
 > 状态：实验性。下文所列的支持范围已与 Ontop 及 W3C R2RML 测试用例对照测试。1.0 之前，命令、输出与 API 可能发生变化。
+
+## 安装
+
+从[发布](https://github.com/CharmingGroot/sparql-v12n/releases)页面下载与平台对应的压缩包，并将 `v12n` 放入 `PATH`。压缩包提供 Linux（x86_64 与 aarch64，静态二进制）、macOS（Apple silicon）和 Windows（x86_64）版本。
+
+每个发布都附有 `SHA256SUMS` 文件和构建来源证明（attestation）。可用以下任一命令校验下载的文件（在 macOS 上，第一条命令请改用 `shasum -a 256 -c`）：
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS
+gh attestation verify v12n-<version>-<target>.tar.gz -R CharmingGroot/sparql-v12n
+```
+
+使用 Rust 1.88 或更高版本从源码构建：
+
+```sh
+cargo install --locked --git https://github.com/CharmingGroot/sparql-v12n v12n-cli
+```
+
+`v12n --version` 输出版本以及构建所用的提交。
 
 ## 支持的 SPARQL
 

@@ -151,7 +151,7 @@ Exit codes: 1 invalid settings or address in use, 2 invalid mapping,
 #[derive(Parser)]
 #[command(
     name = "v12n",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("V12N_COMMIT"), ")"),
     about = "Query PostgreSQL with SPARQL through R2RML mappings",
     after_help = MAIN_HELP
 )]
