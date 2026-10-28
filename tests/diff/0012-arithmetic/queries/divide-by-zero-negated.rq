@@ -1,4 +1,0 @@
-PREFIX ex: <http://example.org/>
-
-# The error also drops row 2 under negation.
-SELECT ?r WHERE { ?r ex:a ?a ; ex:b ?b ; ex:d ?d ; ex:big ?big ; ex:name ?n FILTER(!(?a / ?b > 0)) }
