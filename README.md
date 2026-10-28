@@ -49,6 +49,61 @@ cargo install --locked --git https://github.com/CharmingGroot/sparql-v12n v12n-c
 
 `v12n --version` prints the version and the commit it was built from.
 
+## Quickstart
+
+This runs the shop example in `examples/shop` against a local PostgreSQL
+in Docker. It needs Docker with Compose v2 and the `v12n` binary (see
+[Install](#install)), and runs from the root of a clone of this repository. With a
+build from source, use `./target/release/v12n` in place of `v12n`.
+
+```sh
+git clone https://github.com/CharmingGroot/sparql-v12n.git
+cd sparql-v12n
+```
+
+1. Start PostgreSQL with the example schema and data. Only the `postgres`
+   service of `testenv` starts. It listens on `127.0.0.1:55432` with local
+   development credentials.
+
+   ```sh
+   docker compose -f testenv/docker-compose.yml up -d --wait postgres
+   ```
+
+2. Check the mapping.
+
+   ```sh
+   v12n check examples/shop/mapping.ttl --format table
+   ```
+
+   ```text
+   ok: 2 triples maps, 2 classes, 4 properties
+   ```
+
+3. Run the query for the orders that VIP customers placed.
+
+   ```sh
+   v12n query examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq \
+     --db postgresql://v12n:v12n-dev@127.0.0.1:55432/shop --format table
+   ```
+
+   ```text
+   ?order                           ?amount
+   <http://example.org/order/1001>  "120000"^^<http://www.w3.org/2001/XMLSchema#integer>
+   <http://example.org/order/1003>  "87000"^^<http://www.w3.org/2001/XMLSchema#integer>
+   <http://example.org/order/1004>  "15000"^^<http://www.w3.org/2001/XMLSchema#integer>
+   ```
+
+4. Stop the database and remove its container and network.
+
+   ```sh
+   docker compose -f testenv/docker-compose.yml down -v
+   ```
+
+`v12n explain` with the same mapping and query shows the generated SQL
+without a database. [testenv/README.md](testenv/README.md) describes the
+test environment, including the Ontop endpoint that the differential tests
+use and that this example does not need.
+
 ## Supported SPARQL
 
 The engine answers `SELECT` queries over one R2RML mapping and one
