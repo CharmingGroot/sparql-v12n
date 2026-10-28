@@ -2,7 +2,7 @@
 
 [English](README.md) | [한국어](README.ko.md) | 简体中文
 
-> 本文是 [README.md](README.md)（提交 ffa5953）的翻译。如有出入，以英文原文为准。
+> 本文是 [README.md](README.md)（提交 d9e31c5）的翻译。如有出入，以英文原文为准。
 
 <p align="center"><b>用 Rust 编写的虚拟知识图谱引擎。它通过 R2RML 映射将 SPARQL 查询翻译为 SQL，并在源数据库上执行，无需复制数据。</b></p>
 
@@ -39,6 +39,53 @@ cargo install --locked --git https://github.com/CharmingGroot/sparql-v12n v12n-c
 ```
 
 `v12n --version` 输出版本以及构建所用的提交。
+
+## 快速开始
+
+本示例在 Docker 中的本地 PostgreSQL 上运行 `examples/shop` 中的商店示例。需要支持 Compose v2 的 Docker 和 `v12n` 可执行文件（见[安装](#安装)一节），并在本仓库克隆目录的根目录中执行。若从源码构建，请用 `./target/release/v12n` 代替 `v12n`。
+
+```sh
+git clone https://github.com/CharmingGroot/sparql-v12n.git
+cd sparql-v12n
+```
+
+1. 启动包含示例数据库模式和数据的 PostgreSQL。只会启动 `testenv` 的 `postgres` 服务，它使用本地开发凭据在 `127.0.0.1:55432` 上监听。
+
+   ```sh
+   docker compose -f testenv/docker-compose.yml up -d --wait postgres
+   ```
+
+2. 检查映射。
+
+   ```sh
+   v12n check examples/shop/mapping.ttl --format table
+   ```
+
+   ```text
+   ok: 2 triples maps, 2 classes, 4 properties
+   ```
+
+3. 执行查询 VIP 客户所下订单的查询。
+
+   ```sh
+   v12n query examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq \
+     --db postgresql://v12n:v12n-dev@127.0.0.1:55432/shop --format table
+   ```
+
+   ```text
+   ?order                           ?amount
+   <http://example.org/order/1001>  "120000"^^<http://www.w3.org/2001/XMLSchema#integer>
+   <http://example.org/order/1003>  "87000"^^<http://www.w3.org/2001/XMLSchema#integer>
+   <http://example.org/order/1004>  "15000"^^<http://www.w3.org/2001/XMLSchema#integer>
+   ```
+
+4. 停止数据库，并删除其容器和网络。
+
+   ```sh
+   docker compose -f testenv/docker-compose.yml down -v
+   ```
+
+使用相同的映射和查询运行 `v12n explain`，可以在不连接数据库的情况下查看生成的 SQL。测试环境见 [testenv/README.md](testenv/README.md)，其中也介绍了差分测试使用的 Ontop 端点；本示例不需要它。
 
 ## 支持的 SPARQL
 
