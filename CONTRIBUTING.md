@@ -1,43 +1,40 @@
 # Contributing
 
-Thanks for looking into sparql-v12n. This guide covers how changes are
-proposed, what CI checks, and how to test a change locally.
+How to propose a change, what CI checks, and how to test locally.
 
-## What the project is
+## Scope and rules
 
-The engine does one thing: given an R2RML mapping, a SPARQL query and a
-PostgreSQL database, it answers the query by translating it to SQL. It
-stores, loads and caches nothing. A few rules follow from that and from
-the correctness goal:
+sparql-v12n answers a SPARQL query over an R2RML mapping by translating it
+to SQL and running it on PostgreSQL. It does not store, load or cache
+data. Changes keep to these rules:
 
-- **Answers follow the specifications.** SPARQL 1.1 Query, R2RML and XML
-  Schema 1.1 decide what a correct answer is. Where engines differ, the
-  choice and its reasons are written down in a Discussion titled
-  `Decision: …` (category Announcements) before or with the change.
-- **Unsupported means rejected.** A query or mapping outside the supported
-  subset fails with an `UnsupportedFeature` error (CLI exit code 1, HTTP
-  501). It is never answered differently from what the specification says.
-- **Constants are bound parameters.** No value from a query is written
-  into SQL text; identifiers come only from the mapping and are quoted.
-- **Every change keeps the results checked.** Query results are compared
-  with [Ontop](https://ontop-vkg.org/) and the W3C R2RML test cases (see
-  [tests/diff/README.md](tests/diff/README.md)).
+- SPARQL 1.1 Query, R2RML and XML Schema 1.1 define the correct answer.
+  Where engines differ, the choice and its reasons go into a Discussion
+  titled `Decision: …` (category Announcements), before or with the
+  change.
+- A query or mapping outside the supported subset fails with an
+  `UnsupportedFeature` error (CLI exit code 1, HTTP 501) instead of an
+  answer that differs from the specification.
+- Values from a query reach PostgreSQL only as bound parameters.
+  Identifiers come only from the mapping and are quoted.
+- Query results are compared with [Ontop](https://ontop-vkg.org/) and the
+  W3C R2RML test cases ([tests/diff/README.md](tests/diff/README.md)).
 
 ## Proposing a change
 
-1. **Open an issue first**, for bugs and features alike, so the scope can
-   be agreed before code is written. For a design question with several
-   reasonable answers, say which options you see.
-2. **Branch** as `<type>/<issue>-<short-name>`, for example
+1. Open an issue first, for bugs and features alike, to agree on the
+   scope before writing code. For a design question, list the options
+   you considered.
+2. Name the branch `<type>/<issue>-<short-name>`, for example
    `fix/37-time-midnight`.
-3. **Open a pull request** for that one issue, with `Closes #N` (or
-   `Refs #N`) in the body, and fill in the template. Draft pull requests
-   are welcome for early feedback.
-4. Pull requests are **squash merged** by a maintainer. The pull request
-   title becomes the commit on `main`.
+3. Open one pull request per issue, with `Closes #N` (or `Refs #N`) in
+   the body, and fill in the template. Open it as a draft to get early
+   feedback.
+4. A maintainer squash merges the pull request; its title becomes the
+   commit on `main`.
 
-Issues, pull requests, commit messages and code comments are written in
-English. A translation below a `---` line is welcome.
+Write issues, pull requests, commit messages and code comments in
+English. A translation may follow below a `---` line.
 
 ## Commit and title convention
 
@@ -99,18 +96,19 @@ testenv/fetch-jdbc.sh    # once: the PostgreSQL JDBC driver for Ontop
 testenv/difftest.sh      # every case; DIFF_CASES="0011-time" picks cases
 ```
 
-A new behavior usually comes with a case in `tests/diff/`: a schema, data,
-a mapping and one `.rq` file per query. When v12n deliberately differs
+A change in behavior needs a case in `tests/diff/`: a schema, data, a
+mapping and one `.rq` file per query. When v12n deliberately differs
 from Ontop, or rejects a query, record it in the case's `expect.toml`
 with the issue that explains it, and add it to the tables in
 [tests/diff/README.md](tests/diff/README.md).
 
 ### SQL snapshots
 
-Generated SQL is pinned with [insta](https://insta.rs/) snapshots
-(`snapshots/` directories under `crates/`). When a change alters the SQL, review the new
-snapshots (`cargo insta review`, or run the tests with
-`INSTA_UPDATE=always` and read the diff) and commit them with the change.
+Generated SQL is pinned with [insta](https://insta.rs/) snapshots in the
+`snapshots/` directories under `crates/`. When a change alters the SQL,
+review the new snapshots (`cargo insta review`, or run the tests with
+`INSTA_UPDATE=always` and read the diff) and commit them with the
+change.
 
 ## Code
 
@@ -125,11 +123,10 @@ snapshots (`cargo insta review`, or run the tests with
 
 ## Reporting a security issue
 
-Please do not open a public issue for a vulnerability, for example SQL
-built from query input or a way around the resource limits. Use GitHub's
-private vulnerability reporting on this repository instead.
+Report vulnerabilities privately, as [SECURITY.md](SECURITY.md)
+describes, not in a public issue.
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the
-Apache License 2.0, as the rest of the project ([LICENSE](LICENSE)).
+Contributions are licensed under the Apache License 2.0, like the rest
+of the project ([LICENSE](LICENSE)).
