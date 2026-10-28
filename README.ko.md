@@ -2,7 +2,7 @@
 
 [English](README.md) | 한국어 | [简体中文](README.zh-CN.md)
 
-> 이 문서는 [README.md](README.md)(커밋 c9e8040)의 번역이다. 내용이 다르면 영어 원문을 따른다.
+> 이 문서는 [README.md](README.md)(커밋 2c670f9)의 번역이다. 내용이 다르면 영어 원문을 따른다.
 
 <p align="center"><b>Rust로 작성한 가상 지식 그래프 엔진이다. R2RML 매핑으로 SPARQL 질의를 SQL로 번역하고, 데이터를 복사하지 않고 원본 데이터베이스에서 실행한다.</b></p>
 
@@ -25,6 +25,28 @@
 
 > 상태: 실험 단계. 아래의 지원 범위는 Ontop 및 W3C R2RML 테스트 케이스와 대조해
 > 확인한다. 1.0 이전에 명령, 출력, API가 바뀔 수 있다.
+
+## 설치
+
+[릴리스](https://github.com/CharmingGroot/sparql-v12n/releases) 페이지에서 플랫폼에
+맞는 압축 파일을 내려받고 `v12n`을 `PATH`에 둔다. 압축 파일은 Linux(x86_64,
+aarch64, 정적 바이너리), macOS(Apple silicon), Windows(x86_64)용으로 빌드한다.
+
+릴리스마다 `SHA256SUMS` 파일과 빌드 출처 attestation이 있다. 내려받은 파일은 아래
+명령 중 하나로 확인한다(macOS에서는 첫 명령 대신 `shasum -a 256 -c`를 쓴다).
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS
+gh attestation verify v12n-<version>-<target>.tar.gz -R CharmingGroot/sparql-v12n
+```
+
+Rust 1.88 이상으로 소스에서 빌드하려면 다음을 실행한다.
+
+```sh
+cargo install --locked --git https://github.com/CharmingGroot/sparql-v12n v12n-cli
+```
+
+`v12n --version`은 버전과 빌드한 커밋을 출력한다.
 
 ## 지원하는 SPARQL
 
