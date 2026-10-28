@@ -2,9 +2,9 @@
 
 [English](README.md) | [한국어](README.ko.md) | 简体中文
 
-> 本文是 [README.md](README.md)（提交 405ae0d）的翻译。如有出入，以英文原文为准。
+> 本文是 [README.md](README.md)（提交 c9e8040）的翻译。如有出入，以英文原文为准。
 
-<p align="center"><b>通过 R2RML 映射以 SPARQL 查询 PostgreSQL，无需复制数据。</b></p>
+<p align="center"><b>用 Rust 编写的虚拟知识图谱引擎。它通过 R2RML 映射将 SPARQL 查询翻译为 SQL，并在源数据库上执行，无需复制数据。</b></p>
 
 <p align="center">
   <picture>
@@ -13,10 +13,11 @@
   </picture>
 </p>
 
-- sparql-v12n 将每条 SPARQL 查询翻译为一条 SQL 查询，并在 PostgreSQL 上执行。数据始终保留在 PostgreSQL 中。
+- 每条 SPARQL 查询都会成为一条 SQL 查询，在存放数据的数据库上执行。数据不会被复制。
+- 目前支持 PostgreSQL。其他数据库已列入[路线图](#路线图)。
 - 哪些表和列对应哪些类和属性，由 R2RML 映射决定。映射之外的数据无法查询。
 - 目前尚不支持本体推理。查询某个类时，只会得到映射中声明为该类的数据。参见[路线图](#路线图)。
-- sparql-v12n 使用 Rust 编写。单个可执行文件 `v12n` 同时提供命令行工具和 SPARQL 1.1 Protocol HTTP 端点。
+- 单个可执行文件 `v12n` 同时提供命令行工具和 SPARQL 1.1 Protocol HTTP 端点。
 
 > 状态：实验性。下文所列的支持范围已与 Ontop 及 W3C R2RML 测试用例对照测试。1.0 之前，命令、输出与 API 可能发生变化。
 

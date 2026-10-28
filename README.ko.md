@@ -2,9 +2,9 @@
 
 [English](README.md) | 한국어 | [简体中文](README.zh-CN.md)
 
-> 이 문서는 [README.md](README.md)(커밋 405ae0d)의 번역이다. 내용이 다르면 영어 원문을 따른다.
+> 이 문서는 [README.md](README.md)(커밋 c9e8040)의 번역이다. 내용이 다르면 영어 원문을 따른다.
 
-<p align="center"><b>데이터를 복사하지 않고, R2RML 매핑을 통해 PostgreSQL을 SPARQL로 질의한다.</b></p>
+<p align="center"><b>Rust로 작성한 가상 지식 그래프 엔진이다. R2RML 매핑으로 SPARQL 질의를 SQL로 번역하고, 데이터를 복사하지 않고 원본 데이터베이스에서 실행한다.</b></p>
 
 <p align="center">
   <picture>
@@ -13,14 +13,15 @@
   </picture>
 </p>
 
-- sparql-v12n은 SPARQL 질의 하나를 SQL 질의 하나로 번역해 PostgreSQL에서 실행한다.
-  데이터는 PostgreSQL에 그대로 있다.
+- SPARQL 질의 하나는 SQL 질의 하나가 되고, 데이터가 있는 데이터베이스에서
+  실행된다. 데이터는 복사하지 않는다.
+- 현재는 PostgreSQL을 지원한다. 다른 데이터베이스는 [로드맵](#로드맵)에 있다.
 - 어떤 테이블과 컬럼이 어떤 클래스와 속성이 되는지는 R2RML 매핑이 정한다. 매핑에
   없는 데이터는 질의할 수 없다.
 - 온톨로지 추론은 아직 없다. 클래스를 찾는 질의는 매핑이 그 클래스로 밝힌 것만
   찾는다. [로드맵](#로드맵)을 참고한다.
-- sparql-v12n은 Rust로 작성했다. 실행 파일 `v12n` 하나가 명령줄 도구와 SPARQL 1.1
-  Protocol HTTP 엔드포인트를 모두 제공한다.
+- 실행 파일 `v12n` 하나가 명령줄 도구와 SPARQL 1.1 Protocol HTTP 엔드포인트를
+  모두 제공한다.
 
 > 상태: 실험 단계. 아래의 지원 범위는 Ontop 및 W3C R2RML 테스트 케이스와 대조해
 > 확인한다. 1.0 이전에 명령, 출력, API가 바뀔 수 있다.
