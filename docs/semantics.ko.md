@@ -2,7 +2,7 @@
 
 [English](semantics.md) | 한국어 | [简体中文](semantics.zh-CN.md)
 
-> 이 문서는 [semantics.md](semantics.md)(커밋 ffa5953)의 번역이다. 내용이 다르면 영어 원문을 따른다.
+> 이 문서는 [semantics.md](semantics.md)(커밋 f98a763)의 번역이다. 내용이 다르면 영어 원문을 따른다.
 
 이 문서는 sparql-v12n이 SPARQL 쿼리를 SQL로 변환하는 방법과 쿼리 결과를 결정하는 규칙을 설명한다. 다루는 항목은 컬럼 이름, IRI, 리터럴(literal), 상수, 조인, 중복, `OPTIONAL`, `UNION`, `FILTER`, 정렬이다. 전체 개요와 지원 기능 표는 [README](../README.ko.md)에 있다.
 
@@ -420,6 +420,13 @@ SQL에서는 오류를 `NULL`로 나타낸다. SQL의 `AND`, `OR`, `NOT`도 `NUL
 | `xsd:dateTime` | 두 값 모두 시간대가 있거나 모두 없으면 시점으로 비교한다. 시간대가 있는 값과 없는 값의 비교는 암묵적 시간대에 따라 결과가 달라지므로 거부한다. |
 | IRI, 빈 노드(blank node), 그 밖의 타입의 리터럴 | RDF term으로서(RDFterm-equal) `=`와 `!=`만 사용할 수 있다. `<`와 그 밖의 연산자는 오류다. 서로 다른 두 리터럴은 오류다. |
 
+정수와 decimal에 대한 산술(`+`, `-`, `*`, `/`, 단항 `-`)을 지원한다. 결과 타입은
+XPath의 타입 승격을 따르며, 정수를 정수로 나누면 decimal이 된다(`7 / 2`는
+`3.5`). SQL은 `numeric`으로 계산하므로 큰 정수의 합도 `int8`을 넘치지 않는다.
+0으로 나누기, `numeric`의 NaN과 무한대, 숫자가 아닌 피연산자는 오류다.
+`xsd:double` 값의 산술과, 산술 결과에 대한 `STR`, `LANG`, `DATATYPE`,
+`sameTerm`은 당분간 미지원으로 거부한다(Discussion #144).
+
 컬럼과 비교하는 상수는 컬럼의 타입으로 변환해도 결과가 같으면 컬럼의 타입으로
 변환한다. 그러면 컬럼의 인덱스를 사용할 수 있다. 예를 들어 `?qty > 5`는
 `qty > $1::int8`이 되고, `?qty = 7.0`은 `qty = $1::int8`이 된다.
@@ -474,8 +481,8 @@ SQL에서는 오류를 `NULL`로 나타낸다. SQL의 `AND`, `OR`, `NOT`도 `NUL
     데이터타입인 컬럼의 값
   - `xsd:float`와 파생 정수 타입
   - 1년부터 9999년 범위를 벗어나거나 마이크로초보다 정밀한 dateTime 상수
-- 그 밖의 함수, 산술, `IN`, `EXISTS`, 그리고 term(변수, 상수, 이들에 대한
-  `STR`, `LANG`, `DATATYPE`)이 아닌 식을 피연산자로 쓰는 것
+- 그 밖의 함수, `xsd:double`의 산술, `IN`, `EXISTS`, 그리고 term(변수, 상수,
+  이들에 대한 `STR`, `LANG`, `DATATYPE`)과 산술이 아닌 식을 피연산자로 쓰는 것
 - 인코딩이 UTF-8이 아닌 데이터베이스에서의 문자열 정렬과 `REGEX`
 
 ## ORDER BY, LIMIT, OFFSET
