@@ -7,7 +7,7 @@ English | [한국어](README.ko.md) | [简体中文](README.zh-CN.md)
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
-    <img alt="A SPARQL query and an R2RML mapping go into v12n, which translates the query into one SQL query for PostgreSQL. PostgreSQL returns rows, and v12n returns them as SPARQL results in JSON or CSV." src="docs/images/how-it-works-light.svg" width="760">
+    <img alt="A SPARQL query and an R2RML mapping go into v12n, which translates the query into one SQL query for PostgreSQL. PostgreSQL returns rows, and v12n returns them as SPARQL results in JSON, XML, CSV or TSV." src="docs/images/how-it-works-light.svg" width="760">
   </picture>
 </p>
 

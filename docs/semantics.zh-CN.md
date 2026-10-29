@@ -2,7 +2,7 @@
 
 [English](semantics.md) | [한국어](semantics.ko.md) | 简体中文
 
-> 本文是 [semantics.md](semantics.md)（提交 f98a763）的翻译。如有出入，以英文原文为准。
+> 本文是 [semantics.md](semantics.md)（提交 8e6fa66）的翻译。如有出入，以英文原文为准。
 
 本文介绍 sparql-v12n 如何将 SPARQL 查询翻译为 SQL，以及决定答案的规则：列名、IRI、字面量、常量、连接、去重、`OPTIONAL`、`UNION`、`FILTER` 与排序。总体介绍与支持功能表见 [README](../README.zh-CN.md)。
 

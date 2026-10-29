@@ -2,17 +2,21 @@
 
 [English](usage.md) | [한국어](usage.ko.md) | 简体中文
 
-> 本文是 [usage.md](usage.md)（提交 ffa5953）的翻译。如有出入，以英文原文为准。
+> 本文是 [usage.md](usage.md)（提交 8e6fa66）的翻译。如有出入，以英文原文为准。
 
 本文介绍 `v12n` 命令、输出格式与退出码，以及 HTTP 端点及其设置。总体介绍见 [README](../README.zh-CN.md)，查询的回答规则见 [semantics.zh-CN.md](semantics.zh-CN.md)。
 
 ## `v12n query`
 
-`v12n query mapping.ttl query.rq --db postgresql://reader@localhost/shop` 执行 SPARQL 查询，并以以下三种格式之一输出结果：
+`v12n query mapping.ttl query.rq --db postgresql://reader@localhost/shop` 执行 SPARQL 查询，并以以下五种格式之一输出结果：
 
-- SPARQL 1.1 Query Results JSON。
-- SPARQL 1.1 Query Results CSV，使用 `--format csv`。CSV 仅包含词法形式，未绑定变量为空字段。
+- SPARQL 1.1 Query Results JSON，使用 `--format json`。
+- SPARQL Query Results XML，使用 `--format xml`。
+- SPARQL 1.1 Query Results CSV，使用 `--format csv`。CSV 仅包含词法形式，不含数据类型和语言标签。
+- SPARQL 1.1 Query Results TSV，使用 `--format tsv`。TSV 以 SPARQL 语法写出每个 term：IRI 用 `<>` 括起，字面量加引号并带上语言标签或数据类型，`123` 这样的数字不加引号。
 - 表格，使用 `--format table`。
+
+在 CSV、TSV 和表格中，未绑定变量为空字段。JSON 和 XML 则在解中省略该变量。除表格外，所有格式都随行到达而输出。XML 1.0 无法容纳制表符、换行符和回车符以外的控制字符，因此含有此类字符（例如 U+0001）的字面量会使 XML 输出以错误结束。`--format xml` 和 `--format tsv` 仅适用于 `v12n query`，其他命令以退出码 1 拒绝它们。
 
 查询可以来自三处：
 
@@ -28,7 +32,7 @@
 | `1` | 无效输入：参数、文件、查询语法、不支持的 SPARQL |
 | `2` | 无效映射 |
 | `3` | 数据库错误，或无法转换为 RDF term 的值 |
-| `4` | 语句超时（`--timeout`）。第一行之前发生的超时与其他错误一样报告。输出开始之后发生的超时使 stdout 上的 JSON 保持未终止状态（CSV 没有结束标记） |
+| `4` | 语句超时（`--timeout`）。第一行之前发生的超时与其他错误一样报告。输出开始之后发生的超时使 stdout 上的 JSON 或 XML 保持未终止状态（CSV 和 TSV 没有结束标记） |
 | `5` | 达到行数上限（`--row-limit`）。stdout 包含前 `--row-limit` 个解，构成完整的结果，stderr 中有一条警告 |
 
 stderr 中的这一行会指明原因与上限。例如，结果被截断时输出 `warning: result truncated at the row limit of 10000; more rows exist ...`，超时时输出 `error: statement timeout of 30s reached after 120 rows; ...`。
@@ -79,11 +83,55 @@ stderr 中的这一行会指明原因与上限。例如，结果被截断时输�
 部分错误以一行 `error: ...` 写入 stderr，而不是写入 stdout：
 
 - 结果开始输出之后发生的错误，因为它已无法再改变 stdout；
-- 使用 `--format csv` 或 `--format table` 时的所有错误。
+- 使用 JSON 以外格式时的所有错误。
 
 行数上限的 `warning: ...`（退出码 5）始终写入 stderr。
 
 `v12n <command> --help` 列出每个命令的 JSON 与 CSV 结构。其中的示例在仓库根目录运行。
+
+## 数据库连接
+
+`--db`、`V12N_DATABASE_URL` 与 `[database] url` 接受 libpq 连接 URI（例如 `postgresql://reader@db.example.com:5432/shop?sslmode=verify-full`），或 `key=value` 形式的连接字符串（例如 `host=db.example.com dbname=shop user=reader sslmode=verify-full`）。
+
+### TLS
+
+`sslmode` 参数决定连接是否使用 TLS，以及如何检查服务器证书。各取值的含义与 libpq 相同：
+
+| `sslmode` | TLS | 证书检查 |
+|---|---|---|
+| `disable` | 从不使用 | 无 |
+| `prefer`（默认） | 服务器支持时使用 | 无；`sslrootcert` 指定文件时检查证书链 |
+| `require` | 始终使用 | 无；`sslrootcert` 指定文件时检查证书链 |
+| `verify-ca` | 始终使用 | 证书链可追溯到受信任的 CA |
+| `verify-full` | 始终使用 | 同 `verify-ca`，并且证书包含 `host` 中的主机名 |
+
+`prefer` 与 `require` 会加密连接，但除非 `sslrootcert` 指定了文件，否则接受任何证书。因此它们能防止窃听，却不能防止冒充数据库的服务器。在不受自己控制的网络上，请使用 `verify-full`。
+
+`sslrootcert` 参数指定受信任的 CA：
+
+- 未设置：使用操作系统的根证书。在 Linux 上即 OpenSSL 使用的文件，可由环境变量 `SSL_CERT_FILE` 与 `SSL_CERT_DIR` 替换。
+- 路径：包含一个或多个 CA 证书的 PEM 文件，用于使用自有 CA 的服务。该文件在打开连接时读取。
+- `system`：使用操作系统的根证书。此时 `sslmode` 默认为 `verify-full`，与 libpq 一样拒绝较弱的模式。
+
+```sh
+# A managed service whose certificate chains to a public CA
+v12n query mapping.ttl query.rq \
+  --db 'postgresql://reader@db.example.com/shop?sslmode=verify-full'
+
+# A server with its own CA
+v12n query mapping.ttl query.rq \
+  --db 'postgresql://reader@db.internal/shop?sslmode=verify-full&sslrootcert=/etc/v12n/db-ca.pem'
+```
+
+当服务器提供 `SCRAM-SHA-256-PLUS` 时，密码认证会绑定到 TLS 会话。添加 `channel_binding=require` 可拒绝不提供该机制的服务器。
+
+TLS 连接失败属于数据库错误（退出码 3，kind 为 `database`）。错误消息会指出原因，例如证书链无法追溯到受信任的 CA 时为 `invalid peer certificate: UnknownIssuer`，证书不包含主机名时为 `certificate not valid for name "..."`。
+
+与 libpq 的不同之处如下：
+
+- 未设置 `sslrootcert` 时，libpq 读取 `~/.postgresql/root.crt`，v12n 则使用操作系统的根证书。
+- 使用 `prefer` 时，若 TLS 握手失败，libpq 会不使用 TLS 重试，v12n 则报告错误。
+- 不支持 `sslmode=allow`、客户端证书（`sslcert`、`sslkey`），以及 `PGSSLMODE` 等 `PG*` 环境变量。
 
 ## HTTP 端点
 
@@ -95,7 +143,18 @@ stderr 中的这一行会指明原因与上限。例如，结果被截断时输�
 - 使用 `application/x-www-form-urlencoded`（`query=...`）的 `POST`；
 - 使用 `application/sparql-query` 并以查询作为请求体的 `POST`。
 
-结果为 SPARQL 1.1 Query Results JSON（`application/sparql-results+json`）。结果随行从 PostgreSQL 到达而以流式发送。请求其他任何格式时返回 `406`。
+`Accept` 请求头选择结果格式：
+
+| 格式 | 媒体类型 |
+|---|---|
+| SPARQL 1.1 Query Results JSON | `application/sparql-results+json` |
+| SPARQL Query Results XML | `application/sparql-results+xml` |
+| SPARQL 1.1 Query Results CSV | `text/csv` |
+| SPARQL 1.1 Query Results TSV | `text/tab-separated-values` |
+
+`q` 值最高的格式胜出。每种格式采用与其匹配的最具体媒体范围的 `q` 值，因此 `*/*` 不会覆盖 `text/csv;q=0`。`q` 值相同时，按表中顺序决定。因此，不带 `Accept` 或带 `*/*` 的请求得到 JSON，`text/*` 得到 CSV。不接受上述任何格式的请求返回 `406`。CSV 和 TSV 响应带有 `charset=utf-8`。
+
+所有格式的结果都随行从 PostgreSQL 到达而以流式发送。
 
 参数 `default-graph-uri` 与 `named-graph-uri` 返回 `400`，因为数据集即映射所定义的数据集。
 
@@ -108,7 +167,7 @@ stderr 中的这一行会指明原因与上限。例如，结果被截断时输�
 | `503` | 第一行之前发生的语句超时（此时 `v12n query` 以 4 退出），或达到 `max_concurrent_requests`（响应带有 `Retry-After`） |
 | `500` | 数据库错误或其他内部错误 |
 
-状态码在响应体之前发送。因此，第一行之后发生的错误无法改变状态码。此时，服务器中止响应并记录该错误，JSON 保持未终止状态。
+状态码在响应体之前发送。因此，第一行之后发生的错误（例如语句超时，或 XML 无法容纳的值）无法改变状态码。此时，服务器中止响应并记录该错误。响应以不完整的状态结束，JSON 和 XML 保持未终止状态。
 
 结果是否被截断在第一行之前即可确定。PostgreSQL 在发送行之前会先统计不超过上限的行数。
 
@@ -160,4 +219,4 @@ max_concurrent_requests = 16        # more are refused with 503, not queued
 
 数据库 URL 和密码从不写入日志。请求日志写入 stderr，级别由 `RUST_LOG` 决定。日志包含生成的 SQL 与耗时，但不包含结果值。
 
-TLS、认证与 CORS 由服务器前置的反向代理负责。
+面向 HTTP 客户端的 TLS、认证与 CORS 由服务器前置的反向代理负责。与数据库之间的 TLS 在数据库 URL 中设置（参见 [TLS](#tls)）。
