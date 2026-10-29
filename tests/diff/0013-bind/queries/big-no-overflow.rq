@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# int8's largest value plus one does not overflow: xsd:integer has no bound.
+SELECT ?r (?big + 1 AS ?next) WHERE { ?r ex:big ?big }

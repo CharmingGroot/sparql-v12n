@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Where the OPTIONAL part does not match, ?o is unbound and so is ?next.
+SELECT ?r (?o + 1 AS ?next) WHERE { ?r ex:a ?a OPTIONAL { ?r ex:opt ?o } }

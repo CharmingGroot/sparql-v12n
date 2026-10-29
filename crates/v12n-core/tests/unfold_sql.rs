@@ -698,3 +698,48 @@ fn time_midnight_constant_also_matches_24_00() {
         &[(0, TermNormal::Time)]
     ));
 }
+
+/// `BIND` arithmetic is computed in `numeric`, with one result column per
+/// class of number: integer operands give an integer.
+#[test]
+fn bind_computes_arithmetic_in_numeric() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?o ?total WHERE { ?o ex:amount ?a BIND(?a * 2 + 1 AS ?total) }"
+    ));
+}
+
+/// A division gives a decimal, and a zero divisor is an error that leaves
+/// the variable unbound.
+#[test]
+fn select_expression_division_gives_a_decimal() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?o (?a / 4 AS ?quarter) WHERE { ?o ex:amount ?a }"
+    ));
+}
+
+/// Over a variable of an `OPTIONAL` part, the value is computed where the
+/// part matched, and is unbound elsewhere.
+#[test]
+fn select_expression_over_an_optional_variable() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c (?a + 1 AS ?next) WHERE { ?c ex:tier ?t OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a } }"
+    ));
+}
+
+/// Removing duplicates compares the columns of the pattern's variables,
+/// of which a computed value is a function: it is selected after them.
+#[test]
+fn select_expression_follows_the_columns_whose_duplicates_are_removed() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?c (?a + 1 AS ?n) WHERE { ?o ex:amount ?a ; ex:placedBy ?c }"
+    ));
+}
+
+/// A copied variable takes the columns of its source, and a constant
+/// takes none.
+#[test]
+fn bind_copies_a_variable_and_binds_a_constant() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        r#"SELECT ?d ?k WHERE { ?c ex:name ?n BIND(?c AS ?d) BIND("x" AS ?k) }"#
+    ));
+}

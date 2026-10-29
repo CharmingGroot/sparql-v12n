@@ -1,0 +1,14 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "shop(\"SELECT ?c (?a + 1 AS ?n) WHERE { ?o ex:amount ?a ; ex:placedBy ?c }\")"
+---
+SELECT q."c", q."n", q."n_1"
+FROM (
+SELECT DISTINCT t0."id" AS "o", t0."amount" AS "a", t1."customer_id" AS "c", (t0."amount"::numeric + $1::numeric) AS "n", NULL::numeric AS "n_1"
+FROM "orders" t0
+JOIN "orders" t1 ON t1."id" = t0."id"
+WHERE t0."amount" IS NOT NULL AND t1."customer_id" IS NOT NULL
+) q
+
+-- params
+$1 = "1"

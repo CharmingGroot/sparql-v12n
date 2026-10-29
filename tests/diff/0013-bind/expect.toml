@@ -1,0 +1,24 @@
+# Later steps of #100: a BIND inside OPTIONAL, and a computed variable
+# used in FILTER.
+[query.bind-in-optional]
+expect = "rejected"
+
+[query.filter-over-bind]
+expect = "rejected"
+
+# Ontop keeps the scale of PostgreSQL's numeric results (`3.5000000000000000`,
+# `-4.00`); v12n writes XSD 1.1 canonical forms, as decided in Discussion #35.
+[query.select-divide]
+expect = "mismatch"
+issue = 25
+
+[query.select-decimal]
+expect = "mismatch"
+issue = 25
+
+# Ontop adds int8 values in int8 and fails with "bigint out of range";
+# xsd:integer has no bound, and v12n computes in numeric (#99).
+[query.big-no-overflow]
+expect = "ontop-error"
+issue = 99
+solutions = 4

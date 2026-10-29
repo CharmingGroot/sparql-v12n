@@ -6,7 +6,7 @@ use oxrdf::Term;
 
 use super::{
     ColumnType, Condition, Filter, FilterValue, Renderer, TermDatatype, TermMatch, TermSqlValue,
-    XSD_STRING,
+    ValueCases, ValueKind, XSD_STRING,
 };
 use crate::Error;
 use crate::mapping::TermType;
@@ -457,6 +457,52 @@ impl<'a> Renderer<'a> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// A computed value as `numeric` where it is a number of class `kind`,
+    /// and `NULL` where it is another class or an error, which leaves the
+    /// variable unbound (SPARQL 1.1 §18.5, Extend). The cases render as
+    /// `CASE`, so the first whose guards hold gives the value.
+    pub(super) fn value(&mut self, cases: &ValueCases, kind: ValueKind) -> Result<(), Error> {
+        let class = match kind {
+            ValueKind::Integer => Num::Integer,
+            ValueKind::Decimal => Num::Decimal,
+        };
+        let mut of_class = Vec::with_capacity(cases.len());
+        for (_, value) in cases {
+            of_class.push(match self.operand(value).kind {
+                Kind::Numeric(c) => c == class,
+                Kind::Unsupported(reason) => return Err(unsupported(&reason)),
+                _ => false,
+            });
+        }
+        if !of_class.contains(&true) {
+            self.sql.push_str("NULL::numeric");
+            return Ok(());
+        }
+        if let [(guards, value)] = cases.as_slice()
+            && guards.is_empty()
+        {
+            return self.numeric_value(value);
+        }
+        self.sql.push_str("CASE");
+        for ((guards, value), of_class) in cases.iter().zip(of_class) {
+            self.sql.push_str(" WHEN ");
+            if guards.is_empty() {
+                self.sql.push_str("true");
+            } else {
+                let guards: Vec<&Condition> = guards.iter().collect();
+                self.conditions(&guards)?;
+            }
+            self.sql.push_str(" THEN ");
+            if of_class {
+                self.numeric_value(value)?;
+            } else {
+                self.sql.push_str("NULL::numeric");
+            }
+        }
+        self.sql.push_str(" END");
         Ok(())
     }
 

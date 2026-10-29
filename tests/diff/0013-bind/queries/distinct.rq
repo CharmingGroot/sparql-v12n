@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Every row gives the same value, so DISTINCT leaves one solution.
+SELECT DISTINCT (?a - ?a AS ?zero) WHERE { ?r ex:a ?a }

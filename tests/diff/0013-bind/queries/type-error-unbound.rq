@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# Arithmetic over a string is an error: the variable is unbound, and the
+# solution is kept (SPARQL 1.1 §18.5, Extend).
+SELECT ?r ?bad WHERE { ?r ex:name ?n BIND(?n + 1 AS ?bad) }
