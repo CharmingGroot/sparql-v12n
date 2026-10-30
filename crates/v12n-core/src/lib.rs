@@ -24,6 +24,7 @@ mod xpath_regex;
 mod xsd;
 
 pub use backend::{Backend, Limits};
+pub use catalog::Catalog;
 pub use engine::Engine;
 pub use error::Error;
 pub use planner::Planner;

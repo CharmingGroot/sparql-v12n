@@ -15,6 +15,7 @@ use tokio_postgres::config::Host;
 use tokio_postgres::types::Type;
 use v12n_core::Limits;
 use v12n_core::backend::{Backend, SolutionStream};
+use v12n_core::catalog::{CatalogPlan, CatalogRequest};
 use v12n_core::dialect::PostgresDialect;
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
 use v12n_core::solution::canonical_decimal;
@@ -22,8 +23,8 @@ use v12n_core::sql::{
     ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, SqlPlan, TableKeys, TermKey,
     TermNormal,
 };
-use v12n_core::{sparql, unfold};
-use v12n_postgres::{Error, PostgresBackend};
+use v12n_core::{Engine, Planner, sparql, unfold};
+use v12n_postgres::{Error, PostgresBackend, Solutions};
 
 const SHOP: &str = include_str!("../../../examples/shop/mapping.ttl");
 const VIP_ORDERS: &str = include_str!("../../../examples/shop/queries/vip-orders.rq");
@@ -34,6 +35,16 @@ fn database_url() -> Option<String> {
         eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
     }
     url
+}
+
+/// Runs `plan` on the catalog entries of its tables, read just before.
+async fn execute(database: &PostgresBackend, plan: &SqlPlan) -> Result<Solutions, Error> {
+    let snapshot = database
+        .load_catalog(&CatalogRequest::for_plan(plan))
+        .await?;
+    database
+        .execute(&CatalogPlan::new(plan, Arc::new(snapshot))?)
+        .await
 }
 
 fn plan(mapping: &str, query: &str) -> SqlPlan {
@@ -57,7 +68,7 @@ async fn run_in_order(
     plan: &SqlPlan,
 ) -> Result<(Vec<String>, bool), Error> {
     let database = PostgresBackend::connect(url, limits).await?;
-    let mut solutions = database.execute(plan).await?;
+    let mut solutions = execute(&database, plan).await?;
     let mut rows = Vec::new();
     while let Some(solution) = solutions.try_next().await? {
         let row: Vec<String> = solutions
@@ -176,7 +187,7 @@ async fn truncation_is_known_after_the_first_solution() {
             ..Limits::default()
         };
         let database = PostgresBackend::connect(&url, limits).await.unwrap();
-        let mut solutions = database.execute(&plan).await.unwrap();
+        let mut solutions = execute(&database, &plan).await.unwrap();
         assert!(solutions.try_next().await.unwrap().is_some());
         assert_eq!(solutions.is_truncated(), truncated, "row limit {row_limit}");
     }
@@ -1119,7 +1130,7 @@ async fn trim_scale_matches_the_canonical_decimal_formatter() {
         ..Limits::default()
     };
     let database = PostgresBackend::connect(&url, limits).await.unwrap();
-    let mut solutions = database.execute(&plan(&mapping, query)).await.unwrap();
+    let mut solutions = execute(&database, &plan(&mapping, query)).await.unwrap();
     let mut checked = 0;
     while let Some(solution) = solutions.try_next().await.unwrap() {
         let [Some(d), Some(s), Some(t)] = solution.values() else {
@@ -1202,7 +1213,7 @@ async fn unquoted_name_does_not_match_a_mixed_case_column() {
     );
     let error = run(&url, Limits::default(), &plan).await.unwrap_err();
     assert!(
-        matches!(&error, Error::Database(m) if m.contains("does not exist")),
+        matches!(&error, Error::Core(v12n_core::Error::Catalog(m)) if m.contains("has no column Name")),
         "{error}"
     );
 }
@@ -2249,7 +2260,7 @@ async fn order_holds_through_every_wrapper_and_keys_stay_hidden() {
     let query = "PREFIX ex: <http://example.org/>\n\
                  SELECT ?row ?addr WHERE { ?row ex:k ?k ; ex:addr ?addr } ORDER BY DESC(?k) LIMIT 8";
     let database = PostgresBackend::connect(&url, limits(5)).await.unwrap();
-    let mut solutions = database.execute(&plan(&mapping, query)).await.unwrap();
+    let mut solutions = execute(&database, &plan(&mapping, query)).await.unwrap();
     assert_eq!(solutions.variables(), ["row", "addr"]);
     let mut keys = Vec::new();
     while let Some(solution) = solutions.try_next().await.unwrap() {
@@ -2414,7 +2425,7 @@ async fn order_by_without_an_exact_sql_order_is_rejected() {
         let database = PostgresBackend::connect(&url, Limits::default())
             .await
             .unwrap();
-        match database.execute(&plan(&mapping, &query)).await {
+        match execute(&database, &plan(&mapping, &query)).await {
             Err(Error::Core(v12n_core::Error::UnsupportedFeature(feature))) => {
                 assert!(feature.contains(reason), "{feature}")
             }
@@ -3240,9 +3251,9 @@ async fn pipe(
     }
 }
 
-/// The solutions of `plan` on `database`, in the order they arrive.
-async fn solutions(database: &PostgresBackend, plan: &SqlPlan) -> Vec<String> {
-    let mut solutions = database.execute(plan).await.unwrap();
+/// The solutions of `plan` on `engine`, in the order they arrive.
+async fn solutions(engine: &Engine<PostgresBackend>, plan: &SqlPlan) -> Vec<String> {
+    let mut solutions = engine.execute(plan).await.unwrap();
     let mut rows = Vec::new();
     while let Some(solution) = solutions.try_next().await.unwrap() {
         rows.push(format!("{:?}", solution.values()));
@@ -3250,65 +3261,113 @@ async fn solutions(database: &PostgresBackend, plan: &SqlPlan) -> Vec<String> {
     rows
 }
 
-/// The catalog query, the column probe and the statements prepared for
-/// the same plan before go to the database together, so a query whose
-/// plan the connection has run before takes two round trips (that and
-/// running the statement) and a new plan three. A plan that differs from
-/// one run before only by its constants is known too. A query whose
-/// constants cannot match skips running the statement.
+/// An engine for `mapping` on `database`, with the catalog of the mapping
+/// read, as `v12n serve` starts.
+async fn engine(mapping: &str, database: PostgresBackend) -> Engine<PostgresBackend> {
+    let planner = Planner::new(Mapping::from_turtle(mapping).unwrap());
+    let engine = Engine::new(Arc::new(planner), Arc::default(), database);
+    engine.load_catalog().await.unwrap();
+    engine
+}
+
+/// The fingerprint check and the statement go to the database together,
+/// so a query takes two round trips: that and running the statement. A
+/// query whose constants cannot match skips running the statement.
 #[tokio::test]
-async fn known_plans_take_two_round_trips() {
+async fn queries_take_two_round_trips() {
     let Some(url) = database_url() else { return };
     let (proxied, wire) = wire_counter(&url).await;
     let database = PostgresBackend::connect(&proxied, Limits::default())
         .await
         .unwrap();
+    let engine = engine(SHOP, database).await;
     let name = |id: &str| {
         format!(
             "SELECT ?n WHERE {{ <http://example.org/customer/{id}> <http://example.org/name> ?n }}"
         )
     };
-    for (query, rows, first, again) in [
+    for (query, rows, round_trips) in [
         // Keys show that no duplicates need removing.
-        (name("7"), 1, 3, 2),
-        (name("8"), 1, 2, 2),
-        (VIP_ORDERS.to_owned(), 3, 3, 2),
+        (name("7"), 1, 2),
+        (VIP_ORDERS.to_owned(), 3, 2),
         // No keys to read: the column types tell how to remove duplicates.
         (
             "SELECT DISTINCT ?t WHERE { ?c <http://example.org/tier> ?t }".to_owned(),
             2,
-            3,
             2,
         ),
         (
             "SELECT ?x WHERE { { ?x <http://example.org/name> ?v } UNION { ?x <http://example.org/amount> ?v } }"
                 .to_owned(),
             7,
-            3,
             2,
         ),
-        // The plan of the first query, with a constant that cannot match.
-        (name("007"), 0, 1, 1),
+        // A constant that cannot match.
+        (name("007"), 0, 1),
     ] {
         let plan = plan(SHOP, &query);
         let mut results = Vec::new();
-        for expected in [first, again] {
+        for _ in 0..2 {
             let before = wire.lock().unwrap().round_trips;
-            let found = solutions(&database, &plan).await;
-            let round_trips = wire.lock().unwrap().round_trips - before;
-            assert_eq!((found.len(), round_trips), (rows, expected), "{query}");
+            let found = solutions(&engine, &plan).await;
+            let taken = wire.lock().unwrap().round_trips - before;
+            assert_eq!((found.len(), taken), (rows, round_trips), "{query}");
             results.push(found);
         }
         assert_eq!(results[0], results[1], "{query}");
     }
 }
 
-/// The statements prepared for a plan before are a guess only, checked
-/// against the keys read on every query: once the key that let the query
-/// keep every row is dropped and a row is duplicated, the statement that
-/// removes duplicates is prepared instead, and the row counts once.
+/// A statement whose parameter types call for rendering it again takes a
+/// round trip more the first time; the connection then prepares the
+/// retyped statement together with the first one.
 #[tokio::test]
-async fn a_known_plan_does_not_trust_a_dropped_key() {
+async fn retyped_statements_are_prepared_in_the_same_round_trip_next_time() {
+    let Some(url) = database_url() else { return };
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS v12n_retyped CASCADE;
+             CREATE SCHEMA v12n_retyped;
+             CREATE TABLE v12n_retyped.items (id int PRIMARY KEY, code char(3) NOT NULL);
+             INSERT INTO v12n_retyped.items VALUES (1, 'a'), (2, 'b');",
+        )
+        .await
+        .unwrap();
+    let mapping = "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
+         <#M> rr:logicalTable [ rr:tableName \"v12n_retyped.items\" ] ;\n\
+           rr:subjectMap [ rr:template \"http://example.org/item/{id}\" ] ;\n\
+           rr:predicateObjectMap [ rr:predicate <http://example.org/code> ; \
+           rr:objectMap [ rr:column \"code\" ] ] .";
+    let plan = plan(
+        mapping,
+        "SELECT ?i WHERE { ?i <http://example.org/code> \"a  \" }",
+    );
+    let (proxied, wire) = wire_counter(&url).await;
+    let database = PostgresBackend::connect(&proxied, Limits::default())
+        .await
+        .unwrap();
+    let engine = engine(mapping, database).await;
+    let mut taken = Vec::new();
+    for _ in 0..2 {
+        let before = wire.lock().unwrap().round_trips;
+        assert_eq!(solutions(&engine, &plan).await.len(), 1);
+        taken.push(wire.lock().unwrap().round_trips - before);
+    }
+    client
+        .batch_execute("DROP SCHEMA v12n_retyped CASCADE")
+        .await
+        .unwrap();
+    assert_eq!(taken, [3, 2]);
+}
+
+/// A snapshot is never trusted once the database differs from it: after
+/// the key that let the query keep every row is dropped and a row is
+/// duplicated, the fingerprint check fails, the tables are read again and
+/// the statement that removes duplicates runs, and the row counts once.
+#[tokio::test]
+async fn a_query_does_not_trust_a_dropped_key() {
     let Some(url) = database_url() else { return };
     let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(connection);
@@ -3334,10 +3393,10 @@ async fn a_known_plan_does_not_trust_a_dropped_key() {
     let database = PostgresBackend::connect(&proxied, Limits::default())
         .await
         .unwrap();
+    let engine = engine(mapping, database).await;
     let round_trips = || wire.lock().unwrap().round_trips;
-    let first = solutions(&database, &plan).await;
     let before = round_trips();
-    assert_eq!(solutions(&database, &plan).await, first);
+    let first = solutions(&engine, &plan).await;
     assert_eq!(round_trips() - before, 2);
 
     client
@@ -3348,7 +3407,7 @@ async fn a_known_plan_does_not_trust_a_dropped_key() {
         .await
         .unwrap();
     let before = round_trips();
-    let mut after = solutions(&database, &plan).await;
+    let mut after = solutions(&engine, &plan).await;
     let round_trips = round_trips() - before;
     client
         .batch_execute("DROP SCHEMA v12n_known CASCADE")
@@ -3358,5 +3417,7 @@ async fn a_known_plan_does_not_trust_a_dropped_key() {
     first.sort();
     after.sort();
     assert_eq!(after, first);
-    assert_eq!(round_trips, 3);
+    // The check with the statement, reading the table again, then the
+    // check with the new statement, and running it.
+    assert_eq!(round_trips, 4);
 }

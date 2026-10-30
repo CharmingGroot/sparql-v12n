@@ -35,6 +35,10 @@ pub enum Error {
     /// IRI without a base IRI (an R2RML data error).
     #[error("invalid term: {0}")]
     InvalidTerm(String),
+    /// A logical table or column that the mapping reads and the database
+    /// lacks, as the catalog shows it at the time of the query.
+    #[error("{0}")]
+    Catalog(String),
     /// A valid construct this engine does not support yet.
     #[error("unsupported feature: {0}")]
     UnsupportedFeature(String),

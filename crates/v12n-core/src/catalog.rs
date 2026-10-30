@@ -3,11 +3,16 @@
 //! read once by a [`Backend`](crate::Backend) and checked on every query by
 //! a fingerprint (Discussion #187).
 
+mod plan;
+
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::mapping::{LogicalTable, Mapping, ObjectMap, TermMap, TermMapValue};
-use crate::sql::{ColumnType, Comparison, describe_table};
+use crate::sql::{ColumnType, Comparison, SqlPlan, describe_table};
+
+pub use plan::{CatalogPlan, PlanKeys};
 
 /// The columns a mapping reads from each of its logical tables, named as
 /// the mapping writes them.
@@ -54,6 +59,18 @@ impl CatalogRequest {
                     }
                 }
             }
+        }
+        request
+    }
+
+    /// Every logical table `plan` scans, with the columns it reads.
+    pub fn for_plan(plan: &SqlPlan) -> Self {
+        let mut request = Self::default();
+        for table in plan.logical_tables() {
+            request.table_mut(&table);
+        }
+        for (table, column) in plan.read_columns() {
+            request.add_column(&table, &column);
         }
         request
     }
@@ -115,6 +132,8 @@ impl CatalogSnapshot {
     }
 
     /// What the tables of `request` lack, in the order of `request`.
+    /// Tables the snapshot has no entry for are not read yet and are left
+    /// out.
     pub fn problems(&self, request: &CatalogRequest) -> Vec<CatalogProblem> {
         request
             .tables()
@@ -122,11 +141,16 @@ impl CatalogSnapshot {
             .filter_map(|t| {
                 let table = t.table.clone();
                 match &self.table(&t.table)?.status {
-                    TableStatus::Readable(relation) if relation.missing_columns.is_empty() => None,
-                    TableStatus::Readable(relation) => Some(CatalogProblem::MissingColumns {
-                        table,
-                        columns: relation.missing_columns.clone(),
-                    }),
+                    TableStatus::Readable(relation) => {
+                        let columns: Vec<String> = t
+                            .columns
+                            .iter()
+                            .filter(|c| !relation.columns.contains_key(*c))
+                            .cloned()
+                            .collect();
+                        (!columns.is_empty())
+                            .then_some(CatalogProblem::MissingColumns { table, columns })
+                    }
                     TableStatus::Missing => Some(CatalogProblem::MissingTable(table)),
                     TableStatus::Unreadable(message) => Some(CatalogProblem::Unreadable {
                         table,
@@ -135,6 +159,80 @@ impl CatalogSnapshot {
                 }
             })
             .collect()
+    }
+
+    /// Whether the snapshot has an entry for every table `plan` scans and
+    /// shows each readable, with every column `plan` reads.
+    pub fn covers(&self, plan: &SqlPlan) -> bool {
+        let request = CatalogRequest::for_plan(plan);
+        request
+            .tables()
+            .iter()
+            .all(|t| self.tables.contains_key(&t.table))
+            && self.problems(&request).is_empty()
+    }
+
+    /// The first table or column `plan` reads that the snapshot shows the
+    /// database lacks.
+    pub fn problem_for(&self, plan: &SqlPlan) -> Option<CatalogProblem> {
+        self.problems(&CatalogRequest::for_plan(plan))
+            .into_iter()
+            .next()
+    }
+
+    /// The tables `plan` scans, each with the columns `plan` reads and
+    /// those the snapshot already holds for it, so that reading them again
+    /// keeps what other plans need.
+    pub fn request_for(&self, plan: &SqlPlan) -> CatalogRequest {
+        let mut request = CatalogRequest::for_plan(plan);
+        for t in &mut request.tables {
+            let Some(TableStatus::Readable(relation)) = self.table(&t.table).map(|e| &e.status)
+            else {
+                continue;
+            };
+            for known in relation.columns.keys().chain(&relation.missing_columns) {
+                if !t.columns.contains(known) {
+                    t.columns.push(known.clone());
+                }
+            }
+        }
+        request
+    }
+
+    /// The snapshot with the entries of `fresh` in place of its own.
+    pub fn merged(&self, fresh: Self) -> Self {
+        let mut tables = self.tables.clone();
+        tables.extend(fresh.tables);
+        Self { tables }
+    }
+}
+
+/// The snapshot that the sessions of one front end share. An update
+/// serves the queries that start after it; a running query keeps the
+/// snapshot it started with.
+#[derive(Debug, Default)]
+pub struct Catalog {
+    current: RwLock<Arc<CatalogSnapshot>>,
+}
+
+impl Catalog {
+    pub fn new(snapshot: CatalogSnapshot) -> Self {
+        Self {
+            current: RwLock::new(Arc::new(snapshot)),
+        }
+    }
+
+    pub fn snapshot(&self) -> Arc<CatalogSnapshot> {
+        Arc::clone(&self.current.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Replaces the entries of the tables `fresh` holds and returns the
+    /// snapshot that results.
+    pub fn update(&self, fresh: CatalogSnapshot) -> Arc<CatalogSnapshot> {
+        let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
+        let merged = Arc::new(current.merged(fresh));
+        *current = Arc::clone(&merged);
+        merged
     }
 }
 

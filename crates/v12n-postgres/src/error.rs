@@ -19,6 +19,9 @@ pub enum Error {
     /// The server cancelled the query at `statement_timeout`.
     #[error("query cancelled after the statement timeout of {0:?}")]
     Timeout(Duration),
+    /// The catalog changed after the snapshot the plan was completed from.
+    #[error("the database catalog changed while the query was planned")]
+    StaleCatalog,
     /// A row could not be turned into a solution.
     #[error(transparent)]
     Core(#[from] v12n_core::Error),
@@ -59,6 +62,7 @@ impl BackendError for Error {
             Self::Config(_) => ErrorKind::Config,
             Self::Database(_) => ErrorKind::Database,
             Self::Timeout(timeout) => ErrorKind::Timeout(*timeout),
+            Self::StaleCatalog => ErrorKind::StaleCatalog,
             Self::Core(error) => ErrorKind::Core(error),
         }
     }

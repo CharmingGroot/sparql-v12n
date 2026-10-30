@@ -50,11 +50,11 @@ it.
 | Port | Kind | Role | Implemented by |
 |---|---|---|---|
 | `Planner` | Driving | Holds a mapping and its index; plans queries. Needs no database | `v12n-core` |
-| `Engine<B>` | Driving | Pairs a shared `Planner` with one database session `B`; renders and executes plans | `v12n-core` |
+| `Engine<B>` | Driving | Pairs a shared `Planner` and `Catalog` with one database session `B`; completes, renders and executes plans | `v12n-core` |
 | `Connector` | Driven | Opens a session with the query limits the front end passes | `PostgresConnector` |
-| `Backend` | Driven | One session: its SQL dialect, `execute`, `load_catalog`, `is_closed` | `PostgresBackend` |
+| `Backend` | Driven | One session: its SQL dialect, `load_catalog`, `execute` of a `CatalogPlan`, `is_closed` | `PostgresBackend` |
 | `SolutionStream` | Driven | The solutions of one query, read one at a time; reports truncation | `v12n_postgres::Solutions` |
-| `BackendError` | Driven | Classifies an error as `Config`, `Database`, `Timeout` or `Core`, from which front ends choose exit codes and HTTP statuses | `v12n_postgres::Error` |
+| `BackendError` | Driven | Classifies an error as `Config`, `Database`, `Timeout`, `StaleCatalog` or `Core`, from which front ends choose exit codes and HTTP statuses | `v12n_postgres::Error` |
 | `Dialect` | Driven | The SQL text that differs between databases | `PostgresDialect` |
 
 Trait methods return `impl Future + Send`, so the front ends are generic
@@ -101,52 +101,65 @@ Errors at this stage are about the query or the mapping:
 
 ## Steps that read the database
 
-The SQL that runs is not the SQL of `v12n explain`. Before running a
-plan, the backend reads facts from the database that the rewrites and
-the renderer in `v12n-core` need. These steps are in
-[`PostgresBackend::run`](../crates/v12n-postgres/src/lib.rs) and run for
-every query.
+The SQL that runs is not the SQL of `v12n explain`. Keys, column types
+and resolved column names come from a catalog snapshot
+([`CatalogSnapshot`](../crates/v12n-core/src/catalog.rs)) that the
+backend reads with `load_catalog`, and every query checks that the
+database still matches it ([Discussion #187](https://github.com/CharmingGroot/sparql-v12n/discussions/187)).
 
 ```mermaid
 flowchart TD
-    plan["SqlPlan"] --> trip["Keys, column probe and guessed statements in one round trip"]
-    trip --> names["Resolve unquoted column names"]
-    names --> merge["Merge scans of the same row (eliminate_self_joins)"]
-    merge --> dup["Drop duplicate removal that keys make unnecessary"]
-    dup --> types["Line up UNION branches by type (with_union_types)"]
-    types --> render["Render with keys and types (to_sql_with)"]
-    render --> prepare["Prepare; render again if parameter types need it"]
-    prepare --> bind["Bind constants; skip the query if none can match"]
+    plan["SqlPlan"] --> covers{"Snapshot shows every table and column the plan reads?"}
+    covers -- no --> load["Read those tables (load_catalog)"]
+    load --> complete
+    covers -- yes --> complete["Complete the plan (CatalogPlan::new)"]
+    complete --> trip["Render; check fingerprints and prepare the statement in one round trip"]
+    trip -- catalog changed --> reload["Read the plan's tables again, once"]
+    reload --> complete
+    trip -- current --> retype["Render again if parameter types need it"]
+    retype --> bind["Bind constants; skip the query if none can match"]
     bind --> run["Run the statement (query_raw)"]
 ```
 
-- **Keys.** A query on the catalog lists the unique keys of the tables
-  the plan can use them for. Only keys that hold for every row count:
-  valid, not deferrable, not partial, on plain columns, and not on a
-  table with inheritance children. Keys show when a branch scans the
-  same row twice, so the scans merge, and when the result cannot have
+- **Snapshot.** For each logical table: whether it exists, the columns
+  the mapping reads with their resolved names, types and `NOT NULL`, the
+  unique keys that hold for every row (valid, not deferrable, not
+  partial, on plain columns, and not on a table with inheritance
+  children), validated foreign keys, and a fingerprint: a SHA-256 hash,
+  computed by PostgreSQL, of the catalog rows these come from.
+  `v12n serve` reads the snapshot of every table of the mapping at
+  startup; `v12n query` reads the tables of its plan only.
+- **Completing the plan.**
+  [`CatalogPlan::new`](../crates/v12n-core/src/catalog/plan.rs) runs in
+  `v12n-core` without the database. It resolves column names that
+  PostgreSQL folds to lower case. Keys show when a branch scans the same
+  row twice, so the scans merge, and when the result cannot have
   duplicates, so `DISTINCT` or a duplicate-removing `UNION` is dropped.
-- **Column names and types.** A probe statement resolves column names
-  that PostgreSQL folds to lower case and reports column types. The
-  types decide how branches of a `UNION` line up and how values compare
-  as RDF terms. A comparison that SQL cannot answer as SPARQL does for
-  these types fails here with `UnsupportedFeature`.
+  Column types decide how branches of a `UNION` line up and how values
+  compare as RDF terms; a comparison that SQL cannot answer as SPARQL
+  does fails with `UnsupportedFeature`. A table or column that the
+  snapshot shows missing fails with `Catalog`.
+- **Check.** [`PostgresBackend::run`](../crates/v12n-postgres/src/lib.rs)
+  sends the fingerprint query for the plan's tables and the preparation
+  of the statement in one pipelined round trip. A plan that reads an
+  `rr:sqlQuery` also parses its probe there and compares the column
+  names and types with the snapshot. When anything differs, the
+  statement does not run: the engine reads those tables again and plans
+  once more. A second difference is a retryable error (HTTP 503).
 - **Parameters.** Every constant of the query is a bound parameter. The
   types PostgreSQL infers for them can change the SQL, for example a
   comparison that has to match the text output of a type without a
   decoder, so the statement is rendered and prepared a second time when
-  needed.
+  needed. The connection remembers that SQL by the SQL rendered first,
+  prepares it with the first statement next time, and uses it only when
+  it is exactly the statement the types call for.
 - **Row limit.** When the row limit can cut the result, the statement
   reads one row past the limit and carries `count(*) OVER ()` in an
   extra column, so that the first row tells whether the result is
   truncated.
 
-The rewrite and rendering functions are in `v12n-core` and are pure;
-the backend decides when to call them with what the catalog reports.
-Nothing read from the catalog is kept between queries. The connection
-remembers only the SQL text of the statements it prepared for recent
-plans, and uses one only when it is the statement that the fresh
-information produces.
+The check and the execution are separate round trips, so a schema
+change committed between them is not seen by that query.
 
 ## From rows to results
 
@@ -199,8 +212,10 @@ The two front ends differ after the first row.
 2. `query` builds a single-threaded Tokio runtime and calls
    `PostgresConnector::connect`, which opens one connection and sets the
    statement timeout and read-only transactions for the session.
-3. `Engine::execute` calls `PostgresBackend::run`, which performs the
-   steps that read the database and returns `Solutions`.
+3. `Engine::execute` reads the catalog entries of the plan's tables,
+   since the CLI starts with an empty catalog, completes the plan and
+   calls `PostgresBackend::run`, which checks the entries, prepares and
+   starts the statement, and returns `Solutions`.
 4. `stream_solutions` or `print_solutions_table` reads the solutions to
    the end. A truncated result prints a warning and sets exit code 5
    after the output.
@@ -223,7 +238,7 @@ sequenceDiagram
     S->>L: get()
     L-->>S: Lease (idle Engine or a new connection)
     S->>B: execute(plan)
-    B->>D: keys, probe, prepare
+    B->>D: fingerprint check, prepare
     B->>D: run statement
     S->>B: try_next() for the first row
     B-->>S: first solution (or an error status)
@@ -236,7 +251,9 @@ sequenceDiagram
 ```
 
 `serve` parses the mapping and builds the `Planner` at startup, then
-opens one session to check that the database is reachable. Each request
+opens one session to check that the database is reachable and reads the
+catalog snapshot of the mapping's tables. Tables and columns that the
+mapping reads and the database lacks are logged as warnings. Each request
 goes through `answer` in [`lib.rs`](../crates/v12n-server/src/lib.rs).
 A planning error returns before a permit or a connection is taken.
 
@@ -245,6 +262,11 @@ A planning error returns before a permit or a connection is taken.
 **Mapping and index.** A `Planner` lives as long as the process: one per
 `v12n` run, and one for the server, shared by every request through an
 `Arc`. A changed mapping file takes effect after a restart.
+
+**Catalog snapshot.** The server holds one `Catalog`, shared by the
+sessions of the pool. A reload replaces the entries of the tables it
+read for the queries that start after it; a running query keeps the
+snapshot it started with. `v12n query` starts with an empty catalog.
 
 **Connections.** `v12n query` opens one connection and closes it on
 exit. The server keeps idle `Engine`s in a pool and opens a new one when
@@ -285,7 +307,7 @@ rows for `count(*) OVER ()` before it sends the first one
 |---|---|
 | `Dialect` trait for database-specific SQL ([#134](https://github.com/CharmingGroot/sparql-v12n/issues/134)) | Implemented; `PostgresDialect` is the only dialect |
 | `Engine`, `Backend`, `Connector`, `SolutionStream` ports ([#166](https://github.com/CharmingGroot/sparql-v12n/issues/166)) | Implemented; `v12n-postgres` is the only adapter |
-| Catalog reads as a snapshot taken by the engine instead of inside `PostgresBackend::run` ([#109](https://github.com/CharmingGroot/sparql-v12n/issues/109), [#110](https://github.com/CharmingGroot/sparql-v12n/issues/110), [Discussion #187](https://github.com/CharmingGroot/sparql-v12n/discussions/187)) | In progress; `CatalogSnapshot` is loaded by `v12n check --db`, and queries still read the catalog in `PostgresBackend::run` |
+| Catalog reads as a snapshot taken by the engine instead of inside `PostgresBackend::run` ([#109](https://github.com/CharmingGroot/sparql-v12n/issues/109), [#110](https://github.com/CharmingGroot/sparql-v12n/issues/110), [Discussion #187](https://github.com/CharmingGroot/sparql-v12n/discussions/187)) | Implemented |
 | Ontology support ([#123](https://github.com/CharmingGroot/sparql-v12n/issues/123)–[#127](https://github.com/CharmingGroot/sparql-v12n/issues/127)) | Planned |
 | A second database ([#165](https://github.com/CharmingGroot/sparql-v12n/issues/165)) | Planned |
 | Truncation without materializing the limited rows ([#152](https://github.com/CharmingGroot/sparql-v12n/issues/152)) | Open; decided after measurement |

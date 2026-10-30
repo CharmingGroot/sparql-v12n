@@ -534,7 +534,7 @@ fn check_catalog(planner: &Arc<Planner>, connector: impl Connector) -> Result<()
     let snapshot = runtime
         .block_on(async {
             let backend = connector.connect(Limits::default()).await?;
-            Engine::new(Arc::clone(planner), backend)
+            Engine::new(Arc::clone(planner), Arc::default(), backend)
                 .load_catalog()
                 .await
         })
@@ -770,7 +770,8 @@ fn query(
     runtime.block_on(async {
         let before_output = |e| query_failure(&e, 0);
         let backend = connector.connect(limits).await.map_err(before_output)?;
-        let engine = Engine::new(Arc::new(planner), backend);
+        // An empty catalog: the query reads the entries of its own tables.
+        let engine = Engine::new(Arc::new(planner), Arc::default(), backend);
         let mut solutions = engine.execute(&plan).await.map_err(before_output)?;
         // Waiting for the first row before printing anything means an error
         // in planning or early execution is still reported in `format`.
@@ -850,6 +851,8 @@ fn database_failure(error: &dyn BackendError) -> Failure {
         ErrorKind::Config => (EXIT_INPUT, "input"),
         ErrorKind::Database => (EXIT_DATABASE, "database"),
         ErrorKind::Timeout(_) => (EXIT_TIMEOUT, "timeout"),
+        ErrorKind::StaleCatalog => (EXIT_DATABASE, "database"),
+        ErrorKind::Core(v12n_core::Error::Catalog(_)) => (EXIT_DATABASE, "database"),
         // A comparison the column types make impossible to do right in SQL.
         ErrorKind::Core(v12n_core::Error::UnsupportedFeature(_)) => (EXIT_INPUT, "unsupported"),
         ErrorKind::Core(_) => (EXIT_DATABASE, "data"),

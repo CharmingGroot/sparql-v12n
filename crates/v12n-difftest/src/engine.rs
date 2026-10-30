@@ -103,7 +103,7 @@ pub fn run(
                 ..Limits::default()
             };
             let backend = PostgresConnector::new(database_url).connect(limits).await?;
-            let engine = Engine::new(planner, backend);
+            let engine = Engine::new(planner, Arc::default(), backend);
             let first = solutions(&engine, &plan).await?;
             let second = solutions(&engine, &plan).await?;
             Ok::<_, v12n_postgres::Error>((first, second))

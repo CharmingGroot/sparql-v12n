@@ -17,34 +17,37 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
-use futures_util::future::{join, join4};
+use futures_util::future::{join, join3};
 use tls::Tls;
-use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config, RowStream, Statement};
 use v12n_core::Limits;
 use v12n_core::backend::{Backend, SolutionStream};
-use v12n_core::catalog::{CatalogRequest, CatalogSnapshot};
+use v12n_core::catalog::{CatalogPlan, CatalogRequest, CatalogSnapshot, PlanKeys};
 use v12n_core::dialect::PostgresDialect;
-use v12n_core::mapping::LogicalTable;
 use v12n_core::optimize;
 use v12n_core::solution::{Solution, SolutionBuilder, SqlValue};
 use v12n_core::sql::{
-    ColumnType, ColumnTypes, Comparison, RenderOptions, RenderedSql, SqlPlan, TableKeys, TermKey,
-    TermNormal, column_name_probe, column_probe, column_type_probe, folded_identifier,
-    quote_identifier, quote_table_name,
+    RenderOptions, RenderedSql, SqlPlan, TableKeys, TermKey, TermNormal, quote_identifier,
 };
 
 use bind::{Bound, bind, term_key, term_normal};
 pub use connector::PostgresConnector;
-use decode::{Decoder, Raw, column_type};
+use decode::{Decoder, Raw};
 pub use error::Error;
 
 /// Applied when the connection string sets no `connect_timeout`.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Most plans whose statements a connection remembers ([`PostgresBackend::recent`]).
-const RECENT_PLANS: usize = 64;
+/// Most statements whose retyped SQL a connection remembers
+/// ([`PostgresBackend::retyped`]).
+const RETYPED_STATEMENTS: usize = 64;
 
-/// The unique keys of the tables named in `$1`, see [`PostgresBackend::load_keys`].
+/// The unique keys of the tables named in `$1` that hold for every row at
+/// any time: unique indexes that are valid, not deferrable, not partial
+/// and on plain columns. A table with inheritance children has none, since
+/// a scan reads rows its indexes do not cover; a partitioned table's keys
+/// cover its partitions. The third column tells whether the index decides
+/// equality as SQL `=` does (`UniqueKey::exact_index`).
 const KEYS_SQL: &str = "SELECT t.n::int4, array_agg(a.attname::text ORDER BY c.ord),
    bool_and(a.attnotnull AND c.coll = a.attcollation AND o.opcdefault),
    array_agg(a.atttypid ORDER BY c.ord)
@@ -61,32 +64,21 @@ const KEYS_SQL: &str = "SELECT t.n::int4, array_agg(a.attname::text ORDER BY c.o
      OR NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = r.oid))
  GROUP BY t.n, i.indexrelid";
 
-/// Unique keys of a plan's tables, see [`PostgresBackend::load_keys`].
-struct Keys {
-    /// Every key that always holds, for removing duplicates.
-    unique: TableKeys,
-    /// Those that identify a row by SQL `=`, for merging scans.
-    mergeable: TableKeys,
-}
-
-/// A connection that runs [`SqlPlan`]s.
+/// A connection that runs [`CatalogPlan`]s.
 pub struct PostgresBackend {
     client: Client,
     limits: Limits,
     /// Whether the server encoding is UTF-8, where `COLLATE "C"` orders
     /// strings by code point.
     utf8: bool,
-    /// [`KEYS_SQL`], prepared with the connection. Its text never changes,
-    /// so only preparing it again would cost a round trip per query; it
-    /// still runs on every query, so keys are always read fresh.
-    keys_statement: Statement,
-    /// The statements [`execute`](Self::execute) prepared for recent plans,
-    /// by the plan's SQL rendered without database information. Only a
-    /// guess of what to prepare: the next query of that plan prepares them
-    /// in the same round trip that reads the catalog, and uses one only if
-    /// it is exactly the statement the fresh catalog information gives. A
-    /// stale guess costs a round trip, never a wrong result.
-    recent: Mutex<HashMap<String, Vec<String>>>,
+    catalog: catalog::CatalogStatements,
+    /// For statements whose parameter or result column types made
+    /// [`run`](Self::run) render and prepare them again, the SQL it
+    /// prepared instead, by the SQL it rendered first. Only a guess of what
+    /// to prepare: the next query with that SQL prepares the guess in the
+    /// same round trip as the first statement, and uses it only if it is
+    /// exactly the statement the types call for (Discussion #87).
+    retyped: Mutex<HashMap<String, String>>,
 }
 
 impl PostgresBackend {
@@ -123,237 +115,110 @@ impl PostgresBackend {
         let timeout = limits.statement_timeout;
         let client = tls.connect(&config, timeout).await?;
         let timeout_ms = format!("{}ms", timeout.as_millis());
-        let (row, keys_statement) = join(
+        let (row, catalog) = join(
             client.query_one(
                 "SELECT set_config('statement_timeout', $1, false), \
                  set_config('default_transaction_read_only', 'on', false), \
                  current_setting('server_encoding')",
                 &[&timeout_ms],
             ),
-            client.prepare(KEYS_SQL),
+            catalog::CatalogStatements::prepare(&client),
         )
         .await;
         let row = row.map_err(|e| Error::from_postgres(e, timeout))?;
-        let keys_statement = keys_statement.map_err(|e| Error::from_postgres(e, timeout))?;
+        let catalog = catalog.map_err(|e| Error::from_postgres(e, timeout))?;
         let encoding: String = row.get(2);
         Ok(Self {
             client,
             limits,
             utf8: encoding == "UTF8",
-            keys_statement,
-            recent: Mutex::new(HashMap::new()),
+            catalog,
+            retyped: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Runs a plan for [`Backend::execute`].
-    ///
-    /// Everything that depends on the plan alone is sent in one pipelined
-    /// round trip: the catalog query for keys, one statement that resolves
-    /// column names and reports column types, and the statements prepared
-    /// for the same plan last time. The statement is then prepared, unless
-    /// one of those is it, and run.
-    async fn run(&self, plan: &SqlPlan) -> Result<Solutions, Error> {
-        let timeout = self.limits.statement_timeout;
-        let pg = |e| Error::from_postgres(e, timeout);
-        // Rendering without database information fails where only the
-        // column types tell whether a query is supported; such plans are
-        // not remembered.
-        let shape = plan
-            .to_sql_with(&PostgresDialect, &RenderOptions::default())
-            .ok()
-            .map(|rendered| rendered.sql);
-        let guesses = shape
-            .as_ref()
-            .and_then(|shape| {
-                self.recent
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(shape)
-                    .cloned()
-            })
-            .unwrap_or_default();
-        let tables = keyed_tables(plan);
-        let folded = plan.folded_columns();
-        let mut probe_columns = folded.clone();
-        let term_columns = plan.term_columns();
-        // Whether the statement needs column types is known only after the
-        // keys when they are read, so then they are probed in any case,
-        // within the same round trip.
-        if !tables.is_empty()
-            || plan.distinct
-            || plan.branches.len() > 1
-            || plan.has_duplicates(None)
-            || !term_columns.is_empty()
-        {
-            for column in term_columns.into_iter().chain(plan.selected_columns()) {
-                if !probe_columns.contains(&column) {
-                    probe_columns.push(column);
-                }
-            }
-        }
-        let probe_sql = (!probe_columns.is_empty()).then(|| column_probe(&probe_columns));
-        let (keys, probe, first, second) = join4(
-            self.load_keys_of(&tables),
-            self.prepare_if(probe_sql.as_deref()),
-            self.prepare_if(guesses.first().map(String::as_str)),
-            self.prepare_if(guesses.get(1).map(String::as_str)),
-        )
-        .await;
-        let mut prepared: Vec<(&str, Statement)> = guesses
-            .iter()
-            .zip([first, second])
-            .filter_map(|(sql, statement)| Some((sql.as_str(), statement?.ok()?)))
-            .collect();
-        // A probe that fails is retried as the separate steps it combines,
-        // so that an error is reported by the step it belongs to.
-        let probe = probe.and_then(Result::ok);
-        let plan = match &probe {
-            _ if folded.is_empty() => Cow::Borrowed(plan),
-            Some(probe) => {
-                let resolved: HashMap<_, _> = folded
-                    .iter()
-                    .cloned()
-                    .zip(probe.columns())
-                    .map(|(column, c)| (column, c.name().to_owned()))
-                    .collect();
-                Cow::Owned(plan.with_resolved_columns(&resolved))
-            }
-            None => self.resolve_columns(plan).await.map_err(pg)?,
-        };
-        let probed_types: Option<ColumnTypes> = probe.map(|probe| {
-            probe_columns
-                .into_iter()
-                .zip(probe.columns())
-                .map(|((table, name), c)| {
-                    let name = if folded_identifier(&name) {
-                        quote_identifier(c.name())
-                    } else {
-                        name
-                    };
-                    ((table, name), column_type(c.type_()))
-                })
-                .collect()
-        });
-        let keys = keys.map_err(pg)?;
-        let plan = match keys
-            .as_ref()
-            .and_then(|k| optimize::eliminate_self_joins(&plan, &k.mergeable))
-        {
-            Some(merged) => Cow::Owned(merged),
-            None => plan,
-        };
-        let keys = keys.map(|k| k.unique);
-        // `DISTINCT` and `UNION` compare values with `=`, so the types of
-        // the columns they compare tell which need a key next to them.
-        let removes_duplicates = plan.distinct || plan.has_duplicates(keys.as_ref());
-        let typed = typed_columns(&plan, removes_duplicates);
-        let column_types = if typed.is_empty() {
-            None
-        } else if let Some(types) = probed_types.as_ref().and_then(|probed| {
-            typed
-                .iter()
-                .map(|column| Some((column.clone(), probed.get(column)?.clone())))
-                .collect::<Option<ColumnTypes>>()
-        }) {
-            Some(types)
-        } else {
-            self.column_types(&plan, removes_duplicates)
-                .await
-                .map_err(pg)?
-        };
-        let plan = match &column_types {
-            Some(types) if plan.branches.len() > 1 => Cow::Owned(plan.with_union_types(types)?),
-            _ => plan,
-        };
-        let plan = plan.as_ref();
+    /// Runs a plan for [`Backend::execute`]. The check that the database
+    /// still matches the catalog entries of the plan goes out with the
+    /// preparation of the statement, in one pipelined round trip.
+    async fn run(&self, ready: &CatalogPlan) -> Result<Solutions, Error> {
+        let pg = |e| Error::from_postgres(e, self.limits.statement_timeout);
+        let plan = ready.plan();
         let options = RenderOptions {
-            text_params: &[],
-            keyed_params: &[],
-            normal_params: &[],
-            column_types: column_types.as_ref(),
-            keys: keys.as_ref(),
             non_utf8: !self.utf8,
+            ..ready.render_options()
         };
         let rendered = plan.to_sql_with(&PostgresDialect, &options)?;
         let fetch = row_fetch(self.limits.row_limit, plan.limit);
-        let mut used = vec![statement_sql(plan, &rendered, None, fetch.is_some())];
-        let mut statement = self
-            .take_or_prepare(&mut prepared, &used[0])
-            .await
-            .map_err(pg)?;
+        let sql = statement_sql(plan, &rendered, None, fetch.is_some());
+        let guess = self
+            .retyped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&sql)
+            .cloned();
+        let (current, statement, guessed) = join3(
+            catalog::is_current(&self.client, &self.catalog, ready),
+            self.client.prepare(&sql),
+            self.prepare_if(guess.as_deref()),
+        )
+        .await;
+        // A statement prepared on a changed catalog can fail because of
+        // the change, so the check is reported first.
+        if !current.map_err(pg)? {
+            return Err(Error::StaleCatalog);
+        }
+        let statement = statement.map_err(pg)?;
+        let (statement, rendered) = match retyped(plan, options, &statement, &rendered, fetch)? {
+            None => (statement, rendered),
+            Some((retyped_sql, retyped_rendered)) => {
+                let statement = match guessed.and_then(Result::ok) {
+                    Some(guessed) if guess.as_ref() == Some(&retyped_sql) => guessed,
+                    _ => self.client.prepare(&retyped_sql).await.map_err(pg)?,
+                };
+                self.remember_retyped(sql, retyped_sql);
+                (statement, retyped_rendered)
+            }
+        };
+        self.start(plan, &statement, &rendered, fetch).await
+    }
+
+    async fn prepare_if(
+        &self,
+        sql: Option<&str>,
+    ) -> Option<Result<Statement, tokio_postgres::Error>> {
+        match sql {
+            Some(sql) => Some(self.client.prepare(sql).await),
+            None => None,
+        }
+    }
+
+    fn remember_retyped(&self, sql: String, retyped_sql: String) {
+        let mut retyped = self.retyped.lock().unwrap_or_else(PoisonError::into_inner);
+        if retyped.len() >= RETYPED_STATEMENTS {
+            retyped.clear();
+        }
+        retyped.insert(sql, retyped_sql);
+    }
+
+    /// Binds the constants and starts the statement, or returns no
+    /// solutions without a round trip when no branch can produce a row.
+    async fn start(
+        &self,
+        plan: &SqlPlan,
+        statement: &Statement,
+        rendered: &RenderedSql,
+        fetch: Option<i64>,
+    ) -> Result<Solutions, Error> {
+        let timeout = self.limits.statement_timeout;
         // The projected columns, then the sort keys, then the row count.
         // A query that selects neither selects a constant in their place.
         let data_columns = plan.columns.len();
         let placeholder = usize::from(data_columns == 0 && rendered.order_by.is_empty());
         let count_column = fetch.map(|_| data_columns + rendered.order_by.len() + placeholder);
-        let decoders: Vec<Option<Decoder>> = statement.columns()[..data_columns]
-            .iter()
-            .map(|c| Decoder::for_type(c.type_()))
-            .collect();
-        // Values of types without a decoder become terms through their text
-        // output (see `cast_to_text`), so a constant compared with one is
-        // matched against that text instead of parsed as the type.
-        let text_params: Vec<usize> = statement.params()[..rendered.params.len()]
-            .iter()
-            .enumerate()
-            .filter(|(_, ty)| Decoder::for_type(ty).is_none())
-            .map(|(i, _)| i)
-            .collect();
-        // `=` finds a zero constant equal to `-0` and a `bpchar` constant
-        // equal to values with more padding, which are other terms.
-        let keyed_params: Vec<(usize, TermKey)> = statement.params()[..rendered.params.len()]
-            .iter()
-            .zip(&rendered.params)
-            .enumerate()
-            .filter_map(|(i, (ty, value))| term_key(ty, value).map(|key| (i, key)))
-            .collect();
-        // `=` finds a midnight constant different from `24:00:00`, the same term.
-        let normal_params: Vec<(usize, TermNormal)> = statement.params()[..rendered.params.len()]
-            .iter()
-            .zip(&rendered.params)
-            .enumerate()
-            .filter_map(|(i, (ty, value))| term_normal(ty, value).map(|normal| (i, normal)))
-            .collect();
-        let cast_columns = decoders.iter().any(Option::is_none);
-        let rendered = if cast_columns
-            || !text_params.is_empty()
-            || !keyed_params.is_empty()
-            || !normal_params.is_empty()
-        {
-            let rendered = plan.to_sql_with(
-                &PostgresDialect,
-                &RenderOptions {
-                    text_params: &text_params,
-                    keyed_params: &keyed_params,
-                    normal_params: &normal_params,
-                    ..options
-                },
-            )?;
-            let cast = cast_columns.then_some(decoders.as_slice());
-            let sql = statement_sql(plan, &rendered, cast, fetch.is_some());
-            statement = self
-                .take_or_prepare(&mut prepared, &sql)
-                .await
-                .map_err(pg)?;
-            used.push(sql);
-            rendered
-        } else {
-            rendered
-        };
-        if let Some(shape) = shape
-            && guesses != used
-        {
-            let mut recent = self.recent.lock().unwrap_or_else(PoisonError::into_inner);
-            if recent.len() >= RECENT_PLANS {
-                recent.clear();
-            }
-            recent.insert(shape, used);
-        }
         let decoders = statement.columns()[..data_columns]
             .iter()
             .map(|c| Decoder::for_type(c.type_()).unwrap_or(Decoder::Text))
             .collect();
-
         let mut solutions = Solutions {
             rows: None,
             builder: SolutionBuilder::new(plan),
@@ -371,217 +236,36 @@ impl PostgresBackend {
             .zip(statement.params())
             .map(|((value, datatype), ty)| bind(ty, value, datatype.as_deref()))
             .collect();
-        // Skipping the round trip when no branch can produce a row also
-        // covers the common single-branch case. An alternative of an `IN`
-        // list that cannot match only drops itself, and a constant of an
-        // `OPTIONAL` part or a disjunction only fails its own condition.
-        let mut empty_branches: HashSet<usize> = HashSet::new();
-        let mut alternatives: HashMap<usize, (usize, bool)> = HashMap::new();
-        for (((b, &branch), alternative), _) in bound
-            .iter()
-            .zip(&rendered.param_branches)
-            .zip(&rendered.param_alternatives)
-            .zip(&rendered.param_required)
-            .filter(|(_, required)| **required)
-        {
-            match alternative {
-                Some(group) => {
-                    alternatives.entry(*group).or_insert((branch, false)).1 |= !b.is_no_match()
-                }
-                None if b.is_no_match() => {
-                    empty_branches.insert(branch);
-                }
-                None => {}
-            }
-        }
-        empty_branches.extend(
-            alternatives
-                .values()
-                .filter(|(_, can_match)| !can_match)
-                .map(|&(branch, _)| branch),
-        );
-        if !plan.branches.is_empty() && empty_branches.len() == plan.branches.len() {
+        if !plan.branches.is_empty() && no_branch_can_match(plan, rendered, &bound) {
             return Ok(solutions);
         }
-        solutions.rows = Some(Box::pin(
-            self.query(&statement, &bound, fetch).await.map_err(pg)?,
-        ));
+        let rows = self
+            .query(statement, &bound, fetch)
+            .await
+            .map_err(|e| Error::from_postgres(e, timeout))?;
+        solutions.rows = Some(Box::pin(rows));
         Ok(solutions)
     }
 
-    /// Unique keys of the tables that can show the plan has no duplicate
-    /// solutions (`SqlPlan::key_tables`) or that a branch scans more than
-    /// once, read from the catalog on every query so that a dropped key is
-    /// never trusted. `None` when keys cannot help.
-    ///
-    /// Only keys that hold for every row at any time count: unique
-    /// indexes that are valid, not deferrable, not partial, and on plain
-    /// columns. A view or a table that does not exist has none, and so
-    /// does a table with inheritance children, whose rows the scan reads
-    /// but its indexes do not cover (a partitioned table's keys cover its
-    /// partitions).
+    /// The unique keys that rendering uses for `plan`, read from the
+    /// catalog now; `None` when keys cannot help. See
+    /// [`CatalogSnapshot::plan_keys`].
     pub async fn table_keys(&self, plan: &SqlPlan) -> Result<Option<TableKeys>, Error> {
-        let timeout = self.limits.statement_timeout;
-        self.load_table_keys(plan)
-            .await
-            .map_err(|e| Error::from_postgres(e, timeout))
+        Ok(self.plan_keys(plan).await?.map(|k| k.unique))
     }
 
-    /// The keys of [`table_keys`](Self::table_keys) of the tables that a
-    /// branch of the plan scans more than once (`self_join_tables`) and
-    /// that identify a row by SQL `=`, so that
-    /// `optimize::eliminate_self_joins` can merge such scans. `None` when
-    /// no table is scanned twice.
+    /// The keys that merge two scans of a table that a branch of `plan`
+    /// scans more than once; `None` when no table is scanned twice.
     pub async fn merge_keys(&self, plan: &SqlPlan) -> Result<Option<TableKeys>, Error> {
-        let timeout = self.limits.statement_timeout;
-        let keys = self
-            .load_keys(plan)
-            .await
-            .map_err(|e| Error::from_postgres(e, timeout))?;
+        let keys = self.plan_keys(plan).await?;
         Ok(keys
             .filter(|_| !optimize::self_join_tables(plan).is_empty())
             .map(|k| k.mergeable))
     }
 
-    async fn load_table_keys(
-        &self,
-        plan: &SqlPlan,
-    ) -> Result<Option<TableKeys>, tokio_postgres::Error> {
-        Ok(self.load_keys(plan).await?.map(|k| k.unique))
-    }
-
-    /// The keys of the tables of `key_tables` and `self_join_tables`, in
-    /// one catalog query.
-    ///
-    /// A key merges two scans of its table only when equality on it is
-    /// exactly equality of rows: every column is `NOT NULL` (a unique
-    /// index allows several `NULL`s), the index compares with the column's
-    /// own collation and the type's default operator class, as the SQL
-    /// `=` the plan renders does, and the type compares by `=` without a
-    /// cast or a term key (`ColumnType::comparison`, `ColumnType::term_key`).
-    ///
-    /// A key with a column whose distinct values can give the same term
-    /// (`ColumnType::term_normal`) is left out entirely: two rows that
-    /// differ only there give the same terms, so the key proves neither
-    /// that the rows' solutions differ nor that a scan matches one row.
-    async fn load_keys(&self, plan: &SqlPlan) -> Result<Option<Keys>, tokio_postgres::Error> {
-        self.load_keys_of(&keyed_tables(plan)).await
-    }
-
-    async fn load_keys_of(
-        &self,
-        tables: &[LogicalTable],
-    ) -> Result<Option<Keys>, tokio_postgres::Error> {
-        if tables.is_empty() {
-            return Ok(None);
-        }
-        let names: Vec<String> = tables
-            .iter()
-            .map(|t| match t {
-                LogicalTable::TableName(name) => quote_table_name(name),
-                LogicalTable::SqlQuery(_) => unreachable!("only tables have keys"),
-            })
-            .collect();
-        let rows = self.client.query(&self.keys_statement, &[&names]).await?;
-        let mut keys = Keys {
-            unique: TableKeys::new(),
-            mergeable: TableKeys::new(),
-        };
-        for row in rows {
-            let position: i32 = row.get(0);
-            let columns: Vec<String> = row.get(1);
-            let exact_index: bool = row.get(2);
-            let types: Vec<u32> = row.get(3);
-            let table = &tables[usize::try_from(position - 1).expect("ordinality starts at 1")];
-            let types: Vec<Option<ColumnType>> = types
-                .into_iter()
-                .map(|oid| Type::from_oid(oid).map(|ty| column_type(&ty)))
-                .collect();
-            if types.iter().flatten().any(|ty| ty.term_normal.is_some()) {
-                continue;
-            }
-            let exact_types = types.iter().all(|ty| {
-                ty.as_ref()
-                    .is_some_and(|ty| ty.comparison == Comparison::Value && ty.term_key.is_none())
-            });
-            if exact_index && exact_types {
-                keys.mergeable
-                    .entry(table.clone())
-                    .or_default()
-                    .push(columns.clone());
-            }
-            keys.unique.entry(table.clone()).or_default().push(columns);
-        }
-        Ok(Some(keys))
-    }
-
-    /// The plan with every column name that PostgreSQL may fold
-    /// (`folded_identifier`) replaced by the name PostgreSQL resolves it
-    /// to, read from the result columns of a prepared probe statement.
-    /// The database applies its own folding rules, which depend on the
-    /// encoding, and an `rr:sqlQuery` names its columns as PostgreSQL
-    /// does (`AS StudentId` is `studentid`, `count(*)` is `count`).
-    async fn resolve_columns<'p>(
-        &self,
-        plan: &'p SqlPlan,
-    ) -> Result<Cow<'p, SqlPlan>, tokio_postgres::Error> {
-        let columns = plan.folded_columns();
-        if columns.is_empty() {
-            return Ok(Cow::Borrowed(plan));
-        }
-        let probe = self.client.prepare(&column_name_probe(&columns)).await?;
-        let resolved: HashMap<_, _> = columns
-            .into_iter()
-            .zip(probe.columns())
-            .map(|(column, c)| (column, c.name().to_owned()))
-            .collect();
-        Ok(Cow::Owned(plan.with_resolved_columns(&resolved)))
-    }
-
-    /// Types of the columns the plan compares as RDF terms or combines
-    /// with `UNION`, and of every selected column when the query removes
-    /// duplicates, read by preparing a statement that selects them.
-    /// `None` when there are none.
-    async fn column_types(
-        &self,
-        plan: &SqlPlan,
-        removes_duplicates: bool,
-    ) -> Result<Option<ColumnTypes>, tokio_postgres::Error> {
-        let columns = typed_columns(plan, removes_duplicates);
-        if columns.is_empty() {
-            return Ok(None);
-        }
-        let probe = self.client.prepare(&column_type_probe(&columns)).await?;
-        Ok(Some(
-            columns
-                .into_iter()
-                .zip(probe.columns())
-                .map(|(column, c)| (column, column_type(c.type_())))
-                .collect(),
-        ))
-    }
-
-    async fn prepare_if(
-        &self,
-        sql: Option<&str>,
-    ) -> Option<Result<Statement, tokio_postgres::Error>> {
-        match sql {
-            Some(sql) => Some(self.client.prepare(sql).await),
-            None => None,
-        }
-    }
-
-    /// The statement for `sql`: one of `prepared` if it has that text, which
-    /// was prepared within the same query, or a new one.
-    async fn take_or_prepare(
-        &self,
-        prepared: &mut Vec<(&str, Statement)>,
-        sql: &str,
-    ) -> Result<Statement, tokio_postgres::Error> {
-        match prepared.iter().position(|(text, _)| *text == sql) {
-            Some(i) => Ok(prepared.swap_remove(i).1),
-            None => self.client.prepare(sql).await,
-        }
+    async fn plan_keys(&self, plan: &SqlPlan) -> Result<Option<PlanKeys>, Error> {
+        let snapshot = self.load_catalog(&CatalogRequest::for_plan(plan)).await?;
+        Ok(snapshot.plan_keys(plan))
     }
 
     async fn query(
@@ -608,12 +292,12 @@ impl Backend for PostgresBackend {
         &PostgresDialect
     }
 
-    fn execute(&self, plan: &SqlPlan) -> impl Future<Output = Result<Solutions, Error>> + Send {
+    fn execute(&self, plan: &CatalogPlan) -> impl Future<Output = Result<Solutions, Error>> + Send {
         self.run(plan)
     }
 
     async fn load_catalog(&self, request: &CatalogRequest) -> Result<CatalogSnapshot, Error> {
-        catalog::load(&self.client, request)
+        catalog::load(&self.client, &self.catalog, request)
             .await
             .map_err(|e| Error::from_postgres(e, self.limits.statement_timeout))
     }
@@ -623,34 +307,100 @@ impl Backend for PostgresBackend {
     }
 }
 
-/// The tables whose keys [`PostgresBackend::load_keys`] reads for `plan`: those of
-/// `key_tables` and `self_join_tables`, each once.
-fn keyed_tables(plan: &SqlPlan) -> Vec<LogicalTable> {
-    let mut tables = plan.key_tables();
-    for table in optimize::self_join_tables(plan) {
-        if !tables.contains(&table) {
-            tables.push(table);
-        }
+/// The SQL and rendering for the types PostgreSQL gave the result columns
+/// and the parameters of `statement`, when they differ from the first
+/// rendering: a column without a decoder is cast to text, and a constant
+/// that does not compare as its value compares as its term. `None` when
+/// the first rendering stands.
+fn retyped(
+    plan: &SqlPlan,
+    options: RenderOptions<'_>,
+    statement: &Statement,
+    rendered: &RenderedSql,
+    fetch: Option<i64>,
+) -> Result<Option<(String, RenderedSql)>, v12n_core::Error> {
+    let decoders: Vec<Option<Decoder>> = statement.columns()[..plan.columns.len()]
+        .iter()
+        .map(|c| Decoder::for_type(c.type_()))
+        .collect();
+    let params = &statement.params()[..rendered.params.len()];
+    // Values of types without a decoder become terms through their text
+    // output (see `cast_to_text`), so a constant compared with one is
+    // matched against that text instead of parsed as the type.
+    let text_params: Vec<usize> = params
+        .iter()
+        .enumerate()
+        .filter(|(_, ty)| Decoder::for_type(ty).is_none())
+        .map(|(i, _)| i)
+        .collect();
+    // `=` finds a zero constant equal to `-0` and a `bpchar` constant
+    // equal to values with more padding, which are other terms.
+    let keyed_params: Vec<(usize, TermKey)> = params
+        .iter()
+        .zip(&rendered.params)
+        .enumerate()
+        .filter_map(|(i, (ty, value))| term_key(ty, value).map(|key| (i, key)))
+        .collect();
+    // `=` finds a midnight constant different from `24:00:00`, the same term.
+    let normal_params: Vec<(usize, TermNormal)> = params
+        .iter()
+        .zip(&rendered.params)
+        .enumerate()
+        .filter_map(|(i, (ty, value))| term_normal(ty, value).map(|normal| (i, normal)))
+        .collect();
+    let cast_columns = decoders.iter().any(Option::is_none);
+    if !cast_columns
+        && text_params.is_empty()
+        && keyed_params.is_empty()
+        && normal_params.is_empty()
+    {
+        return Ok(None);
     }
-    tables
+    let rendered = plan.to_sql_with(
+        &PostgresDialect,
+        &RenderOptions {
+            text_params: &text_params,
+            keyed_params: &keyed_params,
+            normal_params: &normal_params,
+            ..options
+        },
+    )?;
+    let cast = cast_columns.then_some(decoders.as_slice());
+    let sql = statement_sql(plan, &rendered, cast, fetch.is_some());
+    Ok(Some((sql, rendered)))
 }
 
-/// The columns whose types [`PostgresBackend::column_types`] reads: those the
-/// plan compares as RDF terms or combines with `UNION`, and every selected
-/// column when the query removes duplicates.
-fn typed_columns(plan: &SqlPlan, removes_duplicates: bool) -> Vec<(LogicalTable, String)> {
-    let mut columns = plan.term_columns();
-    let selected = if removes_duplicates {
-        plan.selected_columns()
-    } else {
-        plan.union_columns()
-    };
-    for column in selected {
-        if !columns.contains(&column) {
-            columns.push(column);
+/// Whether no branch of `plan` can produce a row because a required
+/// constant cannot match its column. An alternative of an `IN` list that
+/// cannot match only drops itself, and a constant of an `OPTIONAL` part or
+/// a disjunction only fails its own condition.
+fn no_branch_can_match(plan: &SqlPlan, rendered: &RenderedSql, bound: &[Bound]) -> bool {
+    let mut empty_branches: HashSet<usize> = HashSet::new();
+    let mut alternatives: HashMap<usize, (usize, bool)> = HashMap::new();
+    for (((b, &branch), alternative), _) in bound
+        .iter()
+        .zip(&rendered.param_branches)
+        .zip(&rendered.param_alternatives)
+        .zip(&rendered.param_required)
+        .filter(|(_, required)| **required)
+    {
+        match alternative {
+            Some(group) => {
+                alternatives.entry(*group).or_insert((branch, false)).1 |= !b.is_no_match()
+            }
+            None if b.is_no_match() => {
+                empty_branches.insert(branch);
+            }
+            None => {}
         }
     }
-    columns
+    empty_branches.extend(
+        alternatives
+            .values()
+            .filter(|(_, can_match)| !can_match)
+            .map(|&(branch, _)| branch),
+    );
+    empty_branches.len() == plan.branches.len()
 }
 
 /// How many rows the statement reads when the row limit can cut the
@@ -1028,19 +778,16 @@ mod tests {
         let database = PostgresBackend::connect(&url, Limits::default())
             .await
             .unwrap();
-        let types = database.column_types(&plan, false).await.unwrap();
-        let keys = database.load_table_keys(&plan).await.unwrap();
-        let rendered = plan
-            .to_sql_with(
-                &PostgresDialect,
-                &RenderOptions {
-                    column_types: types.as_ref(),
-                    keys: keys.as_ref(),
-                    ..RenderOptions::default()
-                },
-            )
+        let snapshot = database
+            .load_catalog(&CatalogRequest::for_plan(&plan))
+            .await
             .unwrap();
-        let sql = statement_sql(&plan, &rendered, None, true);
+        let ready = CatalogPlan::new(&plan, std::sync::Arc::new(snapshot)).unwrap();
+        let rendered = ready
+            .plan()
+            .to_sql_with(&PostgresDialect, &ready.render_options())
+            .unwrap();
+        let sql = statement_sql(ready.plan(), &rendered, None, true);
         let explain: Vec<String> = client
             .query(&format!("EXPLAIN ANALYZE {sql}"), &[&3i64, &10_001i64])
             .await

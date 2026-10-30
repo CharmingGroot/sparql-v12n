@@ -42,11 +42,11 @@ flowchart LR
 | 端口 | 类型 | 职责 | 实现 |
 |---|---|---|---|
 | `Planner` | 驱动（driving） | 持有映射及其索引，规划查询。不需要数据库 | `v12n-core` |
-| `Engine<B>` | 驱动（driving） | 将共享的 `Planner` 与一个数据库会话 `B` 组合，渲染并执行计划 | `v12n-core` |
+| `Engine<B>` | 驱动（driving） | 将共享的 `Planner`、`Catalog` 与一个数据库会话 `B` 组合，完善、渲染并执行计划 | `v12n-core` |
 | `Connector` | 被驱动（driven） | 以前端传入的查询限制打开会话 | `PostgresConnector` |
-| `Backend` | 被驱动（driven） | 一个会话：SQL 方言、`execute`、`load_catalog`、`is_closed` | `PostgresBackend` |
+| `Backend` | 被驱动（driven） | 一个会话：SQL 方言、`load_catalog`、执行 `CatalogPlan` 的 `execute`、`is_closed` | `PostgresBackend` |
 | `SolutionStream` | 被驱动（driven） | 逐个读取一个查询的解，并报告结果是否被截断 | `v12n_postgres::Solutions` |
-| `BackendError` | 被驱动（driven） | 将错误分类为 `Config`、`Database`、`Timeout` 或 `Core`，前端据此决定退出码和 HTTP 状态码 | `v12n_postgres::Error` |
+| `BackendError` | 被驱动（driven） | 将错误分类为 `Config`、`Database`、`Timeout`、`StaleCatalog` 或 `Core`，前端据此决定退出码和 HTTP 状态码 | `v12n_postgres::Error` |
 | `Dialect` | 被驱动（driven） | 各数据库之间不同的 SQL 文本 | `PostgresDialect` |
 
 trait 方法返回 `impl Future + Send`，因此前端对 `Connector` 是泛型的，所有调用都是静态分派。`v12n-server` 不引用任何数据库类型。在 `v12n-cli` 中，只有 `main.rs` 的 `connector` 函数引用 `PostgresConnector`。
@@ -74,27 +74,29 @@ flowchart LR
 
 ## 读取数据库的步骤
 
-实际执行的 SQL 与 `v12n explain` 的 SQL 不同。执行计划之前，后端从数据库读取 `v12n-core` 的重写函数和渲染器所需的信息。这些步骤位于 [`PostgresBackend::run`](../crates/v12n-postgres/src/lib.rs)，每个查询都会执行。
+实际执行的 SQL 与 `v12n explain` 的 SQL 不同。键、列类型和解析后的列名来自后端通过 `load_catalog` 读取的目录快照（[`CatalogSnapshot`](../crates/v12n-core/src/catalog.rs)），每个查询都会确认数据库仍与快照一致（[Discussion #187](https://github.com/CharmingGroot/sparql-v12n/discussions/187)）。
 
 ```mermaid
 flowchart TD
-    plan["SqlPlan"] --> trip["在一次往返中读取键、<br/>探测列并准备推测的语句"]
-    trip --> names["解析未加引号的<br/>列名"]
-    names --> merge["合并对同一行的扫描<br/>(eliminate_self_joins)"]
-    merge --> dup["省略键已证明<br/>多余的去重"]
-    dup --> types["按列类型对齐 UNION 分支<br/>(with_union_types)"]
-    types --> render["结合键和类型渲染<br/>(to_sql_with)"]
-    render --> prepare["准备语句；参数类型<br/>需要时重新渲染"]
-    prepare --> bind["绑定常量；无法匹配时<br/>跳过查询"]
+    plan["SqlPlan"] --> covers{"快照是否包含计划读取的<br/>所有表和列？"}
+    covers -- 否 --> load["读取这些表<br/>(load_catalog)"]
+    load --> complete
+    covers -- 是 --> complete["完善计划<br/>(CatalogPlan::new)"]
+    complete --> trip["渲染；在一次往返中<br/>检查指纹并准备语句"]
+    trip -- 目录已变化 --> reload["重新读取计划的表<br/>一次"]
+    reload --> complete
+    trip -- 一致 --> retype["参数类型需要时<br/>重新渲染"]
+    retype --> bind["绑定常量；无法匹配时<br/>跳过查询"]
     bind --> run["执行语句<br/>(query_raw)"]
 ```
 
-- **键。** 通过目录查询读取计划中可利用键的表的唯一键。只使用对每一行始终成立的键：有效、不可延迟、非部分索引、建在普通列上，且所在表没有继承子表。借助键可以判断一个分支是否两次扫描同一行，从而合并扫描；也可以判断结果不会有重复，从而省略 `DISTINCT` 或去重的 `UNION`。
-- **列名与类型。** 一条探测语句解析被 PostgreSQL 转为小写的列名，并报告列类型。类型决定 `UNION` 各分支如何对齐，以及值如何作为 RDF 项比较。对于这些类型 SQL 无法给出与 SPARQL 相同答案的比较，会在此以 `UnsupportedFeature` 失败。
-- **参数。** 查询中的每个常量都是绑定参数。PostgreSQL 为参数推断的类型可能改变 SQL，例如需要与没有解码器的类型的文本输出进行比较。此时语句会重新渲染并再次准备。
+- **快照。** 每个逻辑表记录：是否存在；映射读取的列及其解析后的名称、类型和 `NOT NULL`；对每一行始终成立的唯一键（有效、不可延迟、非部分索引、建在普通列上，且所在表没有继承子表）；已验证的外键；以及指纹，即 PostgreSQL 对上述信息所来自的目录行计算的 SHA-256 哈希。`v12n serve` 在启动时读取映射中所有表的快照；`v12n query` 只读取其计划涉及的表。
+- **完善计划。** [`CatalogPlan::new`](../crates/v12n-core/src/catalog/plan.rs) 在 `v12n-core` 中运行，不访问数据库。它解析被 PostgreSQL 转为小写的列名。借助键可以判断一个分支是否两次扫描同一行，从而合并扫描；也可以判断结果不会有重复，从而省略 `DISTINCT` 或去重的 `UNION`。列类型决定 `UNION` 各分支如何对齐，以及值如何作为 RDF 项比较；对于这些类型 SQL 无法给出与 SPARQL 相同答案的比较以 `UnsupportedFeature` 失败。快照显示不存在的表或列以 `Catalog` 失败。
+- **检查。** [`PostgresBackend::run`](../crates/v12n-postgres/src/lib.rs) 在一次流水线往返中发送计划所涉及表的指纹查询和语句准备。读取 `rr:sqlQuery` 的计划也在该往返中解析其探测语句，并将列名和类型与快照比较。只要有不同，语句就不会执行：引擎重新读取这些表并再规划一次。第二次仍不同时，以可重试的错误（HTTP 503）失败。
+- **参数。** 查询中的每个常量都是绑定参数。PostgreSQL 为参数推断的类型可能改变 SQL，例如需要与没有解码器的类型的文本输出进行比较。此时语句会重新渲染并再次准备。连接以首次渲染的 SQL 为键记住重新渲染的 SQL，下次与第一条语句一起准备，并且只有当它与类型所要求的语句完全相同时才使用。
 - **行数限制。** 当行数限制可能截断结果时，语句比限制多读取一行，并在额外的一列中带上 `count(*) OVER ()`，这样第一行就能说明结果是否被截断。
 
-重写和渲染函数位于 `v12n-core`，都是纯函数；何时依据目录信息调用它们由后端决定。从目录读取的信息不会在查询之间保留。连接只记住为最近的计划准备的语句的 SQL 文本，并且只有当它与根据最新信息生成的语句相同时才使用。
+检查与执行是两次不同的往返，因此在两者之间提交的模式变更不会反映到该查询中。
 
 ## 从行到结果
 
@@ -126,7 +128,7 @@ flowchart LR
 
 1. `load_plan` 读取映射和查询，构建 `Planner` 并调用 `plan`。
 2. `query` 构建单线程 Tokio 运行时并调用 `PostgresConnector::connect`，后者打开一个连接，并为会话设置语句超时和只读事务。
-3. `Engine::execute` 调用 `PostgresBackend::run`，后者执行读取数据库的步骤并返回 `Solutions`。
+3. 由于 CLI 以空目录开始，`Engine::execute` 先读取计划所涉及表的目录条目，完善计划后调用 `PostgresBackend::run`；后者确认条目、准备并开始执行语句，返回 `Solutions`。
 4. `stream_solutions` 或 `print_solutions_table` 读取全部解。结果被截断时，在输出之后打印警告并以退出码 5 结束。
 
 以 `POST /sparql` 发送同一查询：
@@ -147,7 +149,7 @@ sequenceDiagram
     S->>L: get()
     L-->>S: Lease (空闲 Engine 或新连接)
     S->>B: execute(plan)
-    B->>D: 键、列探测、准备语句
+    B->>D: 指纹检查、准备语句
     B->>D: 执行语句
     S->>B: 为第一行调用 try_next()
     B-->>S: 第一个解 (或错误状态)
@@ -159,11 +161,13 @@ sequenceDiagram
     S->>L: release()
 ```
 
-`serve` 在启动时解析映射并构建 `Planner`，然后打开一个会话以确认数据库可达。每个请求由 [`lib.rs`](../crates/v12n-server/src/lib.rs) 中的 `answer` 处理。规划错误在获取请求许可或连接之前返回。
+`serve` 在启动时解析映射并构建 `Planner`，然后打开一个会话以确认数据库可达，并读取映射中各表的目录快照。映射读取而数据库中不存在的表和列以警告记录到日志。每个请求由 [`lib.rs`](../crates/v12n-server/src/lib.rs) 中的 `answer` 处理。规划错误在获取请求许可或连接之前返回。
 
 ## 生命周期、所有权与限制
 
 **映射与索引。** `Planner` 与进程同生命周期：每次运行 `v12n` 有一个，服务器有一个，并通过 `Arc` 由所有请求共享。修改映射文件后需重启才能生效。
+
+**目录快照。** 服务器持有一个由池中各会话共享的 `Catalog`。重新读取的表条目从之后开始的查询起生效；正在执行的查询继续使用其开始时的快照。`v12n query` 以空目录开始。
 
 **连接。** `v12n query` 打开一个连接，并在退出时关闭。服务器将空闲的 `Engine` 保存在池中，没有空闲会话时新建一个。使用中的会话数由请求许可数限制，因此池本身没有大小限制。会话只有在结果被读完后才回到池中。响应中止或客户端断开时，会话不会回到池中而是被丢弃，其连接随之关闭，因为该连接上可能仍有语句在执行。关闭连接时不会发送取消请求；PostgreSQL 在察觉连接已关闭时停止该语句，无论如何 `statement_timeout` 都是其执行时间的上限。
 
@@ -189,7 +193,7 @@ sequenceDiagram
 |---|---|
 | 用于数据库专用 SQL 的 `Dialect` trait（[#134](https://github.com/CharmingGroot/sparql-v12n/issues/134)） | 已实现；`PostgresDialect` 是唯一的方言 |
 | `Engine`、`Backend`、`Connector`、`SolutionStream` 端口（[#166](https://github.com/CharmingGroot/sparql-v12n/issues/166)） | 已实现；`v12n-postgres` 是唯一的适配器 |
-| 由引擎获取目录快照，而不是在 `PostgresBackend::run` 内读取目录（[#109](https://github.com/CharmingGroot/sparql-v12n/issues/109)、[#110](https://github.com/CharmingGroot/sparql-v12n/issues/110)、[Discussion #187](https://github.com/CharmingGroot/sparql-v12n/discussions/187)） | 进行中；`v12n check --db` 读取 `CatalogSnapshot`，查询仍在 `PostgresBackend::run` 中读取目录 |
+| 由引擎获取目录快照，而不是在 `PostgresBackend::run` 内读取目录（[#109](https://github.com/CharmingGroot/sparql-v12n/issues/109)、[#110](https://github.com/CharmingGroot/sparql-v12n/issues/110)、[Discussion #187](https://github.com/CharmingGroot/sparql-v12n/discussions/187)） | 已实现 |
 | 本体支持（[#123](https://github.com/CharmingGroot/sparql-v12n/issues/123)–[#127](https://github.com/CharmingGroot/sparql-v12n/issues/127)） | 计划中 |
 | 第二种数据库（[#165](https://github.com/CharmingGroot/sparql-v12n/issues/165)） | 计划中 |
 | 不物化受限行即可报告截断（[#152](https://github.com/CharmingGroot/sparql-v12n/issues/152)） | 未定；测量后决定 |

@@ -263,7 +263,7 @@ libpq와 다른 점은 다음과 같다.
 | `400` | 쿼리 문법 오류, `query`가 없거나 두 번 이상 지정된 경우, 데이터셋 파라미터, 너무 많은 SQL branch로 unfold되는 쿼리 |
 | `406` / `413` / `414` / `415` | `406`: 제공하지 않는 형식. `413`: `POST`에서 `max_query_bytes`를 넘는 쿼리. `414`: `GET`에서 `max_query_bytes`를 넘는 쿼리. `415`: 그 밖의 content type |
 | `501` | 아직 지원하지 않는 SPARQL 기능 |
-| `503` | 첫 행 이전에 발생한 statement timeout(이 경우 `v12n query`는 4로 종료한다), 또는 `max_concurrent_requests` 도달(응답에 `Retry-After`가 포함된다) |
+| `503` | 첫 행 이전에 발생한 statement timeout(이 경우 `v12n query`는 4로 종료한다), 또는 `max_concurrent_requests` 도달(응답에 `Retry-After`가 포함된다), 또는 카탈로그가 바뀌어 쿼리 계획을 다시 세우는 동안 카탈로그가 또 바뀐 경우(마이그레이션 중 등) |
 | `500` | 데이터베이스 오류나 그 밖의 내부 오류 |
 
 상태 코드는 본문보다 먼저 전송된다. 따라서 statement timeout이나 XML이 담을 수

@@ -10,7 +10,7 @@ mod plan;
 mod renderer;
 mod required_columns;
 
-pub use catalog_probe::{column_name_probe, column_probe, column_type_probe, table_probe};
+pub use catalog_probe::table_probe;
 pub(crate) use identifier::describe_table;
 pub use identifier::{folded_identifier, identifier_name, quote_identifier, quote_table_name};
 pub use plan::{

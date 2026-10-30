@@ -5,8 +5,11 @@
 //! a query string) and `V12N_TEST_TLS_CERTS` (the directory with the
 //! certificates and CRLs `tls.sh` generates) are set.
 
+use std::sync::Arc;
+
 use v12n_core::Limits;
 use v12n_core::backend::{Backend, SolutionStream};
+use v12n_core::catalog::{CatalogPlan, CatalogRequest};
 use v12n_core::mapping::{Mapping, MappingIndex};
 use v12n_core::sql::SqlPlan;
 use v12n_core::{sparql, unfold};
@@ -75,7 +78,13 @@ fn plan() -> SqlPlan {
 /// Connects and reports whether the session uses TLS.
 async fn ssl_in_use(url: &str) -> Result<bool, Error> {
     let database = PostgresBackend::connect(url, Limits::default()).await?;
-    let mut solutions = database.execute(&plan()).await?;
+    let plan = plan();
+    let snapshot = database
+        .load_catalog(&CatalogRequest::for_plan(&plan))
+        .await?;
+    let mut solutions = database
+        .execute(&CatalogPlan::new(&plan, Arc::new(snapshot))?)
+        .await?;
     let solution = solutions.try_next().await?.expect("one row");
     let [Some(ssl)] = solution.values() else {
         panic!("ssl is unbound");

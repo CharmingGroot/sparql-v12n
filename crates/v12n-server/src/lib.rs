@@ -20,12 +20,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use v12n_core::Planner;
 use v12n_core::backend::{Backend, BackendError, Connector, ErrorKind, SolutionStream};
 use v12n_core::mapping::Mapping;
 use v12n_core::results::{ResultsFormat, ResultsWriter};
 use v12n_core::solution::Solution;
 use v12n_core::sql::SqlPlan;
+use v12n_core::{Catalog, Planner};
 
 pub use config::{Config, DatabaseConfig, ServerLimits};
 use pool::{Lease, Pool};
@@ -55,8 +55,8 @@ pub enum Error {
 }
 
 /// Loads the mapping, checks that the database `connector` reaches is
-/// available, and serves until SIGINT or SIGTERM. In-flight responses
-/// finish first.
+/// available, reads the catalog entries of the mapping's tables, and
+/// serves until SIGINT or SIGTERM. In-flight responses finish first.
 pub async fn serve<C: Connector + 'static>(config: Config, connector: C) -> Result<(), Error> {
     let text = std::fs::read_to_string(&config.mapping).map_err(|e| Error::Mapping {
         path: config.mapping.clone(),
@@ -70,11 +70,22 @@ pub async fn serve<C: Connector + 'static>(config: Config, connector: C) -> Resu
         mapping = mapping.with_base_iri(base);
     }
     let app = App::new(Planner::new(mapping), connector, config.limits);
-    app.pool
+    let lease = app
+        .pool
         .get()
         .await
-        .map_err(|e| Error::Database(Box::new(e)))?
-        .release();
+        .map_err(|e| Error::Database(Box::new(e)))?;
+    let snapshot = lease
+        .engine()
+        .load_catalog()
+        .await
+        .map_err(|e| Error::Database(Box::new(e)))?;
+    lease.release();
+    // A table created later is found when a query reads it, so these do
+    // not stop the server.
+    for problem in snapshot.problems(app.planner.catalog_request()) {
+        tracing::warn!(%problem, "mapping reads what the database lacks");
+    }
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(
@@ -130,7 +141,12 @@ impl<C: Connector> App<C> {
     pub fn new(planner: Planner, connector: C, limits: ServerLimits) -> Arc<Self> {
         let planner = Arc::new(planner);
         Arc::new(Self {
-            pool: Pool::new(connector, Arc::clone(&planner), limits.query),
+            pool: Pool::new(
+                connector,
+                Arc::clone(&planner),
+                Arc::new(Catalog::default()),
+                limits.query,
+            ),
             planner,
             permits: Arc::new(Semaphore::new(limits.max_concurrent_requests)),
             limits,
@@ -332,6 +348,12 @@ fn database_failure(error: &dyn BackendError) -> Failure {
     let (status, kind) = match error.kind() {
         // Before the first row, so the client may retry later.
         ErrorKind::Timeout(_) => (StatusCode::SERVICE_UNAVAILABLE, "timeout"),
+        // Changed again while the query was planned anew, as during a
+        // migration; a retry later can succeed.
+        ErrorKind::StaleCatalog => (StatusCode::SERVICE_UNAVAILABLE, "catalog_changed"),
+        ErrorKind::Core(v12n_core::Error::Catalog(_)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "database")
+        }
         // A comparison the column types make impossible to do right in SQL.
         ErrorKind::Core(v12n_core::Error::UnsupportedFeature(_)) => {
             (StatusCode::NOT_IMPLEMENTED, "unsupported")
@@ -381,6 +403,7 @@ impl<C: Connector> ResultStream<C> {
                     // Only the timeout message is free of stored values.
                     let (kind, message) = match e.kind() {
                         ErrorKind::Timeout(_) => ("timeout", e.to_string()),
+                        ErrorKind::StaleCatalog => ("catalog_changed", e.to_string()),
                         ErrorKind::Core(_) => ("data", String::new()),
                         ErrorKind::Config | ErrorKind::Database => ("database", String::new()),
                     };

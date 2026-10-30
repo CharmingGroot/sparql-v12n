@@ -9,10 +9,9 @@
 use std::future::Future;
 use std::time::Duration;
 
-use crate::catalog::{CatalogRequest, CatalogSnapshot};
+use crate::catalog::{CatalogPlan, CatalogRequest, CatalogSnapshot};
 use crate::dialect::Dialect;
 use crate::solution::Solution;
-use crate::sql::SqlPlan;
 
 /// Default for [`Limits::statement_timeout`].
 pub const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,20 +36,23 @@ impl Default for Limits {
     }
 }
 
-/// One session with a database that runs [`SqlPlan`]s.
+/// One session with a database that runs [`CatalogPlan`]s.
 pub trait Backend: Send + Sync {
     /// Ties the SQL syntax to the database, so that a plan cannot be
     /// rendered for one database and run on another.
     type Dialect: Dialect;
     type Solutions: SolutionStream<Error = Self::Error>;
-    type Error: BackendError;
+    type Error: BackendError + From<crate::Error>;
 
     fn dialect(&self) -> &Self::Dialect;
 
-    /// Runs `plan`. Rows are fetched as the returned solutions are read.
+    /// Runs `plan` if the database still matches the catalog entries it
+    /// was completed from ([`CatalogPlan::entries`]), and fails with
+    /// [`ErrorKind::StaleCatalog`] otherwise. Rows are fetched as the
+    /// returned solutions are read.
     fn execute(
         &self,
-        plan: &SqlPlan,
+        plan: &CatalogPlan,
     ) -> impl Future<Output = Result<Self::Solutions, Self::Error>> + Send;
 
     /// The catalog entries of the logical tables `request` names. A table
@@ -111,6 +113,10 @@ pub enum ErrorKind<'a> {
     /// The database cancelled the query at
     /// [`Limits::statement_timeout`], which is given here.
     Timeout(Duration),
+    /// The catalog no longer matches the snapshot the plan was completed
+    /// from, so the plan was not run. Reading the catalog again and
+    /// planning again can succeed.
+    StaleCatalog,
     /// Rendering the plan for the actual column types, or turning a row
     /// into a solution, failed.
     Core(&'a crate::Error),

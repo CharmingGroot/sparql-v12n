@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Reads a [`CatalogSnapshot`]. The catalog queries and one probe
-//! statement per logical table go out in one pipelined round trip; only a
-//! table whose probe names a missing column takes a second one, a probe
-//! per column, to tell which columns are missing.
+//! Reads a [`CatalogSnapshot`] and checks that the database still matches
+//! one. The catalog queries and one probe statement per logical table go
+//! out in one pipelined round trip; only a table whose probe names a
+//! missing column takes a second one, a probe per column, to tell which
+//! columns are missing.
 
 use std::collections::{HashMap, HashSet};
 
 use futures_util::future::{join, join_all, join4};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
-use tokio_postgres::{Client, Row};
+use tokio_postgres::{Client, Row, Statement};
 use v12n_core::catalog::{
-    CatalogRequest, CatalogSnapshot, Column, Fingerprint, ForeignKey, Relation, TableCatalog,
-    TableRequest, TableStatus, UniqueKey,
+    CatalogPlan, CatalogRequest, CatalogSnapshot, Column, Fingerprint, ForeignKey, Relation,
+    TableCatalog, TableRequest, TableStatus, UniqueKey,
 };
 use v12n_core::mapping::LogicalTable;
 use v12n_core::sql::{quote_table_name, table_probe};
@@ -25,7 +26,7 @@ use crate::decode::column_type;
 /// (Discussion #187). Non-unique indexes are left out, since they do not
 /// change results. A table that does not exist hashes one constant line,
 /// so that creating it changes the fingerprint.
-pub(crate) const FINGERPRINT_SQL: &str = "WITH t AS (
+const FINGERPRINT_SQL: &str = "WITH t AS (
    SELECT n::int4, to_regclass(name) AS rel
    FROM unnest($1::text[]) WITH ORDINALITY AS t(name, n))
  SELECT t.n, t.rel IS NOT NULL,
@@ -68,8 +69,37 @@ const FOREIGN_KEYS_SQL: &str = "SELECT t.n::int4,
  WHERE co.contype = 'f' AND co.convalidated
  ORDER BY t.n, co.conname";
 
+/// The catalog queries, prepared with the connection, so that reading a
+/// snapshot takes one round trip and the fingerprint check on every query
+/// shares the round trip that prepares the statement.
+pub(crate) struct CatalogStatements {
+    fingerprints: Statement,
+    not_null: Statement,
+    keys: Statement,
+    foreign_keys: Statement,
+}
+
+impl CatalogStatements {
+    pub(crate) async fn prepare(client: &Client) -> Result<Self, tokio_postgres::Error> {
+        let (fingerprints, not_null, keys, foreign_keys) = join4(
+            client.prepare(FINGERPRINT_SQL),
+            client.prepare(NOT_NULL_SQL),
+            client.prepare(KEYS_SQL),
+            client.prepare(FOREIGN_KEYS_SQL),
+        )
+        .await;
+        Ok(Self {
+            fingerprints: fingerprints?,
+            not_null: not_null?,
+            keys: keys?,
+            foreign_keys: foreign_keys?,
+        })
+    }
+}
+
 pub(crate) async fn load(
     client: &Client,
+    statements: &CatalogStatements,
     request: &CatalogRequest,
 ) -> Result<CatalogSnapshot, tokio_postgres::Error> {
     let named: Vec<&LogicalTable> = request
@@ -79,7 +109,7 @@ pub(crate) async fn load(
         .filter(|t| matches!(t, LogicalTable::TableName(_)))
         .collect();
     let (facts, probes) = join(
-        TableFacts::read(client, &named),
+        TableFacts::read(client, statements, &named),
         join_all(request.tables().iter().map(|t| probe(client, t))),
     )
     .await;
@@ -94,6 +124,84 @@ pub(crate) async fn load(
         entries.push((requested.table.clone(), entry));
     }
     Ok(CatalogSnapshot::new(entries))
+}
+
+/// Whether the database still matches the catalog entries `plan` was
+/// completed from: the fingerprint of each table, and the result columns
+/// of each `rr:sqlQuery`, whose dependencies the catalog does not list.
+pub(crate) async fn is_current(
+    client: &Client,
+    statements: &CatalogStatements,
+    plan: &CatalogPlan,
+) -> Result<bool, tokio_postgres::Error> {
+    let mut names = Vec::new();
+    let mut expected = Vec::new();
+    let mut queries = Vec::new();
+    for (table, entry) in plan.entries() {
+        match (table, &entry.fingerprint, &entry.status) {
+            (LogicalTable::TableName(name), Some(fingerprint), _) => {
+                names.push(quote_table_name(name));
+                expected.push(fingerprint);
+            }
+            (LogicalTable::SqlQuery(_), _, TableStatus::Readable(relation)) => {
+                queries.push((table, relation));
+            }
+            // The engine runs no plan over a table the snapshot shows
+            // missing or unreadable.
+            _ => return Ok(false),
+        }
+    }
+    let read_fingerprints = async {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        client.query(&statements.fingerprints, &[&names]).await
+    };
+    let (rows, queries) = join(
+        read_fingerprints,
+        join_all(
+            queries
+                .into_iter()
+                .map(|(table, relation)| same_columns(client, table, relation)),
+        ),
+    )
+    .await;
+    let fingerprints_match = rows?.iter().all(|row| {
+        let position: i32 = row.get(0);
+        let found: String = row.get(2);
+        usize::try_from(position - 1)
+            .ok()
+            .and_then(|i| expected.get(i))
+            .is_some_and(|expected| expected.as_str() == found)
+    });
+    let mut queries_match = true;
+    for same in queries {
+        queries_match &= same?;
+    }
+    Ok(fingerprints_match && queries_match)
+}
+
+/// Whether the logical table still has the columns `relation` shows, with
+/// the same names and types.
+async fn same_columns(
+    client: &Client,
+    table: &LogicalTable,
+    relation: &Relation,
+) -> Result<bool, tokio_postgres::Error> {
+    let (written, columns): (Vec<String>, Vec<&Column>) = relation
+        .columns
+        .iter()
+        .map(|(written, column)| (written.clone(), column))
+        .unzip();
+    match client.prepare(&table_probe(table, &written)).await {
+        Ok(statement) => Ok(statement
+            .columns()
+            .iter()
+            .zip(columns)
+            .all(|(c, column)| c.name() == column.name && column_type(c.type_()) == column.ty)),
+        Err(error) if error.code().is_some() => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// `facts` is `None` for an `rr:sqlQuery`, which the catalog does not list.
@@ -136,6 +244,7 @@ struct TableFacts {
 impl TableFacts {
     async fn read(
         client: &Client,
+        statements: &CatalogStatements,
         tables: &[&LogicalTable],
     ) -> Result<HashMap<LogicalTable, Self>, tokio_postgres::Error> {
         if tables.is_empty() {
@@ -149,10 +258,10 @@ impl TableFacts {
             })
             .collect();
         let (fingerprints, not_null, keys, foreign_keys) = join4(
-            client.query(FINGERPRINT_SQL, &[&names]),
-            client.query(NOT_NULL_SQL, &[&names]),
-            client.query(KEYS_SQL, &[&names]),
-            client.query(FOREIGN_KEYS_SQL, &[&names]),
+            client.query(&statements.fingerprints, &[&names]),
+            client.query(&statements.not_null, &[&names]),
+            client.query(&statements.keys, &[&names]),
+            client.query(&statements.foreign_keys, &[&names]),
         )
         .await;
         let mut facts: Vec<Self> = tables.iter().map(|_| Self::default()).collect();
