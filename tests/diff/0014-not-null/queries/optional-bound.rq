@@ -1,0 +1,9 @@
+PREFIX ex: <http://example.org/>
+
+# BOUND reads a NOT NULL column that the LEFT JOIN leaves NULL where the
+# part does not match.
+SELECT ?i WHERE {
+  ?i a ex:Item .
+  OPTIONAL { ?i ex:owner ?o . ?o ex:name ?name }
+  FILTER(!BOUND(?name))
+}

@@ -5,6 +5,7 @@ mod catalog_probe;
 mod column_names;
 mod filter;
 mod identifier;
+mod not_null;
 mod order;
 mod plan;
 mod renderer;

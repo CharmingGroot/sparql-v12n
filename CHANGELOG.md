@@ -31,6 +31,9 @@ Design decisions are recorded in the `Decision:` Discussions.
 
 ### Changed
 
+- The generated SQL leaves out `IS NOT NULL` on term columns that a
+  `NOT NULL` constraint of a table keeps from being `NULL`, except where a
+  `LEFT JOIN` can make them `NULL`.
 - Keys, column types and resolved column names come from a catalog
   snapshot instead of being read on every query (Discussion #187).
   `v12n serve` reads it at startup; each query checks a fingerprint of
