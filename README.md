@@ -93,16 +93,96 @@ cd sparql-v12n
    <http://example.org/order/1004>  "15000"^^<http://www.w3.org/2001/XMLSchema#integer>
    ```
 
+   [How the result is built](#how-the-result-is-built) shows why these
+   three orders are returned.
+
 4. Stop the database and remove its container and network.
 
    ```sh
    docker compose -f testenv/docker-compose.yml down -v
    ```
 
-`v12n explain` with the same mapping and query shows the generated SQL
-without a database. [testenv/README.md](testenv/README.md) describes the
+[testenv/README.md](testenv/README.md) describes the
 test environment, including the Ontop endpoint that the differential tests
 use and that this example does not need.
+
+### How the result is built
+
+The example database has two tables. All their rows are shown below; the
+full files are [schema.sql](examples/shop/schema.sql) and
+[data.sql](examples/shop/data.sql).
+
+`customers`
+
+| id | name | tier |
+|---|---|---|
+| 7 | Kim | VIP |
+| 8 | Lee | REGULAR |
+| 9 | Park | VIP |
+
+`orders`
+
+| id | customer_id | amount |
+|---|---|---|
+| 1001 | 7 | 120000 |
+| 1002 | 8 | 30000 |
+| 1003 | 9 | 87000 |
+| 1004 | 7 | 15000 |
+
+The R2RML mapping turns each row into an IRI with properties. The excerpt
+below leaves out the prefixes, `a rr:TriplesMap` and `ex:name`; the full
+file is [mapping.ttl](examples/shop/mapping.ttl).
+
+```turtle
+<#CustomerMap>
+  rr:logicalTable [ rr:tableName "customers" ] ;
+  rr:subjectMap [ rr:template "http://example.org/customer/{id}" ; rr:class ex:Customer ] ;
+  rr:predicateObjectMap [ rr:predicate ex:tier ; rr:objectMap [ rr:column "tier" ] ] .
+
+<#OrderMap>
+  rr:logicalTable [ rr:tableName "orders" ] ;
+  rr:subjectMap [ rr:template "http://example.org/order/{id}" ; rr:class ex:Order ] ;
+  rr:predicateObjectMap [ rr:predicate ex:amount ; rr:objectMap [ rr:column "amount" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:placedBy ;
+    rr:objectMap [ rr:template "http://example.org/customer/{customer_id}" ]
+  ] .
+```
+
+- The customer row with `id` 7 becomes `<http://example.org/customer/7>`,
+  an `ex:Customer` with `ex:tier "VIP"`.
+- The order row with `id` 1001 becomes `<http://example.org/order/1001>`,
+  an `ex:Order` with `ex:amount 120000`. The `integer` column gives an
+  `xsd:integer` literal.
+- `ex:placedBy` builds a customer IRI from `customer_id` with the same
+  template as the customer subject. Order 1001 has `customer_id` 7, so it
+  points to `<http://example.org/customer/7>`, the IRI of customer row 7.
+
+The query [vip-orders.rq](examples/shop/queries/vip-orders.rq):
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+# Orders placed by VIP customers.
+SELECT ?order ?amount WHERE {
+  ?customer a ex:Customer ; ex:tier "VIP" .
+  ?order ex:placedBy ?customer ; ex:amount ?amount .
+}
+```
+
+`?customer` appears in both patterns, so an order matches only when its
+`ex:placedBy` IRI is the IRI of a customer whose tier is `"VIP"`. In SQL
+this is a join on `orders.customer_id = customers.id`. Customers 7 and 9
+are VIP: customer 7 placed orders 1001 and 1004, and customer 9 placed
+order 1003. Order 1002 belongs to customer 8, whose tier is `"REGULAR"`.
+
+`v12n explain` prints the generated SQL without a database. The join
+appears as `JOIN "orders" t1 ON t1."customer_id" = t0."id"`, and `"VIP"`
+is passed as the parameter `$1`.
+
+```sh
+v12n explain examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq
+```
 
 ## Supported SPARQL
 
