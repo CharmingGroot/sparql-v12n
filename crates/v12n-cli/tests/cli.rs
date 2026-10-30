@@ -667,25 +667,30 @@ fn query_timeout_before_the_first_row_exits_four_and_names_the_timeout() {
     );
 }
 
+/// A view whose first row comes at once and whose second row waits far
+/// longer than any timeout set here, so that the timeout always cancels
+/// the query after exactly one row, however fast the client reads.
+///
+/// A view has no key, so v12n wraps it in `SELECT DISTINCT`. Rows already
+/// in the order of that `DISTINCT` let PostgreSQL remove duplicates with a
+/// `Unique` node, which passes each row on as it arrives, instead of
+/// hashing all rows first. `OFFSET 0` stops PostgreSQL from pushing the
+/// volatile filter below the sort, which would make the sort wait as well.
+const FIRST_ROW_THEN_WAIT: &str = "SELECT id, pad \
+     FROM (SELECT g AS id, g::text AS pad FROM generate_series(1, 2) AS g \
+     ORDER BY id, pad OFFSET 0) AS sorted \
+     WHERE id = 1 OR pg_sleep(60) IS NULL";
+
 #[test]
 fn query_timeout_after_output_started_exits_four_with_one_stderr_line() {
     let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
         eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
         return;
     };
-    // A cross join of 13 scans of the 3 customers has 3^13 (1.6 million)
-    // rows, which stream: every scan is keyed by the subject, so no
-    // duplicates need removing, and without a row limit no window function
-    // holds rows back. Reading them takes the client far longer than the
-    // timeout, and PostgreSQL waits for it.
-    let patterns: String = (1..=13)
-        .map(|i| format!("?c{i} <http://example.org/name> ?n{i} . "))
-        .collect();
-    let query = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("many-rows.rq");
-    std::fs::write(&query, format!("SELECT ?n1 WHERE {{ {patterns}}}")).unwrap();
-    let query = query.to_str().unwrap().to_owned();
-    let mapping = std::fs::read_to_string(SHOP).unwrap();
+    let (mapping, query) = slow_rows(FIRST_ROW_THEN_WAIT);
     for format in ["json", "xml"] {
+        // A row limit counts the rows with a window function, which holds
+        // every row back until the last one (`count_rows` in v12n-postgres).
         let output = v12n(
             &[
                 "query",
@@ -703,24 +708,34 @@ fn query_timeout_after_output_started_exits_four_with_one_stderr_line() {
             &mapping,
         );
         assert_eq!(output.status.code(), Some(4), "{format}");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let start = &stdout[..stdout.len().min(80)];
-        // Neither document is closed, so neither passes for a result.
-        if format == "json" {
-            assert!(stdout.starts_with("{\"head\""), "{start}");
-            assert!(serde_json::from_slice::<Value>(&output.stdout).is_err());
-        } else {
-            assert!(stdout.starts_with("<?xml "), "{start}");
-            assert!(!stdout.contains("</results>"), "{start}");
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(stderr.lines().count(), 1, "{format}: {stderr}");
-        assert!(
-            stderr.starts_with("error: statement timeout of 500ms reached after ")
-                && stderr.contains(" rows;"),
-            "{stderr}"
-        );
+        assert_started_but_unterminated(format, &output.stdout);
+        assert_one_timeout_line_after_the_first_row(format, &output.stderr);
     }
+}
+
+/// Neither document is closed, so neither passes for a result.
+fn assert_started_but_unterminated(format: &str, stdout: &[u8]) {
+    let text = String::from_utf8_lossy(stdout);
+    match format {
+        "json" => {
+            assert!(text.starts_with("{\"head\""), "{text}");
+            assert!(serde_json::from_slice::<Value>(stdout).is_err(), "{text}");
+        }
+        "xml" => {
+            assert!(text.starts_with("<?xml "), "{text}");
+            assert!(!text.contains("</results>"), "{text}");
+        }
+        _ => unreachable!("only JSON and XML have an end marker"),
+    }
+}
+
+fn assert_one_timeout_line_after_the_first_row(format: &str, stderr: &[u8]) {
+    let text = String::from_utf8_lossy(stderr);
+    assert_eq!(text.lines().count(), 1, "{format}: {text}");
+    assert!(
+        text.starts_with("error: statement timeout of 500ms reached after 1 row"),
+        "{format}: {text}"
+    );
 }
 
 /// Runs `v12n serve` with only the given `V12N_*` settings; every case
