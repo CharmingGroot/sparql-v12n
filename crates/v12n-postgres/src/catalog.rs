@@ -60,7 +60,10 @@ const NOT_NULL_SQL: &str = "SELECT t.n::int4, a.attname::text
  WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attnotnull";
 
 /// The validated foreign keys of the tables named in `$1`. A key added
-/// `NOT VALID` does not hold for the rows that were already there.
+/// `NOT VALID` does not hold for the rows that were already there, and a
+/// table with inheritance children has none, since a scan reads their
+/// rows and they do not inherit the key; a partitioned table's keys hold
+/// in its partitions.
 const FOREIGN_KEYS_SQL: &str = "SELECT t.n::int4,
    array(SELECT a.attname::text FROM unnest(co.conkey) WITH ORDINALITY AS k(attnum, ord)
      JOIN pg_attribute a ON a.attrelid = co.conrelid AND a.attnum = k.attnum ORDER BY k.ord),
@@ -69,7 +72,10 @@ const FOREIGN_KEYS_SQL: &str = "SELECT t.n::int4,
      JOIN pg_attribute a ON a.attrelid = co.confrelid AND a.attnum = k.attnum ORDER BY k.ord)
  FROM unnest($1::text[]) WITH ORDINALITY AS t(name, n)
  JOIN pg_constraint co ON co.conrelid = to_regclass(t.name)
+ JOIN pg_class r ON r.oid = co.conrelid
  WHERE co.contype = 'f' AND co.convalidated
+   AND (r.relkind = 'p'
+     OR NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = r.oid))
  ORDER BY t.n, co.conname";
 
 /// The catalog queries, prepared with the connection, so that reading a

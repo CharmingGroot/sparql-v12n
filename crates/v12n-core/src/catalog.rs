@@ -3,6 +3,7 @@
 //! read once by a [`Backend`](crate::Backend) and checked on every query by
 //! a fingerprint (Discussion #187).
 
+mod foreign_keys;
 mod plan;
 
 use std::collections::HashMap;
@@ -267,7 +268,8 @@ pub struct Relation {
     /// Unique keys that hold for every row at any time; none for an
     /// `rr:sqlQuery`.
     pub unique_keys: Vec<UniqueKey>,
-    /// Validated foreign keys; none for an `rr:sqlQuery`.
+    /// Validated foreign keys that hold for every row a scan of the table
+    /// reads; none for an `rr:sqlQuery`.
     pub foreign_keys: Vec<ForeignKey>,
 }
 

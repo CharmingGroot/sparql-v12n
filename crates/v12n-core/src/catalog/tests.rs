@@ -277,3 +277,143 @@ fn reading_tables_again_keeps_the_columns_other_plans_need() {
         "a running query keeps its snapshot"
     );
 }
+
+const BUYERS: &str = "SELECT ?o ?c WHERE { ?o <http://example.org/placedBy> ?c . \
+                      ?c a <http://example.org/Customer> }";
+
+fn int(name: &str) -> ColumnType {
+    ColumnType {
+        name: name.into(),
+        sql_type: format!("\"pg_catalog\".\"{name}\""),
+        ..column_type(Comparison::Value)
+    }
+}
+
+fn entry(columns: &[(&str, ColumnType, bool)], relation: Relation) -> TableCatalog {
+    let columns = columns
+        .iter()
+        .map(|(name, ty, not_null)| {
+            let column = Column {
+                name: (*name).to_owned(),
+                ty: ty.clone(),
+                not_null: *not_null,
+            };
+            ((*name).to_owned(), column)
+        })
+        .collect();
+    TableCatalog {
+        fingerprint: Some(Fingerprint::new("f".into())),
+        status: TableStatus::Readable(Relation {
+            columns,
+            ..relation
+        }),
+    }
+}
+
+fn id_key(exact_index: bool) -> UniqueKey {
+    UniqueKey {
+        columns: names(&["id"]),
+        types: vec![Some(int("int4"))],
+        exact_index,
+    }
+}
+
+/// How the shop's orders reference their customers in the snapshot.
+struct Reference {
+    referenced_table: &'static str,
+    not_null: bool,
+    child_type: &'static str,
+    parent_keys: Vec<UniqueKey>,
+}
+
+impl Default for Reference {
+    fn default() -> Self {
+        Self {
+            referenced_table: "customers",
+            not_null: true,
+            child_type: "int4",
+            parent_keys: vec![id_key(true)],
+        }
+    }
+}
+
+/// The tables `BUYERS` scans once its plan is completed from `reference`.
+fn scanned(reference: Reference) -> Vec<LogicalTable> {
+    let orders = entry(
+        &[
+            ("id", int("int4"), true),
+            ("customer_id", int(reference.child_type), reference.not_null),
+        ],
+        Relation {
+            unique_keys: vec![id_key(true)],
+            foreign_keys: vec![ForeignKey {
+                columns: names(&["customer_id"]),
+                referenced_table: reference.referenced_table.into(),
+                referenced_columns: names(&["id"]),
+            }],
+            ..Relation::default()
+        },
+    );
+    let customers = entry(
+        &[("id", int("int4"), true)],
+        Relation {
+            unique_keys: reference.parent_keys,
+            ..Relation::default()
+        },
+    );
+    let snapshot =
+        CatalogSnapshot::new([(table("orders"), orders), (table("customers"), customers)]);
+    let ready = CatalogPlan::new(&shop_plan(BUYERS), Arc::new(snapshot)).unwrap();
+    assert_eq!(
+        ready.entries().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+        [table("orders"), table("customers")],
+        "the entries that justify the plan are checked"
+    );
+    ready.plan().branches[0].from.clone()
+}
+
+#[test]
+fn foreign_key_on_not_null_columns_removes_the_parent_scan() {
+    assert_eq!(scanned(Reference::default()), [table("orders")]);
+    let quoted = Reference {
+        referenced_table: "\"customers\"",
+        ..Reference::default()
+    };
+    assert_eq!(scanned(quoted), [table("orders")]);
+}
+
+#[test]
+fn foreign_key_that_cannot_vouch_for_one_row_keeps_the_parent_scan() {
+    let both = [table("orders"), table("customers")];
+    let cases = [
+        Reference {
+            not_null: false,
+            ..Reference::default()
+        },
+        Reference {
+            child_type: "int8",
+            ..Reference::default()
+        },
+        Reference {
+            parent_keys: Vec::new(),
+            ..Reference::default()
+        },
+        Reference {
+            parent_keys: vec![id_key(false)],
+            ..Reference::default()
+        },
+        // Either index may be the one the key checks against.
+        Reference {
+            parent_keys: vec![id_key(true), id_key(false)],
+            ..Reference::default()
+        },
+        // Another table, or the same one under a name the plan does not use.
+        Reference {
+            referenced_table: "shop.customers",
+            ..Reference::default()
+        },
+    ];
+    for case in cases {
+        assert_eq!(scanned(case), both);
+    }
+}

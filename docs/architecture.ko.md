@@ -109,6 +109,7 @@ flowchart TD
 - **계획 완성.** [`CatalogPlan::new`](../crates/v12n-core/src/catalog/plan.rs)는 `v12n-core`에서 DB 없이 실행된다.
   PostgreSQL이 소문자로 바꾸는 컬럼 이름을 해석한다.
   키가 있으면 한 브랜치가 같은 행을 두 번 스캔하는지 알 수 있어 스캔을 합치고, 결과에 중복이 생길 수 없는지 알 수 있어 `DISTINCT`나 중복을 제거하는 `UNION`을 생략한다.
+  `NOT NULL` 컬럼에 걸린 검증된 외래 키가 같은 컬럼 타입의 유일 키를 참조하면 각 행에 참조되는 행이 정확히 하나 있다. 쿼리가 그 키로 조인하고 키 컬럼만 읽는 참조 테이블 스캔은 없애고, 그 항은 참조하는 컬럼으로 만든다.
   컬럼 타입에 따라 `UNION` 브랜치를 맞추는 방법과 값을 RDF 항으로 비교하는 방법이 정해진다. 이 타입에서 SQL이 SPARQL과 같은 답을 낼 수 없는 비교는 `UnsupportedFeature`로 실패한다.
   스냅샷에 없다고 나온 테이블이나 컬럼은 `Catalog`로 실패한다.
 - **확인.** [`PostgresBackend::run`](../crates/v12n-postgres/src/lib.rs)은 계획이 읽는 테이블의 지문 쿼리와 문장 준비를 파이프라인 왕복 한 번으로 보낸다.

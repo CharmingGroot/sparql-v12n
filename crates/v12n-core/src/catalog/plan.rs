@@ -16,8 +16,9 @@ use crate::sql::{
 use super::{CatalogSnapshot, Column, TableCatalog, TableStatus};
 
 /// A [`SqlPlan`] completed from one [`CatalogSnapshot`]: column names
-/// resolved, scans of one row merged, duplicate removal decided and
-/// `UNION` branches typed. What a [`Backend`](crate::Backend) runs.
+/// resolved, scans of one row merged, joins that foreign keys make
+/// redundant removed, duplicate removal decided and `UNION` branches
+/// typed. What a [`Backend`](crate::Backend) runs.
 #[derive(Debug, Clone)]
 pub struct CatalogPlan {
     plan: SqlPlan,
@@ -35,12 +36,15 @@ impl CatalogPlan {
     /// missing without a sign.
     ///
     /// Each step reads what the one before it changed: self-joins merge on
-    /// resolved names, and merging changes which duplicates can occur and
-    /// so which columns need types.
+    /// resolved names, a foreign key removes a parent scan only if the
+    /// merged plan reads nothing of it but the key, and both change which
+    /// duplicates can occur and so which columns need types.
     pub fn new(plan: &SqlPlan, snapshot: Arc<CatalogSnapshot>) -> Result<Self, Error> {
         if let Some(problem) = snapshot.problem_for(plan) {
             return Err(Error::Catalog(problem.to_string()));
         }
+        // Taken before any scan is removed: the entry of a removed parent
+        // holds the key that its removal relies on.
         let tables = plan.logical_tables();
         if let Some(unread) = tables.iter().find(|t| snapshot.table(t).is_none()) {
             return Err(Error::Catalog(format!(
@@ -58,6 +62,8 @@ impl CatalogPlan {
         let plan = keys
             .as_ref()
             .and_then(|k| optimize::eliminate_self_joins(&plan, &k.mergeable))
+            .unwrap_or(plan);
+        let plan = optimize::eliminate_foreign_key_joins(&plan, &snapshot.foreign_key_joins(&plan))
             .unwrap_or(plan);
         let keys = keys.map(|k| k.unique);
         // `DISTINCT` and `UNION` compare values with `=`, so the types of
@@ -194,7 +200,7 @@ impl CatalogSnapshot {
             .collect()
     }
 
-    fn relation(&self, table: &LogicalTable) -> Option<&super::Relation> {
+    pub(super) fn relation(&self, table: &LogicalTable) -> Option<&super::Relation> {
         match &self.table(table)?.status {
             TableStatus::Readable(relation) => Some(relation),
             TableStatus::Missing | TableStatus::Unreadable(_) => None,

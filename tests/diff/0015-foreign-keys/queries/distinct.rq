@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT DISTINCT ?c WHERE { ?o ex:placedBy ?c }
