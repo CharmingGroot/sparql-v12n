@@ -108,7 +108,10 @@ generate() {
       echo "    depends_on: { postgres: { condition: service_healthy } }"
       echo "    environment:"
       echo "      ONTOP_MAPPING_FILE: /case/mapping.ttl"
-      echo "      ONTOP_DB_URL: jdbc:postgresql://postgres:5432/$(database "$dir")"
+      # A query that fails in PostgreSQL (an "ontop-error" case) would
+      # leave Ontop's connection in an aborted transaction, failing every
+      # later query; autosave rolls back to a savepoint instead.
+      echo "      ONTOP_DB_URL: jdbc:postgresql://postgres:5432/$(database "$dir")?autosave=always"
       echo "      ONTOP_DB_USER: v12n"
       echo "      ONTOP_DB_PASSWORD: v12n-dev"
       echo "      ONTOP_DB_DRIVER: org.postgresql.Driver"
