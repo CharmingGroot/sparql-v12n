@@ -136,7 +136,9 @@ flowchart TD
   each term column gets (R2RML §11 makes no term from a `NULL`) where a
   `NOT NULL` constraint of a table makes it true; a view's columns and a
   column that a `LEFT JOIN` can leave `NULL` keep it. Keys show when a branch scans the same
-  row twice, so the scans merge, and when the result cannot have
+  row twice, so the scans merge; an `OPTIONAL` part that can only match
+  the row of a scan on its left reads that row's columns, `NULL` where the
+  part's conditions fail, instead of a `LEFT JOIN`. Keys also show when the result cannot have
   duplicates, so `DISTINCT` or a duplicate-removing `UNION` is dropped.
   Column types decide how branches of a `UNION` line up and how values
   compare as RDF terms; a comparison that SQL cannot answer as SPARQL

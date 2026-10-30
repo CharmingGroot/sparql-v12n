@@ -361,6 +361,19 @@ pub(super) struct Renderer<'a> {
     pub(super) options: RenderOptions<'a>,
     /// Logical tables of the branch being rendered.
     pub(super) from: &'a [LogicalTable],
+    /// For each table of the branch being rendered, the row it reads
+    /// when it is the table of an `OPTIONAL` part that reads a row of its
+    /// left side.
+    row_of: Vec<Option<RowOf>>,
+}
+
+/// The SQL of a [`SameRow`](super::SameRow): the table whose row is read,
+/// and each condition of the guard with the column it requires not to be
+/// `NULL`, if that is all it requires.
+#[derive(Debug, Clone)]
+struct RowOf {
+    table: usize,
+    guard: Vec<(Option<String>, String)>,
 }
 
 impl<'a> Renderer<'a> {
@@ -379,6 +392,7 @@ impl<'a> Renderer<'a> {
             units: 0,
             options,
             from: &[],
+            row_of: Vec::new(),
         }
     }
 
@@ -420,6 +434,7 @@ impl<'a> Renderer<'a> {
         // Constants of the select list are strings of terms, never
         // compared, so binding one cannot empty the branch.
         self.required = false;
+        self.read_rows(branch)?;
         self.sql.push_str("SELECT ");
         if distinct {
             self.sql.push_str("DISTINCT ");
@@ -463,7 +478,7 @@ impl<'a> Renderer<'a> {
             // Text in every branch, so that `UNION` combines them.
             match &branch.select[*entry] {
                 SqlExpr::Column { table, name } => {
-                    let column = column_sql(*table, name);
+                    let column = self.column(*table, name);
                     let key = match self.column_type(*table, name).and_then(|ty| ty.term_key) {
                         Some(TermKey::Text) => TermKey::Text.sql(self.dialect, &column),
                         Some(key) => self.dialect.cast(
@@ -512,6 +527,72 @@ impl<'a> Renderer<'a> {
             self.conditions(&filters)?;
         }
         Ok(())
+    }
+
+    /// Sets the rows that the tables of `branch` read (see
+    /// [`SameRow`](super::SameRow)). A guard reads only tables before its
+    /// part, so rendering them in order of their tables renders a guard
+    /// that reads another part's table with that part's guard.
+    fn read_rows(&mut self, branch: &SqlBranch) -> Result<(), Error> {
+        self.row_of = vec![None; branch.from.len()];
+        let mut parts: Vec<&super::SameRow> = branch
+            .left_joins
+            .iter()
+            .filter_map(|j| j.same_row.as_ref())
+            .collect();
+        parts.sort_by_key(|same_row| same_row.scan);
+        for same_row in parts {
+            let guard = same_row
+                .guard
+                .iter()
+                .map(|c| self.guard_condition(c, same_row.row_of))
+                .collect::<Result<_, _>>()?;
+            self.row_of[same_row.scan] = Some(RowOf {
+                table: same_row.row_of,
+                guard,
+            });
+        }
+        Ok(())
+    }
+
+    /// The SQL of one guard condition on the row of `t{row_of}`, with the
+    /// column it only requires not to be `NULL`.
+    fn guard_condition(
+        &mut self,
+        condition: &Condition,
+        row_of: usize,
+    ) -> Result<(Option<String>, String), Error> {
+        let not_null = match condition {
+            Condition::IsNotNull(SqlExpr::Column { table, name }) if *table == row_of => {
+                Some(name.clone())
+            }
+            _ => None,
+        };
+        let start = self.sql.len();
+        self.conditions(&[condition])?;
+        Ok((not_null, self.sql.split_off(start)))
+    }
+
+    /// Column `name` of table alias `t{table}`; for the table of an
+    /// `OPTIONAL` part that reads a row, that row's column where the
+    /// guard holds. A guard condition that only requires this column not
+    /// to be `NULL` is left out, since the column is `NULL` without it.
+    pub(super) fn column(&self, table: usize, name: &str) -> String {
+        let Some(row) = self.row_of.get(table).and_then(Option::as_ref) else {
+            return column_sql(table, name);
+        };
+        let value = self.column(row.table, name);
+        let guard: Vec<&str> = row
+            .guard
+            .iter()
+            .filter(|(not_null, _)| not_null.as_deref() != Some(name))
+            .map(|(_, sql)| sql.as_str())
+            .collect();
+        if guard.is_empty() {
+            value
+        } else {
+            format!("CASE WHEN {} THEN {value} END", guard.join(" AND "))
+        }
     }
 
     /// The tables of `scope`, the whole branch or one of its `OPTIONAL`
@@ -602,11 +683,12 @@ impl<'a> Renderer<'a> {
                         self.conditions(&on[k])?;
                     }
                 }
+                // Its columns read a row of the left side instead.
+                Member::Part(part) if branch.left_joins[part].same_row.is_some() => {}
                 Member::Part(part) => {
                     self.sql.push_str("\nLEFT JOIN ");
                     let required = std::mem::replace(&mut self.required, false);
-                    let single = branch.left_joins[part].tables.len() == 1
-                        && !branch.left_joins.iter().any(|j| j.parent == Some(part));
+                    let single = joins_one_table(branch, part);
                     if !single {
                         self.sql.push('(');
                     }
@@ -640,7 +722,7 @@ impl<'a> Renderer<'a> {
                     let column = match (left, right) {
                         (SqlExpr::Column { table, name }, SqlExpr::Param(_))
                         | (SqlExpr::Param(_), SqlExpr::Column { table, name }) => {
-                            Some(column_sql(*table, name))
+                            Some(self.column(*table, name))
                         }
                         _ => None,
                     };
@@ -674,7 +756,7 @@ impl<'a> Renderer<'a> {
                 Condition::EqAny(left, right) => {
                     let first = self.params.len();
                     let column = match left {
-                        SqlExpr::Column { table, name } => Some(column_sql(*table, name)),
+                        SqlExpr::Column { table, name } => Some(self.column(*table, name)),
                         _ => None,
                     };
                     let as_text = column.is_some() && self.options.text_params.contains(&first);
@@ -797,7 +879,7 @@ impl<'a> Renderer<'a> {
             && let (Some(a), Some(b)) = (self.column_type(*lt, ln), self.column_type(*rt, rn))
             && a.group == b.group
         {
-            let (l, r) = (column_sql(*lt, ln), column_sql(*rt, rn));
+            let (l, r) = (self.column(*lt, ln), self.column(*rt, rn));
             if let Some(normal) = a.term_normal.or(b.term_normal) {
                 self.sql.push_str(&format!(
                     "{} = {}",
@@ -903,10 +985,12 @@ impl<'a> Renderer<'a> {
     ) -> Result<(), Error> {
         match &side.value {
             TermSqlValue::Column { table, name } => match types {
-                None if text => self
-                    .sql
-                    .push_str(&self.dialect.cast(&column_sql(*table, name), &SqlType::Text)),
-                None => self.sql.push_str(&column_sql(*table, name)),
+                None if text => self.sql.push_str(
+                    &self
+                        .dialect
+                        .cast(&self.column(*table, name), &SqlType::Text),
+                ),
+                None => self.sql.push_str(&self.column(*table, name)),
                 Some(_) => {
                     let lexical = self.lexical(*table, name)?;
                     self.sql.push_str(&lexical);
@@ -928,7 +1012,8 @@ impl<'a> Renderer<'a> {
                         TemplatePart::Column(name) => {
                             let (value, unreserved) = match types {
                                 None => (
-                                    self.dialect.cast(&column_sql(*table, name), &SqlType::Text),
+                                    self.dialect
+                                        .cast(&self.column(*table, name), &SqlType::Text),
                                     false,
                                 ),
                                 Some(_) => (
@@ -955,7 +1040,7 @@ impl<'a> Renderer<'a> {
 
     /// SQL for the natural lexical form of a column.
     fn lexical(&self, table: usize, name: &str) -> Result<String, Error> {
-        let column = column_sql(table, name);
+        let column = self.column(table, name);
         let Some(ty) = self.column_type(table, name) else {
             return Ok(self.dialect.cast(&column, &SqlType::Text));
         };
@@ -982,7 +1067,7 @@ impl<'a> Renderer<'a> {
             // Values with the same term are one value for `DISTINCT`,
             // `UNION` and the decoder.
             self.sql
-                .push_str(&normal.sql(self.dialect, &column_sql(*table, name)));
+                .push_str(&normal.sql(self.dialect, &self.column(*table, name)));
             return Ok(());
         }
         let SqlExpr::Term { term, guard } = expr else {
@@ -1017,7 +1102,10 @@ impl<'a> Renderer<'a> {
 
     pub(super) fn expr(&mut self, expr: &SqlExpr) {
         match expr {
-            SqlExpr::Column { table, name } => self.sql.push_str(&column_sql(*table, name)),
+            SqlExpr::Column { table, name } => {
+                let column = self.column(*table, name);
+                self.sql.push_str(&column);
+            }
             SqlExpr::Param(param) => {
                 self.params.push(param.value.clone());
                 self.param_datatypes.push(param.datatype.clone());
@@ -1039,11 +1127,11 @@ impl<'a> Renderer<'a> {
                 table,
                 name,
                 lexical,
-            } => self.sql.push_str(&lexical_sql(
-                self.dialect,
-                &column_sql(*table, name),
-                *lexical,
-            )),
+            } => {
+                let column = self.column(*table, name);
+                self.sql
+                    .push_str(&lexical_sql(self.dialect, &column, *lexical));
+            }
             // Typed, since `UNION` resolves an untyped NULL of two branches
             // to text before it sees the third.
             SqlExpr::Null(ty) => self.sql.push_str(&self.dialect.cast("NULL", ty)),
@@ -1061,7 +1149,7 @@ impl<'a> Renderer<'a> {
     }
 }
 
-pub(super) fn column_sql(table: usize, name: &str) -> String {
+fn column_sql(table: usize, name: &str) -> String {
     format!("t{table}.{}", quote_identifier(name))
 }
 
@@ -1077,8 +1165,21 @@ fn lexical_sql(dialect: &dyn Dialect, column: &str, lexical: Lexical) -> String 
     }
 }
 
+/// Whether `part` joins one table and nothing else, which needs no
+/// parentheses: nested parts that read a row are not joined.
+fn joins_one_table(branch: &SqlBranch, part: usize) -> bool {
+    let mut tables = branch.left_joins[part].tables.len();
+    for nested in branch.left_joins.iter().filter(|j| j.parent == Some(part)) {
+        if nested.same_row.is_none() {
+            return false;
+        }
+        tables -= nested.tables.len();
+    }
+    tables == 1
+}
+
 /// Table aliases a condition refers to, in ascending order.
-fn condition_tables(condition: &Condition) -> Vec<usize> {
+pub(crate) fn condition_tables(condition: &Condition) -> Vec<usize> {
     fn collect(expr: &SqlExpr, out: &mut BTreeSet<usize>) {
         match expr {
             SqlExpr::Column { table, .. } | SqlExpr::Lexical { table, .. } => {

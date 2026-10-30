@@ -1494,6 +1494,7 @@ fn plan(
                     tables: g.tables.clone(),
                     parent: g.parent,
                     conditions: g.conditions.clone(),
+                    same_row: None,
                 })
                 .collect(),
             fixed_columns: branch.fixed_columns(),

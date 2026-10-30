@@ -109,7 +109,7 @@ flowchart TD
 - **계획 완성.** [`CatalogPlan::new`](../crates/v12n-core/src/catalog/plan.rs)는 `v12n-core`에서 DB 없이 실행된다.
   PostgreSQL이 소문자로 바꾸는 컬럼 이름을 해석한다.
   term 컬럼마다 붙는 `IS NOT NULL`(R2RML §11에 따라 `NULL`에서는 항을 만들지 않음)은 테이블의 `NOT NULL` 제약으로 항상 참이면 뺀다. 뷰의 컬럼과 `LEFT JOIN` 때문에 `NULL`이 될 수 있는 컬럼에는 남긴다.
-  키가 있으면 한 브랜치가 같은 행을 두 번 스캔하는지 알 수 있어 스캔을 합치고, 결과에 중복이 생길 수 없는지 알 수 있어 `DISTINCT`나 중복을 제거하는 `UNION`을 생략한다.
+  키가 있으면 한 브랜치가 같은 행을 두 번 스캔하는지 알 수 있어 스캔을 합친다. 왼쪽 스캔의 행에만 일치할 수 있는 `OPTIONAL` 부분은 `LEFT JOIN` 대신 그 행의 컬럼을 읽고, 부분의 조건이 성립하지 않는 곳에서는 `NULL`로 둔다. 또 키로 결과에 중복이 생길 수 없는지 알 수 있어 `DISTINCT`나 중복을 제거하는 `UNION`을 생략한다.
   컬럼 타입에 따라 `UNION` 브랜치를 맞추는 방법과 값을 RDF 항으로 비교하는 방법이 정해진다. 이 타입에서 SQL이 SPARQL과 같은 답을 낼 수 없는 비교는 `UnsupportedFeature`로 실패한다.
   스냅샷에 없다고 나온 테이블이나 컬럼은 `Catalog`로 실패한다.
 - **확인.** [`PostgresBackend::run`](../crates/v12n-postgres/src/lib.rs)은 계획이 읽는 테이블의 지문 쿼리와 문장 준비를 파이프라인 왕복 한 번으로 보낸다.

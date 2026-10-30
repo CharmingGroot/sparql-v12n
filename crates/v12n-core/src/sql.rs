@@ -17,10 +17,11 @@ pub use identifier::{folded_identifier, identifier_name, quote_identifier, quote
 pub use plan::{
     ColumnType, ColumnTypes, Comparison, Condition, Filter, FilterTerm, FilterValue, LeftJoin,
     Lexical, OrderColumn, OrderKey, OrderValue, Param, ProjectedTerm, RenderOptions, RenderedSql,
-    ResultTerm, ResultValue, SqlBranch, SqlExpr, SqlPlan, TableKeys, TermDatatype, TermKey,
-    TermMatch, TermNormal, TermSql, TermSqlValue, ValueCases, ValueKind,
+    ResultTerm, ResultValue, SameRow, SqlBranch, SqlExpr, SqlPlan, TableKeys, TermDatatype,
+    TermKey, TermMatch, TermNormal, TermSql, TermSqlValue, ValueCases, ValueKind,
 };
 
 use crate::Error;
 use plan::XSD_STRING;
-use renderer::{Renderer, column_sql};
+use renderer::Renderer;
+pub(crate) use renderer::condition_tables;

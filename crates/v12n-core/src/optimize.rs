@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Rewrites on the SQL plan: self-join elimination.
 
+mod optional;
+
 use crate::mapping::LogicalTable;
 use crate::sql::{
     Condition, SqlBranch, SqlExpr, SqlPlan, TableKeys, TermDatatype, TermSql, TermSqlValue,
@@ -49,32 +51,53 @@ pub fn self_join_tables(plan: &SqlPlan) -> Vec<LogicalTable> {
 /// `IS NOT NULL` was implied by a dropped equality cannot exist: key
 /// columns are `NOT NULL`.
 ///
-/// Scans on two sides of an `OPTIONAL` are never merged: where the part
-/// does not match, its columns are `NULL` while the left side's are not,
-/// and a `LEFT JOIN` on the key is not the same row in every row. Branches
-/// are separate `SELECT`s, so scans of different `UNION` arms are never
-/// merged either.
+/// Scans on two sides of an `OPTIONAL` are not merged this way: where the
+/// part does not match, its columns are `NULL` while the left side's are
+/// not, so a `LEFT JOIN` on the key is not the same row in every row.
+/// Instead, a part that can only match the row of a scan of its left side
+/// reads that row where its own conditions hold (see [`SameRow`] and the
+/// `optional` module). Branches are separate `SELECT`s, so scans of
+/// different `UNION` arms are never merged.
+///
+/// [`SameRow`]: crate::sql::SameRow
 pub fn eliminate_self_joins(plan: &SqlPlan, keys: &TableKeys) -> Option<SqlPlan> {
     if keys.is_empty() {
         return None;
     }
     let mut out: Option<SqlPlan> = None;
     for (b, branch) in plan.branches.iter().enumerate() {
-        let mut merged: Option<SqlBranch> = None;
-        while let Some((keep, drop, key)) = mergeable(merged.as_ref().unwrap_or(branch), keys) {
-            merge(
-                merged.get_or_insert_with(|| branch.clone()),
-                keep,
-                drop,
-                &key,
-            );
-        }
-        if let Some(mut merged) = merged {
-            dedup_conditions(&mut merged);
+        if let Some(merged) = merged_branch(branch, keys) {
             out.get_or_insert_with(|| plan.clone()).branches[b] = merged;
         }
     }
     out
+}
+
+/// `branch` with its scans of one row merged within each scope, then its
+/// `OPTIONAL` parts that read a row of their left side marked; `None`
+/// when neither applies. Merging first leaves a part with fewer scans of
+/// its own, which is what reading a row needs.
+fn merged_branch(branch: &SqlBranch, keys: &TableKeys) -> Option<SqlBranch> {
+    let mut merged: Option<SqlBranch> = None;
+    while let Some((keep, drop, key)) = mergeable(merged.as_ref().unwrap_or(branch), keys) {
+        merge(
+            merged.get_or_insert_with(|| branch.clone()),
+            keep,
+            drop,
+            &key,
+        );
+    }
+    if let Some(merged) = &mut merged {
+        dedup_conditions(merged);
+    }
+    let rows = optional::same_rows(merged.as_ref().unwrap_or(branch), keys);
+    if !rows.is_empty() {
+        let merged = merged.get_or_insert_with(|| branch.clone());
+        for (part, same_row) in rows {
+            merged.left_joins[part].same_row = Some(same_row);
+        }
+    }
+    merged
 }
 
 /// The `OPTIONAL` part whose own tables include `table`: the innermost
@@ -148,6 +171,19 @@ enum Anchor<'c> {
     Same(&'c Option<TermDatatype>, &'c TermSql),
 }
 
+impl Anchor<'_> {
+    /// Whether the anchor is column `key` of `t{table}` itself, compared
+    /// with the same datatype where it is a term.
+    fn is_column(&self, table: usize, key: &str) -> bool {
+        let found = match self {
+            Anchor::Eq(e) => column_of(e),
+            Anchor::Same(datatype, t) if t.datatype == **datatype => term_column(t),
+            Anchor::Same(..) => None,
+        };
+        found.is_some_and(|(t, c)| t == table && c == key)
+    }
+}
+
 /// Everything `conditions` compare `t{table}.key` with.
 fn anchors<'c>(conditions: &'c [Condition], table: usize, key: &str) -> Vec<Anchor<'c>> {
     let is_key =
@@ -185,12 +221,7 @@ fn anchors<'c>(conditions: &'c [Condition], table: usize, key: &str) -> Vec<Anch
 /// equal values.
 fn same_value(conditions: &[Condition], i: usize, j: usize, key: &str) -> bool {
     let left = anchors(conditions, i, key);
-    let direct = left.iter().any(|anchor| match anchor {
-        Anchor::Eq(e) => column_of(e).is_some_and(|(t, c)| t == j && c == key),
-        Anchor::Same(datatype, t) => {
-            t.datatype == **datatype && term_column(t).is_some_and(|(t, c)| t == j && c == key)
-        }
-    });
+    let direct = left.iter().any(|anchor| anchor.is_column(j, key));
     direct || {
         let right = anchors(conditions, j, key);
         left.iter().any(|a| right.contains(a))
@@ -213,23 +244,29 @@ fn merge(branch: &mut SqlBranch, keep: usize, drop: usize, key: &[String]) {
         let shift = |n: usize| if n > drop { n - 1 } else { n };
         join.tables = shift(join.tables.start)..shift(join.tables.end);
     }
-    let reflexive = |a: Option<(usize, String)>, b: Option<(usize, String)>| match (a, b) {
-        (Some((ta, ca)), Some((tb, cb))) => {
-            ta == keep && tb == keep && ca == cb && key.contains(&ca)
-        }
-        _ => false,
-    };
     let conditions = match scope {
         None => &mut branch.conditions,
         Some(j) => &mut branch.left_joins[j].conditions,
     };
-    conditions.retain(|c| match c {
-        Condition::Eq(a, b) => !reflexive(column_of(a), column_of(b)),
-        Condition::SameTerm(a, b) => {
-            !(a.datatype == b.datatype && reflexive(term_column(a), term_column(b)))
+    conditions.retain(|c| !key_equals_itself(c, keep, key));
+}
+
+/// Whether `condition` compares a column of `key` of `t{table}` with
+/// itself, which holds in every row: key columns are `NOT NULL`.
+fn key_equals_itself(condition: &Condition, table: usize, key: &[String]) -> bool {
+    let reflexive = |a: Option<(usize, String)>, b: Option<(usize, String)>| match (a, b) {
+        (Some((ta, ca)), Some((tb, cb))) => {
+            ta == table && tb == table && ca == cb && key.contains(&ca)
         }
-        _ => true,
-    });
+        _ => false,
+    };
+    match condition {
+        Condition::Eq(a, b) => reflexive(column_of(a), column_of(b)),
+        Condition::SameTerm(a, b) => {
+            a.datatype == b.datatype && reflexive(term_column(a), term_column(b))
+        }
+        _ => false,
+    }
 }
 
 /// Drops repeated conditions of a conjunction, such as the two equalities

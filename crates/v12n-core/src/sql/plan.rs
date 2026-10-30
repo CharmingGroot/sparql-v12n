@@ -155,6 +155,27 @@ pub struct LeftJoin {
     /// §18.3). The left side is the tables before it, those of the parent
     /// part on, or all of them at the top level.
     pub conditions: Vec<Condition>,
+    /// Set when the part can only match one row of a table of its left
+    /// side, which it then reads instead of joining.
+    pub same_row: Option<SameRow>,
+}
+
+/// How an `OPTIONAL` part reads a row of its left side: its one table of
+/// its own, `t{scan}`, can only match the row of `t{row_of}`, pinned by a
+/// `NOT NULL` unique key (see
+/// [`eliminate_self_joins`](crate::optimize::eliminate_self_joins)).
+///
+/// Each column of `t{scan}` is then that column of `t{row_of}` where
+/// every condition of `guard` holds and `NULL` elsewhere, which is what
+/// the `LEFT JOIN` gives, so the part is rendered without one. `guard`
+/// reads only tables before the part and holds no parameter, so it can
+/// be repeated wherever a column of `t{scan}` is read; every part nested
+/// in this one reads a row as well.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SameRow {
+    pub scan: usize,
+    pub row_of: usize,
+    pub guard: Vec<Condition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -799,6 +820,20 @@ impl SqlBranch {
         self.conditions
             .iter()
             .chain(self.left_joins.iter().flat_map(|j| &j.conditions))
+    }
+}
+
+impl LeftJoin {
+    /// The conditions of the part, then those of [`SameRow::guard`].
+    pub(super) fn conditions_mut(&mut self) -> impl Iterator<Item = &mut Condition> {
+        let Self {
+            conditions,
+            same_row,
+            ..
+        } = self;
+        conditions
+            .iter_mut()
+            .chain(same_row.iter_mut().flat_map(|s| &mut s.guard))
     }
 }
 
