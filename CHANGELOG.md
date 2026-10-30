@@ -10,6 +10,12 @@ Design decisions are recorded in the `Decision:` Discussions.
 
 ### Added
 
+- `BIND` and `SELECT (expr AS ?v)` over variables, constants and arithmetic
+  on integers and decimals. An error leaves the variable unbound.
+- Arithmetic (`+`, `-`, `*`, `/`) on integers and decimals in `FILTER`,
+  with XPath's type promotion and SPARQL's error semantics.
+- SPARQL Query Results XML, CSV and TSV from the endpoint, chosen by
+  `Accept`, and from `v12n query --format`.
 - TLS for database connections through rustls: `sslmode` (`disable`,
   `prefer`, `require`, `verify-ca`, `verify-full`) and `sslrootcert` in
   the database URL, with libpq's meaning and its default `prefer`.

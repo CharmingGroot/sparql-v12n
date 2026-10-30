@@ -2,7 +2,7 @@
 
 [English](semantics.md) | 한국어 | [简体中文](semantics.zh-CN.md)
 
-> 이 문서는 [semantics.md](semantics.md)(커밋 8e6fa66)의 번역이다. 내용이 다르면 영어 원문을 따른다.
+> 이 문서는 [semantics.md](semantics.md)(커밋 8c0e55a)의 번역이다. 내용이 다르면 영어 원문을 따른다.
 
 이 문서는 sparql-v12n이 SPARQL 쿼리를 SQL로 변환하는 방법과 쿼리 결과를 결정하는 규칙을 설명한다. 다루는 항목은 컬럼 이름, IRI, 리터럴(literal), 상수, 조인, 중복, `OPTIONAL`, `UNION`, `FILTER`, 정렬이다. 전체 개요와 지원 기능 표는 [README](../README.ko.md)에 있다.
 
@@ -484,6 +484,32 @@ XPath의 타입 승격을 따르며, 정수를 정수로 나누면 decimal이 �
 - 그 밖의 함수, `xsd:double`의 산술, `IN`, `EXISTS`, 그리고 term(변수, 상수,
   이들에 대한 `STR`, `LANG`, `DATATYPE`)과 산술이 아닌 식을 피연산자로 쓰는 것
 - 인코딩이 UTF-8이 아닌 데이터베이스에서의 문자열 정렬과 `REGEX`
+
+## BIND와 SELECT 식
+
+`BIND(expr AS ?v)`와 `SELECT (expr AS ?v)`는 각 해에서 식의 값을 `?v`에
+바인딩한다(SPARQL 1.1 §18.5, Extend). 식은 변수, 상수, 또는
+[`FILTER`](#filter)와 같은 산술이다.
+
+- 변수는 그 변수의 term을, 상수는 상수 자신을 값으로 한다.
+- 산술은 XPath의 타입 승격에 따른 데이터타입의 숫자를 정규 표기로 쓴다
+  ([리터럴](#리터럴) 참고). 정수 컬럼에 대해 `?qty * 2`는 `xsd:integer`이고
+  `?qty / 4`는 `xsd:decimal`이다. XPath가 구현에 맡긴 decimal 나눗셈의
+  정밀도는 PostgreSQL `numeric` 나눗셈의 정밀도를 따른다.
+- 0으로 나누기나 숫자가 아닌 피연산자 같은 오류가 나면 `?v`는 바인딩되지
+  않는다. 해는 그대로 남는다.
+
+SPARQL은 `BIND`를 그것이 쓰인 그룹의 해에 대해 평가한다. v12n은 조인을 마친
+뒤 패턴 전체의 해에 대해 계산한다. 식의 변수 가운데 그룹이 바인딩하지 않을 수
+있는 변수를 패턴의 나머지 부분이 바인딩하지 않으면 두 방식의 값은 같다.
+
+다음은 미지원으로 거부한다.
+
+- 변수, 상수, 산술이 아닌 식. `STR`, 비교, `IF`, `COALESCE`가 그 예다
+- `OPTIONAL`이나 `UNION` 안의 `BIND`
+- 그룹이 바인딩하지 않을 수 있고 패턴의 뒷부분이 바인딩하는 변수에 대한 `BIND`
+- `BIND`나 `SELECT`가 계산한 변수를 트리플 패턴, `FILTER`, `ORDER BY`, 다른
+  식에서 쓰는 것
 
 ## ORDER BY, LIMIT, OFFSET
 
