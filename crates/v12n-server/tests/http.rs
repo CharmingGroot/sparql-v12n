@@ -12,8 +12,9 @@ use axum::http::{Request, Response, StatusCode, header};
 use serde_json::Value;
 use tower::ServiceExt;
 use v12n_core::mapping::Mapping;
-use v12n_postgres::Limits;
-use v12n_server::{App, DatabaseConfig, ServerLimits, TRUNCATED_HEADER, router};
+use v12n_core::{Limits, Planner};
+use v12n_postgres::PostgresConnector;
+use v12n_server::{App, ServerLimits, TRUNCATED_HEADER, router};
 
 const SHOP: &str = include_str!("../../../examples/shop/mapping.ttl");
 const VIP_ORDERS: &str = include_str!("../../../examples/shop/queries/vip-orders.rq");
@@ -23,18 +24,17 @@ const JSON: &str = "application/sparql-results+json";
 /// fast instead of hanging.
 const NO_DATABASE: &str = "postgresql://v12n@127.0.0.1:1/shop?connect_timeout=2";
 
-fn new_app(mapping: &str, url: &str, limits: ServerLimits) -> Arc<App> {
+type PostgresApp = App<PostgresConnector>;
+
+fn new_app(mapping: &str, url: &str, limits: ServerLimits) -> Arc<PostgresApp> {
     App::new(
-        Mapping::from_turtle(mapping).unwrap(),
-        DatabaseConfig {
-            url: url.to_owned(),
-            password: None,
-        },
+        Planner::new(Mapping::from_turtle(mapping).unwrap()),
+        PostgresConnector::new(url),
         limits,
     )
 }
 
-fn offline() -> Arc<App> {
+fn offline() -> Arc<PostgresApp> {
     new_app(SHOP, NO_DATABASE, ServerLimits::default())
 }
 
@@ -64,7 +64,7 @@ fn post_direct(query: &str) -> Request<Body> {
         .unwrap()
 }
 
-async fn send(app: &Arc<App>, request: Request<Body>) -> Response<Body> {
+async fn send(app: &Arc<PostgresApp>, request: Request<Body>) -> Response<Body> {
     router(Arc::clone(app)).oneshot(request).await.unwrap()
 }
 
@@ -78,7 +78,7 @@ async fn text(response: Response<Body>) -> String {
     .unwrap()
 }
 
-async fn status(app: &Arc<App>, request: Request<Body>) -> StatusCode {
+async fn status(app: &Arc<PostgresApp>, request: Request<Body>) -> StatusCode {
     send(app, request).await.status()
 }
 

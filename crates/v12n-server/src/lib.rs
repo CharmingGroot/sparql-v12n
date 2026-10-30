@@ -20,12 +20,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use v12n_core::mapping::{Mapping, MappingIndex};
+use v12n_core::Planner;
+use v12n_core::backend::{Backend, BackendError, Connector, ErrorKind, SolutionStream};
+use v12n_core::mapping::Mapping;
 use v12n_core::results::{ResultsFormat, ResultsWriter};
 use v12n_core::solution::Solution;
 use v12n_core::sql::SqlPlan;
-use v12n_core::{sparql, unfold};
-use v12n_postgres::Solutions;
 
 pub use config::{Config, DatabaseConfig, ServerLimits};
 use pool::{Lease, Pool};
@@ -46,17 +46,18 @@ pub enum Error {
     /// The mapping file cannot be read or is not a valid R2RML mapping.
     #[error("mapping {path}: {message}")]
     Mapping { path: PathBuf, message: String },
-    /// The startup connection to PostgreSQL failed.
-    #[error(transparent)]
-    Database(#[from] v12n_postgres::Error),
+    /// The startup connection to the database failed.
+    #[error("{0}")]
+    Database(Box<dyn BackendError>),
     /// Binding the listen address or serving connections failed.
     #[error("{0}")]
     Io(#[from] io::Error),
 }
 
-/// Loads the mapping, checks that the database is reachable, and serves
-/// until SIGINT or SIGTERM. In-flight responses finish first.
-pub async fn serve(config: Config) -> Result<(), Error> {
+/// Loads the mapping, checks that the database `connector` reaches is
+/// available, and serves until SIGINT or SIGTERM. In-flight responses
+/// finish first.
+pub async fn serve<C: Connector + 'static>(config: Config, connector: C) -> Result<(), Error> {
     let text = std::fs::read_to_string(&config.mapping).map_err(|e| Error::Mapping {
         path: config.mapping.clone(),
         message: e.to_string(),
@@ -68,8 +69,12 @@ pub async fn serve(config: Config) -> Result<(), Error> {
     if let Some(base) = config.base_iri.clone() {
         mapping = mapping.with_base_iri(base);
     }
-    let app = App::new(mapping, config.database, config.limits);
-    app.pool.get().await?.release();
+    let app = App::new(Planner::new(mapping), connector, config.limits);
+    app.pool
+        .get()
+        .await
+        .map_err(|e| Error::Database(Box::new(e)))?
+        .release();
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(
@@ -111,24 +116,22 @@ async fn shutdown_signal() {
 }
 
 /// Shared state of the endpoint.
-pub struct App {
-    mapping: Mapping,
-    index: MappingIndex,
-    pool: Arc<Pool>,
+pub struct App<C: Connector> {
+    planner: Arc<Planner>,
+    pool: Arc<Pool<C>>,
     permits: Arc<Semaphore>,
     limits: ServerLimits,
     next_query_id: AtomicU64,
 }
 
-impl App {
-    /// Connections are opened on demand, at most one per concurrent
-    /// request.
-    pub fn new(mapping: Mapping, database: DatabaseConfig, limits: ServerLimits) -> Arc<Self> {
-        let index = MappingIndex::new(&mapping);
+impl<C: Connector> App<C> {
+    /// Sessions are opened on demand, at most one per concurrent request,
+    /// each with the query limits of `limits`.
+    pub fn new(planner: Planner, connector: C, limits: ServerLimits) -> Arc<Self> {
+        let planner = Arc::new(planner);
         Arc::new(Self {
-            mapping,
-            index,
-            pool: Pool::new(database, limits.query),
+            pool: Pool::new(connector, Arc::clone(&planner), limits.query),
+            planner,
             permits: Arc::new(Semaphore::new(limits.max_concurrent_requests)),
             limits,
             next_query_id: AtomicU64::new(1),
@@ -138,9 +141,9 @@ impl App {
 
 /// `/sparql` for queries and `/healthz` for liveness. Other methods on
 /// `/sparql` get 405 with an `Allow` header.
-pub fn router(app: Arc<App>) -> Router {
+pub fn router<C: Connector + 'static>(app: Arc<App<C>>) -> Router {
     Router::new()
-        .route("/sparql", get(sparql_query).post(sparql_query))
+        .route("/sparql", get(sparql_query::<C>).post(sparql_query::<C>))
         .route("/healthz", get(|| async { "ok\n" }))
         .with_state(app)
 }
@@ -182,8 +185,8 @@ impl IntoResponse for Failure {
     }
 }
 
-async fn sparql_query(
-    State(app): State<Arc<App>>,
+async fn sparql_query<C: Connector + 'static>(
+    State(app): State<Arc<App<C>>>,
     method: Method,
     headers: HeaderMap,
     RawQuery(url_query): RawQuery,
@@ -214,8 +217,8 @@ async fn sparql_query(
     }
 }
 
-async fn answer(
-    app: &Arc<App>,
+async fn answer<C: Connector + 'static>(
+    app: &Arc<App<C>>,
     query_id: u64,
     started: Instant,
     method: &Method,
@@ -239,13 +242,7 @@ async fn answer(
         app.limits.max_query_bytes,
     )
     .await?;
-    let plan = plan(app, &query)?;
-    // The adapter renders again with column types and reports a
-    // rendering error with the right status.
-    match plan.to_sql() {
-        Ok(rendered) => tracing::info!(query_id, sql = %rendered.sql, "unfolded"),
-        Err(_) => tracing::info!(query_id, "unfolded"),
-    }
+    let plan = plan(&app.planner, &query)?;
 
     // Refusing at once instead of queueing keeps a burst from holding
     // client connections open with no bound.
@@ -259,16 +256,25 @@ async fn answer(
             ),
         )
     })?;
-    let lease = app.pool.get().await.map_err(database_failure)?;
+    let lease = app.pool.get().await.map_err(|e| database_failure(&e))?;
+    let engine = lease.engine();
+    // The backend renders again with column types and reports a rendering
+    // error with the right status.
+    match engine.render(&plan) {
+        Ok(rendered) => tracing::info!(query_id, sql = %rendered.sql, "unfolded"),
+        Err(_) => tracing::info!(query_id, "unfolded"),
+    }
     let sql_started = Instant::now();
-    let mut solutions = lease
-        .database()
+    let mut solutions = engine
         .execute(&plan)
         .await
-        .map_err(database_failure)?;
+        .map_err(|e| database_failure(&e))?;
     // The status line goes out before the body (RFC 9110 §15), so the
     // first row is awaited while an error can still become a status.
-    let first = solutions.try_next().await.map_err(database_failure)?;
+    let first = solutions
+        .try_next()
+        .await
+        .map_err(|e| database_failure(&e))?;
     let sql_ms = sql_started.elapsed().as_millis() as u64;
 
     let mut response_headers = HeaderMap::new();
@@ -307,59 +313,55 @@ async fn answer(
     Ok((response_headers, Body::from_stream(body)).into_response())
 }
 
-fn plan(app: &App, query: &str) -> Result<SqlPlan, Failure> {
-    sparql::parse(query)
-        .and_then(|query| unfold::unfold(&query, &app.mapping, &app.index))
-        .map_err(|e| {
-            let (status, kind) = match e {
-                v12n_core::Error::QuerySyntax(_) => (StatusCode::BAD_REQUEST, "query"),
-                // A limit on the request, not a missing feature.
-                v12n_core::Error::TooManyBranches { .. } => {
-                    (StatusCode::BAD_REQUEST, "query_too_complex")
-                }
-                v12n_core::Error::UnsupportedFeature(_) => {
-                    (StatusCode::NOT_IMPLEMENTED, "unsupported")
-                }
-                _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
-            };
-            Failure::new(status, kind, e.to_string())
-        })
+fn plan(planner: &Planner, query: &str) -> Result<SqlPlan, Failure> {
+    planner.plan(query).map_err(|e| {
+        let (status, kind) = match e {
+            v12n_core::Error::QuerySyntax(_) => (StatusCode::BAD_REQUEST, "query"),
+            // A limit on the request, not a missing feature.
+            v12n_core::Error::TooManyBranches { .. } => {
+                (StatusCode::BAD_REQUEST, "query_too_complex")
+            }
+            v12n_core::Error::UnsupportedFeature(_) => (StatusCode::NOT_IMPLEMENTED, "unsupported"),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        };
+        Failure::new(status, kind, e.to_string())
+    })
 }
 
-fn database_failure(error: v12n_postgres::Error) -> Failure {
-    use v12n_postgres::Error;
-    let (status, kind) = match &error {
+fn database_failure(error: &dyn BackendError) -> Failure {
+    let (status, kind) = match error.kind() {
         // Before the first row, so the client may retry later.
-        Error::Timeout(_) => (StatusCode::SERVICE_UNAVAILABLE, "timeout"),
+        ErrorKind::Timeout(_) => (StatusCode::SERVICE_UNAVAILABLE, "timeout"),
         // A comparison the column types make impossible to do right in SQL.
-        Error::Core(v12n_core::Error::UnsupportedFeature(_)) => {
+        ErrorKind::Core(v12n_core::Error::UnsupportedFeature(_)) => {
             (StatusCode::NOT_IMPLEMENTED, "unsupported")
         }
-        Error::Core(_) => (StatusCode::INTERNAL_SERVER_ERROR, "data"),
-        Error::Config(_) | Error::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "database"),
+        ErrorKind::Core(_) => (StatusCode::INTERNAL_SERVER_ERROR, "data"),
+        ErrorKind::Config | ErrorKind::Database => (StatusCode::INTERNAL_SERVER_ERROR, "database"),
     };
     Failure::new(status, kind, error.to_string())
 }
 
 /// Turns solutions into body chunks, holding the request permit and the
 /// connection until the last one is sent or the client goes away.
-struct ResultStream {
+struct ResultStream<C: Connector> {
     /// `None` once the document is closed.
     writer: Option<ResultsWriter<Vec<u8>>>,
-    solutions: Solutions,
+    solutions: <C::Backend as Backend>::Solutions,
     next: Option<Solution>,
-    lease: Option<Lease>,
+    lease: Option<Lease<C>>,
     _permit: OwnedSemaphorePermit,
     truncated: bool,
     query_id: u64,
     started: Instant,
-    /// From sending the SQL to the first row, which with a row limit
-    /// covers most of the execution (see `v12n_postgres`).
+    /// From sending the SQL to the first row. With a row limit this covers
+    /// most of the execution, since truncation is known at the first row
+    /// ([`SolutionStream::is_truncated`]).
     sql_ms: u64,
     rows: u64,
 }
 
-impl ResultStream {
+impl<C: Connector> ResultStream<C> {
     /// The next chunk of at least [`CHUNK_BYTES`] bytes, except the last.
     ///
     /// An error here comes after the status line, so it cannot become an
@@ -377,10 +379,10 @@ impl ResultStream {
                 Ok(next) => self.next = next,
                 Err(e) => {
                     // Only the timeout message is free of stored values.
-                    let (kind, message) = match e {
-                        v12n_postgres::Error::Timeout(_) => ("timeout", e.to_string()),
-                        v12n_postgres::Error::Core(_) => ("data", String::new()),
-                        _ => ("database", String::new()),
+                    let (kind, message) = match e.kind() {
+                        ErrorKind::Timeout(_) => ("timeout", e.to_string()),
+                        ErrorKind::Core(_) => ("data", String::new()),
+                        ErrorKind::Config | ErrorKind::Database => ("database", String::new()),
                     };
                     return Some(Err(self.abort(kind, message)));
                 }

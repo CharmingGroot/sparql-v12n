@@ -13,6 +13,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::NoTls;
 use tokio_postgres::config::Host;
 use tokio_postgres::types::Type;
+use v12n_core::Limits;
+use v12n_core::backend::{Backend, SolutionStream};
 use v12n_core::dialect::PostgresDialect;
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
 use v12n_core::solution::canonical_decimal;
@@ -21,7 +23,7 @@ use v12n_core::sql::{
     TermNormal,
 };
 use v12n_core::{sparql, unfold};
-use v12n_postgres::{Database, Error, Limits};
+use v12n_postgres::{Error, PostgresBackend};
 
 const SHOP: &str = include_str!("../../../examples/shop/mapping.ttl");
 const VIP_ORDERS: &str = include_str!("../../../examples/shop/queries/vip-orders.rq");
@@ -54,7 +56,7 @@ async fn run_in_order(
     limits: Limits,
     plan: &SqlPlan,
 ) -> Result<(Vec<String>, bool), Error> {
-    let database = Database::connect(url, limits).await?;
+    let database = PostgresBackend::connect(url, limits).await?;
     let mut solutions = database.execute(plan).await?;
     let mut rows = Vec::new();
     while let Some(solution) = solutions.try_next().await? {
@@ -100,7 +102,9 @@ async fn constant_subject_binds_an_integer_parameter_that_uses_the_index() {
     // which also shows that no duplicates need removing.
     let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(connection);
-    let database = Database::connect(&url, Limits::default()).await.unwrap();
+    let database = PostgresBackend::connect(&url, Limits::default())
+        .await
+        .unwrap();
     let keys = database.table_keys(&plan).await.unwrap();
     let sql = plan
         .to_sql_with(
@@ -171,7 +175,7 @@ async fn truncation_is_known_after_the_first_solution() {
             row_limit,
             ..Limits::default()
         };
-        let database = Database::connect(&url, limits).await.unwrap();
+        let database = PostgresBackend::connect(&url, limits).await.unwrap();
         let mut solutions = database.execute(&plan).await.unwrap();
         assert!(solutions.try_next().await.unwrap().is_some());
         assert_eq!(solutions.is_truncated(), truncated, "row limit {row_limit}");
@@ -1114,7 +1118,7 @@ async fn trim_scale_matches_the_canonical_decimal_formatter() {
         row_limit: 0,
         ..Limits::default()
     };
-    let database = Database::connect(&url, limits).await.unwrap();
+    let database = PostgresBackend::connect(&url, limits).await.unwrap();
     let mut solutions = database.execute(&plan(&mapping, query)).await.unwrap();
     let mut checked = 0;
     while let Some(solution) = solutions.try_next().await.unwrap() {
@@ -1291,7 +1295,9 @@ async fn table_keys_come_from_unique_indexes_that_always_hold() {
         )
         .await
         .unwrap();
-    let database = Database::connect(&url, Limits::default()).await.unwrap();
+    let database = PostgresBackend::connect(&url, Limits::default())
+        .await
+        .unwrap();
     let mut keys = Vec::new();
     for table in [
         "v12n_keys.pk",
@@ -2242,7 +2248,7 @@ async fn order_holds_through_every_wrapper_and_keys_stay_hidden() {
     // Every solution has exactly the projected variables.
     let query = "PREFIX ex: <http://example.org/>\n\
                  SELECT ?row ?addr WHERE { ?row ex:k ?k ; ex:addr ?addr } ORDER BY DESC(?k) LIMIT 8";
-    let database = Database::connect(&url, limits(5)).await.unwrap();
+    let database = PostgresBackend::connect(&url, limits(5)).await.unwrap();
     let mut solutions = database.execute(&plan(&mapping, query)).await.unwrap();
     assert_eq!(solutions.variables(), ["row", "addr"]);
     let mut keys = Vec::new();
@@ -2315,7 +2321,9 @@ async fn order_by_a_column_keeps_its_index() {
          <#M> rr:logicalTable [ rr:tableName \"v12n_order.items\" ] ;\n\
            rr:subjectMap [ rr:template \"http://example.org/item/{id}\" ] ;\n\
            rr:predicateObjectMap [ rr:predicate <http://example.org/price> ; rr:objectMap [ rr:column \"price\" ] ] .";
-    let database = Database::connect(&url, Limits::default()).await.unwrap();
+    let database = PostgresBackend::connect(&url, Limits::default())
+        .await
+        .unwrap();
     let mut plans = Vec::new();
     for direction in ["", "DESC"] {
         let plan = plan(
@@ -2403,7 +2411,9 @@ async fn order_by_without_an_exact_sql_order_is_rejected() {
         ("SELECT ?row WHERE { ?row ex:r ?v } ORDER BY ?v", "float4"),
     ] {
         let query = format!("PREFIX ex: <http://example.org/>\n{body}");
-        let database = Database::connect(&url, Limits::default()).await.unwrap();
+        let database = PostgresBackend::connect(&url, Limits::default())
+            .await
+            .unwrap();
         match database.execute(&plan(&mapping, &query)).await {
             Err(Error::Core(v12n_core::Error::UnsupportedFeature(feature))) => {
                 assert!(feature.contains(reason), "{feature}")
@@ -2666,7 +2676,9 @@ async fn midnight_as_24_00_is_the_term_00_00_00() {
             format!("?a={} ?n=\"noon\"", alarm("12:30:00.5")),
         ]
     );
-    let database = Database::connect(&url, Limits::default()).await.unwrap();
+    let database = PostgresBackend::connect(&url, Limits::default())
+        .await
+        .unwrap();
     let alarms = query("SELECT ?a ?n WHERE { ?a ex:at ?t ; ex:name ?n }");
     assert_eq!(
         database.table_keys(&alarms).await.unwrap(),
@@ -2938,7 +2950,9 @@ async fn merge_keys_identify_one_row_by_equality() {
         )
         .await
         .unwrap();
-    let database = Database::connect(&url, Limits::default()).await.unwrap();
+    let database = PostgresBackend::connect(&url, Limits::default())
+        .await
+        .unwrap();
     let mut found = Vec::new();
     for table in [
         "pk",
@@ -3044,7 +3058,9 @@ async fn merged_scans_give_the_same_solutions() {
         )
         .await
         .unwrap();
-    let database = Database::connect(&url, Limits::default()).await.unwrap();
+    let database = PostgresBackend::connect(&url, Limits::default())
+        .await
+        .unwrap();
     let mut results = Vec::new();
     for (body, scans) in [
         (r#"?a ex:criticality "High" ; ex:hostname ?h"#, 1),
@@ -3225,7 +3241,7 @@ async fn pipe(
 }
 
 /// The solutions of `plan` on `database`, in the order they arrive.
-async fn solutions(database: &Database, plan: &SqlPlan) -> Vec<String> {
+async fn solutions(database: &PostgresBackend, plan: &SqlPlan) -> Vec<String> {
     let mut solutions = database.execute(plan).await.unwrap();
     let mut rows = Vec::new();
     while let Some(solution) = solutions.try_next().await.unwrap() {
@@ -3244,7 +3260,7 @@ async fn solutions(database: &Database, plan: &SqlPlan) -> Vec<String> {
 async fn known_plans_take_two_round_trips() {
     let Some(url) = database_url() else { return };
     let (proxied, wire) = wire_counter(&url).await;
-    let database = Database::connect(&proxied, Limits::default())
+    let database = PostgresBackend::connect(&proxied, Limits::default())
         .await
         .unwrap();
     let name = |id: &str| {
@@ -3315,7 +3331,7 @@ async fn a_known_plan_does_not_trust_a_dropped_key() {
         "SELECT ?i ?t WHERE { ?i <http://example.org/tag> ?t }",
     );
     let (proxied, wire) = wire_counter(&url).await;
-    let database = Database::connect(&proxied, Limits::default())
+    let database = PostgresBackend::connect(&proxied, Limits::default())
         .await
         .unwrap();
     let round_trips = || wire.lock().unwrap().round_trips;

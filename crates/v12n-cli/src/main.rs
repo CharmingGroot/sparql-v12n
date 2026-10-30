@@ -5,16 +5,18 @@ use std::ffi::OsStr;
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use v12n_core::mapping::{BaseIri, Mapping, MappingIndex, TermType, TriplesMapId};
+use v12n_core::backend::{BackendError, Connector, DEFAULT_ROW_LIMIT, ErrorKind, SolutionStream};
+use v12n_core::mapping::{BaseIri, Mapping, TermType, TriplesMapId};
 use v12n_core::results::{ResultsFormat, ResultsWriter, write_csv_record};
 use v12n_core::solution::Solution;
 use v12n_core::sql::SqlPlan;
-use v12n_core::{sparql, unfold};
-use v12n_postgres::{DEFAULT_ROW_LIMIT, Database, Limits, Solutions};
+use v12n_core::{Engine, Limits, Planner};
+use v12n_postgres::PostgresConnector;
 use v12n_server::config::{Config, env, parse_duration};
 
 /// Exit codes are part of the CLI contract; scripts and agents rely on them.
@@ -401,7 +403,7 @@ fn main() -> ExitCode {
             mapping,
             query_arg,
             base_iri.base_iri.as_ref(),
-            db.as_deref(),
+            db.as_deref().map(|url| connector(url, None)),
             Limits {
                 statement_timeout: *timeout,
                 row_limit: *row_limit,
@@ -471,9 +473,9 @@ fn print_csv<S: AsRef<str>>(records: &[Vec<S>]) -> Result<(), Failure> {
 }
 
 fn check(path: &Path, output: Output) -> Result<(), Failure> {
-    let mapping = load_mapping(path)?;
-    let index = MappingIndex::new(&mapping);
-    let triples_maps = mapping.triples_maps().len();
+    let planner = Planner::new(load_mapping(path)?);
+    let index = planner.index();
+    let triples_maps = planner.mapping().triples_maps().len();
     let classes = index.classes().count();
     let properties = index.properties().count();
     match output.format {
@@ -507,8 +509,8 @@ fn check(path: &Path, output: Output) -> Result<(), Failure> {
 }
 
 fn terms(path: &Path, output: Output) -> Result<(), Failure> {
-    let mapping = load_mapping(path)?;
-    let index = MappingIndex::new(&mapping);
+    let planner = Planner::new(load_mapping(path)?);
+    let (mapping, index) = (planner.mapping(), planner.index());
     let classes: Vec<(&str, Vec<&TriplesMapId>)> = index
         .classes()
         .map(|(iri, ids)| (iri, dedup(ids.iter())))
@@ -608,7 +610,7 @@ fn load_plan(
     mapping_path: &Path,
     query: &QueryArg,
     base_iri: Option<&BaseIri>,
-) -> Result<SqlPlan, Failure> {
+) -> Result<(Planner, SqlPlan), Failure> {
     let stdin = Path::new("-");
     if mapping_path == stdin && query.file.as_deref() == Some(stdin) {
         return Err(Failure::new(
@@ -627,16 +629,16 @@ fn load_plan(
         // clap requires one of them.
         (None, None) => unreachable!("clap requires a query"),
     };
+    let planner = Planner::new(mapping);
     // Errors past this point are about the query, not the mapping.
-    sparql::parse(&text)
-        .and_then(|query| unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping)))
-        .map_err(|e| {
-            let kind = match e {
-                v12n_core::Error::QuerySyntax(_) => "query",
-                _ => "unsupported",
-            };
-            Failure::new(EXIT_INPUT, kind, e.to_string())
-        })
+    let plan = planner.plan(&text).map_err(|e| {
+        let kind = match e {
+            v12n_core::Error::QuerySyntax(_) => "query",
+            _ => "unsupported",
+        };
+        Failure::new(EXIT_INPUT, kind, e.to_string())
+    })?;
+    Ok((planner, plan))
 }
 
 fn explain(
@@ -645,7 +647,7 @@ fn explain(
     base_iri: Option<&BaseIri>,
     output: Output,
 ) -> Result<(), Failure> {
-    let plan = load_plan(mapping_path, query, base_iri)?;
+    let (_, plan) = load_plan(mapping_path, query, base_iri)?;
     // Rendering fails only for a plan that SQL cannot answer as SPARQL does.
     let rendered = plan
         .to_sql()
@@ -697,12 +699,12 @@ fn query(
     mapping_path: &Path,
     query_arg: &QueryArg,
     base_iri: Option<&BaseIri>,
-    db: Option<&str>,
+    connector: Option<impl Connector>,
     limits: Limits,
     output: Output,
 ) -> Result<(), Failure> {
-    let plan = load_plan(mapping_path, query_arg, base_iri)?;
-    let url = db.ok_or_else(|| {
+    let (planner, plan) = load_plan(mapping_path, query_arg, base_iri)?;
+    let connector = connector.ok_or_else(|| {
         Failure::new(
             EXIT_INPUT,
             "input",
@@ -714,11 +716,10 @@ fn query(
         .build()
         .map_err(|e| Failure::new(EXIT_DATABASE, "database", e.to_string()))?;
     runtime.block_on(async {
-        let before_output = |e| query_failure(e, 0);
-        let database = Database::connect(url, limits)
-            .await
-            .map_err(before_output)?;
-        let mut solutions = database.execute(&plan).await.map_err(before_output)?;
+        let before_output = |e| query_failure(&e, 0);
+        let backend = connector.connect(limits).await.map_err(before_output)?;
+        let engine = Engine::new(Arc::new(planner), backend);
+        let mut solutions = engine.execute(&plan).await.map_err(before_output)?;
         // Waiting for the first row before printing anything means an error
         // in planning or early execution is still reported in `format`.
         let first = solutions.try_next().await.map_err(before_output)?;
@@ -748,9 +749,21 @@ fn serve(config_path: Option<&Path>, base_iri: Option<BaseIri>) -> Result<(), Fa
         .enable_all()
         .build()
         .map_err(|e| Failure::new(EXIT_INPUT, "runtime", e.to_string()))?;
+    let connector = connector(&config.database.url, config.database.password.as_deref());
     runtime
-        .block_on(v12n_server::serve(config))
+        .block_on(v12n_server::serve(config, connector))
         .map_err(server_failure)
+}
+
+/// The backend for a database URL. PostgreSQL is the only one, and it
+/// also takes libpq `key=value` strings, which have no scheme to tell
+/// databases apart by.
+fn connector(url: &str, password: Option<&str>) -> PostgresConnector {
+    let connector = PostgresConnector::new(url);
+    match password {
+        Some(password) => connector.with_password(password),
+        None => connector,
+    }
 }
 
 /// `RUST_LOG` takes `info`, `v12n_server=debug,warn` and the like.
@@ -776,28 +789,27 @@ fn server_failure(error: v12n_server::Error) -> Failure {
     match error {
         Error::Config(_) | Error::Io(_) => Failure::new(EXIT_INPUT, "input", error.to_string()),
         Error::Mapping { .. } => Failure::new(EXIT_MAPPING, "mapping", error.to_string()),
-        Error::Database(e) => database_failure(e),
+        Error::Database(e) => database_failure(e.as_ref()),
     }
 }
 
-fn database_failure(error: v12n_postgres::Error) -> Failure {
-    use v12n_postgres::Error;
-    let (code, kind) = match &error {
-        Error::Config(_) => (EXIT_INPUT, "input"),
-        Error::Database(_) => (EXIT_DATABASE, "database"),
-        Error::Timeout(_) => (EXIT_TIMEOUT, "timeout"),
+fn database_failure(error: &dyn BackendError) -> Failure {
+    let (code, kind) = match error.kind() {
+        ErrorKind::Config => (EXIT_INPUT, "input"),
+        ErrorKind::Database => (EXIT_DATABASE, "database"),
+        ErrorKind::Timeout(_) => (EXIT_TIMEOUT, "timeout"),
         // A comparison the column types make impossible to do right in SQL.
-        Error::Core(v12n_core::Error::UnsupportedFeature(_)) => (EXIT_INPUT, "unsupported"),
-        Error::Core(_) => (EXIT_DATABASE, "data"),
+        ErrorKind::Core(v12n_core::Error::UnsupportedFeature(_)) => (EXIT_INPUT, "unsupported"),
+        ErrorKind::Core(_) => (EXIT_DATABASE, "data"),
     };
     Failure::new(code, kind, error.to_string())
 }
 
 /// Like [`database_failure`], with a timeout message that names the limit,
 /// how far the result got, and the options that change it.
-fn query_failure(error: v12n_postgres::Error, rows: u64) -> Failure {
-    match error {
-        v12n_postgres::Error::Timeout(timeout) => {
+fn query_failure(error: &dyn BackendError, rows: u64) -> Failure {
+    match error.kind() {
+        ErrorKind::Timeout(timeout) => {
             let progress = match rows {
                 0 => "before the first row".to_owned(),
                 n => format!("after {n} rows"),
@@ -818,7 +830,7 @@ fn query_failure(error: v12n_postgres::Error, rows: u64) -> Failure {
                 )
             }
         }
-        error => database_failure(error),
+        _ => database_failure(error),
     }
 }
 
@@ -840,7 +852,7 @@ fn row_limit_warning(row_limit: u64) -> Failure {
 
 /// Streams the solutions into `writer` as they arrive.
 async fn stream_solutions(
-    solutions: &mut Solutions,
+    solutions: &mut impl SolutionStream,
     first: Option<Solution>,
     mut writer: ResultsWriter<impl Write>,
 ) -> Result<(), Failure> {
@@ -863,7 +875,7 @@ async fn stream_solutions(
                 // Partial JSON and XML stay unterminated so they cannot
                 // pass for a complete result.
                 let _ = writer.get_mut().flush();
-                return Err(after_output(query_failure(e, count)));
+                return Err(after_output(query_failure(&e, count)));
             }
         };
     }
@@ -877,7 +889,7 @@ async fn stream_solutions(
 /// unbound variables as empty cells. Alignment needs every row first; the
 /// row limit bounds how many that is.
 async fn print_solutions_table(
-    solutions: &mut Solutions,
+    solutions: &mut impl SolutionStream,
     first: Option<Solution>,
     color: bool,
 ) -> Result<(), Failure> {
@@ -894,7 +906,7 @@ async fn print_solutions_table(
         next = solutions
             .try_next()
             .await
-            .map_err(|e| query_failure(e, rows.len() as u64))?;
+            .map_err(|e| query_failure(&e, rows.len() as u64))?;
     }
     let header: Vec<String> = solutions
         .variables()

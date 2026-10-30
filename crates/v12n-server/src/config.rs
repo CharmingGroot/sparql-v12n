@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use v12n_core::Limits;
+use v12n_core::backend::{DEFAULT_ROW_LIMIT, DEFAULT_STATEMENT_TIMEOUT};
 use v12n_core::mapping::BaseIri;
-use v12n_postgres::{DEFAULT_ROW_LIMIT, DEFAULT_STATEMENT_TIMEOUT, Limits};
 
 use crate::Error;
 

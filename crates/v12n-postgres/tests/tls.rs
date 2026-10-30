@@ -5,10 +5,12 @@
 //! a query string) and `V12N_TEST_TLS_CERTS` (the directory holding
 //! `ca.pem` and `wrong-ca.pem`) are set.
 
+use v12n_core::Limits;
+use v12n_core::backend::{Backend, SolutionStream};
 use v12n_core::mapping::{Mapping, MappingIndex};
 use v12n_core::sql::SqlPlan;
 use v12n_core::{sparql, unfold};
-use v12n_postgres::{Database, Error, Limits};
+use v12n_postgres::{Error, PostgresBackend};
 
 /// Whether the session itself runs over TLS, by the server's account.
 const SSL_IN_USE: &str = "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
@@ -52,7 +54,7 @@ fn plan() -> SqlPlan {
 
 /// Connects and reports whether the session uses TLS.
 async fn ssl_in_use(url: &str) -> Result<bool, Error> {
-    let database = Database::connect(url, Limits::default()).await?;
+    let database = PostgresBackend::connect(url, Limits::default()).await?;
     let mut solutions = database.execute(&plan()).await?;
     let solution = solutions.try_next().await?.expect("one row");
     let [Some(ssl)] = solution.values() else {
