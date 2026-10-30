@@ -307,6 +307,8 @@ flowchart LR
 
 ## 디렉터리 구성
 
+[docs/architecture.ko.md](docs/architecture.ko.md)는 크레이트 사이의 의존 관계와 쿼리가 SPARQL 텍스트에서 결과가 되기까지의 경로를 설명한다.
+
 | 경로 | 내용 |
 |---|---|
 | `crates/v12n-core` | SPARQL 파싱, 매핑 인덱스, unfold, 최적화, SQL 렌더링. 데이터베이스 의존성 없음 |
@@ -314,7 +316,7 @@ flowchart LR
 | `crates/v12n-server` | SPARQL 1.1 Protocol HTTP 엔드포인트 |
 | `crates/v12n-cli` | `v12n` 명령 |
 | `crates/v12n-difftest` | Ontop과 비교하는 차등 테스트. 케이스의 쿼리마다 테스트가 하나다 |
-| `docs` | 사용법과 쿼리 의미 규칙 문서, README 그림 |
+| `docs` | [사용법](docs/usage.ko.md), [쿼리 의미 규칙](docs/semantics.ko.md), [아키텍처](docs/architecture.ko.md) 문서, README 그림 |
 | `examples/shop` | 예제 스키마, 데이터, 매핑, 쿼리 |
 | `bench` | 생성한 데이터로 Ontop과 비교하는 벤치마크와 그 결과 |
 | `testenv` | 테스트용 로컬 PostgreSQL과 Ontop 기준 엔드포인트 |
