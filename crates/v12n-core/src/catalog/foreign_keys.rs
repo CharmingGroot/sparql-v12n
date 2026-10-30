@@ -64,6 +64,8 @@ fn pins_one_row(child: &Relation, key: &ForeignKey, parent: &Relation) -> bool {
     references_every_row(&columns)
         && references_one_row(parent, key)
         && same_types(&columns, &referenced)
+        && compares_exactly(&columns)
+        && compares_exactly(&referenced)
 }
 
 /// PostgreSQL checks a foreign key only on rows whose key columns are all
@@ -98,6 +100,14 @@ fn references_one_row(parent: &Relation, key: &ForeignKey) -> bool {
 /// differ.
 fn same_types(columns: &[&Column], referenced: &[&Column]) -> bool {
     columns.iter().zip(referenced).all(|(c, p)| c.ty == p.ty)
+}
+
+/// R2RML §8 joins with SQL `=`, so the term of the referenced row is built
+/// from its own value. Under a nondeterministic collation `=` also finds
+/// a referencing value equal that is a different string, which would
+/// build a different term.
+fn compares_exactly(columns: &[&Column]) -> bool {
+    columns.iter().all(|c| c.deterministic)
 }
 
 /// The columns of `relation` the database stores as `names`, when the

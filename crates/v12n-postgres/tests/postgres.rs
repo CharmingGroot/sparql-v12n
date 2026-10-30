@@ -3426,8 +3426,9 @@ async fn a_query_does_not_trust_a_dropped_key() {
 /// ways (#112). Every referencing table has one row whose customer does
 /// not exist where its key allows it: `NULL` in `notes`, a row added
 /// before a key `NOT VALID` in `unchecked`, and a row of an inheritance
-/// child, which does not inherit the key, in `base`. Each test replaces
-/// the schema `v12n_fk112` with its own.
+/// child, which does not inherit the key, in `base`. In `labelled`, a
+/// collation that ignores case lets `'abc'` reference `'ABC'`. Each test
+/// replaces the schema `v12n_fk112` with its own.
 const FOREIGN_KEYS_SQL: &str = "DROP SCHEMA IF EXISTS v12n_fk112 CASCADE;
     CREATE SCHEMA v12n_fk112;
     CREATE TABLE v12n_fk112.customers (id int PRIMARY KEY, name text NOT NULL);
@@ -3455,7 +3456,14 @@ const FOREIGN_KEYS_SQL: &str = "DROP SCHEMA IF EXISTS v12n_fk112 CASCADE;
     INSERT INTO v12n_fk112.codes VALUES ('a'), ('b');
     CREATE TABLE v12n_fk112.tagged (id int PRIMARY KEY,
       code text NOT NULL REFERENCES v12n_fk112.codes (code));
-    INSERT INTO v12n_fk112.tagged VALUES (60, 'a'), (61, 'a');";
+    INSERT INTO v12n_fk112.tagged VALUES (60, 'a'), (61, 'a');
+    CREATE COLLATION v12n_fk112.nocase (provider = icu, locale = 'und-u-ks-level2',
+      deterministic = false);
+    CREATE TABLE v12n_fk112.labels (name text COLLATE v12n_fk112.nocase PRIMARY KEY);
+    INSERT INTO v12n_fk112.labels VALUES ('ABC');
+    CREATE TABLE v12n_fk112.labelled (id int PRIMARY KEY,
+      label text COLLATE v12n_fk112.nocase NOT NULL REFERENCES v12n_fk112.labels (name));
+    INSERT INTO v12n_fk112.labelled VALUES (70, 'abc');";
 
 /// A triples map per referencing table of [`FOREIGN_KEYS_SQL`] in
 /// `schema`, whose objects come from the referenced table through a
@@ -3466,7 +3474,9 @@ fn foreign_keys_mapping(schema: &str) -> String {
          <#customers> rr:logicalTable [ rr:tableName \"v12n_fk112.customers\" ] ;\n\
            rr:subjectMap [ rr:template \"http://example.org/customer/{id}\" ] .\n\
          <#codes> rr:logicalTable [ rr:tableName \"v12n_fk112.codes\" ] ;\n\
-           rr:subjectMap [ rr:template \"http://example.org/code/{code}\" ] .\n"
+           rr:subjectMap [ rr:template \"http://example.org/code/{code}\" ] .\n\
+         <#labels> rr:logicalTable [ rr:tableName \"v12n_fk112.labels\" ] ;\n\
+           rr:subjectMap [ rr:template \"http://example.org/label/{name}\" ] .\n"
         .to_owned();
     for (table, parent, column) in [
         ("orders", "customers", "customer_id"),
@@ -3475,8 +3485,13 @@ fn foreign_keys_mapping(schema: &str) -> String {
         ("unchecked", "customers", "customer_id"),
         ("base", "customers", "customer_id"),
         ("tagged", "codes", "code"),
+        ("labelled", "labels", "label"),
     ] {
-        let key = if parent == "codes" { "code" } else { "id" };
+        let key = match parent {
+            "codes" => "code",
+            "labels" => "name",
+            _ => "id",
+        };
         mapping.push_str(&format!(
             "<#{table}> rr:logicalTable [ rr:tableName \"v12n_fk112.{table}\" ] ;\n\
                rr:subjectMap [ rr:template \"http://example.org/{table}/{{id}}\" ] ;\n\
@@ -3503,7 +3518,15 @@ async fn foreign_keys_remove_the_parent_scan_only_where_every_row_has_one_parent
         .unwrap();
     let mapping = foreign_keys_mapping("v12n_fk112");
     let mut found = Vec::new();
-    for table in ["orders", "notes", "wide", "unchecked", "base", "tagged"] {
+    for table in [
+        "orders",
+        "notes",
+        "wide",
+        "unchecked",
+        "base",
+        "tagged",
+        "labelled",
+    ] {
         let plan = plan(
             &mapping,
             &format!("SELECT ?s ?o WHERE {{ ?s <http://example.org/{table}> ?o }}"),
@@ -3545,6 +3568,9 @@ async fn foreign_keys_remove_the_parent_scan_only_where_every_row_has_one_parent
                 2,
                 vec![row("tagged", 60, "code/a"), row("tagged", 61, "code/a")]
             ),
+            // R2RML §8: the join finds the label by `=`, and the term is
+            // the label's own value.
+            ("labelled", 2, vec![row("labelled", 70, "label/ABC")]),
         ]
     );
 }

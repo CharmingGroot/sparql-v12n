@@ -281,6 +281,12 @@ pub struct Column {
     pub ty: ColumnType,
     /// Always false for a column of an `rr:sqlQuery`.
     pub not_null: bool,
+    /// Whether `=` on the column finds equal only values that give the
+    /// same term. A nondeterministic collation (PostgreSQL 12) finds
+    /// different strings equal, such as `'abc'` and `'ABC'` under one that
+    /// ignores case. Always true for a column of an `rr:sqlQuery`, whose
+    /// collations the catalog does not show.
+    pub deterministic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

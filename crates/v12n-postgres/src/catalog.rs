@@ -53,14 +53,18 @@ const FINGERPRINT_SQL: &str = "WITH t AS MATERIALIZED (
    FROM pg_constraint co WHERE co.conrelid = t.rel AND co.contype = 'f') l
  GROUP BY t.n, t.rel";
 
-/// The `NOT NULL` columns of the tables named in `$1`, of ordinary and
-/// partitioned tables only: PostgreSQL does not enforce `NOT NULL` on a
-/// foreign table, whose rows come from elsewhere.
-const NOT_NULL_SQL: &str = "SELECT t.n::int4, a.attname::text
+/// The columns of the tables named in `$1` that are `NOT NULL` or compare
+/// under a nondeterministic collation, and which of the two. `NOT NULL`
+/// counts for ordinary and partitioned tables only: PostgreSQL does not
+/// enforce it on a foreign table, whose rows come from elsewhere.
+const COLUMNS_SQL: &str = "SELECT t.n::int4, a.attname::text,
+   a.attnotnull AND r.relkind IN ('r', 'p'), NOT coalesce(co.collisdeterministic, true)
  FROM unnest($1::text[]) WITH ORDINALITY AS t(name, n)
- JOIN pg_class r ON r.oid = to_regclass(t.name) AND r.relkind IN ('r', 'p')
+ JOIN pg_class r ON r.oid = to_regclass(t.name)
  JOIN pg_attribute a ON a.attrelid = r.oid
- WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attnotnull";
+ LEFT JOIN pg_collation co ON co.oid = a.attcollation
+ WHERE a.attnum > 0 AND NOT a.attisdropped
+   AND ((a.attnotnull AND r.relkind IN ('r', 'p')) OR NOT coalesce(co.collisdeterministic, true))";
 
 /// The validated foreign keys of the tables named in `$1`. A key added
 /// `NOT VALID` does not hold for the rows that were already there, and a
@@ -86,7 +90,7 @@ const FOREIGN_KEYS_SQL: &str = "SELECT t.n::int4,
 /// shares the round trip that prepares the statement.
 pub(crate) struct CatalogStatements {
     fingerprints: Statement,
-    not_null: Statement,
+    columns: Statement,
     keys: Statement,
     foreign_keys: Statement,
     /// [`FINGERPRINT_SQL`] for one set of tables, with the names written
@@ -101,16 +105,16 @@ const FINGERPRINT_STATEMENTS: usize = 64;
 
 impl CatalogStatements {
     pub(crate) async fn prepare(client: &Client) -> Result<Self, tokio_postgres::Error> {
-        let (fingerprints, not_null, keys, foreign_keys) = join4(
+        let (fingerprints, columns, keys, foreign_keys) = join4(
             client.prepare(FINGERPRINT_SQL),
-            client.prepare(NOT_NULL_SQL),
+            client.prepare(COLUMNS_SQL),
             client.prepare(KEYS_SQL),
             client.prepare(FOREIGN_KEYS_SQL),
         )
         .await;
         Ok(Self {
             fingerprints: fingerprints?,
-            not_null: not_null?,
+            columns: columns?,
             keys: keys?,
             foreign_keys: foreign_keys?,
             fingerprints_of: Mutex::new(HashMap::new()),
@@ -292,6 +296,7 @@ fn status(probe: Probe, facts: Option<TableFacts>) -> TableStatus {
                 .map(|(written, name, ty)| {
                     let column = Column {
                         not_null: facts.not_null.contains(&name),
+                        deterministic: !facts.nondeterministic.contains(&name),
                         ty: column_type(&ty),
                         name,
                     };
@@ -311,6 +316,7 @@ struct TableFacts {
     exists: bool,
     fingerprint: Option<Fingerprint>,
     not_null: HashSet<String>,
+    nondeterministic: HashSet<String>,
     unique_keys: Vec<UniqueKey>,
     foreign_keys: Vec<ForeignKey>,
 }
@@ -331,9 +337,9 @@ impl TableFacts {
                 LogicalTable::SqlQuery(_) => unreachable!("only tables are in the catalog"),
             })
             .collect();
-        let (fingerprints, not_null, keys, foreign_keys) = join4(
+        let (fingerprints, columns, keys, foreign_keys) = join4(
             client.query(&statements.fingerprints, &[&names]),
-            client.query(&statements.not_null, &[&names]),
+            client.query(&statements.columns, &[&names]),
             client.query(&statements.keys, &[&names]),
             client.query(&statements.foreign_keys, &[&names]),
         )
@@ -344,8 +350,15 @@ impl TableFacts {
             table.exists = row.get(1);
             table.fingerprint = Some(Fingerprint::new(row.get(2)));
         }
-        for row in not_null? {
-            Self::of(&mut facts, &row).not_null.insert(row.get(1));
+        for row in columns? {
+            let table = Self::of(&mut facts, &row);
+            let name: String = row.get(1);
+            if row.get(2) {
+                table.not_null.insert(name.clone());
+            }
+            if row.get(3) {
+                table.nondeterministic.insert(name);
+            }
         }
         for row in keys? {
             let types: Vec<u32> = row.get(3);

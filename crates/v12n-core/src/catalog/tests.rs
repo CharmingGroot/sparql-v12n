@@ -136,6 +136,7 @@ fn problems_follow_the_request_order() {
                         name: (*name).to_owned(),
                         ty: column_type(Comparison::Value),
                         not_null: false,
+                        deterministic: true,
                     };
                     ((*name).to_owned(), column)
                 })
@@ -201,6 +202,7 @@ fn customers(columns: &[&str], keys: Vec<UniqueKey>) -> (LogicalTable, TableCata
                 name: (*name).to_owned(),
                 ty: column_type(Comparison::Value),
                 not_null: true,
+                deterministic: true,
             };
             ((*name).to_owned(), column)
         })
@@ -297,6 +299,7 @@ fn entry(columns: &[(&str, ColumnType, bool)], relation: Relation) -> TableCatal
                 name: (*name).to_owned(),
                 ty: ty.clone(),
                 not_null: *not_null,
+                deterministic: true,
             };
             ((*name).to_owned(), column)
         })
@@ -323,6 +326,7 @@ struct Reference {
     referenced_table: &'static str,
     not_null: bool,
     child_type: &'static str,
+    deterministic: bool,
     parent_keys: Vec<UniqueKey>,
 }
 
@@ -332,6 +336,7 @@ impl Default for Reference {
             referenced_table: "customers",
             not_null: true,
             child_type: "int4",
+            deterministic: true,
             parent_keys: vec![id_key(true)],
         }
     }
@@ -339,7 +344,7 @@ impl Default for Reference {
 
 /// The tables `BUYERS` scans once its plan is completed from `reference`.
 fn scanned(reference: Reference) -> Vec<LogicalTable> {
-    let orders = entry(
+    let mut orders = entry(
         &[
             ("id", int("int4"), true),
             ("customer_id", int(reference.child_type), reference.not_null),
@@ -354,6 +359,13 @@ fn scanned(reference: Reference) -> Vec<LogicalTable> {
             ..Relation::default()
         },
     );
+    if let TableStatus::Readable(relation) = &mut orders.status {
+        relation
+            .columns
+            .get_mut("customer_id")
+            .expect("the column is in the entry")
+            .deterministic = reference.deterministic;
+    }
     let customers = entry(
         &[("id", int("int4"), true)],
         Relation {
@@ -388,6 +400,11 @@ fn foreign_key_that_cannot_vouch_for_one_row_keeps_the_parent_scan() {
     let cases = [
         Reference {
             not_null: false,
+            ..Reference::default()
+        },
+        // `=` under a nondeterministic collation finds another string equal.
+        Reference {
+            deterministic: false,
             ..Reference::default()
         },
         Reference {

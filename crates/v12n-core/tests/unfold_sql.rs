@@ -940,6 +940,7 @@ fn mdr_snapshot() -> CatalogSnapshot {
                     name: (*name).into(),
                     ty: (*ty).clone(),
                     not_null: *not_null,
+                    deterministic: true,
                 };
                 ((*name).to_owned(), column)
             })

@@ -35,8 +35,8 @@ Design decisions are recorded in the `Decision:` Discussions.
   `NOT NULL` constraint of a table keeps from being `NULL`, except where a
   `LEFT JOIN` can make them `NULL`.
 - A scan of a referenced table is removed when a validated foreign key
-  on `NOT NULL` columns, to a unique key of the same column types,
-  joins it and the query reads only the key columns from it, as for the
+  on `NOT NULL` columns, to a unique key of the same column types and
+  under deterministic collations, joins it and the query reads only the key columns from it, as for the
   parent of a referencing object map whose subject the query needs.
   The terms are built from the referencing columns (#112).
 - Keys, column types and resolved column names come from a catalog
