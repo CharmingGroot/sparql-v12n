@@ -131,6 +131,7 @@ them:
 | `sslmode` | TLS | Certificate check |
 |---|---|---|
 | `disable` | Never | None |
+| `allow` | When the server refuses the session without it | None, or the chain when `sslrootcert` names a file |
 | `prefer` (default) | When the server supports it | None, or the chain when `sslrootcert` names a file |
 | `require` | Always | None, or the chain when `sslrootcert` names a file |
 | `verify-ca` | Always | The certificate chains to a trusted CA |
@@ -140,6 +141,11 @@ them:
 unless `sslrootcert` names a file, so they protect against eavesdropping
 but not against a server that impersonates the database. Use
 `verify-full` over a network you do not control.
+
+`allow` connects without TLS and opens a second connection with TLS only
+when the server answers the first with an error, for example because
+`pg_hba.conf` admits the user over `hostssl` only. A network error is not
+retried. When the second connection fails too, its error is reported.
 
 The `sslrootcert` parameter names the trusted CAs:
 
@@ -161,14 +167,60 @@ v12n query mapping.ttl query.rq \
   --db 'postgresql://reader@db.internal/shop?sslmode=verify-full&sslrootcert=/etc/v12n/db-ca.pem'
 ```
 
+The `sslcert` and `sslkey` parameters name a client certificate and its
+private key, for a server that authenticates clients by certificate
+(`cert` in `pg_hba.conf`, or `clientcert=verify-ca` or `verify-full`):
+
+- `sslcert`: a PEM file with the client certificate, followed by any
+  intermediate certificates. The server checks it against its own CA.
+- `sslkey`: a PEM file with the private key, not encrypted. On Unix, as in
+  libpq, the file must not be readable by others: permissions `0600` or
+  less, or `0640` or less when root owns the file.
+
+Both must be set. The certificate is sent when the server asks for one.
+
+The `sslcrl` and `sslcrldir` parameters give certificate revocation lists
+(CRLs) for the server certificate:
+
+- `sslcrl`: a PEM file with one or more CRLs.
+- `sslcrldir`: a directory of PEM files named as `openssl rehash` names
+  them (`<hash>.r0`, `<hash>.r1`, ...). Other files in the directory are
+  ignored.
+
+Both may be set. As in libpq, every certificate in the chain below the
+trusted CA must be covered by a CRL from its issuer, and a CRL past its
+next update is rejected. CRLs apply wherever the chain is checked:
+`verify-ca`, `verify-full`, or `sslrootcert` with a file. Without a chain
+check they would have no effect, so they are rejected as a configuration
+error.
+
+```sh
+# A server that authenticates the client by certificate
+v12n query mapping.ttl query.rq \
+  --db 'postgresql://reader@db.internal/shop?sslmode=verify-full&sslrootcert=/etc/v12n/db-ca.pem&sslcert=/etc/v12n/reader.pem&sslkey=/etc/v12n/reader.key'
+```
+
+All files are read when a connection is opened.
+
 When the server offers `SCRAM-SHA-256-PLUS`, password authentication is
 bound to the TLS session. Add `channel_binding=require` to refuse a server
 that does not offer it.
 
 A failed TLS connection is a database error (exit code 3, kind `database`).
 Its message names the cause, for example `invalid peer certificate:
-UnknownIssuer` when the certificate does not chain to a trusted CA, or
-`certificate not valid for name "..."` when it does not hold the host name.
+UnknownIssuer` when the certificate does not chain to a trusted CA,
+`certificate not valid for name "..."` when it does not hold the host name,
+or `invalid peer certificate: Revoked` when a CRL lists it. An unreadable
+file is also a database error, and its message names the file.
+
+Settings come only from the connection string. libpq's environment
+variables (`PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`,
+`PGSSLCRL`, `PGSSLCRLDIR`, `PGHOST` and the others) are not read, so a
+variable set for `psql` does not change how v12n connects. The connection
+string comes from `--db`, then `V12N_DATABASE_URL`, for `v12n query`, and
+from `V12N_DATABASE_URL`, then `[database] url`, for `v12n serve`. A TLS
+parameter given twice takes its last value, and a parameter not given takes
+the default described in this section.
 
 The behavior differs from libpq in these points:
 
@@ -176,8 +228,14 @@ The behavior differs from libpq in these points:
   the operating system's root certificates instead.
 - With `prefer`, libpq retries without TLS when the TLS handshake fails.
   v12n reports the error.
-- `sslmode=allow`, client certificates (`sslcert`, `sslkey`) and the
-  `PGSSLMODE` and other `PG*` environment variables are not supported.
+- Without `sslcert` and `sslkey`, libpq reads `~/.postgresql/postgresql.crt`
+  and `~/.postgresql/postgresql.key` when they exist, and it skips a
+  certificate file that does not exist. v12n sends a client certificate
+  only when both parameters are set, and reports a missing file.
+- libpq ignores `sslcrl` and `sslcrldir` when it checks no chain. v12n
+  rejects them.
+- Encrypted private keys (`sslpassword`) and the `PG*` environment
+  variables are not supported.
 
 ## HTTP endpoint
 

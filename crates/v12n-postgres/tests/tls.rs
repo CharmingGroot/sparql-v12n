@@ -2,8 +2,8 @@
 //! TLS against a PostgreSQL with `ssl=on` and a server certificate for
 //! `localhost` from a test CA, as `testenv/tls.sh up` starts it. Skipped
 //! unless `V12N_TEST_TLS_DATABASE_URL` (a URL with the host `localhost` and
-//! a query string) and `V12N_TEST_TLS_CERTS` (the directory holding
-//! `ca.pem` and `wrong-ca.pem`) are set.
+//! a query string) and `V12N_TEST_TLS_CERTS` (the directory with the
+//! certificates and CRLs `tls.sh` generates) are set.
 
 use v12n_core::Limits;
 use v12n_core::backend::{Backend, SolutionStream};
@@ -43,6 +43,26 @@ impl Server {
 
     fn root_cert(&self, file: &str) -> String {
         format!("sslrootcert={}/{file}", self.certs)
+    }
+
+    /// `verify-full` against the test CA, plus `params`.
+    fn verified(&self, params: &str) -> String {
+        self.with(&format!(
+            "sslmode=verify-full&{}&{params}",
+            self.root_cert("ca.pem")
+        ))
+    }
+
+    /// The URL for the role that `tls.sh` admits over TLS with a client
+    /// certificate only.
+    fn cert_role(&self, params: &str) -> String {
+        let (scheme, rest) = self.url.split_once("://").unwrap();
+        let (_, address) = rest.split_once('@').expect("the URL must hold credentials");
+        format!("{scheme}://v12n_cert@{address}&{params}")
+    }
+
+    fn client_cert(&self) -> String {
+        format!("sslcert={0}/client.pem&sslkey={0}/client.key", self.certs)
     }
 }
 
@@ -157,4 +177,91 @@ async fn verify_full_without_a_root_file_checks_the_system_store() {
         ssl_in_use(&server.with("sslrootcert=system")).await,
         "UnknownIssuer",
     );
+}
+
+#[tokio::test]
+async fn a_client_certificate_authenticates_the_role_it_names() {
+    let Some(server) = server() else { return };
+    let url = server.cert_role(&format!(
+        "sslmode=verify-full&{}&{}",
+        server.root_cert("ca.pem"),
+        server.client_cert()
+    ));
+    assert!(ssl_in_use(&url).await.unwrap());
+    assert_rejected(
+        ssl_in_use(&server.cert_role("sslmode=require")).await,
+        "certificate",
+    );
+}
+
+/// libpq's rule for the key file; Windows has no such mode bits.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_client_key_that_others_can_read_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(server) = server() else { return };
+    let key = std::env::temp_dir().join(format!("v12n-tls-test-{}.key", std::process::id()));
+    std::fs::copy(format!("{}/client.key", server.certs), &key).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let url = server.cert_role(&format!(
+        "sslmode=require&sslcert={}/client.pem&sslkey={}",
+        server.certs,
+        key.display()
+    ));
+    let result = ssl_in_use(&url).await;
+    std::fs::remove_file(&key).unwrap();
+    assert_rejected(result, "group or world access");
+}
+
+#[tokio::test]
+async fn allow_uses_plain_text_when_the_server_accepts_it() {
+    let Some(server) = server() else { return };
+    assert!(!ssl_in_use(&server.with("sslmode=allow")).await.unwrap());
+}
+
+#[tokio::test]
+async fn allow_retries_with_tls_when_the_server_refuses_plain_text() {
+    let Some(server) = server() else { return };
+    let client_cert = server.client_cert();
+    // The plain attempt alone is refused by pg_hba.conf.
+    assert_rejected(
+        ssl_in_use(&server.cert_role(&format!("sslmode=disable&{client_cert}"))).await,
+        "no encryption",
+    );
+    let url = server.cert_role(&format!("sslmode=allow&{client_cert}"));
+    assert!(ssl_in_use(&url).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_crl_without_the_server_certificate_lets_it_through() {
+    let Some(server) = server() else { return };
+    let url = server.verified(&format!("sslcrl={}/empty.crl", server.certs));
+    assert!(ssl_in_use(&url).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_revoked_server_certificate_is_rejected() {
+    let Some(server) = server() else { return };
+    let crl = format!("sslcrl={}/revoked.crl", server.certs);
+    assert_rejected(ssl_in_use(&server.verified(&crl)).await, "Revoked");
+    let crl_dir = format!("sslcrldir={}/revoked-crls", server.certs);
+    assert_rejected(ssl_in_use(&server.verified(&crl_dir)).await, "Revoked");
+    // The chain check of verify-ca, and of require with a root file,
+    // applies the CRL too.
+    for mode in ["verify-ca", "require"] {
+        let url = server.with(&format!(
+            "sslmode={mode}&{}&{crl}",
+            server.root_cert("ca.pem")
+        ));
+        assert_rejected(ssl_in_use(&url).await, "Revoked");
+    }
+}
+
+#[tokio::test]
+async fn a_crl_is_required_for_every_issuer_in_the_chain() {
+    let Some(server) = server() else { return };
+    // A list from another CA says nothing about the server certificate.
+    let url = server.verified(&format!("sslcrl={}/wrong-ca.crl", server.certs));
+    assert_rejected(ssl_in_use(&url).await, "UnknownRevocationStatus");
 }

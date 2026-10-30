@@ -127,6 +127,7 @@ CLI는 사람이 직접 실행하는 경우뿐 아니라 셸 도구가 호출하
 | `sslmode` | TLS | 인증서 검사 |
 |---|---|---|
 | `disable` | 사용하지 않음 | 없음 |
+| `allow` | TLS 없는 세션을 서버가 거절하면 사용 | 없음. `sslrootcert`에 파일을 지정하면 체인 검사 |
 | `prefer`(기본값) | 서버가 지원하면 사용 | 없음. `sslrootcert`에 파일을 지정하면 체인 검사 |
 | `require` | 항상 사용 | 없음. `sslrootcert`에 파일을 지정하면 체인 검사 |
 | `verify-ca` | 항상 사용 | 인증서가 신뢰하는 CA로 이어지는지 검사 |
@@ -135,6 +136,11 @@ CLI는 사람이 직접 실행하는 경우뿐 아니라 셸 도구가 호출하
 `prefer`와 `require`는 연결을 암호화하지만, `sslrootcert`에 파일을 지정하지
 않으면 어떤 인증서든 받아들인다. 따라서 도청은 막지만 데이터베이스로 위장한
 서버는 막지 못한다. 직접 관리하지 않는 네트워크에서는 `verify-full`을 사용한다.
+
+`allow`는 TLS 없이 연결하고, 서버가 이 연결에 오류로 응답할 때에만 TLS로 두 번째
+연결을 연다. 예를 들어 `pg_hba.conf`가 해당 사용자를 `hostssl`로만 허용하는
+경우다. 네트워크 오류에서는 다시 시도하지 않는다. 두 번째 연결도 실패하면 그
+오류를 보고한다.
 
 `sslrootcert` 파라미터는 신뢰하는 CA를 지정한다.
 
@@ -155,13 +161,56 @@ v12n query mapping.ttl query.rq \
   --db 'postgresql://reader@db.internal/shop?sslmode=verify-full&sslrootcert=/etc/v12n/db-ca.pem'
 ```
 
+`sslcert`와 `sslkey` 파라미터는 클라이언트 인증서와 그 개인 키를 지정한다.
+인증서로 클라이언트를 인증하는 서버(`pg_hba.conf`의 `cert`, 또는
+`clientcert=verify-ca`나 `verify-full`)에 사용한다.
+
+- `sslcert`: 클라이언트 인증서와 그 뒤에 필요한 중간 인증서를 담은 PEM 파일.
+  서버는 이 인증서를 자신의 CA로 검사한다.
+- `sslkey`: 암호화하지 않은 개인 키를 담은 PEM 파일. Unix에서는 libpq와
+  마찬가지로 다른 사용자가 읽을 수 없어야 한다. 권한은 `0600` 이하, 파일
+  소유자가 root이면 `0640` 이하여야 한다.
+
+두 파라미터를 함께 지정해야 한다. 인증서는 서버가 요청할 때 보낸다.
+
+`sslcrl`과 `sslcrldir` 파라미터는 서버 인증서에 적용할 인증서 폐기 목록(CRL)을
+지정한다.
+
+- `sslcrl`: CRL 하나 이상을 담은 PEM 파일.
+- `sslcrldir`: `openssl rehash`가 붙이는 이름(`<hash>.r0`, `<hash>.r1`, ...)의
+  PEM 파일을 담은 디렉터리. 디렉터리의 다른 파일은 읽지 않는다.
+
+두 파라미터를 함께 지정할 수 있다. libpq와 마찬가지로, 신뢰하는 CA 아래 체인의
+모든 인증서에 그 발급자의 CRL이 있어야 하고, 다음 갱신 시각이 지난 CRL은
+거절한다. CRL은 체인을 검사하는 경우(`verify-ca`, `verify-full`, 또는
+`sslrootcert`에 파일을 지정한 경우)에 적용한다. 체인을 검사하지 않으면 CRL은
+효과가 없으므로 설정 오류로 거절한다.
+
+```sh
+# A server that authenticates the client by certificate
+v12n query mapping.ttl query.rq \
+  --db 'postgresql://reader@db.internal/shop?sslmode=verify-full&sslrootcert=/etc/v12n/db-ca.pem&sslcert=/etc/v12n/reader.pem&sslkey=/etc/v12n/reader.key'
+```
+
+모든 파일은 연결을 열 때 읽는다.
+
 서버가 `SCRAM-SHA-256-PLUS`를 제공하면 비밀번호 인증이 TLS 세션에 바인딩된다.
 이를 제공하지 않는 서버를 거절하려면 `channel_binding=require`를 추가한다.
 
 TLS 연결에 실패하면 데이터베이스 오류(종료 코드 3, kind `database`)가 된다.
 오류 메시지는 원인을 명시한다. 예를 들어 인증서가 신뢰하는 CA로 이어지지 않으면
 `invalid peer certificate: UnknownIssuer`를, 인증서에 호스트 이름이 없으면
-`certificate not valid for name "..."`를 출력한다.
+`certificate not valid for name "..."`를, CRL에 인증서가 있으면
+`invalid peer certificate: Revoked`를 출력한다. 파일을 읽을 수 없을 때도
+데이터베이스 오류가 되며, 메시지에 그 파일을 명시한다.
+
+설정은 연결 문자열에서만 읽는다. libpq의 환경 변수(`PGSSLMODE`,
+`PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGSSLCRL`, `PGSSLCRLDIR`, `PGHOST`
+등)는 읽지 않으므로, `psql`을 위해 설정한 변수가 v12n의 연결을 바꾸지 않는다.
+연결 문자열은 `v12n query`에서는 `--db`, `V12N_DATABASE_URL` 순으로,
+`v12n serve`에서는 `V12N_DATABASE_URL`, `[database] url` 순으로 정한다. 같은
+TLS 파라미터를 두 번 지정하면 마지막 값을 쓰고, 지정하지 않은 파라미터는 이
+절에서 설명한 기본값을 쓴다.
 
 libpq와 다른 점은 다음과 같다.
 
@@ -169,8 +218,13 @@ libpq와 다른 점은 다음과 같다.
   v12n은 대신 운영체제의 루트 인증서를 사용한다.
 - `prefer`에서 TLS 핸드셰이크가 실패하면 libpq는 TLS 없이 다시 연결한다. v12n은
   오류를 보고한다.
-- `sslmode=allow`, 클라이언트 인증서(`sslcert`, `sslkey`), `PGSSLMODE`를 비롯한
-  `PG*` 환경 변수는 지원하지 않는다.
+- `sslcert`와 `sslkey`를 지정하지 않으면 libpq는 `~/.postgresql/postgresql.crt`와
+  `~/.postgresql/postgresql.key`가 있을 때 이를 읽고, 없는 인증서 파일은 건너뛴다.
+  v12n은 두 파라미터를 모두 지정했을 때에만 클라이언트 인증서를 보내고, 없는
+  파일은 오류로 보고한다.
+- 체인을 검사하지 않을 때 libpq는 `sslcrl`과 `sslcrldir`을 무시한다. v12n은
+  이를 거절한다.
+- 암호화한 개인 키(`sslpassword`)와 `PG*` 환경 변수는 지원하지 않는다.
 
 ## HTTP 엔드포인트
 

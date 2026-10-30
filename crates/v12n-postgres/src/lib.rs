@@ -19,7 +19,7 @@ use futures_util::TryStreamExt;
 use futures_util::future::{join, join4};
 use tls::Tls;
 use tokio_postgres::types::{ToSql, Type};
-use tokio_postgres::{Client, Config, NoTls, RowStream, Statement};
+use tokio_postgres::{Client, Config, RowStream, Statement};
 use v12n_core::Limits;
 use v12n_core::backend::{Backend, SolutionStream};
 use v12n_core::dialect::PostgresDialect;
@@ -119,21 +119,7 @@ impl PostgresBackend {
             config.connect_timeout(DEFAULT_CONNECT_TIMEOUT);
         }
         let timeout = limits.statement_timeout;
-        let failed = |e| Error::from_postgres(e, timeout);
-        // Connection failures also surface as errors on the client's next
-        // request, so the task's own result adds nothing.
-        let client = match tls.connector()? {
-            None => {
-                let (client, connection) = config.connect(NoTls).await.map_err(failed)?;
-                tokio::spawn(connection);
-                client
-            }
-            Some(connector) => {
-                let (client, connection) = config.connect(connector).await.map_err(failed)?;
-                tokio::spawn(connection);
-                client
-            }
-        };
+        let client = tls.connect(&config, timeout).await?;
         let timeout_ms = format!("{}ms", timeout.as_millis());
         let (row, keys_statement) = join(
             client.query_one(
