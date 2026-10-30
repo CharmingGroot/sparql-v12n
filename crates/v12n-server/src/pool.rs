@@ -1,31 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Reuses PostgreSQL connections across requests. The request permit
-//! bounds how many are leased at once, so the pool needs no size limit
-//! of its own.
+//! Reuses database sessions across requests. The request permit bounds
+//! how many are leased at once, so the pool needs no size limit of its
+//! own.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use v12n_postgres::{Database, Error, Limits};
+use v12n_core::backend::{Backend, Connector};
+use v12n_core::{Engine, Limits, Planner};
 
-use crate::config::DatabaseConfig;
+type BackendError<C> = <<C as Connector>::Backend as Backend>::Error;
 
-pub(crate) struct Pool {
-    database: DatabaseConfig,
+pub(crate) struct Pool<C: Connector> {
+    connector: C,
+    planner: Arc<Planner>,
     limits: Limits,
-    idle: Mutex<Vec<Database>>,
+    idle: Mutex<Vec<Engine<C::Backend>>>,
 }
 
-impl Pool {
-    pub fn new(database: DatabaseConfig, limits: Limits) -> Arc<Self> {
+impl<C: Connector> Pool<C> {
+    pub fn new(connector: C, planner: Arc<Planner>, limits: Limits) -> Arc<Self> {
         Arc::new(Self {
-            database,
+            connector,
+            planner,
             limits,
             idle: Mutex::new(Vec::new()),
         })
     }
 
-    /// An idle connection that is still open, or a new one.
-    pub async fn get(self: &Arc<Self>) -> Result<Lease, Error> {
+    /// An idle session that is still open, or a new one.
+    pub async fn get(self: &Arc<Self>) -> Result<Lease<C>, BackendError<C>> {
         loop {
             let idle = self
                 .idle
@@ -33,50 +36,45 @@ impl Pool {
                 .unwrap_or_else(PoisonError::into_inner)
                 .pop();
             match idle {
-                Some(database) if database.is_closed() => continue,
-                Some(database) => return Ok(self.lease(database)),
+                Some(engine) if engine.backend().is_closed() => continue,
+                Some(engine) => return Ok(self.lease(engine)),
                 None => break,
             }
         }
-        let database = match &self.database.password {
-            Some(password) => {
-                Database::connect_with_password(&self.database.url, password, self.limits).await?
-            }
-            None => Database::connect(&self.database.url, self.limits).await?,
-        };
-        Ok(self.lease(database))
+        let backend = self.connector.connect(self.limits).await?;
+        Ok(self.lease(Engine::new(Arc::clone(&self.planner), backend)))
     }
 
-    fn lease(self: &Arc<Self>, database: Database) -> Lease {
+    fn lease(self: &Arc<Self>, engine: Engine<C::Backend>) -> Lease<C> {
         Lease {
-            database,
+            engine,
             pool: Arc::clone(self),
         }
     }
 }
 
-/// A connection taken from the pool. Dropping it closes the connection;
-/// only [`release`](Self::release) returns it, because a lease dropped
+/// A session taken from the pool. Dropping it closes the session; only
+/// [`release`](Self::release) returns it, because a lease dropped
 /// mid-query may leave a statement running that the next request would
 /// wait behind.
-pub(crate) struct Lease {
-    database: Database,
-    pool: Arc<Pool>,
+pub(crate) struct Lease<C: Connector> {
+    engine: Engine<C::Backend>,
+    pool: Arc<Pool<C>>,
 }
 
-impl Lease {
-    pub fn database(&self) -> &Database {
-        &self.database
+impl<C: Connector> Lease<C> {
+    pub fn engine(&self) -> &Engine<C::Backend> {
+        &self.engine
     }
 
-    /// Returns the connection after its result has been read to the end.
+    /// Returns the session after its result has been read to the end.
     pub fn release(self) {
-        if !self.database.is_closed() {
+        if !self.engine.backend().is_closed() {
             self.pool
                 .idle
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push(self.database);
+                .push(self.engine);
         }
     }
 }

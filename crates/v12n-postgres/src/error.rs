@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use tokio_postgres::error::SqlState;
+use v12n_core::backend::{BackendError, ErrorKind};
 
 /// Everything that can go wrong while running a plan.
 #[derive(Debug, thiserror::Error)]
@@ -50,4 +51,15 @@ fn message(error: &(dyn std::error::Error + 'static)) -> String {
         source = cause.source();
     }
     out
+}
+
+impl BackendError for Error {
+    fn kind(&self) -> ErrorKind<'_> {
+        match self {
+            Self::Config(_) => ErrorKind::Config,
+            Self::Database(_) => ErrorKind::Database,
+            Self::Timeout(timeout) => ErrorKind::Timeout(*timeout),
+            Self::Core(error) => ErrorKind::Core(error),
+        }
+    }
 }

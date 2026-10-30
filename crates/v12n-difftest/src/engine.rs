@@ -3,28 +3,25 @@
 //! does, without the CLI or HTTP layers.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use v12n_core::mapping::{BaseIri, Mapping, MappingIndex};
+use v12n_core::backend::{BackendError, Connector, ErrorKind, SolutionStream};
+use v12n_core::mapping::{BaseIri, Mapping};
 use v12n_core::sql::SqlPlan;
-use v12n_core::{sparql, unfold};
-use v12n_postgres::{Database, Limits};
+use v12n_core::{Engine, Limits, Planner};
+use v12n_postgres::{PostgresBackend, PostgresConnector};
 
 use crate::compare::{Results, Row};
 
-/// Unfolds the query; the outer error is a broken mapping, which is a
-/// problem with the case rather than with the query.
-fn unfold_query(
-    mapping: &str,
-    base_iri: Option<&str>,
-    query: &str,
-) -> Result<Result<SqlPlan, v12n_core::Error>, String> {
+/// The case's mapping, ready to plan; an error is a broken mapping, which
+/// is a problem with the case rather than with the query.
+fn planner(mapping: &str, base_iri: Option<&str>) -> Result<Planner, String> {
     let mut mapping = Mapping::from_turtle(mapping).map_err(|e| format!("mapping.ttl: {e}"))?;
     if let Some(base) = base_iri {
         let base = BaseIri::new(base).map_err(|e| format!("case.toml: {e}"))?;
         mapping = mapping.with_base_iri(base);
     }
-    Ok(sparql::parse(query)
-        .and_then(|query| unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping))))
+    Ok(Planner::new(mapping))
 }
 
 /// Why the engine did not answer.
@@ -57,7 +54,7 @@ pub fn rejected_at_planning(
     base_iri: Option<&str>,
     query: &str,
 ) -> Result<Option<String>, String> {
-    match unfold_query(mapping, base_iri, query)? {
+    match planner(mapping, base_iri)?.plan(query) {
         Err(v12n_core::Error::UnsupportedFeature(feature)) => Ok(Some(feature)),
         Err(e) => Err(format!("expected an unsupported-feature error, got: {e}")),
         Ok(_) => Ok(None),
@@ -82,20 +79,19 @@ pub fn mapping_error(mapping: &str) -> Result<String, String> {
 ///
 /// The query runs twice on one connection and the second result is the
 /// one compared: the second run takes the statements prepared by the first
-/// as its guess (`Database::execute`), which a single run never does. Both
-/// runs must give the same bag of solutions.
+/// as its guess (`PostgresBackend` remembers them per connection), which a
+/// single run never does. Both runs must give the same bag of solutions.
 pub fn run(
     database_url: &str,
     mapping: &str,
     base_iri: Option<&str>,
     query: &str,
 ) -> Result<Results, Failure> {
-    let plan = unfold_query(mapping, base_iri, query)
-        .map_err(Failure::Other)?
-        .map_err(|e| match e {
-            v12n_core::Error::UnsupportedFeature(feature) => Failure::Unsupported(feature),
-            e => Failure::Other(e.to_string()),
-        })?;
+    let planner = Arc::new(planner(mapping, base_iri).map_err(Failure::Other)?);
+    let plan = planner.plan(query).map_err(|e| match e {
+        v12n_core::Error::UnsupportedFeature(feature) => Failure::Unsupported(feature),
+        e => Failure::Other(e.to_string()),
+    })?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -106,16 +102,17 @@ pub fn run(
                 row_limit: 0,
                 ..Limits::default()
             };
-            let database = Database::connect(database_url, limits).await?;
-            let first = solutions(&database, &plan).await?;
-            let second = solutions(&database, &plan).await?;
+            let backend = PostgresConnector::new(database_url).connect(limits).await?;
+            let engine = Engine::new(planner, backend);
+            let first = solutions(&engine, &plan).await?;
+            let second = solutions(&engine, &plan).await?;
             Ok::<_, v12n_postgres::Error>((first, second))
         })
-        .map_err(|e| match e {
-            v12n_postgres::Error::Core(v12n_core::Error::UnsupportedFeature(feature)) => {
-                Failure::Unsupported(feature)
+        .map_err(|e| match e.kind() {
+            ErrorKind::Core(v12n_core::Error::UnsupportedFeature(feature)) => {
+                Failure::Unsupported(feature.clone())
             }
-            e => Failure::Other(e.to_string()),
+            _ => Failure::Other(e.to_string()),
         })
         .and_then(|(first, second)| {
             if first.variables == second.variables && bag(&first.rows) == bag(&second.rows) {
@@ -129,8 +126,11 @@ pub fn run(
         })
 }
 
-async fn solutions(database: &Database, plan: &SqlPlan) -> Result<Results, v12n_postgres::Error> {
-    let mut solutions = database.execute(plan).await?;
+async fn solutions(
+    engine: &Engine<PostgresBackend>,
+    plan: &SqlPlan,
+) -> Result<Results, v12n_postgres::Error> {
+    let mut solutions = engine.execute(plan).await?;
     let variables = solutions.variables().to_vec();
     let mut rows = Vec::new();
     while let Some(solution) = solutions.try_next().await? {
