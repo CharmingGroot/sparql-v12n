@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?n ?b ?c WHERE { ?n ex:body ?b OPTIONAL { ?n ex:about ?c } }

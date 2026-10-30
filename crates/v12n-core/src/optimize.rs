@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Rewrites on the SQL plan: self-join elimination.
+//! Rewrites on the SQL plan: self-join elimination, and join elimination
+//! on foreign keys.
+
+mod foreign_keys;
+
+pub use foreign_keys::{ForeignKeyJoin, eliminate_foreign_key_joins};
 
 use crate::mapping::LogicalTable;
 use crate::sql::{

@@ -12,7 +12,7 @@ mod renderer;
 mod required_columns;
 
 pub use catalog_probe::table_probe;
-pub(crate) use identifier::describe_table;
+pub(crate) use identifier::{describe_table, stored_table_name};
 pub use identifier::{folded_identifier, identifier_name, quote_identifier, quote_table_name};
 pub use plan::{
     ColumnType, ColumnTypes, Comparison, Condition, Filter, FilterTerm, FilterValue, LeftJoin,

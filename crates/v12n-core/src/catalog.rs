@@ -3,6 +3,7 @@
 //! read once by a [`Backend`](crate::Backend) and checked on every query by
 //! a fingerprint (Discussion #187).
 
+mod foreign_keys;
 mod plan;
 
 use std::collections::HashMap;
@@ -267,7 +268,8 @@ pub struct Relation {
     /// Unique keys that hold for every row at any time; none for an
     /// `rr:sqlQuery`.
     pub unique_keys: Vec<UniqueKey>,
-    /// Validated foreign keys; none for an `rr:sqlQuery`.
+    /// Validated foreign keys that hold for every row a scan of the table
+    /// reads; none for an `rr:sqlQuery`.
     pub foreign_keys: Vec<ForeignKey>,
 }
 
@@ -279,6 +281,12 @@ pub struct Column {
     pub ty: ColumnType,
     /// Always false for a column of an `rr:sqlQuery`.
     pub not_null: bool,
+    /// Whether `=` on the column finds equal only values that give the
+    /// same term. A nondeterministic collation (PostgreSQL 12) finds
+    /// different strings equal, such as `'abc'` and `'ABC'` under one that
+    /// ignores case. Always true for a column of an `rr:sqlQuery`, whose
+    /// collations the catalog does not show.
+    pub deterministic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

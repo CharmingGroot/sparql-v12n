@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Snapshots of the SQL generated for example queries.
 
+use std::sync::Arc;
+
+use v12n_core::catalog::{
+    CatalogPlan, CatalogSnapshot, Column, Fingerprint, ForeignKey, Relation, TableCatalog,
+    TableStatus, UniqueKey,
+};
 use v12n_core::dialect::{Dialect, PostgresDialect, SqlType};
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
 use v12n_core::sql::{
@@ -908,4 +914,119 @@ fn every_dialect_method_is_reached_without_postgres_syntax_around_it() {
     ] {
         assert!(marked.contains(marker), "{marker} not reached:\n{marked}");
     }
+}
+
+/// The MDR tables as a snapshot reports them: every key column `NOT NULL`,
+/// `links.src_id` and `links.dst_id` referencing `assets.id`, and
+/// `alerts.asset_id` too.
+fn mdr_snapshot() -> CatalogSnapshot {
+    let int4 = column_type("int4", Some("integer"));
+    let text = column_type("text", None);
+    let id = UniqueKey {
+        columns: vec!["id".into()],
+        types: vec![Some(int4.clone())],
+        exact_index: true,
+    };
+    let references = |column: &str| ForeignKey {
+        columns: vec![column.into()],
+        referenced_table: "assets".into(),
+        referenced_columns: vec!["id".into()],
+    };
+    let entry = |columns: &[(&str, &ColumnType, bool)], unique_keys, foreign_keys| {
+        let columns = columns
+            .iter()
+            .map(|(name, ty, not_null)| {
+                let column = Column {
+                    name: (*name).into(),
+                    ty: (*ty).clone(),
+                    not_null: *not_null,
+                    deterministic: true,
+                };
+                ((*name).to_owned(), column)
+            })
+            .collect();
+        TableCatalog {
+            fingerprint: Some(Fingerprint::new("f".into())),
+            status: TableStatus::Readable(Relation {
+                columns,
+                missing_columns: Vec::new(),
+                unique_keys,
+                foreign_keys,
+            }),
+        }
+    };
+    let assets = entry(
+        &[
+            ("id", &int4, true),
+            ("hostname", &text, true),
+            ("criticality", &text, false),
+        ],
+        vec![id.clone()],
+        Vec::new(),
+    );
+    let alerts = entry(
+        &[
+            ("id", &int4, true),
+            ("asset_id", &int4, true),
+            ("title", &text, true),
+            ("severity_id", &int4, true),
+        ],
+        vec![id],
+        vec![references("asset_id")],
+    );
+    let links = entry(
+        &[("src_id", &int4, true), ("dst_id", &int4, true)],
+        vec![UniqueKey {
+            columns: vec!["src_id".into(), "dst_id".into()],
+            types: vec![Some(int4.clone()), Some(int4.clone())],
+            exact_index: true,
+        }],
+        vec![references("src_id"), references("dst_id")],
+    );
+    CatalogSnapshot::new(
+        [("assets", assets), ("alerts", alerts), ("links", links)]
+            .map(|(name, entry)| (LogicalTable::TableName(name.into()), entry)),
+    )
+}
+
+/// The SQL of a plan completed from [`mdr_snapshot`] (#112).
+fn explain_on_snapshot(query: &str) -> String {
+    let mapping = Mapping::from_turtle(MDR).unwrap();
+    let index = MappingIndex::new(&mapping);
+    let query = sparql::parse(&format!("{PREFIXES}{query}")).unwrap();
+    let plan = unfold::unfold(&query, &mapping, &index).unwrap();
+    let ready = CatalogPlan::new(&plan, Arc::new(mdr_snapshot())).unwrap();
+    let rendered = to_sql(ready.plan(), &ready.render_options());
+    let mut out = rendered.sql;
+    out.push_str("\n\n-- params\n");
+    for (i, p) in rendered.params.iter().enumerate() {
+        out.push_str(&format!("${} = {p:?}\n", i + 1));
+    }
+    out
+}
+
+/// `links.dst_id` references a row of `assets`, whose subject the link
+/// rebuilds from it: the referencing object map needs no join.
+#[test]
+fn foreign_key_removes_the_join_to_a_parent_subject() {
+    insta::assert_snapshot!(explain_on_snapshot(
+        "SELECT ?a ?b WHERE { ?a ex:connectsTo ?b }"
+    ));
+}
+
+/// The class of the asset a finding is on holds for the row the foreign
+/// key references; the template join compares the two columns as terms.
+#[test]
+fn foreign_key_removes_the_scan_of_a_class_of_the_referenced_row() {
+    insta::assert_snapshot!(explain_on_snapshot(
+        "SELECT ?f ?a WHERE { ?f ex:onAsset ?a ; ex:severityId 5 . ?a a ex:Asset }"
+    ));
+}
+
+/// The parent's hostname is read from the merged parent scan, which stays.
+#[test]
+fn foreign_key_keeps_a_parent_whose_other_columns_are_read() {
+    insta::assert_snapshot!(explain_on_snapshot(
+        "SELECT ?a ?b ?h WHERE { ?a ex:connectsTo ?b . ?b ex:hostname ?h }"
+    ));
 }

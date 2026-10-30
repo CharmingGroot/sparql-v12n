@@ -3421,3 +3421,198 @@ async fn a_query_does_not_trust_a_dropped_key() {
     // check with the new statement, and running it.
     assert_eq!(round_trips, 4);
 }
+
+/// Customers, and tables whose `customer_id` references them in different
+/// ways (#112). Every referencing table has one row whose customer does
+/// not exist where its key allows it: `NULL` in `notes`, a row added
+/// before a key `NOT VALID` in `unchecked`, and a row of an inheritance
+/// child, which does not inherit the key, in `base`. In `labelled`, a
+/// collation that ignores case lets `'abc'` reference `'ABC'`. Each test
+/// replaces the schema `v12n_fk112` with its own.
+const FOREIGN_KEYS_SQL: &str = "DROP SCHEMA IF EXISTS v12n_fk112 CASCADE;
+    CREATE SCHEMA v12n_fk112;
+    CREATE TABLE v12n_fk112.customers (id int PRIMARY KEY, name text NOT NULL);
+    INSERT INTO v12n_fk112.customers VALUES (1, 'kim'), (2, 'lee'), (3, 'max');
+    CREATE TABLE v12n_fk112.orders (id int PRIMARY KEY,
+      customer_id int NOT NULL REFERENCES v12n_fk112.customers);
+    INSERT INTO v12n_fk112.orders VALUES (10, 1), (11, 1), (12, 2);
+    CREATE TABLE v12n_fk112.notes (id int PRIMARY KEY,
+      customer_id int REFERENCES v12n_fk112.customers);
+    INSERT INTO v12n_fk112.notes VALUES (20, 1), (21, NULL);
+    CREATE TABLE v12n_fk112.wide (id int PRIMARY KEY,
+      customer_id bigint NOT NULL REFERENCES v12n_fk112.customers);
+    INSERT INTO v12n_fk112.wide VALUES (30, 3);
+    CREATE TABLE v12n_fk112.unchecked (id int PRIMARY KEY, customer_id int NOT NULL);
+    INSERT INTO v12n_fk112.unchecked VALUES (40, 1), (41, 9);
+    ALTER TABLE v12n_fk112.unchecked ADD FOREIGN KEY (customer_id)
+      REFERENCES v12n_fk112.customers NOT VALID;
+    CREATE TABLE v12n_fk112.base (id int PRIMARY KEY,
+      customer_id int NOT NULL REFERENCES v12n_fk112.customers);
+    CREATE TABLE v12n_fk112.derived () INHERITS (v12n_fk112.base);
+    INSERT INTO v12n_fk112.base VALUES (50, 2);
+    INSERT INTO v12n_fk112.derived VALUES (51, 9);
+    CREATE TABLE v12n_fk112.codes (code text NOT NULL);
+    CREATE UNIQUE INDEX ON v12n_fk112.codes (code text_pattern_ops);
+    INSERT INTO v12n_fk112.codes VALUES ('a'), ('b');
+    CREATE TABLE v12n_fk112.tagged (id int PRIMARY KEY,
+      code text NOT NULL REFERENCES v12n_fk112.codes (code));
+    INSERT INTO v12n_fk112.tagged VALUES (60, 'a'), (61, 'a');
+    CREATE COLLATION v12n_fk112.nocase (provider = icu, locale = 'und-u-ks-level2',
+      deterministic = false);
+    CREATE TABLE v12n_fk112.labels (name text COLLATE v12n_fk112.nocase PRIMARY KEY);
+    INSERT INTO v12n_fk112.labels VALUES ('ABC');
+    CREATE TABLE v12n_fk112.labelled (id int PRIMARY KEY,
+      label text COLLATE v12n_fk112.nocase NOT NULL REFERENCES v12n_fk112.labels (name));
+    INSERT INTO v12n_fk112.labelled VALUES (70, 'abc');";
+
+/// A triples map per referencing table of [`FOREIGN_KEYS_SQL`] in
+/// `schema`, whose objects come from the referenced table through a
+/// referencing object map.
+fn foreign_keys_mapping(schema: &str) -> String {
+    let mut mapping = "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
+         @prefix ex: <http://example.org/> .\n\
+         <#customers> rr:logicalTable [ rr:tableName \"v12n_fk112.customers\" ] ;\n\
+           rr:subjectMap [ rr:template \"http://example.org/customer/{id}\" ] .\n\
+         <#codes> rr:logicalTable [ rr:tableName \"v12n_fk112.codes\" ] ;\n\
+           rr:subjectMap [ rr:template \"http://example.org/code/{code}\" ] .\n\
+         <#labels> rr:logicalTable [ rr:tableName \"v12n_fk112.labels\" ] ;\n\
+           rr:subjectMap [ rr:template \"http://example.org/label/{name}\" ] .\n"
+        .to_owned();
+    for (table, parent, column) in [
+        ("orders", "customers", "customer_id"),
+        ("notes", "customers", "customer_id"),
+        ("wide", "customers", "customer_id"),
+        ("unchecked", "customers", "customer_id"),
+        ("base", "customers", "customer_id"),
+        ("tagged", "codes", "code"),
+        ("labelled", "labels", "label"),
+    ] {
+        let key = match parent {
+            "codes" => "code",
+            "labels" => "name",
+            _ => "id",
+        };
+        mapping.push_str(&format!(
+            "<#{table}> rr:logicalTable [ rr:tableName \"v12n_fk112.{table}\" ] ;\n\
+               rr:subjectMap [ rr:template \"http://example.org/{table}/{{id}}\" ] ;\n\
+               rr:predicateObjectMap [ rr:predicate ex:{table} ;\n\
+                 rr:objectMap [ rr:parentTriplesMap <#{parent}> ;\n\
+                   rr:joinCondition [ rr:child \"{column}\" ; rr:parent \"{key}\" ] ] ] .\n"
+        ));
+    }
+    mapping.replace("v12n_fk112", schema)
+}
+
+/// A parent scan goes only where the snapshot shows a validated key on
+/// `NOT NULL` columns of the referenced type, which no table with
+/// inheritance children has, to a unique key that decides `=` as the
+/// join does; the solutions are those of the join either way.
+#[tokio::test]
+async fn foreign_keys_remove_the_parent_scan_only_where_every_row_has_one_parent() {
+    let Some(url) = database_url() else { return };
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client.batch_execute(FOREIGN_KEYS_SQL).await.unwrap();
+    let database = PostgresBackend::connect(&url, Limits::default())
+        .await
+        .unwrap();
+    let mapping = foreign_keys_mapping("v12n_fk112");
+    let mut found = Vec::new();
+    for table in [
+        "orders",
+        "notes",
+        "wide",
+        "unchecked",
+        "base",
+        "tagged",
+        "labelled",
+    ] {
+        let plan = plan(
+            &mapping,
+            &format!("SELECT ?s ?o WHERE {{ ?s <http://example.org/{table}> ?o }}"),
+        );
+        let snapshot = database
+            .load_catalog(&CatalogRequest::for_plan(&plan))
+            .await
+            .unwrap();
+        let ready = CatalogPlan::new(&plan, Arc::new(snapshot)).unwrap();
+        let scans = ready.plan().branches[0].from.len();
+        let (rows, _) = run(&url, Limits::default(), &plan).await.unwrap();
+        found.push((table, scans, rows));
+    }
+    client
+        .batch_execute("DROP SCHEMA v12n_fk112 CASCADE")
+        .await
+        .unwrap();
+    let row = |table: &str, id: u32, object: &str| {
+        format!("?s=<http://example.org/{table}/{id}> ?o=<http://example.org/{object}>")
+    };
+    assert_eq!(
+        found,
+        [
+            (
+                "orders",
+                1,
+                vec![
+                    row("orders", 10, "customer/1"),
+                    row("orders", 11, "customer/1"),
+                    row("orders", 12, "customer/2"),
+                ]
+            ),
+            ("notes", 2, vec![row("notes", 20, "customer/1")]),
+            ("wide", 2, vec![row("wide", 30, "customer/3")]),
+            ("unchecked", 2, vec![row("unchecked", 40, "customer/1")]),
+            ("base", 2, vec![row("base", 50, "customer/2")]),
+            (
+                "tagged",
+                2,
+                vec![row("tagged", 60, "code/a"), row("tagged", 61, "code/a")]
+            ),
+            // R2RML §8: the join finds the label by `=`, and the term is
+            // the label's own value.
+            ("labelled", 2, vec![row("labelled", 70, "label/ABC")]),
+        ]
+    );
+}
+
+/// After the foreign key is dropped and a row without a customer is
+/// added, the fingerprint check fails, the plan is completed again with
+/// the join, and the row is left out.
+#[tokio::test]
+async fn a_query_does_not_trust_a_dropped_foreign_key() {
+    let Some(url) = database_url() else { return };
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    let schema = "v12n_fk112_dropped";
+    client
+        .batch_execute(&FOREIGN_KEYS_SQL.replace("v12n_fk112", schema))
+        .await
+        .unwrap();
+    let mapping = foreign_keys_mapping(schema);
+    let plan = plan(
+        &mapping,
+        "SELECT ?s ?o WHERE { ?s <http://example.org/orders> ?o }",
+    );
+    let database = PostgresBackend::connect(&url, Limits::default())
+        .await
+        .unwrap();
+    let engine = engine(&mapping, database).await;
+    let mut before = solutions(&engine, &plan).await;
+    client
+        .batch_execute(
+            &"ALTER TABLE v12n_fk112.orders DROP CONSTRAINT orders_customer_id_fkey;
+              INSERT INTO v12n_fk112.orders VALUES (13, 9);"
+                .replace("v12n_fk112", schema),
+        )
+        .await
+        .unwrap();
+    let mut after = solutions(&engine, &plan).await;
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    before.sort();
+    after.sort();
+    assert_eq!(before.len(), 3);
+    assert_eq!(after, before);
+}

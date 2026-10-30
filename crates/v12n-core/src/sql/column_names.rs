@@ -139,10 +139,19 @@ impl SqlBranch {
     /// order values refer to by `f` of it. `from`, `fixed_columns` and
     /// the ranges of `left_joins` are left to the caller.
     pub(crate) fn rename_tables(&mut self, f: &impl Fn(usize) -> usize) {
-        fn expr(e: &mut SqlExpr, f: &impl Fn(usize) -> usize) {
+        self.for_each_reference(&mut |table, _| *table = f(*table));
+    }
+
+    /// Calls `f` with every table alias that the select list, the
+    /// conditions, the order values and the computed values refer to,
+    /// with the names of the columns read from that table there: one for
+    /// a column, those of its parts for a template, none for a template
+    /// of constant parts only.
+    pub(crate) fn for_each_reference(&mut self, f: &mut dyn FnMut(&mut usize, &mut [&mut String])) {
+        fn expr(e: &mut SqlExpr, f: &mut dyn FnMut(&mut usize, &mut [&mut String])) {
             match e {
-                SqlExpr::Column { table, .. } | SqlExpr::Lexical { table, .. } => {
-                    *table = f(*table)
+                SqlExpr::Column { table, name } | SqlExpr::Lexical { table, name, .. } => {
+                    f(table, &mut [name]);
                 }
                 SqlExpr::Param(_)
                 | SqlExpr::Null(_)
@@ -159,15 +168,23 @@ impl SqlBranch {
                 }
             }
         }
-        fn term(t: &mut TermSql, f: &impl Fn(usize) -> usize) {
+        fn term(t: &mut TermSql, f: &mut dyn FnMut(&mut usize, &mut [&mut String])) {
             match &mut t.value {
-                TermSqlValue::Column { table, .. } | TermSqlValue::Template { table, .. } => {
-                    *table = f(*table);
+                TermSqlValue::Column { table, name } => f(table, &mut [name]),
+                TermSqlValue::Template { table, parts, .. } => {
+                    let mut names: Vec<&mut String> = parts
+                        .iter_mut()
+                        .filter_map(|part| match part {
+                            TemplatePart::Column(name) => Some(name),
+                            TemplatePart::Literal(_) => None,
+                        })
+                        .collect();
+                    f(table, &mut names);
                 }
                 TermSqlValue::Param(_) => {}
             }
         }
-        fn condition(c: &mut Condition, f: &impl Fn(usize) -> usize) {
+        fn condition(c: &mut Condition, f: &mut dyn FnMut(&mut usize, &mut [&mut String])) {
             match c {
                 Condition::Eq(left, right) => {
                     expr(left, f);

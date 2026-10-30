@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?o ?c WHERE { ?o ex:buyer ?c OPTIONAL { ?c a ex:Customer } }
