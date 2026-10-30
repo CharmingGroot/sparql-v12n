@@ -2,7 +2,7 @@
 
 [English](semantics.md) | [한국어](semantics.ko.md) | 简体中文
 
-> 本文是 [semantics.md](semantics.md)（提交 8e6fa66）的翻译。如有出入，以英文原文为准。
+> 本文是 [semantics.md](semantics.md)（提交 8c0e55a）的翻译。如有出入，以英文原文为准。
 
 本文介绍 sparql-v12n 如何将 SPARQL 查询翻译为 SQL，以及决定答案的规则：列名、IRI、字面量、常量、连接、去重、`OPTIONAL`、`UNION`、`FILTER` 与排序。总体介绍与支持功能表见 [README](../README.zh-CN.md)。
 
@@ -285,6 +285,23 @@ SQL 以 `NULL` 表示错误。SQL 的 `AND`、`OR` 与 `NOT` 对 `NULL` 的处�
   - 超出公元 1 至 9999 年范围或精度细于微秒的 dateTime 常量；
 - 其他函数、`xsd:double` 的算术、`IN`、`EXISTS`，以及以 term（变量、常量，以及它们的 `STR`、`LANG` 或 `DATATYPE`）和算术以外的表达式作为操作数；
 - 在编码不是 UTF-8 的数据库中进行字符串排序和 `REGEX`。
+
+## BIND 与 SELECT 表达式
+
+`BIND(expr AS ?v)` 与 `SELECT (expr AS ?v)` 在每个解中将表达式的值绑定到 `?v`（SPARQL 1.1 §18.5，Extend）。表达式为变量、常量，或与 [`FILTER`](#filter) 中相同的算术：
+
+- 变量给出其 term，常量给出其自身。
+- 算术给出一个数，其数据类型遵循 XPath 的类型提升，并以规范形式写出（见[字面量](#字面量)）。在整数列上，`?qty * 2` 为 `xsd:integer`，`?qty / 4` 为 `xsd:decimal`。XPath 将 decimal 除法的精度留给实现决定，此处采用 PostgreSQL `numeric` 除法的精度。
+- 发生错误时（例如除以零，或操作数不是数字），`?v` 保持未绑定。该解仍被保留。
+
+SPARQL 在 `BIND` 所在组的解上对其求值。v12n 在连接之后，在整个模式的解上计算它。当表达式中该组可能未绑定的变量不被模式的其余部分绑定时，两者给出相同的值。
+
+以下情形作为不支持的功能拒绝：
+
+- 变量、常量与算术以外的表达式，例如 `STR`、比较、`IF` 与 `COALESCE`；
+- `OPTIONAL` 或 `UNION` 内部的 `BIND`；
+- 对其所在组可能未绑定、而模式后续部分会绑定的变量使用 `BIND`；
+- 在三元组模式、`FILTER`、`ORDER BY` 或其他表达式中使用由 `BIND` 或 `SELECT` 计算的变量。
 
 ## ORDER BY、LIMIT 与 OFFSET
 

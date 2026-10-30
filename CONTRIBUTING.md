@@ -36,6 +36,18 @@ data. Changes keep to these rules:
 Write issues, pull requests, commit messages and code comments in
 English. A translation may follow below a `---` line.
 
+## Translations
+
+The README and the documents in `docs/` have Korean (`.ko.md`) and
+Chinese (`.zh-CN.md`) translations. The English document is the source,
+and each translation names the commit of the English text it follows.
+
+A change to supported features, examples or limits in an English
+document updates the translations in the same pull request, or lists the
+translations left to update and the issue that tracks them. A pull
+request that changes only translations does not need the PostgreSQL or
+differential tests.
+
 ## Commit and title convention
 
 CI checks the pull request title, the branch name and the sign-off.
