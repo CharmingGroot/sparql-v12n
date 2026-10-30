@@ -97,6 +97,7 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0017-double-arithmetic/filter-nan-not-ordered` | #99 | Ontop compares computed doubles in PostgreSQL, which orders NaN above every number; XPath orders NaN with nothing, so `!(?n * 2 > 0)` holds for a NaN. |
 | `0011-time/time-results`, `time-constant-midnight`, `time-constant-24`, `time-join`, `time-distinct`, `time-key-subject`, `time-order` | #37 | Ontop writes a `time` of `24:00:00` as is and treats it as another term than `00:00:00`; v12n writes the canonical form `00:00:00` for both and treats them as one term, as decided in Discussion #91. |
 | `0012-arithmetic/big-no-overflow`, `0013-bind/big-no-overflow` (Ontop error) | #99 | Ontop adds `bigint` values as `bigint` and fails with "bigint out of range"; `xsd:integer` has no bound, and v12n computes in `numeric`. |
+| `0017-double-arithmetic/filter-effective-boolean-value` (Ontop error) | #99 | Ontop writes the NaN test of a double's effective boolean value as an unquoted `NaN`, which PostgreSQL reads as a column name. |
 | `0002-constants/uuid-uppercase` | #26 | Ontop matches a `uuid` constant by value; the terms differ in case. |
 | `0006-filter/string-order-code-points`, `0008-order/string-accent`, `0008-order/string-hangul` | #26 | Ontop orders strings by the database collation; SPARQL orders them by code point. |
 | `0002-constants/date-non-canonical`, `date-invalid` (Ontop error) | #26 | Ontop refuses ill-typed `xsd:date` constants, which match nothing. |

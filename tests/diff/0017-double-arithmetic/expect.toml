@@ -16,3 +16,12 @@ issue = 25
 [query.select-integer-promoted]
 expect = "mismatch"
 issue = 25
+
+# Ontop writes the NaN test of a double's effective boolean value as an
+# unquoted `NaN`, which PostgreSQL reads as a column name ("column "nan"
+# does not exist"). v12n returns the rows whose product is neither zero
+# nor NaN (#99).
+[query.filter-effective-boolean-value]
+expect = "ontop-error"
+issue = 99
+solutions = 5
