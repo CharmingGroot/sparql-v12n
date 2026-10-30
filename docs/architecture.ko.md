@@ -48,7 +48,7 @@ flowchart LR
 | `Planner` | 주도(driving) | 매핑과 인덱스를 가지고 쿼리 계획을 세운다. DB가 필요 없다 | `v12n-core` |
 | `Engine<B>` | 주도(driving) | 공유하는 `Planner`와 DB 세션 `B` 하나를 묶어 계획을 렌더링하고 실행한다 | `v12n-core` |
 | `Connector` | 피동(driven) | 프런트엔드가 넘기는 쿼리 제한으로 세션을 연다 | `PostgresConnector` |
-| `Backend` | 피동(driven) | 세션 하나. SQL 방언, `execute`, `is_closed` | `PostgresBackend` |
+| `Backend` | 피동(driven) | 세션 하나. SQL 방언, `execute`, `load_catalog`, `is_closed` | `PostgresBackend` |
 | `SolutionStream` | 피동(driven) | 쿼리 하나의 솔루션을 하나씩 읽고, 결과가 잘렸는지 알린다 | `v12n_postgres::Solutions` |
 | `BackendError` | 피동(driven) | 오류를 `Config`, `Database`, `Timeout`, `Core`로 분류한다. 프런트엔드는 이 분류로 종료 코드와 HTTP 상태를 정한다 | `v12n_postgres::Error` |
 | `Dialect` | 피동(driven) | DB마다 다른 SQL 문법 | `PostgresDialect` |
@@ -233,7 +233,7 @@ PostgreSQL은 `ORDER BY`와 `DISTINCT`를 위해 정렬하고 조인을 만든�
 |---|---|
 | DB별 SQL을 위한 `Dialect` trait([#134](https://github.com/CharmingGroot/sparql-v12n/issues/134)) | 구현됨. 방언은 `PostgresDialect` 하나 |
 | `Engine`, `Backend`, `Connector`, `SolutionStream` 포트([#166](https://github.com/CharmingGroot/sparql-v12n/issues/166)) | 구현됨. 어댑터는 `v12n-postgres` 하나 |
-| 카탈로그 정보를 `PostgresBackend::run` 안이 아니라 엔진이 만든 스냅샷으로 읽기([#109](https://github.com/CharmingGroot/sparql-v12n/issues/109), [#110](https://github.com/CharmingGroot/sparql-v12n/issues/110)) | 계획됨 |
+| 카탈로그 정보를 `PostgresBackend::run` 안이 아니라 엔진이 만든 스냅샷으로 읽기([#109](https://github.com/CharmingGroot/sparql-v12n/issues/109), [#110](https://github.com/CharmingGroot/sparql-v12n/issues/110), [Discussion #187](https://github.com/CharmingGroot/sparql-v12n/discussions/187)) | 진행 중. `v12n check --db`가 `CatalogSnapshot`을 읽고, 쿼리는 아직 `PostgresBackend::run`에서 카탈로그를 읽는다 |
 | 온톨로지 지원([#123](https://github.com/CharmingGroot/sparql-v12n/issues/123)–[#127](https://github.com/CharmingGroot/sparql-v12n/issues/127)) | 계획됨 |
 | 두 번째 DB([#165](https://github.com/CharmingGroot/sparql-v12n/issues/165)) | 계획됨 |
 | 제한된 행을 모두 모으지 않고 잘림 알리기([#152](https://github.com/CharmingGroot/sparql-v12n/issues/152)) | 미정. 측정 후 결정 |

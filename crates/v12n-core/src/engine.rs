@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::Error;
 use crate::backend::Backend;
+use crate::catalog::CatalogSnapshot;
 use crate::planner::Planner;
 use crate::sql::{RenderOptions, RenderedSql, SqlPlan};
 
@@ -35,6 +36,13 @@ impl<B: Backend> Engine<B> {
     /// different SQL once it knows the column types and keys.
     pub fn render(&self, plan: &SqlPlan) -> Result<RenderedSql, Error> {
         plan.to_sql_with(self.backend.dialect(), &RenderOptions::default())
+    }
+
+    /// The catalog entries of every logical table of the mapping.
+    pub async fn load_catalog(&self) -> Result<CatalogSnapshot, B::Error> {
+        self.backend
+            .load_catalog(self.planner.catalog_request())
+            .await
     }
 
     /// Runs `plan` on the backend.

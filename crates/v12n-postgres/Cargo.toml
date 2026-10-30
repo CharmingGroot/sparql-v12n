@@ -11,7 +11,7 @@ publish.workspace = true
 [dependencies]
 v12n-core.workspace = true
 bytes.workspace = true
-futures-util.workspace = true
+futures-util = { workspace = true, features = ["alloc"] }
 percent-encoding.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true

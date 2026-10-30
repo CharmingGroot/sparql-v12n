@@ -25,6 +25,9 @@ Design decisions are recorded in the `Decision:` Discussions.
   certificate revocation lists (`sslcrl`, `sslcrldir`) in the database
   URL, with libpq's meaning. libpq's `PG*` environment variables are not
   read.
+- `v12n check --db URL` also checks that every table and column the
+  mapping reads exists and can be read, and exits with 2 listing what the
+  database lacks.
 
 ## [0.0.1] - 2026-10-28
 

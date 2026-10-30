@@ -44,7 +44,7 @@ flowchart LR
 | `Planner` | 驱动（driving） | 持有映射及其索引，规划查询。不需要数据库 | `v12n-core` |
 | `Engine<B>` | 驱动（driving） | 将共享的 `Planner` 与一个数据库会话 `B` 组合，渲染并执行计划 | `v12n-core` |
 | `Connector` | 被驱动（driven） | 以前端传入的查询限制打开会话 | `PostgresConnector` |
-| `Backend` | 被驱动（driven） | 一个会话：SQL 方言、`execute`、`is_closed` | `PostgresBackend` |
+| `Backend` | 被驱动（driven） | 一个会话：SQL 方言、`execute`、`load_catalog`、`is_closed` | `PostgresBackend` |
 | `SolutionStream` | 被驱动（driven） | 逐个读取一个查询的解，并报告结果是否被截断 | `v12n_postgres::Solutions` |
 | `BackendError` | 被驱动（driven） | 将错误分类为 `Config`、`Database`、`Timeout` 或 `Core`，前端据此决定退出码和 HTTP 状态码 | `v12n_postgres::Error` |
 | `Dialect` | 被驱动（driven） | 各数据库之间不同的 SQL 文本 | `PostgresDialect` |
@@ -189,7 +189,7 @@ sequenceDiagram
 |---|---|
 | 用于数据库专用 SQL 的 `Dialect` trait（[#134](https://github.com/CharmingGroot/sparql-v12n/issues/134)） | 已实现；`PostgresDialect` 是唯一的方言 |
 | `Engine`、`Backend`、`Connector`、`SolutionStream` 端口（[#166](https://github.com/CharmingGroot/sparql-v12n/issues/166)） | 已实现；`v12n-postgres` 是唯一的适配器 |
-| 由引擎获取目录快照，而不是在 `PostgresBackend::run` 内读取目录（[#109](https://github.com/CharmingGroot/sparql-v12n/issues/109)、[#110](https://github.com/CharmingGroot/sparql-v12n/issues/110)） | 计划中 |
+| 由引擎获取目录快照，而不是在 `PostgresBackend::run` 内读取目录（[#109](https://github.com/CharmingGroot/sparql-v12n/issues/109)、[#110](https://github.com/CharmingGroot/sparql-v12n/issues/110)、[Discussion #187](https://github.com/CharmingGroot/sparql-v12n/discussions/187)） | 进行中；`v12n check --db` 读取 `CatalogSnapshot`，查询仍在 `PostgresBackend::run` 中读取目录 |
 | 本体支持（[#123](https://github.com/CharmingGroot/sparql-v12n/issues/123)–[#127](https://github.com/CharmingGroot/sparql-v12n/issues/127)） | 计划中 |
 | 第二种数据库（[#165](https://github.com/CharmingGroot/sparql-v12n/issues/165)） | 计划中 |
 | 不物化受限行即可报告截断（[#152](https://github.com/CharmingGroot/sparql-v12n/issues/152)） | 未定；测量后决定 |

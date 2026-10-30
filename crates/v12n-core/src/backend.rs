@@ -9,6 +9,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use crate::catalog::{CatalogRequest, CatalogSnapshot};
 use crate::dialect::Dialect;
 use crate::solution::Solution;
 use crate::sql::SqlPlan;
@@ -51,6 +52,13 @@ pub trait Backend: Send + Sync {
         &self,
         plan: &SqlPlan,
     ) -> impl Future<Output = Result<Self::Solutions, Self::Error>> + Send;
+
+    /// The catalog entries of the logical tables `request` names. A table
+    /// or column that does not exist is part of the snapshot, not an error.
+    fn load_catalog(
+        &self,
+        request: &CatalogRequest,
+    ) -> impl Future<Output = Result<CatalogSnapshot, Self::Error>> + Send;
 
     /// Whether the session is gone, e.g. after a server restart, so that a
     /// pool does not hand it out again.

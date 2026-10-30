@@ -399,6 +399,35 @@ fn query_shop_vip_orders_prints_sparql_json_results() {
     assert_eq!(output.status.code(), Some(5));
 }
 
+/// Runs against the `testenv` PostgreSQL; skipped unless
+/// `V12N_TEST_DATABASE_URL` is set.
+#[test]
+fn check_with_db_reports_tables_and_columns_the_database_lacks() {
+    let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
+        eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let output = v12n(&["check", SHOP, "--db", &url, "--format", "json"], "");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_json(&output)["ok"], json!(true));
+
+    let mapping = std::fs::read_to_string(SHOP)
+        .unwrap()
+        .replace("rr:column \"tier\"", "rr:column \"rank\"")
+        .replace("\"orders\"", "\"v12n_no_such_table\"");
+    let output = v12n(&["check", "-", "--db", &url, "--format", "json"], &mapping);
+    assert_eq!(output.status.code(), Some(2));
+    let error = &stdout_json(&output)["error"];
+    assert_eq!(error["kind"], json!("catalog"));
+    assert_eq!(
+        error["details"]["problems"],
+        json!([
+            "table customers has no column rank",
+            "table v12n_no_such_table does not exist"
+        ])
+    );
+}
+
 fn bindings(output: &Output) -> usize {
     stdout_json(output)["results"]["bindings"]
         .as_array()
