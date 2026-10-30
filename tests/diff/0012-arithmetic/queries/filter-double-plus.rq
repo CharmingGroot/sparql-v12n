@@ -1,4 +1,4 @@
 PREFIX ex: <http://example.org/>
 
-# Arithmetic on xsd:double values is not supported yet.
+# An integer plus a double is a double (XPath type promotion, #99).
 SELECT ?r WHERE { ?r ex:a ?a ; ex:b ?b ; ex:d ?d ; ex:big ?big ; ex:name ?n FILTER(?a + 1.5e0 > 0) }

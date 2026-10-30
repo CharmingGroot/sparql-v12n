@@ -1,8 +1,3 @@
-# Arithmetic on xsd:double values is rejected until its NaN and infinities
-# follow XPath (#99, Discussion #144).
-[query.double-rejected]
-expect = "rejected"
-
 # Ontop adds int8 values in int8 and fails with "bigint out of range";
 # xsd:integer has no bound, and v12n computes in numeric (#99).
 [query.big-no-overflow]

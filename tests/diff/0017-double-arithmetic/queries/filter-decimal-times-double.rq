@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A decimal times a double is a double.
+SELECT ?r WHERE { ?r ex:d ?d FILTER(?d * 2e0 = 3) }

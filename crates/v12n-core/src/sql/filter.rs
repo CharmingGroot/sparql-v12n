@@ -15,6 +15,8 @@ use crate::solution::canonical_double;
 use crate::sparql::{ArithOp, CompareOp, TermTest};
 use crate::xsd::{self, Num, Number, Value, XSD};
 
+mod double;
+
 const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
 
 /// How much of a filter's result matters where it is rendered.
@@ -360,8 +362,9 @@ impl<'a> Renderer<'a> {
 
     /// The result of `op` over `operands`, or of negation without `op`:
     /// a number whose class follows XPath's type promotion (an integer
-    /// divided by an integer is a decimal, op:numeric-divide), and a type
-    /// error when an operand is not a number (SPARQL 1.1 §17.3).
+    /// divided by an integer is a decimal, op:numeric-divide; anything
+    /// with a double is a double), and a type error when an operand is not
+    /// a number (SPARQL 1.1 §17.3).
     fn arith<'v>(
         &self,
         value: &'v FilterValue,
@@ -391,16 +394,7 @@ impl<'a> Renderer<'a> {
                 _ => return operand,
             }
         }
-        if class == Num::Double {
-            operand.term_type = Some(TermType::Literal);
-            operand.kind = Kind::Unsupported(
-                "arithmetic on xsd:double values, whose NaN and infinities SQL computes \
-                 differently"
-                    .to_owned(),
-            );
-            return operand;
-        }
-        if op == Some(ArithOp::Divide) {
+        if op == Some(ArithOp::Divide) && class < Num::Double {
             class = Num::Decimal;
         }
         operand.kind = Kind::Numeric(class);
@@ -408,7 +402,8 @@ impl<'a> Renderer<'a> {
         operand
     }
 
-    /// An arithmetic expression, or one of its operands, as `numeric`.
+    /// An arithmetic expression of integers and decimals, or one of its
+    /// operands, as `numeric`.
     /// Integers are computed in `numeric` too, since `xsd:integer` has no
     /// bound and `int8` would overflow. A division by zero is an error
     /// (op:numeric-divide), so its divisor is `NULLIF(…, 0)`; an operand
@@ -467,14 +462,20 @@ impl<'a> Renderer<'a> {
         Ok(())
     }
 
-    /// A computed value as `numeric` where it is a number of class `kind`,
-    /// and `NULL` where it is another class or an error, which leaves the
+    /// A computed value as a number of class `kind` where it is one, and
+    /// `NULL` where it is another class or an error, which leaves the
     /// variable unbound (SPARQL 1.1 §18.5, Extend). The cases render as
     /// `CASE`, so the first whose guards hold gives the value.
     pub(super) fn value(&mut self, cases: &ValueCases, kind: ValueKind) -> Result<(), Error> {
         let class = match kind {
             ValueKind::Integer => Num::Integer,
             ValueKind::Decimal => Num::Decimal,
+            ValueKind::Double => Num::Double,
+        };
+        let ty = if class == Num::Double {
+            SqlType::Double
+        } else {
+            SqlType::Numeric
         };
         let mut of_class = Vec::with_capacity(cases.len());
         for (_, value) in cases {
@@ -485,13 +486,13 @@ impl<'a> Renderer<'a> {
             });
         }
         if !of_class.contains(&true) {
-            self.typed_null(&SqlType::Numeric);
+            self.typed_null(&ty);
             return Ok(());
         }
         if let [(guards, value)] = cases.as_slice()
             && guards.is_empty()
         {
-            return self.numeric_value(value);
+            return self.class_value(value, class);
         }
         self.sql.push_str("CASE");
         for ((guards, value), of_class) in cases.iter().zip(of_class) {
@@ -504,13 +505,23 @@ impl<'a> Renderer<'a> {
             }
             self.sql.push_str(" THEN ");
             if of_class {
-                self.numeric_value(value)?;
+                self.class_value(value, class)?;
             } else {
-                self.typed_null(&SqlType::Numeric);
+                self.typed_null(&ty);
             }
         }
         self.sql.push_str(" END");
         Ok(())
+    }
+
+    /// A computed number of class `class`, as `float8` for a double and
+    /// as `numeric` otherwise.
+    fn class_value(&mut self, value: &FilterValue, class: Num) -> Result<(), Error> {
+        if class == Num::Double {
+            self.double_value(value)
+        } else {
+            self.numeric_value(value)
+        }
     }
 
     /// The datatype IRI of a literal operand.
@@ -853,6 +864,9 @@ impl<'a> Renderer<'a> {
             return Ok(());
         }
         let promoted = class(l).max(class(r));
+        if promoted == Num::Double && (is_arith(l.value) || is_arith(r.value)) {
+            return self.double_compare(op, l, r);
+        }
         let fits = |n: &Option<Number>| n.as_ref().is_none_or(|n| n.int8().is_some());
         let ty = match (&ln, &rn) {
             // An integer column and an integral constant compare as
@@ -945,13 +959,9 @@ impl<'a> Renderer<'a> {
         ty: Num,
     ) -> Result<(), Error> {
         if is_arith(operand.value) {
-            // Compared as `numeric` (or `float8` against a double), which
-            // PostgreSQL compares exactly with the other side's type.
-            return if ty == Num::Double {
-                self.cast_rendered(&SqlType::Double, |this| this.numeric_value(operand.value))
-            } else {
-                self.numeric_value(operand.value)
-            };
+            // Compared as `numeric`, which PostgreSQL compares exactly with
+            // the other side's type.
+            return self.numeric_value(operand.value);
         }
         if let Some(number) = number {
             let value = match ty {
@@ -974,7 +984,9 @@ impl<'a> Renderer<'a> {
             .column
             .expect("a numeric operand is a column or a constant");
         let column = super::column_sql(table, name);
-        if class < ty {
+        if class == Num::Decimal && ty == Num::Double {
+            self.sql.push_str(&self.decimal_column_as_double(&column));
+        } else if class < ty {
             self.sql
                 .push_str(&self.dialect.cast(&column, &ty.sql_type()));
         } else {
@@ -1095,6 +1107,9 @@ impl<'a> Renderer<'a> {
             if let Kind::Unsupported(reason) = &operand.kind {
                 return Err(unsupported(reason));
             }
+            if operand.kind == Kind::Numeric(Num::Double) {
+                return self.double_ebv(value);
+            }
             // A number is true unless it is zero (SPARQL 1.1 §17.2.2).
             self.sql.push('(');
             self.numeric_value(value)?;
@@ -1167,9 +1182,11 @@ fn natural_kind(ty: &ColumnType) -> Kind {
         Some("double") if ty.name == "float8" => Kind::Numeric(Num::Double),
         // The literal's value is the double of the value's shortest
         // decimal form, not the value widened to a double.
-        Some("double") => {
-            Kind::Unsupported(format!("comparing values of {} columns by value", ty.name))
-        }
+        Some("double") => Kind::Unsupported(format!(
+            "comparing or computing with values of {} columns, whose xsd:double literals have \
+             the value of their shortest decimal form",
+            ty.name
+        )),
         Some("boolean") => Kind::Boolean,
         Some("dateTime") => Kind::DateTime {
             zoned: ty.name == "timestamptz",
@@ -1404,7 +1421,7 @@ pub(super) mod tests {
         assert_eq!(x("i4", "-?x < 0"), "(-t0.\"i4\"::numeric) < $1::int8");
         assert_eq!(
             x("i4", "+?x = 3"),
-            "(t0.\"i4\"::numeric + $1::numeric) = $2::int8"
+            "(t0.\"i4\"::numeric - $1::numeric) = $2::int8"
         );
     }
 
@@ -1438,11 +1455,100 @@ pub(super) mod tests {
 
     #[test]
     fn arithmetic_that_sql_cannot_answer_exactly_is_rejected() {
-        assert!(rejected("?s ex:f8 ?x", "?x + 1 > 0").contains("xsd:double"));
-        assert!(rejected("?s ex:i4 ?x", "?x + 1e0 > 0").contains("xsd:double"));
+        assert!(rejected("?s ex:f4 ?x", "?x + 1 > 0").contains("float4"));
+        assert!(rejected("?s ex:f4 ?x", "?x * 1e0 > 0").contains("float4"));
         assert!(rejected("?s ex:i4 ?x", "STR(?x + 1) = \"2\"").contains("STR, LANG"));
+        assert!(rejected("?s ex:f8 ?x", "STR(?x + 1) = \"2\"").contains("STR, LANG"));
         assert!(rejected("?s ex:i4 ?x", "sameTerm(?x + 1, 2)").contains("sameTerm"));
-        assert!(rejected("?s ex:f8 ?x", "isLiteral(?x * 2)").contains("xsd:double"));
+    }
+
+    #[test]
+    fn double_arithmetic_is_computed_once_and_excludes_nan_from_comparisons() {
+        let sql = x("f8", "?x * 2 > 1");
+        assert!(
+            sql.starts_with(
+                "(SELECT (x > $2::float8 AND x <> 'NaN'::float8) FROM (SELECT CASE WHEN CASE \
+                 WHEN abs(t0.\"f8\") BETWEEN '1e0'::float8 AND"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with("ELSE t0.\"f8\" * $1::float8 END AS x) AS d)"),
+            "{sql}"
+        );
+        // Integers convert to float8 exactly rounded, and are never NaN.
+        let sql = x("i4", "?x / 2e0 = 1");
+        assert!(
+            sql.starts_with(
+                "(SELECT (x = $2::float8 AND x <> 'NaN'::float8) FROM (SELECT CASE WHEN \
+                 $1::float8 = 0 THEN"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with("ELSE t0.\"i4\"::float8 / $1::float8 END AS x) AS d)"),
+            "{sql}"
+        );
+        // Integer arithmetic stays exact in numeric, then becomes a double.
+        let sql = x("i4", "(?x + 1) * 1e0 > 2");
+        assert!(
+            sql.contains("FROM (SELECT (t0.\"i4\"::numeric + $1::numeric) AS x) AS d)"),
+            "{sql}"
+        );
+        assert!(
+            x("f8", "?x * 2").starts_with("(SELECT (x <> 0 AND x <> 'NaN'::float8) FROM"),
+            "effective boolean value"
+        );
+        // Unary plus subtracts zero, which keeps a -0.
+        assert!(x("f8", "+?x = 0").contains("ELSE t0.\"f8\" - $1::float8 END"));
+        assert_eq!(x("f8", "isLiteral(?x * 2)"), "true");
+        assert_eq!(x("txt", "?x * 1e0 > 0"), "NULL::bool");
+    }
+
+    fn params(query: &str) -> Vec<String> {
+        let types = types();
+        plan(query)
+            .unwrap()
+            .to_sql_with(
+                &PostgresDialect,
+                &RenderOptions {
+                    column_types: Some(&types),
+                    ..RenderOptions::default()
+                },
+            )
+            .unwrap()
+            .params
+    }
+
+    #[test]
+    fn double_arithmetic_of_constants_is_computed_before_binding() {
+        // 1e0 / 0 is INF in IEEE 754; Rust's f64 computes it.
+        assert_eq!(x("i4", "?x < 1e0 / 0"), "(t0.\"i4\"::float8 < $1::float8)");
+        assert_eq!(
+            params("SELECT ?s WHERE { ?s ex:i4 ?x FILTER(?x < 1e0 / 0 - -1) }")[0],
+            "INF"
+        );
+        // NaN is never ordered.
+        assert_eq!(
+            x("i4", "?x < 0e0 / 0"),
+            "(t0.\"i4\"::float8 < $1::float8 AND $1::float8 <> 'NaN'::float8)"
+        );
+        // Arithmetic on integers and decimals stays exact in SQL.
+        assert!(x("i4", "?x < (1 + 2) * 1e0").contains("($1::numeric + $2::numeric) AS x"));
+    }
+
+    #[test]
+    fn decimals_promote_to_doubles_with_infinities_and_ill_typed_values() {
+        let sql = x("dec", "?x < 1e0");
+        assert!(
+            sql.starts_with(
+                "(CASE WHEN NOT (t0.\"dec\"::text NOT IN ('NaN', 'Infinity', '-Infinity')) \
+                 THEN NULL::float8 WHEN abs(t0.\"dec\") >= 2::numeric ^ 1024 - 2::numeric ^ \
+                 970 THEN"
+            ),
+            "{sql}"
+        );
+        assert!(sql.ends_with("ELSE t0.\"dec\"::float8 END < $1::float8 AND t0.\"dec\"::text NOT IN ('NaN', 'Infinity', '-Infinity'))"), "{sql}");
     }
 
     #[test]

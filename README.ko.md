@@ -207,10 +207,10 @@ v12n explain examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq
 |---|---|---|
 | 기본 그래프 패턴(basic graph pattern) | 상수 술어와 `rdf:type`. 상수와 공유 변수는 컬럼 타입이 달라도 RDF term으로 비교한다. 같은 트리플을 만드는 행이 여러 개여도 트리플은 한 번만 센다 | 변수 술어, property path, `GRAPH`, `FROM`, `FROM NAMED` |
 | `SELECT`, `SELECT *`, `DISTINCT` | 해(solution)에 대한 bag 의미론 | `REDUCED`, 하위 쿼리, `GROUP BY`와 집계 |
-| `BIND`, `SELECT (expr AS ?v)` | 변수, 상수, 정수와 decimal의 `+`, `-`, `*`, `/`. 오류가 나면 변수는 바인딩되지 않는다 | 그 밖의 식. `OPTIONAL`이나 `UNION` 안의 `BIND`. 계산한 변수를 트리플 패턴, `FILTER`, `ORDER BY`, 다른 식에서 쓰는 것 |
+| `BIND`, `SELECT (expr AS ?v)` | 변수, 상수, 정수·decimal·double의 `+`, `-`, `*`, `/`. 오류가 나면 변수는 바인딩되지 않는다 | 그 밖의 식. `OPTIONAL`이나 `UNION` 안의 `BIND`. 계산한 변수를 트리플 패턴, `FILTER`, `ORDER BY`, 다른 식에서 쓰는 것 |
 | `OPTIONAL` | 중첩·연속 사용, 내부의 `FILTER`, 바인딩되지 않은 변수 | 여러 `OPTIONAL` 부분에서만 바인딩되는 변수에 대한 `SELECT DISTINCT`, 한쪽이 빈 `UNION`을 감싸는 `OPTIONAL` 안의 `FILTER` |
 | `UNION` | 양쪽의 bag 합집합(`OPTIONAL` 안에서도 지원). 한 변수에 형태가 다른 term map을 쓸 수 있다 | 같은 변수에서 자연 데이터타입 컬럼과 다른 리터럴 형태 사이의 중복 제거 |
-| `FILTER` | `=`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `\|\|`, `!`, `BOUND`, `sameTerm`, `isIRI`, `isBlank`, `isLiteral`, `STR`, `LANG`, `DATATYPE`, `REGEX`, 정수와 decimal의 `+`, `-`, `*`, `/`. SPARQL의 오류 의미론을 따른다 | 그 밖의 함수, `xsd:double`의 산술, `IN`, `EXISTS`. SPARQL 1.1이 확장에 맡긴 비교(`xsd:date`의 순서 비교, 언어 태그가 있는 리터럴에 대한 `!=`, 시간대가 있는 dateTime과 없는 dateTime의 비교). `real` 컬럼에 대한 비교. `\d`, `\w`, `\p{..}`, 역참조를 쓰는 `REGEX` |
+| `FILTER` | `=`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `\|\|`, `!`, `BOUND`, `sameTerm`, `isIRI`, `isBlank`, `isLiteral`, `STR`, `LANG`, `DATATYPE`, `REGEX`, 정수·decimal·double의 `+`, `-`, `*`, `/`(double은 IEEE 754 결과). SPARQL의 오류 의미론을 따른다 | 그 밖의 함수, `IN`, `EXISTS`. SPARQL 1.1이 확장에 맡긴 비교(`xsd:date`의 순서 비교, 언어 태그가 있는 리터럴에 대한 `!=`, 시간대가 있는 dateTime과 없는 dateTime의 비교). `real` 컬럼에 대한 비교와 산술. `\d`, `\w`, `\p{..}`, 역참조를 쓰는 `REGEX` |
 | `ORDER BY`, `LIMIT`, `OFFSET` | SPARQL 1.1의 순서. SPARQL이 정하지 않은 부분은 고정된 순서를 쓴다 | `SELECT DISTINCT`가 투영하지 않는 변수에 대한 `ORDER BY` |
 | 리터럴(literal) | RDF 1.1 term 동등성. 언어 태그는 소문자로, `xsd:string`은 simple literal로 다루고, 값은 XSD 1.1 정규 표기(canonical form)로 쓴다 | `FILTER`에서 `xsd:float`와 파생 정수 타입을 값으로 비교하는 것 |
 | 그 밖의 형식 | RDFS 추론 없음. `rdf:type`은 매핑에 명시된 클래스와만 일치한다 | `ASK`, `CONSTRUCT`, `DESCRIBE`, `MINUS`, `VALUES`, `SERVICE` |

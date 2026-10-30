@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Products of doubles in canonical form.
+SELECT ?r (?f * ?g AS ?p) (?n - 1 AS ?m) WHERE { ?r ex:f ?f ; ex:g ?g ; ex:n ?n }

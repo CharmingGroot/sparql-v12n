@@ -357,6 +357,459 @@ async fn bind_and_select_expressions_follow_xpath_numbers() {
     );
 }
 
+/// Doubles where IEEE 754 arithmetic has its edges: zeros of both signs,
+/// subnormals, the largest double, the infinities and NaN, and powers of
+/// two around the bounds that the SQL of each operator checks.
+fn double_edges() -> Vec<f64> {
+    let mut edges = vec![
+        0.0,
+        f64::from_bits(1),
+        f64::from_bits(3),
+        f64::MIN_POSITIVE,
+        2f64.powi(-538),
+        2f64.powi(-537),
+        2f64.powi(-537) * (1.0 + f64::EPSILON),
+        2f64.powi(-538) * (1.0 + f64::EPSILON),
+        2f64.powi(-537) * (1.0 - f64::EPSILON),
+        2f64.powi(-51),
+        2f64.powi(-512),
+        0.1,
+        0.5,
+        1.0 - f64::EPSILON / 2.0,
+        1.0,
+        1.0 + f64::EPSILON,
+        1.5,
+        3.0,
+        2f64.powi(53),
+        2f64.powi(512),
+        2f64.powi(970),
+        1e308,
+        2f64.powi(1023),
+        f64::MAX / 2.0,
+        f64::MAX,
+        f64::INFINITY,
+    ];
+    edges.extend(edges.clone().iter().map(|x| -x));
+    edges.push(f64::NAN);
+    edges
+}
+
+/// A fixed sequence of 64-bit values (xorshift64*), so that the cases
+/// are the same in every run.
+struct Bits(u64);
+
+impl Bits {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// A double of random bits, NaN aside.
+    fn double(&mut self) -> f64 {
+        loop {
+            let x = f64::from_bits(self.next());
+            if !x.is_nan() {
+                return x;
+            }
+        }
+    }
+
+    /// A mantissa in [1, 2).
+    fn mantissa(&mut self) -> f64 {
+        1.0 + (self.next() >> 12) as f64 / (1u64 << 52) as f64
+    }
+
+    /// A pair whose product (`multiply`) or quotient is `m × 2^exponent`
+    /// for `m` 1, 1.5 or random in [1, 2), moved by a few units in the last
+    /// place, with random signs.
+    fn near(&mut self, exponent: i32, multiply: bool) -> (f64, f64) {
+        let m = match self.next() % 3 {
+            0 => 1.0,
+            1 => 1.5,
+            _ => self.mantissa(),
+        };
+        let (am, ae) = (
+            self.mantissa(),
+            exponent / 2 + (self.next() % 41) as i32 - 20,
+        );
+        let mut b = if multiply {
+            m / am * 2f64.powi(exponent - ae)
+        } else {
+            am / m * 2f64.powi(ae - exponent)
+        };
+        for _ in 0..self.next() % 4 {
+            let bits = b.to_bits();
+            b = f64::from_bits(if self.next().is_multiple_of(2) {
+                bits + 1
+            } else {
+                bits - 1
+            });
+        }
+        let mut sign = || {
+            if self.next().is_multiple_of(2) {
+                1.0
+            } else {
+                -1.0
+            }
+        };
+        (am * 2f64.powi(ae) * sign(), b * sign())
+    }
+}
+
+/// Every pair of edge values, pairs whose product or quotient is near
+/// half the smallest subnormal, the smallest subnormals and 2^1024, and
+/// pairs of random bits.
+fn double_pairs() -> Vec<(f64, f64)> {
+    let edges = double_edges();
+    let mut pairs: Vec<(f64, f64)> = edges
+        .iter()
+        .flat_map(|&a| edges.iter().map(move |&b| (a, b)))
+        .collect();
+    let mut bits = Bits(0x9e37_79b9_7f4a_7c15);
+    for exponent in [-1075, -1074, -1073, 1023, 1024] {
+        for multiply in [true, false] {
+            pairs.extend((0..200).map(|_| bits.near(exponent, multiply)));
+        }
+    }
+    pairs.extend((0..1000).map(|_| (bits.double(), bits.double())));
+    pairs
+}
+
+/// `x` as PostgreSQL reads a `float8` exactly.
+fn float8_literal(x: f64) -> String {
+    if x.is_nan() {
+        "'NaN'".to_owned()
+    } else if x.is_infinite() {
+        if x > 0.0 { "'Infinity'" } else { "'-Infinity'" }.to_owned()
+    } else {
+        format!("'{x:e}'")
+    }
+}
+
+fn double_term(x: f64) -> String {
+    format!(
+        "\"{}\"^^<http://www.w3.org/2001/XMLSchema#double>",
+        v12n_core::solution::canonical_double(x)
+    )
+}
+
+/// A table `pairs (id, a, b)` of `float8` values in a new schema, with
+/// its mapping.
+async fn double_pairs_table(url: &str, schema: &str, pairs: &[(f64, f64)]) -> String {
+    let (client, connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    let values: Vec<String> = pairs
+        .iter()
+        .enumerate()
+        .map(|(id, (a, b))| format!("({id}, {}, {})", float8_literal(*a), float8_literal(*b)))
+        .collect();
+    client
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE;
+             CREATE SCHEMA {schema};
+             CREATE TABLE {schema}.pairs (id int PRIMARY KEY, a float8 NOT NULL, b float8 NOT NULL);
+             INSERT INTO {schema}.pairs VALUES {};",
+            values.join(", ")
+        ))
+        .await
+        .unwrap();
+    format!(
+        r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#P> rr:logicalTable [ rr:tableName "{schema}.pairs" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{{id}}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:a ; rr:objectMap [ rr:column "a" ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:b ; rr:objectMap [ rr:column "b" ] ] .
+    "#
+    )
+}
+
+async fn drop_schema(url: &str, schema: &str) {
+    let (client, connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+/// The ids of the rows of [`double_pairs_table`] that `filter` keeps.
+async fn double_filter_rows(url: &str, mapping: &str, filter: &str) -> Vec<usize> {
+    let mut ids: Vec<usize> = filtered_rows(url, mapping, "?row ex:a ?a ; ex:b ?b", filter)
+        .await
+        .iter()
+        .map(|id| id.parse().unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// `xsd:double` arithmetic (#99): every operator gives its IEEE 754
+/// result (XPath F&O 3.1 §4.2) where PostgreSQL's `float8` operators raise
+/// errors (overflow, underflow to zero, division by zero), compared with
+/// Rust's `f64` over edge values, pairs near the bounds and random bits.
+#[tokio::test]
+async fn double_arithmetic_gives_ieee_754_results() {
+    let Some(url) = database_url() else { return };
+    let pairs = double_pairs();
+    let mapping = double_pairs_table(&url, "v12n_dbl99", &pairs).await;
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?row (?a + ?b AS ?sum) (?a - ?b AS ?difference) (?a * ?b AS ?product)
+          (?a / ?b AS ?quotient) (-?a AS ?negated) (+?a AS ?same)
+          ((?a + ?b) * (?a - ?b) AS ?nested)
+        WHERE { ?row ex:a ?a ; ex:b ?b }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    let mut expected: Vec<String> = pairs
+        .iter()
+        .enumerate()
+        .map(|(id, &(a, b))| {
+            let terms = [
+                ("sum", a + b),
+                ("difference", a - b),
+                ("product", a * b),
+                ("quotient", a / b),
+                ("negated", -a),
+                ("same", a),
+                ("nested", (a + b) * (a - b)),
+            ];
+            let mut row = format!("?row=<http://example.org/row/{id}>");
+            for (variable, value) in terms {
+                row.push_str(&format!(" ?{variable}={}", double_term(value)));
+            }
+            row
+        })
+        .collect();
+    expected.sort();
+    for (row, expected) in rows.iter().zip(&expected) {
+        assert_eq!(row, expected);
+    }
+    assert_eq!(rows.len(), expected.len());
+
+    // Comparisons with NaN are false, also under negation; errors are not.
+    let keeps = |test: fn(f64, f64) -> bool| -> Vec<usize> {
+        (0..pairs.len())
+            .filter(|&id| test(pairs[id].0, pairs[id].1))
+            .collect()
+    };
+    type Test = fn(f64, f64) -> bool;
+    let filters: [(&str, Test); 6] = [
+        ("?a * ?b > 1", |a, b| a * b > 1.0),
+        ("!(?a / ?b < 1)", |a, b| a / b >= 1.0 || (a / b).is_nan()),
+        ("?a + ?b = ?a", |a, b| a + b == a),
+        ("!(?a - ?b != 0)", |a, b| a - b == 0.0),
+        ("?a * ?b >= ?a / ?b", |a, b| a * b >= a / b),
+        // Effective boolean value: false for zero and NaN.
+        ("?a * ?b", |a, b| {
+            let p = a * b;
+            p != 0.0 && !p.is_nan()
+        }),
+    ];
+    for (filter, test) in filters {
+        assert_eq!(
+            double_filter_rows(&url, &mapping, filter).await,
+            keeps(test),
+            "{filter}"
+        );
+    }
+    drop_schema(&url, "v12n_dbl99").await;
+}
+
+/// Constants next to double columns: PostgreSQL computes constant parts of
+/// an expression when it plans the query, also in branches of `CASE` that
+/// a row never takes, so no check may fail there either.
+#[tokio::test]
+async fn double_arithmetic_with_constants_plans_without_errors() {
+    let Some(url) = database_url() else { return };
+    let edges = double_edges();
+    let pairs: Vec<(f64, f64)> = edges.iter().map(|&a| (a, 0.0)).collect();
+    let mapping = double_pairs_table(&url, "v12n_dbl99_constants", &pairs).await;
+    let constants = [
+        "0e0",
+        "-0e0",
+        "4.9e-324",
+        "-4.9e-324",
+        "1e-300",
+        "1.5e0",
+        "1e300",
+        "1.7976931348623157e308",
+        "\"INF\"^^xsd:double",
+        "\"-INF\"^^xsd:double",
+        "\"NaN\"^^xsd:double",
+        "0",
+        "-3",
+        "2.5",
+    ];
+    for constant in constants {
+        let c: f64 = sparql_double(constant);
+        let query = format!(
+            "PREFIX ex: <http://example.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             SELECT ?row (?a + {constant} AS ?s1) ({constant} - ?a AS ?s2)
+               (?a * {constant} AS ?p1) ({constant} * ?a AS ?p2)
+               (?a / {constant} AS ?q1) ({constant} / ?a AS ?q2)
+               ({constant} * {constant} / ?a AS ?q3)
+             WHERE {{ ?row ex:a ?a }}"
+        );
+        let (rows, _) = run(&url, Limits::default(), &plan(&mapping, &query))
+            .await
+            .unwrap_or_else(|e| panic!("{constant}: {e}"));
+        let mut expected: Vec<String> = edges
+            .iter()
+            .enumerate()
+            .map(|(id, &a)| {
+                let mut row = format!("?row=<http://example.org/row/{id}>");
+                for (variable, value) in [
+                    ("s1", a + c),
+                    ("s2", c - a),
+                    ("p1", a * c),
+                    ("p2", c * a),
+                    ("q1", a / c),
+                    ("q2", c / a),
+                    ("q3", c * c / a),
+                ] {
+                    row.push_str(&format!(" ?{variable}={}", double_term(value)));
+                }
+                row
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(rows, expected, "{constant}");
+    }
+    drop_schema(&url, "v12n_dbl99_constants").await;
+}
+
+/// The double that a numeric constant of [`double_arithmetic_with_constants_plans_without_errors`]
+/// is promoted to.
+fn sparql_double(constant: &str) -> f64 {
+    match constant {
+        "\"INF\"^^xsd:double" => f64::INFINITY,
+        "\"-INF\"^^xsd:double" => f64::NEG_INFINITY,
+        "\"NaN\"^^xsd:double" => f64::NAN,
+        number => number.parse().unwrap(),
+    }
+}
+
+/// `DISTINCT` over computed doubles keeps `-0.0E0` and `0.0E0` apart,
+/// which `float8`'s `=` finds equal, and keeps one NaN.
+#[tokio::test]
+async fn distinct_double_results_are_distinct_terms() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        "SELECT * FROM (VALUES (1, '0'::float8), (2, '-0'), (3, 'NaN'), (4, 'NaN'), \
+           (5, 1), (6, 1)) v(id, a)",
+        &["a"],
+    );
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT DISTINCT (?a * 1e0 AS ?v) WHERE { ?row ex:a ?a }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    let mut expected = [0.0, -0.0, f64::NAN, 1.0].map(|x| format!("?v={}", double_term(x)));
+    expected.sort();
+    assert_eq!(rows, expected);
+}
+
+/// 2^-1075, half the smallest subnormal, as an exact decimal: 5^1075
+/// over 10^1075.
+fn half_minimum_decimal() -> String {
+    let mut digits = vec![1u8];
+    for _ in 0..1075 {
+        let mut carry = 0;
+        for digit in digits.iter_mut() {
+            let product = *digit * 5 + carry;
+            *digit = product % 10;
+            carry = product / 10;
+        }
+        if carry > 0 {
+            digits.push(carry);
+        }
+    }
+    let fraction: String = digits.iter().rev().map(|d| char::from(b'0' + d)).collect();
+    format!("0.{fraction:0>1075}")
+}
+
+/// Integers and decimals promoted to doubles (F&O 3.1 §19.1.2.2): the
+/// nearest double, ties to even, an infinity from 2^1024 − 2^970 and a
+/// zero of the decimal's sign at 2^-1075, where PostgreSQL raises errors;
+/// a `numeric` NaN or infinity is not a decimal, so promoting it is an
+/// error.
+#[tokio::test]
+async fn integers_and_decimals_promote_to_the_nearest_double() {
+    let Some(url) = database_url() else { return };
+    // 2^1024 − 2^970, the midpoint between the largest double and 2^1024.
+    let midpoint = "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792";
+    let half_minimum = half_minimum_decimal();
+    let decimals = [
+        midpoint.to_owned(),
+        format!("{}1", &midpoint[..midpoint.len() - 1]),
+        format!("-{midpoint}"),
+        "1e400".to_owned(),
+        "-1e-400".to_owned(),
+        half_minimum.clone(),
+        format!("-{half_minimum}1"),
+        "0.1".to_owned(),
+        "123456789012345678901234567890.5".to_owned(),
+        "-0.0000000000000000000000000000000000000000000000000000000000000001".to_owned(),
+    ];
+    let rows: Vec<String> = decimals
+        .iter()
+        .enumerate()
+        .map(|(id, d)| format!("({id}, '{d}'::numeric, {id}::int8)"))
+        .chain([
+            "(100, 'NaN'::numeric, 9223372036854775807::int8)".to_owned(),
+            "(101, 'Infinity'::numeric, -9223372036854775807::int8)".to_owned(),
+        ])
+        .collect();
+    let mapping = sql_query_mapping(
+        &format!("SELECT * FROM (VALUES {}) v(id, d, i)", rows.join(", ")),
+        &["d", "i"],
+    );
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?row (?d * 1e0 AS ?dd) ((?i + 1) * 1e0 AS ?ii) (?d / 1e0 + ?i AS ?mixed)
+        WHERE { ?row ex:d ?d ; ex:i ?i }";
+    let (got, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    // Rust reads a decimal as its nearest double, ties to even.
+    let mut expected: Vec<String> = decimals
+        .iter()
+        .enumerate()
+        .map(|(id, d)| {
+            let (d, i) = (d.parse::<f64>().unwrap(), id as f64);
+            format!(
+                "?row=<http://example.org/row/{id}> ?dd={} ?ii={} ?mixed={}",
+                double_term(d),
+                double_term(i + 1.0),
+                double_term(d + i)
+            )
+        })
+        .chain([
+            format!(
+                "?row=<http://example.org/row/100> ?ii={}",
+                double_term(9_223_372_036_854_775_808.0)
+            ),
+            format!(
+                "?row=<http://example.org/row/101> ?ii={}",
+                double_term(-9_223_372_036_854_775_806.0)
+            ),
+        ])
+        .collect();
+    expected.sort();
+    assert_eq!(got, expected);
+
+    let rows = |filter: &'static str| {
+        let (url, mapping) = (url.clone(), mapping.clone());
+        async move { filtered_rows(&url, &mapping, "?row ex:d ?d", filter).await }
+    };
+    // A numeric infinity is not INF: comparing it is an error.
+    assert_eq!(rows("?d = \"INF\"^^xsd:double").await, ["0", "3"]);
+    assert_eq!(rows("!(?d < 1e0)").await, ["0", "1", "3", "8"]);
+}
+
 #[tokio::test]
 async fn natural_mapping_covers_postgres_types() {
     let Some(url) = database_url() else { return };

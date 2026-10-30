@@ -134,6 +134,7 @@ pub type ValueCases = Vec<(Vec<Condition>, FilterValue)>;
 pub enum ValueKind {
     Integer,
     Decimal,
+    Double,
 }
 
 /// An `OPTIONAL` part of a branch: `LEFT JOIN (tables) ON conditions`, so
@@ -191,9 +192,9 @@ pub enum SqlExpr {
         term: TermSql,
         guard: Option<Box<SqlExpr>>,
     },
-    /// Entry `value` of [`SqlBranch::values`] as `numeric` where it is a
-    /// number of class `kind`, `NULL` where it is another class or an
-    /// error.
+    /// Entry `value` of [`SqlBranch::values`] where it is a number of
+    /// class `kind` (`float8` for a double, `numeric` otherwise), `NULL`
+    /// where it is another class or an error.
     Value { value: usize, kind: ValueKind },
 }
 

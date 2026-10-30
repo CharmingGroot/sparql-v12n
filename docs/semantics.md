@@ -453,13 +453,32 @@ Comparisons follow the SPARQL operator mapping.
 | IRIs, blank nodes, and literals of other types | `=` and `!=` only, as RDF terms (RDFterm-equal). `<` and the other operators are an error. Two different literals are an error. |
 
 Arithmetic (`+`, `-`, `*`, `/` and unary minus) is supported on
-integers and decimals. The result follows XPath's type promotion: an
-integer divided by an integer is a decimal (`7 / 2` is `3.5`). SQL
-computes it in `numeric`, so a sum of large integers does not overflow
-`int8`. A division by zero, a `numeric` NaN or infinity, and an operand
-that is not a number are errors. Arithmetic on `xsd:double` values, and
-`STR`, `LANG`, `DATATYPE` or `sameTerm` of an arithmetic result, are
-rejected as unsupported for now (Discussion #144).
+integers, decimals and doubles. The result follows XPath's type
+promotion: an integer divided by an integer is a decimal (`7 / 2` is
+`3.5`), and an operation with an `xsd:double` operand is a double. SQL
+computes integers and decimals in `numeric`, so a sum of large integers
+does not overflow `int8`. A division by zero of integers or decimals, a
+`numeric` NaN or infinity, and an operand that is not a number are
+errors. `STR`, `LANG`, `DATATYPE` or `sameTerm` of an arithmetic result
+are rejected as unsupported for now (Discussion #144).
+
+Doubles follow IEEE 754, as XPath requires:
+
+- A division by zero gives `INF` or `-INF` by the signs of both
+  operands, the sign of a zero included, and `0e0 / 0` gives `NaN`.
+- A result too large for a double is an infinity, and a result too small
+  is a zero of its sign.
+- NaN is neither equal to nor ordered with anything, so `!(?x * 2 > 0)`
+  holds for a NaN.
+
+PostgreSQL's `float8` operators raise errors in these cases, so the SQL
+of each operator checks for them first, with checks that are exact. The
+PostgreSQL tests compare every operator with IEEE 754 over edge values,
+pairs near the bounds and random operands. An integer or decimal operand
+becomes the nearest double. A decimal of 2^1024 − 2^970 or more in
+magnitude becomes an infinity, and one of 2^-1075 or less a zero of its
+sign (XML Schema 1.1, `floatingPointRound`). Arithmetic on constants
+only is computed before the query is sent.
 
 A constant compared with a column is converted to the type of the column
 where that gives the same answer. An index on the column can then be
@@ -513,14 +532,15 @@ differently from engines that extend SPARQL:
   datatype is not in the table above, such as `xsd:date`;
 - ordering or comparing two language-tagged literals, except with `=`
   outside a negation;
-- comparisons over any of the following:
-  - `real` columns;
+- comparisons and arithmetic over any of the following:
+  - `real` columns, whose `xsd:double` literals have the value of their
+    shortest decimal form;
   - values of a column whose `rr:datatype` is a numeric, boolean or
     dateTime datatype other than the natural datatype of the column;
   - `xsd:float` and the derived integer types;
   - dateTime constants outside the years 1 to 9999, or finer than a
     microsecond;
-- other functions, arithmetic on `xsd:double`, `IN`, `EXISTS`, and
+- other functions, `IN`, `EXISTS`, and
   expressions other than terms and arithmetic (variables, constants, and `STR`, `LANG` or `DATATYPE` of
   them) as operands;
 - string ordering and `REGEX` in a database whose encoding is not UTF-8.
@@ -537,6 +557,9 @@ a variable, a constant, or arithmetic as in [`FILTER`](#filter):
   an integer column, `?qty * 2` is an `xsd:integer` and `?qty / 4` is an
   `xsd:decimal`. The precision of a decimal division, which XPath leaves
   to the implementation, is that of PostgreSQL's `numeric` division.
+  `?qty * 1.5e0` is an `xsd:double`, such as `1.5E0`, `-0.0E0`, `INF` or
+  `NaN`. `SELECT DISTINCT` keeps `-0.0E0` and `0.0E0` apart, which are
+  different terms.
 - An error, such as a division by zero or an operand that is not a
   number, leaves `?v` unbound. The solution is kept.
 

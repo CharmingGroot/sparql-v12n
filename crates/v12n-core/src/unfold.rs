@@ -33,6 +33,7 @@ pub const MAX_BRANCHES: usize = 64;
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const XSD_DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
+const XSD_DOUBLE: &str = "http://www.w3.org/2001/XMLSchema#double";
 
 /// Unfolds a query into a SQL plan over the mapping's logical tables.
 ///
@@ -1190,13 +1191,39 @@ enum Computed<'q> {
     },
 }
 
-/// The classes of number an arithmetic expression can give: a division
-/// always gives a decimal (op:numeric-divide).
+/// The classes of number an arithmetic expression can give, by XPath's
+/// type promotion: a double constant makes every enclosing result a
+/// double; otherwise a division gives a decimal (op:numeric-divide), and
+/// a variable may be a double column.
 fn value_kinds(expression: &Expression) -> Vec<ValueKind> {
+    if has_double_constant(expression) {
+        return vec![ValueKind::Double];
+    }
+    let mut kinds = exact_kinds(expression);
+    if !expression.variables().is_empty() {
+        kinds.push(ValueKind::Double);
+    }
+    kinds
+}
+
+/// The classes of an arithmetic expression over integers and decimals.
+fn exact_kinds(expression: &Expression) -> Vec<ValueKind> {
     match expression {
         Expression::Arith(ArithOp::Divide, ..) => vec![ValueKind::Decimal],
-        Expression::Negate(inner) => value_kinds(inner),
+        Expression::Negate(inner) => exact_kinds(inner),
         _ => vec![ValueKind::Integer, ValueKind::Decimal],
+    }
+}
+
+fn has_double_constant(expression: &Expression) -> bool {
+    match expression {
+        Expression::Constant(Term::Literal(literal)) => matches!(
+            crate::xsd::value(literal.value(), literal.datatype().as_str()),
+            crate::xsd::Value::Numeric(n) if n.class == crate::xsd::Num::Double
+        ),
+        Expression::Arith(_, a, b) => has_double_constant(a) || has_double_constant(b),
+        Expression::Negate(inner) => has_double_constant(inner),
+        _ => false,
     }
 }
 
@@ -1368,6 +1395,7 @@ fn plan(
                             match kind {
                                 ValueKind::Integer => XSD_INTEGER,
                                 ValueKind::Decimal => XSD_DECIMAL,
+                                ValueKind::Double => XSD_DOUBLE,
                             }
                             .to_owned(),
                         ),
