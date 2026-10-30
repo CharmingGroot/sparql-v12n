@@ -6,6 +6,7 @@
 //! columns are missing.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, PoisonError};
 
 use futures_util::future::{join, join_all, join4};
 use tokio_postgres::error::SqlState;
@@ -25,8 +26,10 @@ use crate::decode::column_type;
 /// rows that keys, column types, names and foreign keys are read from
 /// (Discussion #187). Non-unique indexes are left out, since they do not
 /// change results. A table that does not exist hashes one constant line,
-/// so that creating it changes the fingerprint.
-const FINGERPRINT_SQL: &str = "WITH t AS (
+/// so that creating it changes the fingerprint. `MATERIALIZED` resolves
+/// each name once; inlined, every branch resolves it again and scans
+/// `pg_index` and `pg_constraint` without an index.
+const FINGERPRINT_SQL: &str = "WITH t AS MATERIALIZED (
    SELECT n::int4, to_regclass(name) AS rel
    FROM unnest($1::text[]) WITH ORDINALITY AS t(name, n))
  SELECT t.n, t.rel IS NOT NULL,
@@ -77,7 +80,15 @@ pub(crate) struct CatalogStatements {
     not_null: Statement,
     keys: Statement,
     foreign_keys: Statement,
+    /// [`FINGERPRINT_SQL`] for one set of tables, with the names written
+    /// in it ([`fingerprint_sql_of`]), by those names. PostgreSQL plans
+    /// such a statement once; the one with `$1` it plans again on every
+    /// run, since a generic plan cannot know how many names it gets.
+    fingerprints_of: Mutex<HashMap<Vec<String>, Statement>>,
 }
+
+/// Most table sets whose fingerprint statement a connection keeps.
+const FINGERPRINT_STATEMENTS: usize = 64;
 
 impl CatalogStatements {
     pub(crate) async fn prepare(client: &Client) -> Result<Self, tokio_postgres::Error> {
@@ -93,8 +104,59 @@ impl CatalogStatements {
             not_null: not_null?,
             keys: keys?,
             foreign_keys: foreign_keys?,
+            fingerprints_of: Mutex::new(HashMap::new()),
         })
     }
+
+    /// The fingerprints of the tables named in `names`. The first time a
+    /// set of names comes, the statement with `$1` reads them and the one
+    /// with the names written in it is prepared in the same round trip,
+    /// for the next time.
+    async fn fingerprints(
+        &self,
+        client: &Client,
+        names: &[String],
+    ) -> Result<Vec<Row>, tokio_postgres::Error> {
+        let known = self
+            .fingerprints_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(names)
+            .cloned();
+        if let Some(statement) = known {
+            return client.query(&statement, &[]).await;
+        }
+        let (rows, prepared) = join(
+            client.query(&self.fingerprints, &[&names]),
+            client.prepare(&fingerprint_sql_of(names)),
+        )
+        .await;
+        if let Ok(statement) = prepared {
+            let mut known = self
+                .fingerprints_of
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if known.len() >= FINGERPRINT_STATEMENTS {
+                known.clear();
+            }
+            known.insert(names.to_vec(), statement);
+        }
+        rows
+    }
+}
+
+/// [`FINGERPRINT_SQL`] with `names` written in place of `$1`, each as an
+/// escape string literal, whose meaning does not depend on
+/// `standard_conforming_strings`.
+fn fingerprint_sql_of(names: &[String]) -> String {
+    let literals: Vec<String> = names
+        .iter()
+        .map(|name| format!("E'{}'", name.replace('\\', "\\\\").replace('\'', "''")))
+        .collect();
+    FINGERPRINT_SQL.replace(
+        "$1::text[]",
+        &format!("ARRAY[{}]::text[]", literals.join(", ")),
+    )
 }
 
 pub(crate) async fn load(
@@ -134,6 +196,9 @@ pub(crate) async fn is_current(
     statements: &CatalogStatements,
     plan: &CatalogPlan,
 ) -> Result<bool, tokio_postgres::Error> {
+    if !plan.needs_check() {
+        return Ok(true);
+    }
     let mut names = Vec::new();
     let mut expected = Vec::new();
     let mut queries = Vec::new();
@@ -155,7 +220,7 @@ pub(crate) async fn is_current(
         if names.is_empty() {
             return Ok(Vec::new());
         }
-        client.query(&statements.fingerprints, &[&names]).await
+        statements.fingerprints(client, &names).await
     };
     let (rows, queries) = join(
         read_fingerprints,
@@ -375,4 +440,19 @@ fn database_message(error: &tokio_postgres::Error) -> String {
     error
         .as_db_error()
         .map_or_else(|| error.to_string(), |db| db.message().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_sql_of_writes_names_as_escape_strings() {
+        let sql = fingerprint_sql_of(&["\"a'b\"".into(), "\"c\\d\"".into()]);
+        assert!(
+            sql.contains("unnest(ARRAY[E'\"a''b\"', E'\"c\\\\d\"']::text[])"),
+            "{sql}"
+        );
+        assert!(!sql.contains('$'), "{sql}");
+    }
 }

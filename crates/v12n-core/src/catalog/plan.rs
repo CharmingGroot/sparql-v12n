@@ -25,6 +25,8 @@ pub struct CatalogPlan {
     column_types: Option<ColumnTypes>,
     snapshot: Arc<CatalogSnapshot>,
     tables: Vec<LogicalTable>,
+    /// Whether the backend checks the entries before it runs the plan.
+    check: bool,
 }
 
 impl CatalogPlan {
@@ -73,6 +75,7 @@ impl CatalogPlan {
             column_types,
             snapshot,
             tables,
+            check: true,
         })
     }
 
@@ -88,6 +91,23 @@ impl CatalogPlan {
             keys: self.keys.as_ref(),
             ..RenderOptions::default()
         }
+    }
+
+    /// The plan without the check, for entries read from the database in
+    /// the round trip before: checking them would compare them with
+    /// themselves, and a change committed since is no more likely than
+    /// one committed between a check and the statement.
+    pub fn without_check(self) -> Self {
+        Self {
+            check: false,
+            ..self
+        }
+    }
+
+    /// Whether the backend has to check [`entries`](Self::entries) before it
+    /// runs the plan.
+    pub fn needs_check(&self) -> bool {
+        self.check
     }
 
     /// The catalog entries the plan was completed from. The backend runs

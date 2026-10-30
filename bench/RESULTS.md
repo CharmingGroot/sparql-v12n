@@ -220,6 +220,70 @@ there). The CLI opens a new connection per query, so it has no earlier
 statements to reuse and takes three round trips instead of four or five;
 its time is mostly process start and connecting. 1M was not re-run.
 
+## Catalog snapshot after #110
+
+[#110](https://github.com/CharmingGroot/sparql-v12n/issues/110) reads keys,
+column types and resolved names into a catalog snapshot instead of on
+every query, and checks a fingerprint of the catalog rows of a plan's
+tables in the round trip that prepares the statement
+(Discussion [#187](https://github.com/CharmingGroot/sparql-v12n/discussions/187)).
+`v12n serve` reads the snapshot at startup; `v12n query` reads the tables
+of its plan and does not check them again.
+
+One session on 2026-10-30, 100k data in the testenv PostgreSQL 17
+(Docker), host load average 4 to 5, release builds of `fb31cee` (before)
+and of the change (after), alternating A/B and B/A: 5 warm-up and 60 timed
+HTTP requests per query, 20 `v12n query` runs per query. Milliseconds,
+median / p95 (first row and CLI: median). The spread is the difference
+between the odd and even runs of the build before; a change within it
+counts as no change. Every query returned the same results on both
+builds. Round trips are counted by the proxy of `bench.py`; later
+requests take 2 on both builds.
+
+| Query | Round trips, first request | HTTP before | after | change | spread | First row before | after | CLI before | after | change | spread |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| q01-lookup | 3 → 2 | 0.653 / 0.754 | 0.624 / 0.683 | −4.5% | 1.3% | 0.650 | 0.620 | 10.61 | 10.97 | +3.4% | 5.3% |
+| q02-join | 3 → 2 | 2.571 / 3.592 | 2.480 / 3.030 | −3.5% | 2.7% | 1.644 | 1.581 | 13.08 | 13.78 | +5.3% | 1.5% |
+| q03-star | 3 → 2 | 1.933 / 2.362 | 1.888 / 2.282 | −2.3% | 4.3% | 0.979 | 0.943 | 11.50 | 12.36 | +7.4% | 2.2% |
+| q04-optional | 3 → 2 | 6.590 / 7.729 | 6.510 / 7.662 | −1.2% | 1.0% | 1.869 | 1.870 | 17.12 | 17.40 | +1.6% | 0.3% |
+| q05-filter | 3 → 2 | 6.481 / 8.341 | 6.427 / 10.039 | −0.8% | 2.1% | 1.557 | 1.394 | 17.07 | 17.89 | +4.8% | 2.0% |
+| q06-union | 3 → 2 | 6.812 / 8.135 | 6.908 / 8.420 | +1.4% | 1.1% | 1.492 | 1.489 | 17.29 | 18.45 | +6.7% | 0.4% |
+| q07-order-limit | 3 → 2 | 1.281 / 2.088 | 1.224 / 2.280 | −4.5% | 2.6% | 1.271 | 1.213 | 11.57 | 12.29 | +6.2% | 1.2% |
+| q08-distinct-keyless | 3 → 2 | 21.399 / 23.088 | 21.235 / 22.089 | −0.8% | 0.3% | 18.254 | 18.190 | 29.02 | 30.85 | +6.3% | 0.0% |
+| q09-keyless-set | 3 → 2 | 12.817 / 13.533 | 12.908 / 13.627 | +0.7% | 1.7% | 9.508 | 9.724 | 22.13 | 23.00 | +4.0% | 1.0% |
+
+Over HTTP, q01, q02 and q07 are 3.5–4.5% faster, q04 is 1.2% faster
+and q06 1.4% slower, each 0.2–0.3 points beyond the spread, and the
+others change within it. The CLI is 0.3–1.8 ms slower for every query but
+q01 (+1.6% to +7.4%): each run opens a new connection, on which
+PostgreSQL plans every catalog query, and the snapshot also reads
+`NOT NULL`, foreign keys and fingerprints. A `v12n query` run takes 6
+round trips on both builds, connection included. Server startup took 15.6 → 15.2 ms
+(−2.8%, spread 1.5%, 10 starts each) and 3 → 4 round trips.
+
+The first version of the change (`8a0c547`) passed the table names of
+the check as `$1`. PostgreSQL then planned the fingerprint query on every
+run, since a generic plan cannot know how many names it gets, and the
+inlined CTE resolved each name once per branch. Each connection now
+prepares the query once per set of tables, with the names written in it.
+In the same session, against `8a0c547`:
+
+| Query | HTTP `8a0c547` | after | change | spread | CLI `8a0c547` | after | change | spread |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| q01-lookup | 0.734 | 0.649 | −11.7% | 0.6% | 11.35 | 10.86 | −4.2% | 0.3% |
+| q02-join | 3.315 | 3.160 | −4.7% | 14.7% | 14.11 | 13.45 | −4.7% | 1.9% |
+| q03-star | 2.032 | 1.865 | −8.2% | 3.5% | 12.73 | 12.51 | −1.8% | 4.5% |
+| q04-optional | 6.857 | 6.698 | −2.3% | 1.0% | 17.84 | 17.61 | −1.3% | 0.1% |
+| q05-filter | 6.586 | 6.297 | −4.4% | 3.3% | 18.07 | 18.11 | +0.2% | 0.6% |
+| q06-union | 6.840 | 6.750 | −1.3% | 1.2% | 17.84 | 17.62 | −1.2% | 0.1% |
+| q07-order-limit | 1.292 | 1.206 | −6.6% | 1.9% | 12.77 | 12.55 | −1.7% | 3.8% |
+| q08-distinct-keyless | 21.814 | 21.191 | −2.9% | 0.4% | 31.09 | 30.87 | −0.7% | 0.9% |
+| q09-keyless-set | 12.869 | 12.650 | −1.7% | 0.3% | 23.64 | 23.35 | −1.2% | 1.4% |
+
+Over HTTP the change is 1.3–11.7% faster than `8a0c547` for every query
+but q02, whose spread was 14.7% in this run; the CLI is 1.2–4.7% faster
+for q01, q02, q04 and q06 and changes within the spread for the others.
+
 ## Analysis
 
 **Where v12n is faster.** On every query that returns many rows, by 7–8×
