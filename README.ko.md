@@ -148,30 +148,36 @@ Ontop 엔드포인트도 여기서 설명하며, 이 예제에는 필요하지 �
 
 ## 로드맵
 
-지원 범위는 아래 순서대로 넓어진다. 각 단계는 하나의
-[마일스톤](https://github.com/CharmingGroot/sparql-v12n/milestones)이며, 화살표는
-뒤 단계가 앞 단계를 바탕으로 만들어진다는 뜻이다.
+예정된 작업은 [마일스톤](https://github.com/CharmingGroot/sparql-v12n/milestones)으로
+묶는다. 화살표는 뒤 마일스톤이 앞 마일스톤의 작업을 사용한다는 뜻이다. 경로로
+이어지지 않은 마일스톤끼리는 서로 의존하지 않는다. 점선 상자는 main 브랜치에
+반영된 작업이 아직 없는 마일스톤이다. 상태는 릴리스가 아니라 main 브랜치 기준이며,
+현재 지원 범위와 제약은 [지원하는 SPARQL](#지원하는-sparql)에 있다.
 
 ```mermaid
 flowchart LR
-  R1["1. 값 식"] --> R2["3. 연산자와 쿼리 형식"] --> R3["4. 집계"]
-  M["2. 카탈로그 메타데이터"] --> O1["5. RDFS 온톨로지"] --> O2["7. OWL 2 QL 온톨로지"]
-  M --> R4["6. 그래프 패턴과 경로"]
+  M["M 카탈로그 메타데이터"] --> O1["O1 RDFS 온톨로지"] --> O2["O2 OWL 2 QL 온톨로지"]
+  M --> R4["R4 그래프 패턴과 경로"]
   O1 --> R4
-  D["8. 더 많은 데이터베이스"]
+  M --> D["D 더 많은 데이터베이스"]
+  R1["R1 값 식<br/>(일부 지원)"] --> R3["R3 집계"]
+  R2["R2 연산자와 쿼리 형식<br/>(일부 지원)"]
+  classDef planned stroke-dasharray: 5 4
+  class R3,M,O1,O2,R4,D planned
 ```
 
-1. 값 식: `BIND`, `SELECT` 안의 식, 산술, SPARQL 1.1 함수
-2. 한 번 읽고 갱신하는 카탈로그 메타데이터, NOT NULL과 외래 키 제약을 이용한 최적화
-3. `VALUES`, `MINUS`, `EXISTS`, 하위 쿼리, `ASK`, `CONSTRUCT`,
-   `DESCRIBE`, 추가 결과 형식
-4. `GROUP BY`와 집계
-5. 온톨로지: RDFS entailment
-6. 변수 술어, named graph, property path
-7. 온톨로지: OWL 2 QL
-8. PostgreSQL 이외의 데이터베이스
+| 마일스톤 | main에 반영된 것 | 남은 작업 |
+|---|---|---|
+| [R1 값 식](https://github.com/CharmingGroot/sparql-v12n/milestone/1) | `FILTER`의 산술, `BIND`와 `SELECT` 식 | 조건 함수, RDF term 함수, 문자열·수치·날짜와 시간·해시 함수, 형 변환, `ORDER BY`의 새 식 |
+| [R2 연산자와 쿼리 형식](https://github.com/CharmingGroot/sparql-v12n/milestone/3) | SPARQL XML, CSV, TSV 결과 | `VALUES`, `MINUS`, `EXISTS`, 하위 쿼리, `ASK`, `CONSTRUCT`, `DESCRIBE` |
+| [R3 집계](https://github.com/CharmingGroot/sparql-v12n/milestone/4) | | `GROUP BY`, `HAVING`, 집계 함수 |
+| [M 카탈로그 메타데이터](https://github.com/CharmingGroot/sparql-v12n/milestone/2) | | 엔진과 백엔드 포트, 한 번 읽고 갱신하는 카탈로그 메타데이터, NOT NULL과 외래 키 제약을 이용한 최적화 |
+| [O1 RDFS 온톨로지](https://github.com/CharmingGroot/sparql-v12n/milestone/5) | | RDFS entailment |
+| [O2 OWL 2 QL 온톨로지](https://github.com/CharmingGroot/sparql-v12n/milestone/7) | | OWL 2 QL |
+| [R4 그래프 패턴과 경로](https://github.com/CharmingGroot/sparql-v12n/milestone/6) | | 변수 술어, named graph, property path |
+| [D 더 많은 데이터베이스](https://github.com/CharmingGroot/sparql-v12n/milestone/8) | PostgreSQL 전용 SQL 문법을 `Dialect` trait으로 분리 | PostgreSQL 외의 두 번째 데이터베이스 |
 
-이 단계들 다음으로 AI 에이전트용 MCP 서버를 계획하고 있다.
+이 마일스톤들 다음으로 AI 에이전트용 MCP 서버를 계획하고 있다.
 
 ## 디렉터리 구성
 

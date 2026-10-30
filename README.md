@@ -152,30 +152,36 @@ formats and exit codes, and the HTTP endpoint with its settings.
 
 ## Roadmap
 
-The supported subset grows in the order below. Each step is a
-[milestone](https://github.com/CharmingGroot/sparql-v12n/milestones), and
-an arrow means the later step builds on the earlier one.
+Planned work is grouped into
+[milestones](https://github.com/CharmingGroot/sparql-v12n/milestones). An
+arrow means that the later milestone uses work from the earlier one.
+Milestones with no path between them do not depend on each other. Dashed
+boxes have no work on the main branch yet. Status refers to the main
+branch, not to a release; [Supported SPARQL](#supported-sparql) lists
+what works today and its limits.
 
 ```mermaid
 flowchart LR
-  R1["1. Value expressions"] --> R2["3. Operators and query forms"] --> R3["4. Aggregates"]
-  M["2. Catalog metadata"] --> O1["5. RDFS ontologies"] --> O2["7. OWL 2 QL ontologies"]
-  M --> R4["6. Graph patterns and paths"]
+  M["M Catalog metadata"] --> O1["O1 RDFS ontologies"] --> O2["O2 OWL 2 QL ontologies"]
+  M --> R4["R4 Graph patterns and paths"]
   O1 --> R4
-  D["8. More databases"]
+  M --> D["D More databases"]
+  R1["R1 Value expressions<br/>(partly done)"] --> R3["R3 Aggregates"]
+  R2["R2 Operators and query forms<br/>(partly done)"]
+  classDef planned stroke-dasharray: 5 4
+  class R3,M,O1,O2,R4,D planned
 ```
 
-1. Value expressions: `BIND`, expressions in `SELECT`, arithmetic and the
-   SPARQL 1.1 functions
-2. Catalog metadata loaded once and refreshed, with optimizations from
-   NOT NULL and foreign key constraints
-3. `VALUES`, `MINUS`, `EXISTS`, subqueries, `ASK`, `CONSTRUCT`,
-   `DESCRIBE`, and more result formats
-4. `GROUP BY` and aggregates
-5. Ontologies: RDFS entailment
-6. Variable predicates, named graphs and property paths
-7. Ontologies: OWL 2 QL
-8. Databases other than PostgreSQL
+| Milestone | On main | Remaining |
+|---|---|---|
+| [R1 Value expressions](https://github.com/CharmingGroot/sparql-v12n/milestone/1) | Arithmetic in `FILTER`, `BIND` and `SELECT` expressions | Conditional, RDF term, string, numeric, date and time and hash functions, casts, and the new expressions in `ORDER BY` |
+| [R2 Operators and query forms](https://github.com/CharmingGroot/sparql-v12n/milestone/3) | SPARQL XML, CSV and TSV results | `VALUES`, `MINUS`, `EXISTS`, subqueries, `ASK`, `CONSTRUCT`, `DESCRIBE` |
+| [R3 Aggregates](https://github.com/CharmingGroot/sparql-v12n/milestone/4) | | `GROUP BY`, `HAVING` and the aggregate functions |
+| [M Catalog metadata](https://github.com/CharmingGroot/sparql-v12n/milestone/2) | | Engine and backend ports, catalog metadata loaded once and refreshed, optimizations from NOT NULL and foreign key constraints |
+| [O1 RDFS ontologies](https://github.com/CharmingGroot/sparql-v12n/milestone/5) | | RDFS entailment |
+| [O2 OWL 2 QL ontologies](https://github.com/CharmingGroot/sparql-v12n/milestone/7) | | OWL 2 QL |
+| [R4 Graph patterns and paths](https://github.com/CharmingGroot/sparql-v12n/milestone/6) | | Variable predicates, named graphs and property paths |
+| [D More databases](https://github.com/CharmingGroot/sparql-v12n/milestone/8) | PostgreSQL-specific SQL syntax behind a `Dialect` trait | A second database besides PostgreSQL |
 
 An MCP server for AI agents is planned after these.
 
