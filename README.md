@@ -25,6 +25,21 @@ English | [한국어](README.ko.md) | [简体中文](README.zh-CN.md)
 > Status: experimental. The supported subset below is tested against Ontop and
 > the W3C R2RML test cases. Commands, output and APIs may change before 1.0.
 
+## Purpose
+
+v12n queries data that stays in a relational database as an RDF graph,
+without loading it into a separate RDF store. The R2RML mapping defines
+the graph. Each query runs as SQL on the source tables, and only the rows
+of its result are turned into RDF terms. A performance goal of the
+project is to convert and return large `SELECT` results efficiently, from
+the database rows to the serialized response.
+
+The engine is worth evaluating when the data is in PostgreSQL, the
+queries fit the [supported subset](#supported-sparql), and the classes
+and properties that the mapping states are enough without ontology
+reasoning. It is experimental and supports PostgreSQL only.
+[Performance](#performance) links the benchmark against Ontop.
+
 ## Install
 
 Download the archive for your platform from the
@@ -229,6 +244,43 @@ query to 64 KiB and serves at most 16 requests at a time.
 
 [docs/usage.md](docs/usage.md) describes each command with its output
 formats and exit codes, and the HTTP endpoint with its settings.
+
+## Performance
+
+[bench/README.md](bench/README.md) describes the benchmark against Ontop
+on the same PostgreSQL, mapping and queries, and
+[bench/RESULTS.md](bench/RESULTS.md) reports the results and their
+analysis. A timing counts only when the engine returns the same solutions
+as Ontop.
+
+The figures below come from one benchmark session on 2026-10-26 at
+commit `57f7f63`. They are not measurements of the current main branch.
+PostgreSQL 17.11 held 1,000,000 rows in `alerts`, 100,000 in `assets`,
+200,000 in `links` and 2,200,000 in `observables`. v12n ran natively on
+an Apple M4 (16 GiB) under macOS, and Ontop 5.5.0 (`-Xmx256m`) and
+PostgreSQL ran in the Docker Desktop VM. Each time is the median of 10
+runs, from sending a SPARQL 1.1 Protocol request on a new connection to
+the end of the JSON response.
+
+| Query | Result rows | v12n (ms) | Ontop (ms) |
+|---|---:|---:|---:|
+| `q06-union` | 145,000 | 124.5 | 1267.4 |
+| `q07-order-limit` | 100 | 194.8 | 142.9 |
+
+In that session v12n took less time than Ontop on eight of the nine
+queries and more on `q07-order-limit`, which sorts by an integer and an
+IRI. A later change reduced the time of that query at 100,000 alerts
+([IRI sort keys after #75](bench/RESULTS.md#iri-sort-keys-after-75)),
+and the 1,000,000-alert session was not repeated. The results hold for
+this machine and these queries. Ontop's heap was limited to 256 MiB, and
+a larger heap may change its time on large results
+([caveats](bench/RESULTS.md#caveats)).
+
+These times are end to end. They include SQL execution in PostgreSQL,
+decoding the rows, building RDF terms and writing the response.
+Translating SPARQL to SQL is measured separately and took 15–40 µs per
+query in the report. Neither engine converts the whole database to RDF,
+so the benchmark does not measure whole-dataset RDF materialization.
 
 ## Roadmap
 

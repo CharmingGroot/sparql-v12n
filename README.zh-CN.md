@@ -21,6 +21,12 @@
 
 > 状态：实验性。下文所列的支持范围已与 Ontop 及 W3C R2RML 测试用例对照测试。1.0 之前，命令、输出与 API 可能发生变化。
 
+## 目的
+
+v12n 将保留在关系数据库中的数据作为 RDF 图进行查询，无需将数据加载到单独的 RDF 存储中。该图由 R2RML 映射定义。每条查询都以 SQL 在源表上执行，只有其结果中的行才会被转换为 RDF 项。本项目的性能目标之一是高效地转换并返回大规模 `SELECT` 结果，涵盖从数据库行到序列化响应的全过程。
+
+当数据位于 PostgreSQL 中、查询属于[支持的范围](#支持的-sparql)、并且无需本体推理、仅凭映射中声明的类和属性即可满足需求时，值得评估本引擎。本引擎目前处于实验阶段，仅支持 PostgreSQL。与 Ontop 对比的基准测试见[性能](#性能)。
+
 ## 安装
 
 从[发布](https://github.com/CharmingGroot/sparql-v12n/releases)页面下载与平台对应的压缩包，并将 `v12n` 放入 `PATH`。压缩包提供 Linux（x86_64 与 aarch64，静态二进制）、macOS（Apple silicon）和 Windows（x86_64）版本。
@@ -183,6 +189,21 @@ v12n explain examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq
 默认启用的限制为只读数据库会话、30 秒语句超时，以及最多 10000 个解。HTTP 端点还将查询大小限制为 64 KiB，并且最多同时处理 16 个请求。
 
 各命令的输出格式与退出码，以及 HTTP 端点及其设置，见 [docs/usage.zh-CN.md](docs/usage.zh-CN.md)。
+
+## 性能
+
+[bench/README.md](bench/README.md) 说明在相同的 PostgreSQL、映射和查询上与 Ontop 对比的基准测试，[bench/RESULTS.md](bench/RESULTS.md) 给出测量结果及其分析。只有当引擎返回与 Ontop 相同的解时，其计时才计入结果。
+
+以下数据来自 2026-10-26 在提交 `57f7f63` 上进行的一次基准测试，并非当前 main 分支的测量值。PostgreSQL 17.11 中载入了 `alerts` 1,000,000 行、`assets` 100,000 行、`links` 200,000 行和 `observables` 2,200,000 行。v12n 在 Apple M4（16 GiB）的 macOS 上原生运行，Ontop 5.5.0（`-Xmx256m`）和 PostgreSQL 在 Docker Desktop 虚拟机中运行。每个时间为 10 次运行的中位数，从在新连接上发送 SPARQL 1.1 Protocol 请求开始，到 JSON 响应结束为止。
+
+| 查询 | 结果行数 | v12n（毫秒） | Ontop（毫秒） |
+|---|---:|---:|---:|
+| `q06-union` | 145,000 | 124.5 | 1267.4 |
+| `q07-order-limit` | 100 | 194.8 | 142.9 |
+
+在该次测试中，v12n 在九条查询中的八条上用时少于 Ontop，而在按整数和 IRI 排序的 `q07-order-limit` 上用时更长。此后的一项修改缩短了该查询在 `alerts` 为 100,000 行时的用时（[#75 之后的 IRI 排序键](bench/RESULTS.md#iri-sort-keys-after-75)），`alerts` 为 1,000,000 行的测试没有重新运行。上述结果仅适用于该机器和这些查询。Ontop 的堆被限制为 256 MiB，更大的堆可能改变其在大结果上的用时（[注意事项](bench/RESULTS.md#caveats)）。
+
+这些时间是端到端时间，包括 PostgreSQL 中的 SQL 执行、行解码、RDF 项构造以及响应写出。SPARQL 到 SQL 的翻译时间单独测量，报告中每条查询为 15–40 µs。两个引擎都不会将整个数据库转换为 RDF，因此该基准测试不测量整个数据集的 RDF 物化。
 
 ## 路线图
 
