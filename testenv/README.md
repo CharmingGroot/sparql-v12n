@@ -78,6 +78,10 @@ named `v12n-tls` and listens on `127.0.0.1:55434`; `TLS_PG_NAME` and
 `TLS_PG_PORT` change them. The certificates are valid for seven days and
 are generated again on every `up`.
 
+CI starts the same server in the `test` job of `.github/workflows/ci.yml`,
+from the image of its PostgreSQL service, and runs the TLS tests with the
+other PostgreSQL tests.
+
 ## Files
 
 - `difftest.sh`: differential tests of every case against Ontop
