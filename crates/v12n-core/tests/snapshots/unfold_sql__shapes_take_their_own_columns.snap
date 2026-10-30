@@ -2,11 +2,11 @@
 source: crates/v12n-core/tests/unfold_sql.rs
 expression: "explain(UNION, &format!(\"{PREFIXES}SELECT ?c ?k WHERE {{ ?c ex:kind ?k }}\"))"
 ---
-SELECT t0."id" AS "c", NULL AS "c_1", true AS "k", NULL::"pg_catalog"."bool" AS "k_1"
+SELECT t0."id" AS "c", NULL AS "c_1", true AS "k", NULL::bool AS "k_1"
 FROM "customers" t0
 WHERE t0."id" IS NOT NULL
 UNION
-SELECT NULL AS "c", t0."code" AS "c_1", NULL::"pg_catalog"."bool" AS "k", true AS "k_1"
+SELECT NULL AS "c", t0."code" AS "c_1", NULL::bool AS "k", true AS "k_1"
 FROM "wholesalers" t0
 WHERE t0."code" IS NOT NULL
 

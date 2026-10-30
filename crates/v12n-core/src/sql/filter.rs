@@ -9,6 +9,7 @@ use super::{
     ValueCases, ValueKind, XSD_STRING,
 };
 use crate::Error;
+use crate::dialect::{Dialect, SqlType};
 use crate::mapping::TermType;
 use crate::solution::canonical_double;
 use crate::sparql::{ArithOp, CompareOp, TermTest};
@@ -103,8 +104,11 @@ fn is_arith(value: &FilterValue) -> bool {
 /// The value of `numeric` columns that is not an `xsd:decimal`: `NaN` and
 /// the infinities have no decimal lexical form, so their literals are
 /// ill-typed.
-fn decimal_guard(column: &str) -> String {
-    format!("{column}::text NOT IN ('NaN', 'Infinity', '-Infinity')")
+fn decimal_guard(dialect: &dyn Dialect, column: &str) -> String {
+    format!(
+        "{} NOT IN ('NaN', 'Infinity', '-Infinity')",
+        dialect.cast(column, &SqlType::Text)
+    )
 }
 
 impl<'a> Renderer<'a> {
@@ -112,7 +116,7 @@ impl<'a> Renderer<'a> {
         match filter {
             Filter::Constant(Some(true)) => self.sql.push_str("true"),
             Filter::Constant(Some(false)) => self.sql.push_str("false"),
-            Filter::Constant(None) => self.sql.push_str("NULL::bool"),
+            Filter::Constant(None) => self.typed_null(&SqlType::Boolean),
             Filter::And(a, b) | Filter::Or(a, b) => {
                 let op = if matches!(filter, Filter::And(..)) {
                     " AND "
@@ -194,7 +198,7 @@ impl<'a> Renderer<'a> {
                     return Err(unsupported(reason));
                 }
                 let Some(term_type) = operand.term_type else {
-                    self.sql.push_str("NULL::bool");
+                    self.typed_null(&SqlType::Boolean);
                     return Ok(());
                 };
                 let holds = match test {
@@ -436,13 +440,14 @@ impl<'a> Renderer<'a> {
                         .decimal
                         .clone()
                         .expect("integer and decimal constants have a decimal value");
-                    self.expr(&super::SqlExpr::Param(decimal.into()));
-                    self.sql.push_str("::numeric");
+                    self.cast_rendered(&SqlType::Numeric, |this| {
+                        this.expr(&super::SqlExpr::Param(decimal.into()))
+                    });
                     return Ok(());
                 }
                 let Some((table, name)) = operand.column else {
                     // A type error: an operand that is not a number.
-                    self.sql.push_str("NULL::numeric");
+                    self.typed_null(&SqlType::Numeric);
                     return Ok(());
                 };
                 let column = super::column_sql(table, name);
@@ -451,9 +456,11 @@ impl<'a> Renderer<'a> {
                     // xsd:decimal values: an error.
                     Kind::Numeric(Num::Decimal) => self.sql.push_str(&format!(
                         "CASE WHEN {} THEN {column} END",
-                        decimal_guard(&column)
+                        decimal_guard(self.dialect, &column)
                     )),
-                    _ => self.sql.push_str(&format!("{column}::numeric")),
+                    _ => self
+                        .sql
+                        .push_str(&self.dialect.cast(&column, &SqlType::Numeric)),
                 }
             }
         }
@@ -478,7 +485,7 @@ impl<'a> Renderer<'a> {
             });
         }
         if !of_class.contains(&true) {
-            self.sql.push_str("NULL::numeric");
+            self.typed_null(&SqlType::Numeric);
             return Ok(());
         }
         if let [(guards, value)] = cases.as_slice()
@@ -499,7 +506,7 @@ impl<'a> Renderer<'a> {
             if of_class {
                 self.numeric_value(value)?;
             } else {
-                self.sql.push_str("NULL::numeric");
+                self.typed_null(&SqlType::Numeric);
             }
         }
         self.sql.push_str(" END");
@@ -553,7 +560,7 @@ impl<'a> Renderer<'a> {
     ) -> Result<(), Error> {
         let (mut l, mut r) = (self.operand(left), self.operand(right));
         if l.kind == Kind::Error || r.kind == Kind::Error {
-            self.sql.push_str("NULL::bool");
+            self.typed_null(&SqlType::Boolean);
             return Ok(());
         }
         // Without column types: as if the column had the other side's
@@ -580,7 +587,7 @@ impl<'a> Renderer<'a> {
             && l.kind.is_literal()
             && r.kind.is_literal()
         {
-            self.sql.push_str("NULL::bool");
+            self.typed_null(&SqlType::Boolean);
             return Ok(());
         }
         match (&l.kind, &r.kind) {
@@ -596,26 +603,32 @@ impl<'a> Renderer<'a> {
                     ));
                 }
                 self.text(&l)?;
-                self.sql.push_str(&format!(" COLLATE \"C\" {} ", op.sql()));
+                self.sql.push_str(self.dialect.code_point_collation());
+                self.sql.push_str(&format!(" {} ", op.sql()));
                 self.text(&r)
             }
             (Kind::Boolean, Kind::Boolean) => {
-                self.typed_value(&l, "bool")?;
+                self.typed_value(&l, &SqlType::Boolean)?;
                 self.sql.push_str(&format!(" {} ", op.sql()));
-                self.typed_value(&r, "bool")
+                self.typed_value(&r, &SqlType::Boolean)
             }
             (Kind::DateTime { zoned: a }, Kind::DateTime { zoned: b }) if a == b => {
-                let ty = if *a { "timestamptz" } else { "timestamp" };
+                let ty = if *a {
+                    SqlType::TimestampTz
+                } else {
+                    SqlType::Timestamp
+                };
+                let dialect = self.dialect;
                 self.guarded(
                     mode,
                     &[&l, &r],
                     op,
                     |o| o.infinite,
-                    |c| format!("isfinite({c})"),
+                    |c| dialect.is_finite(c),
                     |this| {
-                        this.typed_value(&l, ty)?;
+                        this.typed_value(&l, &ty)?;
                         this.sql.push_str(&format!(" {} ", op.sql()));
-                        this.typed_value(&r, ty)
+                        this.typed_value(&r, &ty)
                     },
                 )
             }
@@ -655,10 +668,10 @@ impl<'a> Renderer<'a> {
                 | (CompareOp::Equal, Kind::BlankNode, Kind::BlankNode) => {
                     return self.same_term_or_strings(same_term, l, r, mode);
                 }
-                (CompareOp::Equal, ..) => "false",
-                _ => "NULL::bool",
+                (CompareOp::Equal, ..) => "false".to_owned(),
+                _ => self.dialect.cast("NULL", &SqlType::Boolean),
             };
-            self.sql.push_str(sql);
+            self.sql.push_str(&sql);
             return Ok(());
         }
         let ill_typed = matches!(a, Kind::IllTyped(_)) || matches!(b, Kind::IllTyped(_));
@@ -694,7 +707,7 @@ impl<'a> Renderer<'a> {
                 }
             ))),
             _ => {
-                self.sql.push_str("NULL::bool");
+                self.typed_null(&SqlType::Boolean);
                 Ok(())
             }
         }
@@ -739,7 +752,7 @@ impl<'a> Renderer<'a> {
     fn same_strings(&mut self, l: &Operand<'_>, r: &Operand<'_>) -> Result<(), Error> {
         let same_kind = match (&l.kind, &r.kind) {
             (Kind::Error, _) | (_, Kind::Error) => {
-                self.sql.push_str("NULL::bool");
+                self.typed_null(&SqlType::Boolean);
                 return Ok(());
             }
             (Kind::Lang(a), Kind::Lang(b)) => a == b,
@@ -768,7 +781,7 @@ impl<'a> Renderer<'a> {
             return Err(unsupported(reason));
         }
         if !matches!(operand.kind, Kind::String | Kind::Lang(_) | Kind::Unknown) {
-            self.sql.push_str("NULL::bool");
+            self.typed_null(&SqlType::Boolean);
             return Ok(());
         }
         if self.options.non_utf8 {
@@ -778,10 +791,17 @@ impl<'a> Renderer<'a> {
             ));
         }
         self.sql.push('(');
+        let start = self.sql.len();
         self.text(&operand)?;
-        self.sql.push_str(" COLLATE \"C\" ~ ");
-        self.expr(&super::SqlExpr::Param(pattern.into()));
-        self.sql.push_str("::text)");
+        self.sql.push_str(self.dialect.code_point_collation());
+        let text = self.sql.split_off(start);
+        self.cast_rendered(&SqlType::Text, |this| {
+            this.expr(&super::SqlExpr::Param(pattern.into()))
+        });
+        let pattern = self.sql.split_off(start);
+        self.sql
+            .push_str(&self.dialect.regex_match(&text, &pattern));
+        self.sql.push(')');
         Ok(())
     }
 
@@ -875,7 +895,7 @@ impl<'a> Renderer<'a> {
             self.sql.push_str(
                 &decimal_columns
                     .iter()
-                    .map(|c| decimal_guard(c))
+                    .map(|c| decimal_guard(self.dialect, c))
                     .collect::<Vec<_>>()
                     .join(" AND "),
             );
@@ -888,14 +908,14 @@ impl<'a> Renderer<'a> {
         self.number(l, ln.as_ref(), class(l), ty)?;
         self.sql.push_str(&format!(" {} ", op.sql()));
         self.number(r, rn.as_ref(), class(r), ty)?;
+        let nan = self.dialect.cast("'NaN'", &SqlType::Double);
         for column in &float_columns {
-            self.sql
-                .push_str(&format!(" AND {column} <> 'NaN'::float8"));
+            self.sql.push_str(&format!(" AND {column} <> {nan}"));
         }
         if !exact_decimal {
             for column in &decimal_columns {
                 self.sql
-                    .push_str(&format!(" AND {}", decimal_guard(column)));
+                    .push_str(&format!(" AND {}", decimal_guard(self.dialect, column)));
             }
         }
         if guarded {
@@ -906,8 +926,9 @@ impl<'a> Renderer<'a> {
             // which RDFterm-equal finds equal.
             if op == CompareOp::Equal && decimal_columns.len() == 2 {
                 self.sql.push_str(&format!(
-                    " WHEN {}::text = {}::text THEN true",
-                    decimal_columns[0], decimal_columns[1]
+                    " WHEN {} = {} THEN true",
+                    self.dialect.cast(&decimal_columns[0], &SqlType::Text),
+                    self.dialect.cast(&decimal_columns[1], &SqlType::Text)
                 ));
             }
             self.sql.push_str(" END");
@@ -926,11 +947,11 @@ impl<'a> Renderer<'a> {
         if is_arith(operand.value) {
             // Compared as `numeric` (or `float8` against a double), which
             // PostgreSQL compares exactly with the other side's type.
-            self.numeric_value(operand.value)?;
-            if ty == Num::Double {
-                self.sql.push_str("::float8");
-            }
-            return Ok(());
+            return if ty == Num::Double {
+                self.cast_rendered(&SqlType::Double, |this| this.numeric_value(operand.value))
+            } else {
+                self.numeric_value(operand.value)
+            };
         }
         if let Some(number) = number {
             let value = match ty {
@@ -944,22 +965,26 @@ impl<'a> Renderer<'a> {
                     .expect("decimal comparisons only with integer and decimal constants"),
                 Num::Double => canonical_double(number.double),
             };
-            self.expr(&super::SqlExpr::Param(value.into()));
-            self.sql.push_str(&format!("::{}", ty.sql_type()));
+            self.cast_rendered(&ty.sql_type(), |this| {
+                this.expr(&super::SqlExpr::Param(value.into()))
+            });
             return Ok(());
         }
         let (table, name) = operand
             .column
             .expect("a numeric operand is a column or a constant");
-        self.sql.push_str(&super::column_sql(table, name));
+        let column = super::column_sql(table, name);
         if class < ty {
-            self.sql.push_str(&format!("::{}", ty.sql_type()));
+            self.sql
+                .push_str(&self.dialect.cast(&column, &ty.sql_type()));
+        } else {
+            self.sql.push_str(&column);
         }
         Ok(())
     }
 
     /// A boolean or dateTime operand as a value of SQL type `ty`.
-    pub(super) fn typed_value(&mut self, operand: &Operand<'_>, ty: &str) -> Result<(), Error> {
+    pub(super) fn typed_value(&mut self, operand: &Operand<'_>, ty: &SqlType) -> Result<(), Error> {
         let value = match &operand.constant {
             Some(Value::Boolean(b)) => b.to_string(),
             Some(Value::DateTime(d)) => d.canonical.clone(),
@@ -971,8 +996,7 @@ impl<'a> Renderer<'a> {
                 return Ok(());
             }
         };
-        self.expr(&super::SqlExpr::Param(value.into()));
-        self.sql.push_str(&format!("::{ty}"));
+        self.cast_rendered(ty, |this| this.expr(&super::SqlExpr::Param(value.into())));
         Ok(())
     }
 
@@ -1024,12 +1048,13 @@ impl<'a> Renderer<'a> {
                 if text.contains('\0') {
                     return Err(unsupported("strings with a NUL character in FILTER"));
                 }
-                self.expr(&super::SqlExpr::Param(text.as_str().into()));
-                self.sql.push_str("::text");
+                self.cast_rendered(&SqlType::Text, |this| {
+                    this.expr(&super::SqlExpr::Param(text.as_str().into()))
+                });
             }
             Text::Term(term) => {
                 // A template is a concatenation, which binds looser than
-                // the COLLATE and the comparison around it.
+                // the collation and the comparison around it.
                 let types = self.options.column_types;
                 self.sql.push('(');
                 if term.base_iri.is_some() {
@@ -1041,15 +1066,20 @@ impl<'a> Renderer<'a> {
             }
             Text::NaturalDatatype { column, datatype } => {
                 self.sql.push_str(&format!(
-                    "CASE WHEN isfinite({}) THEN ",
-                    super::column_sql(column.0, column.1)
+                    "CASE WHEN {} THEN ",
+                    self.dialect
+                        .is_finite(&super::column_sql(column.0, column.1))
                 ));
-                self.expr(&super::SqlExpr::Param(datatype.as_str().into()));
-                self.sql.push_str("::text ELSE ");
-                self.expr(&super::SqlExpr::Param(XSD_STRING.into()));
-                self.sql.push_str("::text END");
+                self.cast_rendered(&SqlType::Text, |this| {
+                    this.expr(&super::SqlExpr::Param(datatype.as_str().into()))
+                });
+                self.sql.push_str(" ELSE ");
+                self.cast_rendered(&SqlType::Text, |this| {
+                    this.expr(&super::SqlExpr::Param(XSD_STRING.into()))
+                });
+                self.sql.push_str(" END");
             }
-            Text::Unknown => self.sql.push_str("NULL::text"),
+            Text::Unknown => self.typed_null(&SqlType::Text),
         }
         Ok(())
     }
@@ -1058,7 +1088,7 @@ impl<'a> Renderer<'a> {
     fn ebv(&mut self, value: &FilterValue) -> Result<(), Error> {
         let operand = self.operand(value);
         if operand.kind == Kind::Error {
-            self.sql.push_str("NULL::bool");
+            self.typed_null(&SqlType::Boolean);
             return Ok(());
         }
         if is_arith(value) {
@@ -1108,18 +1138,19 @@ impl<'a> Renderer<'a> {
             (Kind::Numeric(Num::Integer), Some(c)) => self.sql.push_str(&format!("{c} <> 0")),
             (Kind::Numeric(Num::Decimal), Some(c)) => self.sql.push_str(&format!(
                 "CASE WHEN {} THEN {c} <> 0 ELSE false END",
-                decimal_guard(&c)
+                decimal_guard(self.dialect, &c)
             )),
-            (Kind::Numeric(Num::Double), Some(c)) => self
-                .sql
-                .push_str(&format!("({c} <> 0 AND {c} <> 'NaN'::float8)")),
+            (Kind::Numeric(Num::Double), Some(c)) => self.sql.push_str(&format!(
+                "({c} <> 0 AND {c} <> {})",
+                self.dialect.cast("'NaN'", &SqlType::Double)
+            )),
             (Kind::String | Kind::Lang(_) | Kind::Unknown, _) => {
                 self.sql.push('(');
                 self.text(&operand)?;
                 self.sql.push_str(" <> '')");
             }
             (Kind::Unsupported(reason), _) => return Err(unsupported(reason)),
-            _ => self.sql.push_str("NULL::bool"),
+            _ => self.typed_null(&SqlType::Boolean),
         }
         Ok(())
     }
@@ -1195,6 +1226,7 @@ pub(super) fn unsupported(reason: &str) -> Error {
 pub(super) mod tests {
     use super::super::{ColumnTypes, Comparison, Lexical, RenderOptions, SqlPlan};
     use super::*;
+    use crate::dialect::PostgresDialect;
     use crate::mapping::{LogicalTable, Mapping, MappingIndex};
     use crate::sql::TermKey;
     use crate::{sparql, unfold};
@@ -1310,11 +1342,14 @@ pub(super) mod tests {
     fn sql_of(query: &str, non_utf8: bool) -> Result<String, Error> {
         let types = types();
         Ok(plan(query)?
-            .to_sql_with(&RenderOptions {
-                column_types: Some(&types),
-                non_utf8,
-                ..RenderOptions::default()
-            })?
+            .to_sql_with(
+                &PostgresDialect,
+                &RenderOptions {
+                    column_types: Some(&types),
+                    non_utf8,
+                    ..RenderOptions::default()
+                },
+            )?
             .sql)
     }
 
@@ -1661,10 +1696,13 @@ pub(super) mod tests {
             let rendered =
                 plan("SELECT ?s WHERE { ?s ex:label ?x FILTER(REGEX(?x, \"^a.c\", \"i\")) }")
                     .unwrap()
-                    .to_sql_with(&RenderOptions {
-                        column_types: Some(&types),
-                        ..RenderOptions::default()
-                    })
+                    .to_sql_with(
+                        &PostgresDialect,
+                        &RenderOptions {
+                            column_types: Some(&types),
+                            ..RenderOptions::default()
+                        },
+                    )
                     .unwrap();
             (rendered.sql, rendered.params)
         };

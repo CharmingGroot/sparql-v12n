@@ -11,6 +11,7 @@ use std::ops::Range;
 use oxrdf::Term;
 
 use crate::Error;
+use crate::dialect::SqlType;
 use crate::mapping::{
     BaseIri, LogicalTable, Mapping, MappingIndex, ObjectMap, TemplatePart, TermType, TriplesMap,
 };
@@ -28,9 +29,6 @@ use term::{Equality, LiteralType, TermExpr, TermValue, is_injective, literal_typ
 /// the count. The same limit applies to the combinations tried for each
 /// `OPTIONAL` part.
 pub const MAX_BRANCHES: usize = 64;
-
-/// SQL type of the flag that tells whether an `OPTIONAL` part matched.
-const BOOLEAN: &str = "\"pg_catalog\".\"bool\"";
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -1477,7 +1475,7 @@ fn plan(
                                 .map(|(table, name)| column(table, name)),
                         );
                     }
-                    (None, true) => select.push(SqlExpr::Null(BOOLEAN.to_owned())),
+                    (None, true) => select.push(SqlExpr::Null(SqlType::Boolean)),
                     (None, false) => {
                         select.extend(std::iter::repeat_n(SqlExpr::Unbound, alternative.width()));
                     }

@@ -6,6 +6,7 @@ use std::ops::Range;
 
 use oxrdf::Term;
 
+use crate::dialect::{Dialect, SqlType};
 use crate::mapping::{BaseIri, LogicalTable, TemplatePart, TermType};
 use crate::sparql::{ArithOp, CompareOp, TermTest};
 
@@ -171,8 +172,8 @@ pub enum SqlExpr {
         name: String,
         lexical: Lexical,
     },
-    /// `NULL` of an SQL type, written as [`ColumnType::sql_type`].
-    Null(String),
+    /// `NULL` of an SQL type.
+    Null(SqlType),
     /// `NULL` for a column of an `OPTIONAL` part that cannot match in
     /// this branch. Its type comes from the other branches (see
     /// [`SqlPlan::with_union_types`]).
@@ -603,7 +604,7 @@ pub struct ColumnType {
 /// key(col) = key($1)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TermKey {
-    /// `x::text`: floating point, where `-0 = 0` holds but `-0.0E0` and
+    /// The text output: floating point, where `-0 = 0` holds but `-0.0E0` and
     /// `0.0E0` are different `xsd:double` terms (XML Schema 1.1
     /// `doubleCanonicalMap`).
     Text,
@@ -614,9 +615,9 @@ pub enum TermKey {
 }
 
 impl TermKey {
-    pub(super) fn sql(self, expr: &str) -> String {
+    pub(super) fn sql(self, dialect: &dyn Dialect, expr: &str) -> String {
         match self {
-            Self::Text => format!("{expr}::text"),
+            Self::Text => dialect.cast(expr, &SqlType::Text),
             Self::OctetLength => format!("octet_length({expr})"),
         }
     }
@@ -628,16 +629,16 @@ impl TermKey {
 /// them as one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TermNormal {
-    /// `x + interval '0'`: `time`, where `24:00:00` and `00:00:00` are
+    /// [`Dialect::time_normal`]: `time`, where `24:00:00` and `00:00:00` are
     /// different values but the same `xsd:time` value, whose canonical
     /// form is `00:00:00` (XML Schema 1.1 `timeCanonicalMap`).
     Time,
 }
 
 impl TermNormal {
-    pub(super) fn sql(self, expr: &str) -> String {
+    pub(super) fn sql(self, dialect: &dyn Dialect, expr: &str) -> String {
         match self {
-            Self::Time => format!("({expr} + interval '0')"),
+            Self::Time => dialect.time_normal(expr),
         }
     }
 
@@ -665,14 +666,14 @@ pub enum Comparison {
 /// SQL for a column's natural lexical form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lexical {
-    /// The text output, `col::text`.
+    /// The text output.
     Text,
     /// `true` or `false`.
     Boolean,
     /// Upper-case hexadecimal digits.
     Hex,
-    /// The canonical `xsd:decimal` form of a PostgreSQL `numeric`,
-    /// `trim_scale(col)::text` (PostgreSQL 13 or later).
+    /// The canonical `xsd:decimal` form of an exact number
+    /// ([`Dialect::decimal_lexical`]).
     Decimal,
 }
 
@@ -787,7 +788,7 @@ pub struct RenderedSql {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderColumn {
     pub alias: String,
-    /// Compared under `COLLATE "C"`, by code point.
+    /// Compared by code point ([`Dialect::code_point_collation`]).
     pub collated: bool,
     pub descending: bool,
 }

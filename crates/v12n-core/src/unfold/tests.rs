@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::dialect::PostgresDialect;
 use crate::sparql;
 use crate::sql::{Filter, RenderOptions, TableKeys, TermMatch, TermSql, TermSqlValue};
 
@@ -1072,10 +1073,13 @@ fn unfold_union_with_keys_keeps_the_rows_of_proven_arms() {
     // The second arm has two branches, so only the first can be proven.
     assert_eq!(plan.key_tables(), [LogicalTable::TableName("a".into())]);
     let sql = plan
-        .to_sql_with(&RenderOptions {
-            keys: Some(&keys),
-            ..RenderOptions::default()
-        })
+        .to_sql_with(
+            &PostgresDialect,
+            &RenderOptions {
+                keys: Some(&keys),
+                ..RenderOptions::default()
+            },
+        )
         .unwrap()
         .sql;
     assert!(
@@ -1119,10 +1123,7 @@ fn unfold_union_side_that_cannot_match_has_no_branch() {
 fn unfold_constant_in_one_union_side_is_selected_as_a_flag() {
     let plan = union_query("SELECT ?k WHERE { { ?x ex:kind ?k } UNION { ?x ex:q ?w } }").unwrap();
     assert_eq!(plan.branches[0].select[0], SqlExpr::True);
-    assert_eq!(
-        plan.branches[1].select[0],
-        SqlExpr::Null(BOOLEAN.to_owned())
-    );
+    assert_eq!(plan.branches[1].select[0], SqlExpr::Null(SqlType::Boolean));
     assert_eq!(plan.projection[0].terms[0].guard.as_deref(), Some("k"));
 }
 

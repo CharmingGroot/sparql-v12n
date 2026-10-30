@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use super::*;
+use crate::dialect::PostgresDialect;
 use crate::mapping::{Mapping, MappingIndex};
 use crate::sql::RenderOptions;
 use crate::{sparql, unfold};
@@ -96,10 +97,13 @@ fn sql(plan: &SqlPlan) -> String {
 
 fn rendered(plan: &SqlPlan) -> crate::sql::RenderedSql {
     let keys = keys();
-    plan.to_sql_with(&RenderOptions {
-        keys: Some(&keys),
-        ..RenderOptions::default()
-    })
+    plan.to_sql_with(
+        &PostgresDialect,
+        &RenderOptions {
+            keys: Some(&keys),
+            ..RenderOptions::default()
+        },
+    )
     .unwrap()
 }
 
@@ -316,10 +320,13 @@ fn merged_plan_still_proves_there_are_no_duplicates() {
     let keys = keys();
     assert!(!plan.has_duplicates(Some(&keys)));
     let sql = plan
-        .to_sql_with(&RenderOptions {
-            keys: Some(&keys),
-            ..RenderOptions::default()
-        })
+        .to_sql_with(
+            &PostgresDialect,
+            &RenderOptions {
+                keys: Some(&keys),
+                ..RenderOptions::default()
+            },
+        )
         .unwrap()
         .sql;
     assert!(!sql.contains("DISTINCT"), "{sql}");

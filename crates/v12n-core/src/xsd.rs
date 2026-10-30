@@ -2,6 +2,7 @@
 //! Values of XML Schema literals that `FILTER` compares (SPARQL 1.1 §17.3),
 //! read from their lexical forms (XML Schema 1.1 Part 2).
 
+use crate::dialect::SqlType;
 use crate::solution::canonical_decimal;
 
 pub(crate) const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -16,12 +17,12 @@ pub(crate) enum Num {
 }
 
 impl Num {
-    /// The PostgreSQL type a value of this class is compared as.
-    pub fn sql_type(self) -> &'static str {
+    /// The SQL type a value of this class is compared as.
+    pub fn sql_type(self) -> SqlType {
         match self {
-            Self::Integer => "int8",
-            Self::Decimal => "numeric",
-            Self::Double => "float8",
+            Self::Integer => SqlType::BigInt,
+            Self::Decimal => SqlType::Numeric,
+            Self::Double => SqlType::Double,
         }
     }
 }
