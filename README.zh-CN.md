@@ -236,6 +236,8 @@ flowchart LR
 
 ## 目录结构
 
+[docs/architecture.zh-CN.md](docs/architecture.zh-CN.md) 介绍各 crate 之间的依赖关系，以及查询从 SPARQL 文本到结果的路径。
+
 | 路径 | 内容 |
 |---|---|
 | `crates/v12n-core` | SPARQL 解析、映射索引、展开、优化、SQL 渲染。不依赖数据库 |
@@ -243,7 +245,7 @@ flowchart LR
 | `crates/v12n-server` | SPARQL 1.1 Protocol HTTP 端点 |
 | `crates/v12n-cli` | `v12n` 命令 |
 | `crates/v12n-difftest` | 针对 Ontop 的差分测试，每个用例查询对应一个测试 |
-| `docs` | 使用说明与查询语义参考文档，以及 README 中的图 |
+| `docs` | [使用说明](docs/usage.zh-CN.md)、[查询语义](docs/semantics.zh-CN.md)与[架构](docs/architecture.zh-CN.md)参考文档，以及 README 中的图 |
 | `examples/shop` | 示例数据库模式、数据、映射与查询 |
 | `bench` | 在生成数据上与 Ontop 对比的基准测试及其结果 |
 | `testenv` | 用于测试的本地 PostgreSQL 与 Ontop 参考端点 |

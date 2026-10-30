@@ -319,6 +319,9 @@ An MCP server for AI agents is planned after these.
 
 ## Layout
 
+[docs/architecture.md](docs/architecture.md) describes how the crates depend
+on each other and the path of a query from SPARQL text to results.
+
 | Path | Contents |
 |---|---|
 | `crates/v12n-core` | SPARQL parsing, mapping index, unfolding, optimization, SQL rendering. No database dependency |
@@ -326,7 +329,7 @@ An MCP server for AI agents is planned after these.
 | `crates/v12n-server` | SPARQL 1.1 Protocol HTTP endpoint |
 | `crates/v12n-cli` | The `v12n` command |
 | `crates/v12n-difftest` | Differential tests against Ontop, one test per case query |
-| `docs` | Usage and query semantics references, and the README diagram |
+| `docs` | [Usage](docs/usage.md), [query semantics](docs/semantics.md) and [architecture](docs/architecture.md) references, and the README diagram |
 | `examples/shop` | Example schema, data, mapping and queries |
 | `bench` | Benchmark against Ontop on generated data, and its results |
 | `testenv` | Local PostgreSQL and the Ontop reference endpoint for tests |
