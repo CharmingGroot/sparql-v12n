@@ -121,27 +121,32 @@ cd sparql-v12n
 
 ## 路线图
 
-受支持的子集按以下顺序扩展。每一步是一个[里程碑](https://github.com/CharmingGroot/sparql-v12n/milestones)，箭头表示后一步建立在前一步之上。
+计划中的工作按[里程碑](https://github.com/CharmingGroot/sparql-v12n/milestones)分组。箭头表示后一个里程碑使用前一个里程碑的工作。没有路径相连的里程碑彼此不依赖。虚线框表示 main 分支上尚无已合并工作的里程碑。状态以 main 分支为准，而非发布版本；当前支持的范围与限制见[支持的 SPARQL](#支持的-sparql)。
 
 ```mermaid
 flowchart LR
-  R1["1. 值表达式"] --> R2["3. 运算符与查询形式"] --> R3["4. 聚合"]
-  M["2. 目录元数据"] --> O1["5. RDFS 本体"] --> O2["7. OWL 2 QL 本体"]
-  M --> R4["6. 图模式与路径"]
+  M["M 目录元数据"] --> O1["O1 RDFS 本体"] --> O2["O2 OWL 2 QL 本体"]
+  M --> R4["R4 图模式与路径"]
   O1 --> R4
-  D["8. 更多数据库"]
+  M --> D["D 更多数据库"]
+  R1["R1 值表达式<br/>（部分支持）"] --> R3["R3 聚合"]
+  R2["R2 运算符与查询形式<br/>（部分支持）"]
+  classDef planned stroke-dasharray: 5 4
+  class R3,M,O1,O2,R4,D planned
 ```
 
-1. 值表达式：`BIND`、`SELECT` 中的表达式、算术以及 SPARQL 1.1 函数
-2. 目录元数据一次加载并可刷新，并利用 NOT NULL 与外键约束进行优化
-3. `VALUES`、`MINUS`、`EXISTS`、子查询、`ASK`、`CONSTRUCT`、`DESCRIBE`，以及更多结果格式
-4. `GROUP BY` 与聚合
-5. 本体：RDFS 蕴涵
-6. 变量谓词、命名图与属性路径
-7. 本体：OWL 2 QL
-8. PostgreSQL 以外的数据库
+| 里程碑 | main 上已有 | 剩余工作 |
+|---|---|---|
+| [R1 值表达式](https://github.com/CharmingGroot/sparql-v12n/milestone/1) | `FILTER` 中的算术、`BIND` 与 `SELECT` 表达式 | 条件函数、RDF 项函数、字符串、数值、日期时间与哈希函数、类型转换，以及 `ORDER BY` 中的新表达式 |
+| [R2 运算符与查询形式](https://github.com/CharmingGroot/sparql-v12n/milestone/3) | SPARQL XML、CSV、TSV 结果 | `VALUES`、`MINUS`、`EXISTS`、子查询、`ASK`、`CONSTRUCT`、`DESCRIBE` |
+| [R3 聚合](https://github.com/CharmingGroot/sparql-v12n/milestone/4) | | `GROUP BY`、`HAVING` 与聚合函数 |
+| [M 目录元数据](https://github.com/CharmingGroot/sparql-v12n/milestone/2) | | 引擎与后端端口、一次加载并可刷新的目录元数据、利用 NOT NULL 与外键约束的优化 |
+| [O1 RDFS 本体](https://github.com/CharmingGroot/sparql-v12n/milestone/5) | | RDFS 蕴涵 |
+| [O2 OWL 2 QL 本体](https://github.com/CharmingGroot/sparql-v12n/milestone/7) | | OWL 2 QL |
+| [R4 图模式与路径](https://github.com/CharmingGroot/sparql-v12n/milestone/6) | | 变量谓词、命名图与属性路径 |
+| [D 更多数据库](https://github.com/CharmingGroot/sparql-v12n/milestone/8) | 将 PostgreSQL 专用 SQL 语法分离到 `Dialect` trait | PostgreSQL 之外的第二个数据库 |
 
-面向 AI 智能体的 MCP 服务器计划在上述步骤之后实现。
+面向 AI 智能体的 MCP 服务器计划在这些里程碑之后实现。
 
 ## 目录结构
 
