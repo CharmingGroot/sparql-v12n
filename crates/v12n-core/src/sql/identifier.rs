@@ -30,7 +30,7 @@ pub(super) fn logical_table(table: &LogicalTable) -> String {
 /// encoding-dependent rules for non-ASCII letters, and truncates it to
 /// `NAMEDATALEN - 1` bytes. Quoting such a name as written would refer to
 /// a different column, so its effective name is asked from the database
-/// ([`column_name_probe`]). A name of lower-case ASCII letters, digits,
+/// ([`table_probe`](super::table_probe)). A name of lower-case ASCII letters, digits,
 /// `_` and `$` of at most 63 bytes folds to itself and needs no lookup.
 /// Anything else that is not a regular identifier keeps being quoted as
 /// written.

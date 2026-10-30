@@ -447,16 +447,34 @@ impl SqlPlan {
     /// they are written ([`folded_identifier`]), with their logical tables,
     /// each once, in order of appearance.
     pub fn folded_columns(&self) -> Vec<(LogicalTable, String)> {
+        let mut out = self.read_columns();
+        out.retain(|(_, name)| folded_identifier(name));
+        out
+    }
+
+    /// Every column the plan reads, with its logical table, each once, in
+    /// order of appearance.
+    pub fn read_columns(&self) -> Vec<(LogicalTable, String)> {
         let mut out: Vec<(LogicalTable, String)> = Vec::new();
         let mut plan = self.clone();
         plan.for_each_column(|table, name| {
-            if folded_identifier(name) {
-                let key = (table.clone(), name.clone());
-                if !out.contains(&key) {
-                    out.push(key);
-                }
+            let key = (table.clone(), name.clone());
+            if !out.contains(&key) {
+                out.push(key);
             }
         });
+        out
+    }
+
+    /// Every logical table the plan scans, each once, in order of
+    /// appearance.
+    pub fn logical_tables(&self) -> Vec<LogicalTable> {
+        let mut out: Vec<LogicalTable> = Vec::new();
+        for table in self.branches.iter().flat_map(|b| &b.from) {
+            if !out.contains(table) {
+                out.push(table.clone());
+            }
+        }
         out
     }
 }

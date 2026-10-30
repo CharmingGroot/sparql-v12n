@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use crate::sql::{TermKey, TermNormal};
 
 use super::*;
@@ -124,16 +126,26 @@ fn a_key_with_a_normalized_column_does_not_separate_terms() {
 #[test]
 fn problems_follow_the_request_order() {
     let request = CatalogRequest::for_mapping(&Mapping::from_turtle(SHOP).unwrap());
-    let readable = |missing: &[&str]| TableCatalog {
+    let readable = |found: &[&str]| TableCatalog {
         fingerprint: Some(Fingerprint::new("f".into())),
         status: TableStatus::Readable(Relation {
-            missing_columns: names(missing),
+            columns: found
+                .iter()
+                .map(|name| {
+                    let column = Column {
+                        name: (*name).to_owned(),
+                        ty: column_type(Comparison::Value),
+                        not_null: false,
+                    };
+                    ((*name).to_owned(), column)
+                })
+                .collect(),
             ..Relation::default()
         }),
     };
     let snapshot = CatalogSnapshot::new([
-        (table("orders"), readable(&["amount"])),
-        (table("customers"), readable(&[])),
+        (table("orders"), readable(&["id", "customer_id"])),
+        (table("customers"), readable(&["id", "name", "tier"])),
     ]);
     assert_eq!(
         snapshot
@@ -170,5 +182,98 @@ fn problems_follow_the_request_order() {
             "table customers does not exist",
             "table orders cannot be read: permission denied"
         ]
+    );
+}
+
+fn shop_plan(query: &str) -> SqlPlan {
+    let mapping = Mapping::from_turtle(SHOP).unwrap();
+    let index = crate::mapping::MappingIndex::new(&mapping);
+    crate::unfold::unfold(&crate::sparql::parse(query).unwrap(), &mapping, &index).unwrap()
+}
+
+const NAMES: &str = "SELECT ?c ?n WHERE { ?c <http://example.org/name> ?n }";
+
+fn customers(columns: &[&str], keys: Vec<UniqueKey>) -> (LogicalTable, TableCatalog) {
+    let columns = columns
+        .iter()
+        .map(|name| {
+            let column = Column {
+                name: (*name).to_owned(),
+                ty: column_type(Comparison::Value),
+                not_null: true,
+            };
+            ((*name).to_owned(), column)
+        })
+        .collect();
+    let entry = TableCatalog {
+        fingerprint: Some(Fingerprint::new("f".into())),
+        status: TableStatus::Readable(Relation {
+            columns,
+            unique_keys: keys,
+            ..Relation::default()
+        }),
+    };
+    (table("customers"), entry)
+}
+
+#[test]
+fn a_plan_needs_every_table_and_column_it_reads() {
+    let plan = shop_plan(NAMES);
+    let unread = CatalogPlan::new(&plan, Arc::default()).unwrap_err();
+    assert_eq!(
+        unread,
+        crate::Error::Catalog("table customers was not read from the catalog".into())
+    );
+    let snapshot = CatalogSnapshot::new([customers(&["id"], Vec::new())]);
+    assert!(!snapshot.covers(&plan));
+    let missing = CatalogPlan::new(&plan, Arc::new(snapshot)).unwrap_err();
+    assert_eq!(
+        missing,
+        crate::Error::Catalog("table customers has no column name".into())
+    );
+}
+
+#[test]
+fn keys_from_the_snapshot_drop_duplicate_removal() {
+    let plan = shop_plan(NAMES);
+    let without = CatalogSnapshot::new([customers(&["id", "name"], Vec::new())]);
+    let ready = CatalogPlan::new(&plan, Arc::new(without)).unwrap();
+    assert!(ready.plan().has_duplicates(ready.render_options().keys));
+
+    let id = key(vec![Some(column_type(Comparison::Value))], true);
+    let id = UniqueKey {
+        columns: names(&["id"]),
+        ..id
+    };
+    let with = CatalogSnapshot::new([customers(&["id", "name"], vec![id])]);
+    let ready = CatalogPlan::new(&plan, Arc::new(with)).unwrap();
+    assert!(!ready.plan().has_duplicates(ready.render_options().keys));
+    assert_eq!(
+        ready.entries().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+        [table("customers")]
+    );
+}
+
+#[test]
+fn reading_tables_again_keeps_the_columns_other_plans_need() {
+    let catalog = Catalog::new(CatalogSnapshot::new([customers(
+        &["id", "name", "tier"],
+        Vec::new(),
+    )]));
+    let snapshot = catalog.snapshot();
+    let request = snapshot.request_for(&shop_plan(NAMES));
+    let [customers_request] = request.tables() else {
+        panic!("{request:?}");
+    };
+    let mut columns = customers_request.columns.clone();
+    columns.sort();
+    assert_eq!(columns, names(&["id", "name", "tier"]));
+
+    let replaced = catalog.update(CatalogSnapshot::new([customers(&["id"], Vec::new())]));
+    assert!(Arc::ptr_eq(&replaced, &catalog.snapshot()));
+    assert!(!replaced.covers(&shop_plan(NAMES)));
+    assert!(
+        snapshot.covers(&shop_plan(NAMES)),
+        "a running query keeps its snapshot"
     );
 }

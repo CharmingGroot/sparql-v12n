@@ -29,6 +29,18 @@ Design decisions are recorded in the `Decision:` Discussions.
   mapping reads exists and can be read, and exits with 2 listing what the
   database lacks.
 
+### Changed
+
+- Keys, column types and resolved column names come from a catalog
+  snapshot instead of being read on every query (Discussion #187).
+  `v12n serve` reads it at startup; each query checks a fingerprint of
+  the catalog entries of its tables in the round trip that prepares the
+  statement, and reads them again when the database changed. A query
+  whose catalog changed again while it was planned anew gets HTTP 503.
+- A table or column that the mapping reads and the database lacks fails
+  the query with an error that names it, before the statement is
+  prepared.
+
 ## [0.0.1] - 2026-10-28
 
 First public version: a SPARQL-to-SQL virtualization engine over R2RML

@@ -6,22 +6,29 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use v12n_core::backend::{Backend, Connector};
-use v12n_core::{Engine, Limits, Planner};
+use v12n_core::{Catalog, Engine, Limits, Planner};
 
 type BackendError<C> = <<C as Connector>::Backend as Backend>::Error;
 
 pub(crate) struct Pool<C: Connector> {
     connector: C,
     planner: Arc<Planner>,
+    catalog: Arc<Catalog>,
     limits: Limits,
     idle: Mutex<Vec<Engine<C::Backend>>>,
 }
 
 impl<C: Connector> Pool<C> {
-    pub fn new(connector: C, planner: Arc<Planner>, limits: Limits) -> Arc<Self> {
+    pub fn new(
+        connector: C,
+        planner: Arc<Planner>,
+        catalog: Arc<Catalog>,
+        limits: Limits,
+    ) -> Arc<Self> {
         Arc::new(Self {
             connector,
             planner,
+            catalog,
             limits,
             idle: Mutex::new(Vec::new()),
         })
@@ -42,7 +49,12 @@ impl<C: Connector> Pool<C> {
             }
         }
         let backend = self.connector.connect(self.limits).await?;
-        Ok(self.lease(Engine::new(Arc::clone(&self.planner), backend)))
+        let engine = Engine::new(
+            Arc::clone(&self.planner),
+            Arc::clone(&self.catalog),
+            backend,
+        );
+        Ok(self.lease(engine))
     }
 
     fn lease(self: &Arc<Self>, engine: Engine<C::Backend>) -> Lease<C> {

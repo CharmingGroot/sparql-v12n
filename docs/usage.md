@@ -275,7 +275,7 @@ the dataset is the one that the mapping defines.
 | `400` | A query syntax error, a missing or repeated `query`, dataset parameters, or a query that unfolds into too many SQL branches |
 | `406` / `413` / `414` / `415` | `406`: a format that is not offered. `413`: a query over `max_query_bytes` in a `POST`. `414`: a query over `max_query_bytes` in a `GET`. `415`: any other content type |
 | `501` | A SPARQL feature that is not supported yet |
-| `503` | A statement timeout before the first row (`v12n query` exits with 4 in this case), or `max_concurrent_requests` reached (the response carries `Retry-After`) |
+| `503` | A statement timeout before the first row (`v12n query` exits with 4 in this case), or `max_concurrent_requests` reached (the response carries `Retry-After`), or a catalog that changed again while the query was planned anew after a change, as during a migration |
 | `500` | A database error or another internal error |
 
 The status is sent before the body. An error after the first row, such as

@@ -4,23 +4,29 @@
 use std::sync::Arc;
 
 use crate::Error;
-use crate::backend::Backend;
-use crate::catalog::CatalogSnapshot;
+use crate::backend::{Backend, BackendError, ErrorKind};
+use crate::catalog::{Catalog, CatalogPlan, CatalogSnapshot};
 use crate::planner::Planner;
 use crate::sql::{RenderOptions, RenderedSql, SqlPlan};
 
-/// A [`Planner`] paired with one [`Backend`] session.
+/// A [`Planner`] paired with one [`Backend`] session and the [`Catalog`]
+/// that the sessions of a front end share.
 ///
 /// Steps between planning and running a plan that need the database, such
 /// as reading its catalog, belong here, so that every front end gets them.
 pub struct Engine<B> {
     planner: Arc<Planner>,
+    catalog: Arc<Catalog>,
     backend: B,
 }
 
 impl<B: Backend> Engine<B> {
-    pub fn new(planner: Arc<Planner>, backend: B) -> Self {
-        Self { planner, backend }
+    pub fn new(planner: Arc<Planner>, catalog: Arc<Catalog>, backend: B) -> Self {
+        Self {
+            planner,
+            catalog,
+            backend,
+        }
     }
 
     pub fn planner(&self) -> &Planner {
@@ -38,15 +44,52 @@ impl<B: Backend> Engine<B> {
         plan.to_sql_with(self.backend.dialect(), &RenderOptions::default())
     }
 
-    /// The catalog entries of every logical table of the mapping.
-    pub async fn load_catalog(&self) -> Result<CatalogSnapshot, B::Error> {
-        self.backend
+    /// Reads the catalog entries of every logical table of the mapping
+    /// into the shared catalog, and returns the snapshot that results.
+    pub async fn load_catalog(&self) -> Result<Arc<CatalogSnapshot>, B::Error> {
+        let fresh = self
+            .backend
             .load_catalog(self.planner.catalog_request())
-            .await
+            .await?;
+        Ok(self.catalog.update(fresh))
     }
 
-    /// Runs `plan` on the backend.
+    /// Runs `plan` on the shared catalog snapshot (Discussion #187). The
+    /// tables of `plan` are read first when the snapshot does not show all
+    /// it reads, and read again once when the database no longer matches
+    /// the snapshot.
     pub async fn execute(&self, plan: &SqlPlan) -> Result<B::Solutions, B::Error> {
-        self.backend.execute(plan).await
+        let mut snapshot = self.catalog.snapshot();
+        if !snapshot.covers(plan) {
+            snapshot = self.reload(plan, &snapshot).await?;
+        }
+        match self.run(plan, Arc::clone(&snapshot)).await {
+            Err(e) if matches!(e.kind(), ErrorKind::StaleCatalog) => {
+                let snapshot = self.reload(plan, &snapshot).await?;
+                self.run(plan, snapshot).await
+            }
+            result => result,
+        }
+    }
+
+    async fn reload(
+        &self,
+        plan: &SqlPlan,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<Arc<CatalogSnapshot>, B::Error> {
+        let fresh = self
+            .backend
+            .load_catalog(&snapshot.request_for(plan))
+            .await?;
+        Ok(self.catalog.update(fresh))
+    }
+
+    async fn run(
+        &self,
+        plan: &SqlPlan,
+        snapshot: Arc<CatalogSnapshot>,
+    ) -> Result<B::Solutions, B::Error> {
+        let plan = CatalogPlan::new(plan, snapshot)?;
+        self.backend.execute(&plan).await
     }
 }
