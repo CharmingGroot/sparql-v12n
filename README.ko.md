@@ -9,7 +9,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
-    <img alt="SPARQL 쿼리와 R2RML 매핑을 입력하면 v12n이 쿼리를 SQL 쿼리 하나로 변환해 PostgreSQL에 보낸다. PostgreSQL이 행을 돌려주면 v12n은 이를 JSON, XML, CSV, TSV 형식의 SPARQL 결과로 반환한다." src="docs/images/how-it-works-light.svg" width="760">
+    <img alt="호출자가 v12n에 SPARQL 쿼리를 보낸다. R2RML 매핑은 쿼리 계획과 RDF term 구성에 사용되고, DB의 키와 컬럼 타입은 SQL 생성에 사용된다. PostgreSQL은 결과를 조회하는 SQL 쿼리 하나를 실행해 행을 반환한다. v12n은 행을 디코딩해 RDF term을 만들고, SELECT 바인딩을 JSON, XML, CSV, TSV로 스트리밍한다. 원본 데이터는 PostgreSQL에 남으며, 메타데이터 조회와 prepared statement 준비에 DB 왕복이 추가될 수 있다." src="docs/images/how-it-works-light.svg" width="760">
   </picture>
 </p>
 

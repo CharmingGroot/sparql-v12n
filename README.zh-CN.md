@@ -9,7 +9,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
-    <img alt="SPARQL 查询和 R2RML 映射输入 v12n，v12n 将查询翻译为一条 SQL 查询并发送给 PostgreSQL。PostgreSQL 返回行，v12n 再将其作为 JSON、XML、CSV 或 TSV 格式的 SPARQL 结果返回。" src="docs/images/how-it-works-light.svg" width="760">
+    <img alt="调用方将 SPARQL 查询提交给 v12n。R2RML 映射用于查询规划和 RDF 项构造，数据库的键和列类型用于生成 SQL。PostgreSQL 执行一条获取结果的 SQL 查询并返回行。v12n 解码这些行、构造 RDF 项，并以 JSON、XML、CSV 或 TSV 流式输出 SELECT 绑定。源数据保留在 PostgreSQL 中；加载元数据和准备语句可能需要额外的数据库往返。" src="docs/images/how-it-works-light.svg" width="760">
   </picture>
 </p>
 
