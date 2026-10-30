@@ -7,7 +7,7 @@ English | [한국어](README.ko.md) | [简体中文](README.zh-CN.md)
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
-    <img alt="A SPARQL query and an R2RML mapping go into v12n, which translates the query into one SQL query for PostgreSQL. PostgreSQL returns rows, and v12n returns them as SPARQL results in JSON, XML, CSV or TSV." src="docs/images/how-it-works-light.svg" width="760">
+    <img alt="A caller submits a SPARQL query to v12n. The R2RML mapping guides query planning and RDF term construction, and database keys and column types inform SQL generation. PostgreSQL runs one SQL query that retrieves the results and returns rows. v12n decodes the rows, builds RDF terms and streams the SELECT bindings as JSON, XML, CSV or TSV. The source data stays in PostgreSQL; loading metadata and preparing statements may take additional database round trips." src="docs/images/how-it-works-light.svg" width="760">
   </picture>
 </p>
 
