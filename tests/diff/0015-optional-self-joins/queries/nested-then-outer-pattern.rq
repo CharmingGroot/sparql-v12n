@@ -1,3 +1,0 @@
-PREFIX ex: <http://example.org/>
-
-SELECT ?a ?c ?s WHERE { ?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c OPTIONAL { ?a ex:site ?s } ?a ex:hostname ?s } }
