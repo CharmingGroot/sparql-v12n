@@ -109,7 +109,7 @@ impl Tls {
         };
         let verifier = Verifier {
             roots,
-            check_name: false,
+            check_name: check == Some(true),
             algorithms: provider.signature_verification_algorithms,
         };
         let config = ClientConfig::builder_with_provider(provider)
