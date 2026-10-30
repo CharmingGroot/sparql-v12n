@@ -108,6 +108,7 @@ flowchart TD
   `v12n serve`는 시작할 때 매핑의 모든 테이블을 읽고, `v12n query`는 계획이 읽는 테이블만 읽는다.
 - **계획 완성.** [`CatalogPlan::new`](../crates/v12n-core/src/catalog/plan.rs)는 `v12n-core`에서 DB 없이 실행된다.
   PostgreSQL이 소문자로 바꾸는 컬럼 이름을 해석한다.
+  term 컬럼마다 붙는 `IS NOT NULL`(R2RML §11에 따라 `NULL`에서는 항을 만들지 않음)은 테이블의 `NOT NULL` 제약으로 항상 참이면 뺀다. 뷰의 컬럼과 `LEFT JOIN` 때문에 `NULL`이 될 수 있는 컬럼에는 남긴다.
   키가 있으면 한 브랜치가 같은 행을 두 번 스캔하는지 알 수 있어 스캔을 합치고, 결과에 중복이 생길 수 없는지 알 수 있어 `DISTINCT`나 중복을 제거하는 `UNION`을 생략한다.
   `NOT NULL` 컬럼에 걸린 검증된 외래 키가 같은 컬럼 타입의 유일 키를 참조하면 각 행에 참조되는 행이 정확히 하나 있다. 쿼리가 그 키로 조인하고 키 컬럼만 읽는 참조 테이블 스캔은 없애고, 그 항은 참조하는 컬럼으로 만든다.
   컬럼 타입에 따라 `UNION` 브랜치를 맞추는 방법과 값을 RDF 항으로 비교하는 방법이 정해진다. 이 타입에서 SQL이 SPARQL과 같은 답을 낼 수 없는 비교는 `UnsupportedFeature`로 실패한다.

@@ -35,6 +35,24 @@ XSD_STRING = "http://www.w3.org/2001/XMLSchema#string"
 # The first solution, or the end of an empty result, in SPARQL JSON results.
 FIRST_ROW = re.compile(rb'"bindings"\s*:\s*\[\s*[{\]]')
 HTTP_TIMEOUT = 900
+# What a statement in pg_stat_statements is, by the first pattern its text
+# matches; any other statement is SQL the engine generated for the query.
+# v12n's catalog statements (crates/v12n-postgres/src/catalog.rs and
+# lib.rs) resolve table names with to_regclass and read the system
+# catalogs, which SQL generated from a mapping over the application's
+# tables does not. Generated SQL can name pg_catalog types and call
+# pg_typeof, so neither marks a catalog statement. A `SELECT 1` is a
+# connection check, which Ontop runs on some requests. The column probes
+# (`table_probe` in v12n-core, only prepared) are the only statements with
+# the alias p0.
+STATEMENT_KINDS = (
+    ("transaction", re.compile(r"^\s*(BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE)\b", re.I)),
+    ("session", re.compile(r"^\s*((SET|RESET|SHOW|DISCARD)\b|SELECT\s+(\$\d+|\d+)\s*;?\s*$)|\bset_config\s*\(", re.I)),
+    ("catalog", re.compile(
+        r"\bto_regclass\s*\(|\bpg_(class|index|attribute|constraint|inherits|opclass|namespace|type)\b"
+        r"|\sp0\s+LIMIT\s+(0|\$\d+)\s*$", re.I)),
+)
+KINDS = ("query", "catalog", "transaction", "session")
 
 
 def log(message):
@@ -56,6 +74,21 @@ def summary(values):
         "p95": round(percentile(values, 95), 3),
         "min": round(min(values), 3),
         "max": round(max(values), 3),
+    }
+
+
+def statement_kind(sql):
+    for kind, pattern in STATEMENT_KINDS:
+        if pattern.search(sql):
+            return kind
+    return "query"
+
+
+def per_request(statements, runs):
+    return {
+        "statements": round(sum(s["calls"] for s in statements) / runs, 2),
+        "exec_ms": round(sum(s["total_exec_ms"] for s in statements) / runs, 3),
+        "plan_ms": round(sum(s["total_plan_ms"] for s in statements) / runs, 3),
     }
 
 
@@ -421,27 +454,23 @@ class Postgres:
         run(self.compose + ["exec", "-T", "postgres", "psql", "-X", "-q", "-U", "v12n", "-d", "mdr", "-c", "SELECT pg_stat_statements_reset()"])
 
     def statements(self):
-        """Per role: statements run, execution and planning time, and each
-        statement, the one that took the most time first."""
-        totals = self.query_json(
-            """SELECT coalesce(json_object_agg(rolname, t), '{}') FROM (
-                 SELECT r.rolname, json_build_object(
-                   'calls', sum(s.calls), 'exec_ms', sum(s.total_exec_time),
-                   'plan_ms', sum(s.total_plan_time), 'rows', sum(s.rows)) AS t
-                 FROM pg_stat_statements s JOIN pg_roles r ON r.oid = s.userid
-                 WHERE r.rolname LIKE 'bench\\_%' GROUP BY r.rolname) x"""
-        )
+        """Per role, each statement with its kind, the one that took the
+        most time first."""
         each = self.query_json(
             """SELECT coalesce(json_object_agg(rolname, t), '{}') FROM (
                  SELECT rolname, json_agg(json_build_object(
-                   'calls', calls, 'mean_exec_ms', mean_exec_time,
-                   'mean_plan_ms', mean_plan_time, 'query', query) ORDER BY total_exec_time DESC) AS t
+                   'calls', calls, 'total_exec_ms', total_exec_time, 'total_plan_ms', total_plan_time,
+                   'mean_exec_ms', mean_exec_time, 'mean_plan_ms', mean_plan_time, 'rows', rows,
+                   'query', query) ORDER BY total_exec_time DESC) AS t
                  FROM (SELECT r.rolname, s.* FROM pg_stat_statements s
                        JOIN pg_roles r ON r.oid = s.userid
                        WHERE r.rolname LIKE 'bench\\_%') y
                  GROUP BY rolname) x"""
         )
-        return {role: dict(t, top=each[role][0], statements=each[role]) for role, t in totals.items()}
+        for statements in each.values():
+            for s in statements:
+                s["kind"] = statement_kind(s["query"])
+        return each
 
 
 def cli_query(binary, mapping, query_path, db_url):
@@ -696,15 +725,18 @@ def main():
                 record = entry["engines"][e.name]
                 record["ttfr_ms"] = summary(timings[e.name]["ttfr"])
                 record["total_ms"] = summary(timings[e.name]["total"])
-                db_stats = stats.get(role[e.name])
-                if db_stats:
-                    record["db_per_request"] = {
-                        "statements": round(db_stats["calls"] / args.runs, 2),
-                        "exec_ms": round(db_stats["exec_ms"] / args.runs, 3),
-                        "plan_ms": round(db_stats["plan_ms"] / args.runs, 3),
-                    }
-                    record["top_statement"] = db_stats["top"]
-                    record["statements"] = db_stats["statements"]
+                statements = stats.get(role[e.name])
+                if statements:
+                    record["db_per_request"] = dict(
+                        per_request(statements, args.runs),
+                        by_kind={k: per_request([s for s in statements if s["kind"] == k], args.runs) for k in KINDS},
+                    )
+                    # Statements that were only prepared, such as v12n's
+                    # column probes, have an entry without calls.
+                    top = next((s for s in statements if s["kind"] == "query" and s["calls"]), None)
+                    if top:
+                        record["top_statement"] = top
+                    record["statements"] = statements
             results["queries"][name] = entry
             log(f"{name}: " + ", ".join(
                 f"{e}={v['total_ms']['median']}ms" if v.get("total_ms") else f"{e}=n/a"
@@ -857,19 +889,35 @@ def markdown(r):
         "",
         "## Where the time goes (per request, median ms unless noted)",
         "",
-        "| Query | Translate (µs) | SQL render (µs) | v12n round trips | v12n statements | v12n DB exec | Ontop statements | Ontop DB exec | CLI total | CLI first row |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Query | Translate (µs) | SQL render (µs) | v12n round trips | v12n generated query exec (mean) | Ontop generated query exec (mean) | CLI total | CLI first row |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for name, q in r.get("queries", {}).items():
         t = r.get("translation", {}).get(name, {})
         v, o = q["engines"].get("v12n", {}), q["engines"].get("ontop", {})
-        vd, od = v.get("db_per_request", {}), o.get("db_per_request", {})
+        vq = v.get("db_per_request", {}).get("by_kind", {}).get("query", {})
+        oq = o.get("db_per_request", {}).get("by_kind", {}).get("query", {})
         c = r.get("cli", {}).get(name, {})
         lines.append(
             f"| {name} | {t.get('translate_us', {}).get('median', '-')} | {t.get('render_us', {}).get('median', '-')} | "
-            f"{statistics.median(v['round_trips']) if v.get('round_trips') else '-'} | {vd.get('statements', '-')} | {vd.get('exec_ms', '-')} | {od.get('statements', '-')} | {od.get('exec_ms', '-')} | "
+            f"{statistics.median(v['round_trips']) if v.get('round_trips') else '-'} | {vq.get('exec_ms', '-')} | {oq.get('exec_ms', '-')} | "
             f"{fmt(c.get('total_ms'))} | {fmt(c.get('ttfr_ms'))} |"
         )
+    lines += [
+        "",
+        "## Statements in PostgreSQL per request (statements / exec ms, mean of the timed runs)",
+        "",
+        "| Query | Engine | Generated query | Catalog | Transaction control | Session | All |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for name, q in r.get("queries", {}).items():
+        for engine, record in q["engines"].items():
+            d = record.get("db_per_request")
+            if not d:
+                continue
+            cells = [d["by_kind"].get(k) for k in KINDS] + [d]
+            lines.append(f"| {name} | {engine} | " + " | ".join(
+                f"{c['statements']} / {c['exec_ms']}" if c and c["statements"] else "-" for c in cells) + " |")
     load = r.get("load", {})
     if load:
         lines += [
@@ -885,13 +933,13 @@ def markdown(r):
                 f"| {name} | {l.get('per_second')} | {fmt(l.get('latency_ms'))} / {fmt(l.get('latency_ms'), 'p95')} | "
                 f"{l.get('errors')} | {l.get('rss_max_sampled_mib')} MiB |"
             )
-    lines += ["", "## Most expensive statement per query", ""]
+    lines += ["", "## Generated SQL per query (the query statement that took the most time)", ""]
     for name, q in r.get("queries", {}).items():
         for engine in ("v12n", "ontop"):
             top = q["engines"].get(engine, {}).get("top_statement")
             if top:
                 lines += [
-                    f"### {name}, {engine}: {top['calls']} calls, {top['mean_exec_ms']:.2f} ms mean",
+                    f"### {name}, {engine}: {top['calls']} calls, {top['mean_exec_ms']:.3f} ms mean",
                     "",
                     "```sql",
                     top["query"].strip(),

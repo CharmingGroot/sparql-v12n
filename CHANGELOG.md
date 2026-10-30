@@ -31,6 +31,9 @@ Design decisions are recorded in the `Decision:` Discussions.
 
 ### Changed
 
+- The generated SQL leaves out `IS NOT NULL` on term columns that a
+  `NOT NULL` constraint of a table keeps from being `NULL`, except where a
+  `LEFT JOIN` can make them `NULL`.
 - A scan of a referenced table is removed when a validated foreign key
   on `NOT NULL` columns, to a unique key of the same column types,
   joins it and the query reads only the key columns from it, as for the

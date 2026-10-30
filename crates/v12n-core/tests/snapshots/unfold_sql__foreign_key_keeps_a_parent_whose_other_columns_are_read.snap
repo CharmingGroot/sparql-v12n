@@ -5,6 +5,5 @@ expression: "explain_on_snapshot(\"SELECT ?a ?b ?h WHERE { ?a ex:connectsTo ?b .
 SELECT DISTINCT t0."src_id" AS "a", t1."id" AS "b", t1."hostname" AS "h"
 FROM "links" t0
 JOIN "assets" t1 ON t1."id" = t0."dst_id"
-WHERE t0."src_id" IS NOT NULL AND t1."hostname" IS NOT NULL
 
 -- params

@@ -3,13 +3,17 @@
 //! `V12N_TEST_DATABASE_URL` is set, e.g.
 //! `postgresql://v12n:v12n-dev@127.0.0.1:55432/shop`.
 
+use std::sync::Arc;
+
 use tokio_postgres::{Client, NoTls};
 use v12n_core::Limits;
 use v12n_core::backend::Backend;
 use v12n_core::catalog::{
-    CatalogRequest, CatalogSnapshot, Fingerprint, ForeignKey, Relation, TableStatus,
+    CatalogPlan, CatalogRequest, CatalogSnapshot, Fingerprint, ForeignKey, Relation, TableStatus,
 };
-use v12n_core::mapping::{LogicalTable, Mapping};
+use v12n_core::dialect::PostgresDialect;
+use v12n_core::mapping::{LogicalTable, Mapping, MappingIndex};
+use v12n_core::{sparql, unfold};
 use v12n_postgres::PostgresBackend;
 
 const MAPPING: &str = r#"
@@ -213,4 +217,74 @@ async fn fingerprint_changes_with_what_the_snapshot_reads() {
         .batch_execute("DROP SCHEMA v12n_fingerprint CASCADE")
         .await
         .unwrap();
+}
+
+/// R2RML §11: a `NULL` gives no term, so every term column gets
+/// `IS NOT NULL` unless the catalog shows a `NOT NULL` constraint on a
+/// table column (#111). A view's columns stay nullable.
+#[tokio::test]
+async fn not_null_columns_lose_their_condition() {
+    let Some(url) = database_url() else { return };
+    let (admin, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    admin
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS v12n_notnull CASCADE;
+             CREATE SCHEMA v12n_notnull;
+             CREATE TABLE v12n_notnull.items (id int PRIMARY KEY, label text NOT NULL, note text);
+             CREATE VIEW v12n_notnull.shown AS SELECT id, label FROM v12n_notnull.items;",
+        )
+        .await
+        .unwrap();
+    let mapping = Mapping::from_turtle(
+        r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#Items> rr:logicalTable [ rr:tableName "v12n_notnull.items" ] ;
+          rr:subjectMap [ rr:template "item/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "label" ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:note ; rr:objectMap [ rr:column "note" ] ] .
+        <#Shown> rr:logicalTable [ rr:tableName "v12n_notnull.shown" ] ;
+          rr:subjectMap [ rr:template "shown/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:shown ; rr:objectMap [ rr:column "label" ] ] .
+        "#,
+    )
+    .unwrap();
+    let unfolded = |query: &str| {
+        let query = sparql::parse(query).unwrap();
+        unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping)).unwrap()
+    };
+    let backend = PostgresBackend::connect(&url, Limits::default())
+        .await
+        .unwrap();
+    let mut rendered = Vec::new();
+    for query in [
+        "SELECT ?i ?l ?n WHERE { ?i <http://example.org/label> ?l ; <http://example.org/note> ?n }",
+        "SELECT ?i ?l WHERE { ?i <http://example.org/shown> ?l }",
+    ] {
+        let plan = unfolded(query);
+        let snapshot = backend
+            .load_catalog(&CatalogRequest::for_plan(&plan))
+            .await
+            .unwrap();
+        let ready = CatalogPlan::new(&plan, Arc::new(snapshot)).unwrap();
+        let text = ready
+            .plan()
+            .to_sql_with(&PostgresDialect, &ready.render_options())
+            .unwrap()
+            .sql;
+        rendered.push(text);
+    }
+    admin
+        .batch_execute("DROP SCHEMA v12n_notnull CASCADE")
+        .await
+        .unwrap();
+    let [items, shown] = &rendered[..] else {
+        unreachable!()
+    };
+    assert!(!items.contains("\"label\" IS NOT NULL"), "{items}");
+    assert!(!items.contains("\"id\" IS NOT NULL"), "{items}");
+    assert!(items.contains("\"note\" IS NOT NULL"), "{items}");
+    assert!(shown.contains("\"label\" IS NOT NULL"), "{shown}");
+    assert!(shown.contains("\"id\" IS NOT NULL"), "{shown}");
 }

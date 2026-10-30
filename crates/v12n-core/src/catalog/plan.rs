@@ -2,7 +2,7 @@
 //! The steps between unfolding and rendering that need the database's
 //! catalog, taken from a [`CatalogSnapshot`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Error;
@@ -65,6 +65,12 @@ impl CatalogPlan {
             .unwrap_or(plan);
         let plan = optimize::eliminate_foreign_key_joins(&plan, &snapshot.foreign_key_joins(&plan))
             .unwrap_or(plan);
+        let not_null = snapshot.not_null_columns(&plan.read_columns());
+        let plan = if not_null.is_empty() {
+            plan
+        } else {
+            plan.without_implied_not_null(&not_null)
+        };
         let keys = keys.map(|k| k.unique);
         // `DISTINCT` and `UNION` compare values with `=`, so the types of
         // the columns they compare tell which need a key next to them.
@@ -197,6 +203,25 @@ impl CatalogSnapshot {
                     .1;
                 Some(((table.clone(), name.clone()), column.ty.clone()))
             })
+            .collect()
+    }
+
+    /// Those of `columns`, named as the resolved plan names them, that a
+    /// `NOT NULL` constraint keeps from being `NULL`.
+    fn not_null_columns(
+        &self,
+        columns: &[(LogicalTable, String)],
+    ) -> HashSet<(LogicalTable, String)> {
+        columns
+            .iter()
+            .filter(|(table, name)| {
+                self.relation(table).is_some_and(|relation| {
+                    relation.columns.iter().any(|(written, column)| {
+                        column.not_null && plan_name(written, column) == *name
+                    })
+                })
+            })
+            .cloned()
             .collect()
     }
 

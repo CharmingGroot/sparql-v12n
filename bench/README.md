@@ -74,7 +74,34 @@ filtered column, created after loading, followed by `VACUUM ANALYZE`.
   translate` times parsing and unfolding, and SQL rendering, per query.
 - **Database side**: `pg_stat_statements`, one login role per engine, gives
   the statements each request runs and their execution and planning time,
-  and the most expensive statement (the SQL each engine generated).
+  as a mean over the timed runs. Each statement is reported under one of
+  these kinds, by its text:
+  - `transaction`: transaction control (`BEGIN`, `START TRANSACTION`,
+    `COMMIT`, `END`, `ROLLBACK`, `ABORT`, `SAVEPOINT`, `RELEASE`), such
+    as the `BEGIN` and `COMMIT` around each Ontop query.
+  - `session`: session settings (`SET`, `RESET`, `SHOW`, `DISCARD`, or a
+    call to `set_config`), such as the settings v12n makes on a new
+    connection, and connection checks (`SELECT 1`), which Ontop runs on
+    some requests.
+  - `catalog`: a statement that calls `to_regclass` or reads `pg_class`,
+    `pg_index`, `pg_attribute`, `pg_constraint`, `pg_inherits`,
+    `pg_opclass`, `pg_namespace` or `pg_type`, or a v12n column probe
+    (`SELECT … FROM … p0 LIMIT 0`). For v12n these are the catalog
+    statements of `crates/v12n-postgres/src/catalog.rs` and `lib.rs`:
+    the fingerprint check run on every request, and the fingerprint,
+    `NOT NULL`, unique key and foreign key queries and the probes of a
+    snapshot load on a new connection. The probes are only prepared and
+    have no calls.
+  - `query`: every other statement, the SQL the engine generated for the
+    SPARQL query. Generated SQL may name `pg_catalog` types or call
+    `pg_typeof`; neither makes it a catalog statement.
+
+  `results.md` gives the count and execution time per request of each
+  kind and of all statements, and the generated query that took the
+  most time (`top_statement` in `results.json`). The SQL execution time
+  in the per-query table is that of the generated query only.
+  `results.json` lists every statement with its kind, so a
+  classification can be checked.
 - **Round trips**: a third `v12n serve` reaches PostgreSQL through a
   proxy in `bench.py` that counts the requests v12n waits on per HTTP
   request (pipelined requests count once; prepare-only steps count too,

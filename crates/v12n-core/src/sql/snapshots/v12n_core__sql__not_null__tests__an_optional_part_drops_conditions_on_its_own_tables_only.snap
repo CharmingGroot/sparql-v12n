@@ -1,0 +1,12 @@
+---
+source: crates/v12n-core/src/sql/not_null.rs
+expression: constrained
+---
+SELECT q."c", q."a"
+FROM (
+SELECT DISTINCT t0."id" AS "c", t1."id" AS "o", t2."amount" AS "a"
+FROM "customers" t0
+LEFT JOIN ("orders" t1
+JOIN "orders" t2 ON t2."id" = t1."id") ON t1."customer_id" = t0."id"
+WHERE (t2."amount" IS NOT NULL)
+) q

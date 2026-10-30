@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# The view's label is NULL for odd ids, so those rows give no triple.
+SELECT ?i ?l WHERE { ?i ex:shownLabel ?l }
