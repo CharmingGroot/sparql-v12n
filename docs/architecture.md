@@ -145,7 +145,9 @@ flowchart TD
   `rr:sqlQuery` also parses its probe there and compares the column
   names and types with the snapshot. When anything differs, the
   statement does not run: the engine reads those tables again and plans
-  once more. A second difference is a retryable error (HTTP 503).
+  once more. A second difference is a retryable error (HTTP 503). A
+  query that has just read its tables, as every `v12n query` does, does
+  not check them again.
 - **Parameters.** Every constant of the query is a bound parameter. The
   types PostgreSQL infers for them can change the SQL, for example a
   comparison that has to match the text output of a type without a
