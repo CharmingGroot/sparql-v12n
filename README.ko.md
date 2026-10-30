@@ -27,6 +27,19 @@
 > 상태: 실험 단계. 아래의 지원 범위는 Ontop 및 W3C R2RML 테스트 케이스와 대조해
 > 검증한다. 1.0 이전에는 명령, 출력, API가 바뀔 수 있다.
 
+## 목적
+
+v12n은 관계형 데이터베이스에 있는 데이터를 별도 RDF 저장소에 적재하지 않고 RDF
+그래프로 조회한다. 그래프는 R2RML 매핑이 정의한다. 각 쿼리는 원본 테이블에서
+SQL로 실행되고, 결과에 포함된 행만 RDF term으로 변환된다. 대량의 `SELECT` 결과를
+DB 행에서 직렬화된 응답까지 효율적으로 변환하고 반환하는 것이 이 프로젝트의 성능
+목표다.
+
+데이터가 PostgreSQL에 있고, 쿼리가 [지원 범위](#지원하는-sparql)에 들어가며,
+온톨로지 추론 없이 매핑에 명시된 클래스와 속성만으로 충분할 때 이 엔진을 검토할
+수 있다. 현재 실험 단계이며 PostgreSQL만 지원한다. Ontop과 비교한 벤치마크는
+[성능](#성능)에서 연결한다.
+
 ## 설치
 
 [릴리스](https://github.com/CharmingGroot/sparql-v12n/releases) 페이지에서 플랫폼에
@@ -225,6 +238,39 @@ v12n explain examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq
 
 각 명령의 출력 형식과 종료 코드, HTTP 엔드포인트와 그 설정은
 [docs/usage.ko.md](docs/usage.ko.md)에 있다.
+
+## 성능
+
+[bench/README.md](bench/README.md)는 같은 PostgreSQL, 매핑, 쿼리로 Ontop과
+비교하는 벤치마크를 설명하고, [bench/RESULTS.md](bench/RESULTS.md)는 측정 결과와
+분석을 담는다. 각 엔진의 시간은 Ontop과 같은 해(solution)를 반환한 경우에만
+집계한다.
+
+아래 수치는 2026-10-26에 커밋 `57f7f63`에서 실행한 벤치마크 한 차례의 결과이며,
+현재 main 브랜치의 측정값이 아니다. PostgreSQL 17.11에 `alerts` 1,000,000행,
+`assets` 100,000행, `links` 200,000행, `observables` 2,200,000행을 적재했다.
+v12n은 Apple M4(16 GiB)의 macOS에서 네이티브로 실행했고, Ontop 5.5.0(`-Xmx256m`)과
+PostgreSQL은 Docker Desktop VM에서 실행했다. 각 시간은 10회 실행의 중앙값이며,
+새 연결에서 SPARQL 1.1 Protocol 요청을 보낸 시점부터 JSON 응답이 끝날 때까지를
+측정한다.
+
+| 쿼리 | 결과 행 | v12n (ms) | Ontop (ms) |
+|---|---:|---:|---:|
+| `q06-union` | 145,000 | 124.5 | 1267.4 |
+| `q07-order-limit` | 100 | 194.8 | 142.9 |
+
+이 측정에서 v12n은 쿼리 9개 중 8개에서 Ontop보다 짧게 걸렸고, 정수와 IRI로
+정렬하는 `q07-order-limit`에서는 더 오래 걸렸다. 이후의 변경으로 `alerts`
+100,000행에서 이 쿼리의 시간이 줄었으며([#75 이후 IRI 정렬 키](bench/RESULTS.md#iri-sort-keys-after-75)),
+`alerts` 1,000,000행 측정은 다시 실행하지 않았다. 이 결과는 이 기계와 이
+쿼리들에 한정된다. Ontop의 힙은 256 MiB로 제한되었으며, 힙을 늘리면 큰 결과에서의 시간이
+달라질 수 있다([주의 사항](bench/RESULTS.md#caveats)).
+
+이 시간은 전체 소요 시간(end to end)이다. PostgreSQL의 SQL 실행, 행 디코딩,
+RDF term 구성, 응답 작성이 모두 포함된다. SPARQL→SQL 변환 시간은 따로 측정하며,
+보고서에서는 쿼리당 15–40 µs였다. 두 엔진 모두 데이터베이스 전체를 RDF로 변환하지
+않으므로, 이 벤치마크는 전체 데이터의 RDF 물질화(materialization)를 측정하지
+않는다.
 
 ## 로드맵
 

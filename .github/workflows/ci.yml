@@ -186,6 +186,20 @@ jobs:
         env:
           CONTAINER: ${{ job.services.postgres.id }}
         run: cat examples/shop/schema.sql examples/shop/data.sql | docker exec -i "$CONTAINER" psql -q -v ON_ERROR_STOP=1 -U v12n -d shop
+      # The server of the TLS tests, from the image the service already
+      # pulled, so that it downloads nothing. tls.sh writes its variables to
+      # a file rather than through eval, which would hide its exit status.
+      - name: Start PostgreSQL with TLS
+        id: tls
+        if: ${{ !cancelled() }}
+        env:
+          CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          image=$(docker inspect --format '{{.Config.Image}}' "$CONTAINER")
+          TLS_PG_IMAGE="$image" testenv/tls.sh up > "$RUNNER_TEMP/tls.env"
+          . "$RUNNER_TEMP/tls.env"
+          echo "url=$V12N_TEST_TLS_DATABASE_URL" >> "$GITHUB_OUTPUT"
+          echo "certs=$V12N_TEST_TLS_CERTS" >> "$GITHUB_OUTPUT"
       # Integration test binaries against PostgreSQL, plus the v12n-postgres
       # library, whose unit tests include one that reads a query plan from
       # PostgreSQL; reuses the build above. The differential tests have
@@ -194,6 +208,8 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           V12N_TEST_DATABASE_URL: postgresql://v12n:v12n-dev@127.0.0.1:55432/shop
+          V12N_TEST_TLS_DATABASE_URL: ${{ steps.tls.outputs.url }}
+          V12N_TEST_TLS_CERTS: ${{ steps.tls.outputs.certs }}
         run: cargo nextest run --workspace --locked --profile ci -E '(kind(test) - package(v12n-difftest)) + (kind(lib) & package(v12n-postgres))'
       - name: Keep the PostgreSQL test report
         if: always()

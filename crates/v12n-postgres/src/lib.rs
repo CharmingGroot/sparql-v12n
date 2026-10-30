@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Runs SQL produced by `v12n-core` on PostgreSQL and streams rows back as
-//! SPARQL solutions.
+//! SPARQL solutions: the PostgreSQL adapter of the core's
+//! [`Backend`] port.
 
 mod bind;
+mod connector;
 mod decode;
 mod error;
 mod tls;
@@ -18,6 +20,8 @@ use futures_util::future::{join, join4};
 use tls::Tls;
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Config, RowStream, Statement};
+use v12n_core::Limits;
+use v12n_core::backend::{Backend, SolutionStream};
 use v12n_core::dialect::PostgresDialect;
 use v12n_core::mapping::LogicalTable;
 use v12n_core::optimize;
@@ -29,19 +33,16 @@ use v12n_core::sql::{
 };
 
 use bind::{Bound, bind, term_key, term_normal};
+pub use connector::PostgresConnector;
 use decode::{Decoder, Raw, column_type};
 pub use error::Error;
 
-/// Default for [`Limits::statement_timeout`].
-pub const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Default for [`Limits::row_limit`].
-pub const DEFAULT_ROW_LIMIT: u64 = 10_000;
 /// Applied when the connection string sets no `connect_timeout`.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Most plans whose statements a connection remembers ([`Database::recent`]).
+/// Most plans whose statements a connection remembers ([`PostgresBackend::recent`]).
 const RECENT_PLANS: usize = 64;
 
-/// The unique keys of the tables named in `$1`, see [`Database::load_keys`].
+/// The unique keys of the tables named in `$1`, see [`PostgresBackend::load_keys`].
 const KEYS_SQL: &str = "SELECT t.n::int4, array_agg(a.attname::text ORDER BY c.ord),
    bool_and(a.attnotnull AND c.coll = a.attcollation AND o.opcdefault),
    array_agg(a.atttypid ORDER BY c.ord)
@@ -58,7 +59,7 @@ const KEYS_SQL: &str = "SELECT t.n::int4, array_agg(a.attname::text ORDER BY c.o
      OR NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = r.oid))
  GROUP BY t.n, i.indexrelid";
 
-/// Unique keys of a plan's tables, see [`Database::load_keys`].
+/// Unique keys of a plan's tables, see [`PostgresBackend::load_keys`].
 struct Keys {
     /// Every key that always holds, for removing duplicates.
     unique: TableKeys,
@@ -66,26 +67,8 @@ struct Keys {
     mergeable: TableKeys,
 }
 
-/// Resource limits for every query run on a [`Database`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Limits {
-    /// PostgreSQL `statement_timeout`; zero disables it.
-    pub statement_timeout: Duration,
-    /// Most solutions returned per query; zero means no limit.
-    pub row_limit: u64,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            statement_timeout: DEFAULT_STATEMENT_TIMEOUT,
-            row_limit: DEFAULT_ROW_LIMIT,
-        }
-    }
-}
-
 /// A connection that runs [`SqlPlan`]s.
-pub struct Database {
+pub struct PostgresBackend {
     client: Client,
     limits: Limits,
     /// Whether the server encoding is UTF-8, where `COLLATE "C"` orders
@@ -104,7 +87,7 @@ pub struct Database {
     recent: Mutex<HashMap<String, Vec<String>>>,
 }
 
-impl Database {
+impl PostgresBackend {
     /// Connects with a libpq-style connection string or URL and sets up the
     /// session: the statement timeout, and read-only transactions so that
     /// an `rr:sqlQuery` cannot change data even through a function call.
@@ -160,19 +143,14 @@ impl Database {
         })
     }
 
-    /// Whether the connection is gone, e.g. after a server restart.
-    pub fn is_closed(&self) -> bool {
-        self.client.is_closed()
-    }
-
-    /// Runs a plan. Rows are fetched as the returned [`Solutions`] are read.
+    /// Runs a plan for [`Backend::execute`].
     ///
     /// Everything that depends on the plan alone is sent in one pipelined
     /// round trip: the catalog query for keys, one statement that resolves
     /// column names and reports column types, and the statements prepared
     /// for the same plan last time. The statement is then prepared, unless
     /// one of those is it, and run.
-    pub async fn execute(&self, plan: &SqlPlan) -> Result<Solutions, Error> {
+    async fn run(&self, plan: &SqlPlan) -> Result<Solutions, Error> {
         let timeout = self.limits.statement_timeout;
         let pg = |e| Error::from_postgres(e, timeout);
         // Rendering without database information fails where only the
@@ -619,7 +597,25 @@ impl Database {
     }
 }
 
-/// The tables whose keys [`Database::load_keys`] reads for `plan`: those of
+impl Backend for PostgresBackend {
+    type Dialect = PostgresDialect;
+    type Solutions = Solutions;
+    type Error = Error;
+
+    fn dialect(&self) -> &PostgresDialect {
+        &PostgresDialect
+    }
+
+    fn execute(&self, plan: &SqlPlan) -> impl Future<Output = Result<Solutions, Error>> + Send {
+        self.run(plan)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.client.is_closed()
+    }
+}
+
+/// The tables whose keys [`PostgresBackend::load_keys`] reads for `plan`: those of
 /// `key_tables` and `self_join_tables`, each once.
 fn keyed_tables(plan: &SqlPlan) -> Vec<LogicalTable> {
     let mut tables = plan.key_tables();
@@ -631,7 +627,7 @@ fn keyed_tables(plan: &SqlPlan) -> Vec<LogicalTable> {
     tables
 }
 
-/// The columns whose types [`Database::column_types`] reads: those the
+/// The columns whose types [`PostgresBackend::column_types`] reads: those the
 /// plan compares as RDF terms or combines with `UNION`, and every selected
 /// column when the query removes duplicates.
 fn typed_columns(plan: &SqlPlan, removes_duplicates: bool) -> Vec<(LogicalTable, String)> {
@@ -768,15 +764,14 @@ pub struct Solutions {
     timeout: Duration,
 }
 
-impl Solutions {
-    /// Projected variable names, without `?`.
-    pub fn variables(&self) -> &[String] {
+impl SolutionStream for Solutions {
+    type Error = Error;
+
+    fn variables(&self) -> &[String] {
         self.builder.variables()
     }
 
-    /// The next solution, or `None` when there are no more or the row
-    /// limit is reached; [`is_truncated`](Self::is_truncated) tells which.
-    pub async fn try_next(&mut self) -> Result<Option<Solution>, Error> {
+    async fn try_next(&mut self) -> Result<Option<Solution>, Error> {
         let Some(rows) = self.rows.as_mut() else {
             return Ok(None);
         };
@@ -821,9 +816,7 @@ impl Solutions {
         Ok(Some(self.builder.build(&values)?))
     }
 
-    /// Whether the result has more rows than the row limit. Known once
-    /// the first solution has been read.
-    pub fn is_truncated(&self) -> bool {
+    fn is_truncated(&self) -> bool {
         self.truncated
     }
 }
@@ -1024,7 +1017,9 @@ mod tests {
         )
         .unwrap();
         let plan = unfold::unfold(&query, &mapping, &MappingIndex::new(&mapping)).unwrap();
-        let database = Database::connect(&url, Limits::default()).await.unwrap();
+        let database = PostgresBackend::connect(&url, Limits::default())
+            .await
+            .unwrap();
         let types = database.column_types(&plan, false).await.unwrap();
         let keys = database.load_table_keys(&plan).await.unwrap();
         let rendered = plan

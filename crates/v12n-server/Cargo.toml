@@ -10,7 +10,6 @@ publish.workspace = true
 
 [dependencies]
 v12n-core.workspace = true
-v12n-postgres.workspace = true
 axum.workspace = true
 bytes.workspace = true
 form_urlencoded.workspace = true
@@ -22,6 +21,7 @@ toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+v12n-postgres.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tower = { workspace = true, features = ["util"] }
