@@ -14,7 +14,7 @@ use super::required_columns::arm_has_duplicates;
 use super::{
     ColumnType, ColumnTypes, Comparison, Condition, Lexical, OrderColumn, RenderOptions,
     RenderedSql, SqlBranch, SqlExpr, SqlPlan, TermDatatype, TermKey, TermNormal, TermSql,
-    TermSqlValue, filter, order, quote_identifier,
+    TermSqlValue, ValueKind, filter, order, quote_identifier,
 };
 
 impl RenderedSql {
@@ -139,10 +139,8 @@ impl SqlPlan {
                 select.typed_text_from = Some(self.columns.len());
             }
         }
-        if (self.distinct || dedup)
-            && let Some(types) = options.column_types
-        {
-            select.term_keys = self.term_keys(&select, types);
+        if self.distinct || dedup {
+            select.term_keys = self.term_keys(&select, options.column_types);
         }
         let subquery = select.aliases.len() > self.columns.len()
             || !select.term_keys.is_empty()
@@ -286,20 +284,23 @@ impl SqlPlan {
 
     /// The [`TermKey`] columns to select next to the entries of `select`
     /// whose duplicates are removed: one per entry that some branch reads
-    /// from a column whose type has a key.
-    fn term_keys(&self, select: &Select, types: &ColumnTypes) -> Vec<(String, usize)> {
+    /// from a column whose type has a key, or computes as a double.
+    fn term_keys(&self, select: &Select, types: Option<&ColumnTypes>) -> Vec<(String, usize)> {
         let mut used: HashSet<String> = select.aliases.iter().cloned().collect();
         let mut out = Vec::new();
         for &entry in &select.order {
-            let keyed = self.branches.iter().any(|branch| {
-                matches!(
-                    &branch.select[entry],
-                    SqlExpr::Column { table, name }
-                        if types
+            let keyed = self
+                .branches
+                .iter()
+                .any(|branch| match &branch.select[entry] {
+                    SqlExpr::Column { table, name } => types.is_some_and(|types| {
+                        types
                             .get(&(branch.from[*table].clone(), name.clone()))
                             .is_some_and(|ty| ty.term_key.is_some())
-                )
-            });
+                    }),
+                    SqlExpr::Value { kind, .. } => *kind == ValueKind::Double,
+                    _ => false,
+                });
             if keyed {
                 let mut alias = format!("{}_key", select.aliases[entry]);
                 while used.contains(&alias) {
@@ -474,6 +475,13 @@ impl<'a> Renderer<'a> {
                     };
                     self.sql.push_str(&key);
                 }
+                SqlExpr::Value {
+                    value,
+                    kind: kind @ ValueKind::Double,
+                } => self.wrapped(
+                    |this| this.value(&branch.values[*value], *kind),
+                    |dialect, value| TermKey::Text.sql(dialect, &format!("({value})")),
+                )?,
                 _ => self
                     .sql
                     .push_str(&self.dialect.cast("NULL", &SqlType::Text)),

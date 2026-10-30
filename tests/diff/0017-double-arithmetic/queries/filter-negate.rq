@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# The negation of -INF is INF, and of -0 is 0.
+SELECT ?r WHERE { ?r ex:f ?f FILTER(-?f > 0) }

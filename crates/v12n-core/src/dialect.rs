@@ -48,6 +48,10 @@ pub trait Dialect {
     /// Whether the timestamp or date `expr` is neither infinity.
     fn is_finite(&self, expr: &str) -> String;
 
+    /// Whether the sign bit of the 64-bit floating point `expr` is set,
+    /// which tells `-0` from `0`.
+    fn sign_bit(&self, expr: &str) -> String;
+
     /// The name of the SQL type of `expr`, as text.
     fn type_of(&self, expr: &str) -> String;
 

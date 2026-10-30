@@ -166,10 +166,10 @@ v12n explain examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq
 |---|---|---|
 | 基本图模式 | 常量谓词与 `rdf:type`；常量与共享变量按 RDF term 匹配，可跨越不同的列类型；一个三元组无论由多少行产生都只计一次 | 变量谓词、属性路径、`GRAPH`、`FROM` 与 `FROM NAMED` |
 | `SELECT`、`SELECT *`、`DISTINCT` | 对解采用 bag 语义 | `REDUCED`、子查询、`GROUP BY` 与聚合 |
-| `BIND`、`SELECT (expr AS ?v)` | 变量、常量，或整数与 decimal 的 `+`、`-`、`*`、`/`；发生错误时变量保持未绑定 | 其他表达式；`OPTIONAL` 或 `UNION` 内部的 `BIND`；在三元组模式、`FILTER`、`ORDER BY` 或其他表达式中使用计算得到的变量 |
+| `BIND`、`SELECT (expr AS ?v)` | 变量、常量，或整数、decimal 与 double 的 `+`、`-`、`*`、`/`；发生错误时变量保持未绑定 | 其他表达式；`OPTIONAL` 或 `UNION` 内部的 `BIND`；在三元组模式、`FILTER`、`ORDER BY` 或其他表达式中使用计算得到的变量 |
 | `OPTIONAL` | 嵌套与顺序排列、内部的 `FILTER`、未绑定变量 | 对仅由多个 `OPTIONAL` 部分绑定的变量使用 `SELECT DISTINCT`；`OPTIONAL` 内部包围一侧为空的 `UNION` 的 `FILTER` |
 | `UNION` | 两侧的 bag 并集，在 `OPTIONAL` 内部同样适用；同一变量可对应不同形态的 term map | 在同一变量的自然数据类型列与另一种字面量形态之间去重 |
-| `FILTER` | `=`、`!=`、`<`、`<=`、`>`、`>=`、`&&`、`\|\|`、`!`、`BOUND`、`sameTerm`、`isIRI`、`isBlank`、`isLiteral`、`STR`、`LANG`、`DATATYPE`、`REGEX`、整数与 decimal 的 `+`、`-`、`*`、`/`，遵循 SPARQL 的错误语义 | 其他函数、`xsd:double` 的算术、`IN`、`EXISTS`；SPARQL 1.1 留给扩展处理的比较（`xsd:date` 的排序、带语言标签字面量上的 `!=`、带时区与不带时区的 dateTime 之间的比较）；`real` 列上的比较；含 `\d`、`\w`、`\p{..}` 与反向引用的 `REGEX` |
+| `FILTER` | `=`、`!=`、`<`、`<=`、`>`、`>=`、`&&`、`\|\|`、`!`、`BOUND`、`sameTerm`、`isIRI`、`isBlank`、`isLiteral`、`STR`、`LANG`、`DATATYPE`、`REGEX`、整数、decimal 与 double 的 `+`、`-`、`*`、`/`（double 采用 IEEE 754 结果），遵循 SPARQL 的错误语义 | 其他函数、`IN`、`EXISTS`；SPARQL 1.1 留给扩展处理的比较（`xsd:date` 的排序、带语言标签字面量上的 `!=`、带时区与不带时区的 dateTime 之间的比较）；`real` 列上的比较与算术；含 `\d`、`\w`、`\p{..}` 与反向引用的 `REGEX` |
 | `ORDER BY`、`LIMIT`、`OFFSET` | SPARQL 1.1 的顺序，在其未规定之处采用固定顺序 | 对 `SELECT DISTINCT` 未投影的变量使用 `ORDER BY` |
 | 字面量 | RDF 1.1 的 term 相等：语言标签为小写，`xsd:string` 即简单字面量，XSD 1.1 规范词法形式 | 在 `FILTER` 中按值比较 `xsd:float` 与派生整数类型 |
 | 其他形式 | 不进行 RDFS 推理：`rdf:type` 匹配映射中声明的类 | `ASK`、`CONSTRUCT`、`DESCRIBE`、`MINUS`、`VALUES`、`SERVICE` |

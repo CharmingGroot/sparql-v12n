@@ -26,6 +26,7 @@ const POSTGRES_SYNTAX: &[&str] = &[
     "interval",
     "encode(",
     "generate_series",
+    "float8send",
 ];
 
 /// Writes each construct of [`Dialect`] as a marker, such as
@@ -52,6 +53,10 @@ impl Dialect for MarkerDialect {
 
     fn is_finite(&self, expr: &str) -> String {
         format!("<<IS_FINITE {expr}>>")
+    }
+
+    fn sign_bit(&self, expr: &str) -> String {
+        format!("<<SIGN_BIT {expr}>>")
     }
 
     fn type_of(&self, expr: &str) -> String {
@@ -788,6 +793,15 @@ fn time_midnight_constant_also_matches_24_00() {
 fn bind_computes_arithmetic_in_numeric() {
     insta::assert_snapshot!(explain_shop_with_types(
         "SELECT ?o ?total WHERE { ?o ex:amount ?a BIND(?a * 2 + 1 AS ?total) }"
+    ));
+}
+
+/// A double constant makes the result a double: one `float8` result
+/// column, computed with the IEEE 754 results of each operator.
+#[test]
+fn bind_computes_double_arithmetic_in_float8() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?o ?scaled WHERE { ?o ex:amount ?a BIND(?a * 1.5e0 AS ?scaled) }"
     ));
 }
 

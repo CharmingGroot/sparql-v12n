@@ -12,6 +12,10 @@ Design decisions are recorded in the `Decision:` Discussions.
 
 - `BIND` and `SELECT (expr AS ?v)` over variables, constants and arithmetic
   on integers and decimals. An error leaves the variable unbound.
+- Arithmetic on `xsd:double` values in `FILTER`, `BIND` and `SELECT`, with
+  IEEE 754 results: infinities and signed zeros where PostgreSQL's
+  `float8` operators raise errors, and NaN neither equal to nor ordered
+  with anything.
 - Arithmetic (`+`, `-`, `*`, `/`) on integers and decimals in `FILTER`,
   with XPath's type promotion and SPARQL's error semantics.
 - SPARQL Query Results XML, CSV and TSV from the endpoint, chosen by
@@ -43,6 +47,12 @@ Design decisions are recorded in the `Decision:` Discussions.
 - A table or column that the mapping reads and the database lacks fails
   the query with an error that names it, before the statement is
   prepared.
+
+### Fixed
+
+- An `xsd:decimal` compared with an `xsd:double` becomes the nearest
+  double without raising an error beyond the range of doubles, and a
+  `numeric` NaN or infinity is an error there, as in other comparisons.
 
 ## [0.0.1] - 2026-10-28
 

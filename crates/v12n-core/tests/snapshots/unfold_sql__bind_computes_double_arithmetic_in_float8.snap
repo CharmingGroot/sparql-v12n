@@ -1,0 +1,10 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"SELECT ?o ?scaled WHERE { ?o ex:amount ?a BIND(?a * 1.5e0 AS ?scaled) }\")"
+---
+SELECT t0."id" AS "o", CASE WHEN CASE WHEN abs(t0."amount"::float8) BETWEEN '1e0'::float8 AND '1.7976931348623157e308'::float8 AND abs($1::float8) BETWEEN '1e0'::float8 AND '1.7976931348623157e308'::float8 THEN abs((t0."amount"::float8 * '7.458340731200207e-155'::float8) * ($1::float8 * '7.458340731200207e-155'::float8)) >= 1 END THEN CASE WHEN (t0."amount"::float8 < 0) <> ($1::float8 < 0) THEN '-Infinity'::float8 ELSE 'Infinity'::float8 END WHEN CASE WHEN t0."amount"::float8 <> 0 AND $1::float8 <> 0 AND abs(t0."amount"::float8) < 1 AND abs($1::float8) < 1 AND (abs(t0."amount"::float8) < '2.2227587494850775e-162'::float8 OR abs($1::float8) < '2.2227587494850775e-162'::float8) THEN (SELECT CASE WHEN m * n < 1 THEN true WHEN m * n > 1 THEN false ELSE ((mh * nh - 1) + mh * nl + ml * nh) + ml * nl <= 0 END FROM (SELECT m, n, mh, m - mh AS ml, nh, n - nh AS nl FROM (SELECT m, n, m * '1.34217729e8'::float8 - (m * '1.34217729e8'::float8 - m) AS mh, n * '1.34217729e8'::float8 - (n * '1.34217729e8'::float8 - n) AS nh FROM (SELECT abs(t0."amount"::float8) * '8.997827589086393e161'::float8 AS m, abs($1::float8) * '4.4989137945431964e161'::float8 AS n) AS s) AS h) AS l) END THEN CASE WHEN (t0."amount"::float8 < 0) <> ($1::float8 < 0) THEN '-0e0'::float8 ELSE '0e0'::float8 END ELSE t0."amount"::float8 * $1::float8 END AS "scaled"
+FROM "orders" t0
+WHERE t0."id" IS NOT NULL AND t0."amount" IS NOT NULL
+
+-- params
+$1 = "1.5E0"
