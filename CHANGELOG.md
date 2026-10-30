@@ -31,6 +31,10 @@ Design decisions are recorded in the `Decision:` Discussions.
 
 ### Changed
 
+- An `OPTIONAL` part that can only match the row of a table on its left,
+  joined on a `NOT NULL` unique key, reads that row's columns instead of
+  a `LEFT JOIN` of the table with itself; they are `NULL` where the
+  part's other conditions do not hold.
 - The generated SQL leaves out `IS NOT NULL` on term columns that a
   `NOT NULL` constraint of a table keeps from being `NULL`, except where a
   `LEFT JOIN` can make them `NULL`.

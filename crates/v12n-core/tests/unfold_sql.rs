@@ -682,15 +682,45 @@ fn self_join_parent_of_a_referencing_object_map() {
     ));
 }
 
-/// Two scans inside one `OPTIONAL` part merge; a scan on each side of it
-/// does not (bench q04): the part's columns are `NULL` where it does not
-/// match.
+/// Two scans inside one `OPTIONAL` part merge, and a part on the row of
+/// the left side reads it; the part over another table keeps its `LEFT
+/// JOIN`.
 #[test]
-fn self_join_inside_optional_merges_across_it_does_not() {
+fn self_join_inside_and_across_optional() {
     insta::assert_snapshot!(explain_merged(
         "SELECT ?a ?c ?f ?t WHERE { ?a ex:hostname ?h \
          OPTIONAL { ?a ex:criticality ?c } \
          OPTIONAL { ?f ex:onAsset ?a ; ex:title ?t } }"
+    ));
+}
+
+/// bench q04: the part can only match the asset's own row, where its
+/// criticality is not `NULL`, so the column is read as it is (#151).
+#[test]
+fn self_join_optional_reads_the_left_row() {
+    insta::assert_snapshot!(explain_merged(
+        "SELECT ?asset ?criticality WHERE { ?asset a ex:Asset . \
+         OPTIONAL { ?asset ex:criticality ?criticality } }"
+    ));
+}
+
+/// Each column of a part is `NULL` where any condition of its part, or
+/// of a part it is nested in, does not hold.
+#[test]
+fn self_join_nested_optional_reads_the_outer_row() {
+    insta::assert_snapshot!(explain_merged(
+        "SELECT ?a ?h ?c WHERE { ?a a ex:Asset \
+         OPTIONAL { ?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c } } }"
+    ));
+}
+
+/// A `FILTER` inside the part renders with parameters, so the part keeps
+/// its `LEFT JOIN`.
+#[test]
+fn self_join_optional_with_filter_keeps_the_left_join() {
+    insta::assert_snapshot!(explain_merged(
+        "SELECT ?a ?c WHERE { ?a a ex:Asset \
+         OPTIONAL { ?a ex:criticality ?c FILTER(?c != \"Low\") } }"
     ));
 }
 

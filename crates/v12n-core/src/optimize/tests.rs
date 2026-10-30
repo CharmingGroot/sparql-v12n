@@ -264,17 +264,230 @@ fn scans_inside_one_optional_part_are_merged() {
     );
 }
 
-/// `LEFT JOIN assets t1 ON t1.id = t0.id AND t1.criticality IS NOT NULL`
-/// is `NULL` where the part does not match, while `t0` is not.
+/// bench q04: `LEFT JOIN assets t1 ON t1.id = t0.id AND t1.criticality IS
+/// NOT NULL` can only match the row of `t0`, and matches it where its
+/// criticality is not `NULL`, which is where `t0.criticality` is not.
 #[test]
-fn scans_on_two_sides_of_optional_are_kept() {
-    let plan = plan("SELECT ?a ?c WHERE { ?a a ex:Asset OPTIONAL { ?a ex:criticality ?c } }");
-    assert_eq!(eliminate_self_joins(&plan, &keys()), None);
-    let plan = plan_of(
+fn optional_part_on_the_same_row_reads_the_left_scan() {
+    let plan = merged("SELECT ?a ?c WHERE { ?a a ex:Asset OPTIONAL { ?a ex:criticality ?c } }");
+    let [branch] = plan.branches.as_slice() else {
+        panic!("one branch");
+    };
+    let same_row = branch.left_joins[0].same_row.as_ref().expect("reads a row");
+    assert_eq!((same_row.scan, same_row.row_of), (1, 0));
+    assert_eq!(
+        same_row.guard,
+        [Condition::IsNotNull(SqlExpr::Column {
+            table: 0,
+            name: "criticality".into()
+        })]
+    );
+    assert_eq!(
+        sql(&plan),
+        "SELECT t0.\"id\" AS \"a\", t0.\"criticality\" AS \"c\"\n\
+         FROM \"assets\" t0\n\
+         WHERE t0.\"id\" IS NOT NULL"
+    );
+    // The plan still has the scan, so what it fixes is unchanged.
+    assert_eq!(tables(branch), ["assets", "assets"]);
+    assert!(!plan.has_duplicates(Some(&keys())));
+}
+
+#[test]
+fn each_optional_part_reads_the_row_on_its_own() {
+    let plan = merged(
         "SELECT ?a ?c ?s WHERE { ?a ex:hostname ?h \
          OPTIONAL { ?a ex:criticality ?c } OPTIONAL { ?a ex:site ?s } }",
     );
-    assert_eq!(eliminate_self_joins(&plan, &keys()), None);
+    assert_eq!(
+        sql(&plan),
+        "SELECT t0.\"id\" AS \"a\", t0.\"criticality\" AS \"c\", t0.\"site\" AS \"s\"\n\
+         FROM \"assets\" t0\n\
+         WHERE t0.\"id\" IS NOT NULL AND t0.\"hostname\" IS NOT NULL"
+    );
+}
+
+/// The part matches only where both columns are not `NULL`, so each is
+/// `NULL` where the other is.
+#[test]
+fn columns_of_a_part_are_null_where_any_of_its_conditions_fails() {
+    let plan = merged(
+        "SELECT ?a ?c ?s WHERE { ?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c ; ex:site ?s } }",
+    );
+    assert_eq!(
+        sql(&plan),
+        "SELECT t0.\"id\" AS \"a\", \
+         CASE WHEN t0.\"site\" IS NOT NULL THEN t0.\"criticality\" END AS \"c\", \
+         CASE WHEN t0.\"criticality\" IS NOT NULL THEN t0.\"site\" END AS \"s\"\n\
+         FROM \"assets\" t0\n\
+         WHERE t0.\"id\" IS NOT NULL AND t0.\"hostname\" IS NOT NULL"
+    );
+}
+
+/// The nested part reads the row of the outer part's scan, which is
+/// `NULL` where the outer part does not match.
+#[test]
+fn nested_optional_part_reads_the_row_of_the_outer_part() {
+    let plan = merged(
+        "SELECT ?a ?c ?s WHERE { ?a ex:hostname ?h \
+         OPTIONAL { ?a ex:criticality ?c OPTIONAL { ?a ex:site ?s } } }",
+    );
+    let rows: Vec<(usize, usize)> = plan.branches[0]
+        .left_joins
+        .iter()
+        .map(|j| j.same_row.as_ref().map(|r| (r.scan, r.row_of)).unwrap())
+        .collect();
+    assert_eq!(rows, [(1, 0), (2, 1)]);
+    assert_eq!(
+        sql(&plan),
+        "SELECT t0.\"id\" AS \"a\", t0.\"criticality\" AS \"c\", \
+         CASE WHEN t0.\"criticality\" IS NOT NULL THEN t0.\"site\" END AS \"s\"\n\
+         FROM \"assets\" t0\n\
+         WHERE t0.\"id\" IS NOT NULL AND t0.\"hostname\" IS NOT NULL"
+    );
+}
+
+/// A nested part reads the row of a part that joins another table.
+#[test]
+fn nested_part_reads_the_row_of_an_outer_part_that_joins() {
+    let plan = merged(
+        "SELECT ?a ?f ?t WHERE { ?a ex:hostname ?h \
+         OPTIONAL { ?f ex:onAsset ?a OPTIONAL { ?f ex:title ?t } } }",
+    );
+    assert_eq!(
+        sql(&plan),
+        "SELECT t0.\"id\" AS \"a\", t1.\"id\" AS \"f\", t1.\"title\" AS \"t\"\n\
+         FROM \"assets\" t0\n\
+         LEFT JOIN \"alerts\" t1 ON t1.\"asset_id\" = t0.\"id\" AND t1.\"id\" IS NOT NULL\n\
+         WHERE t0.\"id\" IS NOT NULL AND t0.\"hostname\" IS NOT NULL"
+    );
+}
+
+/// The second part binds `?x` where the first did not, or to the same
+/// value (SPARQL 1.1 §18.3); its guard reads the first part's column.
+#[test]
+fn guard_compares_with_an_earlier_part_that_reads_the_row() {
+    let plan = merged(
+        "SELECT ?a ?x WHERE { ?a ex:hostname ?h \
+         OPTIONAL { ?a ex:criticality ?x } OPTIONAL { ?a ex:site ?x } }",
+    );
+    let sql = sql(&plan);
+    assert!(
+        sql.contains(
+            "CASE WHEN (t0.\"criticality\" IS NULL OR t0.\"site\" = t0.\"criticality\") \
+             THEN t0.\"site\" END"
+        ) && !sql.contains("JOIN"),
+        "{sql}"
+    );
+}
+
+/// The constant that pins the part is the one the required scan has, so
+/// the guard does not repeat it.
+#[test]
+fn constant_subject_pins_the_optional_part_to_the_row() {
+    let plan = merged(
+        "SELECT ?h ?c WHERE { <http://example.org/asset/7> ex:hostname ?h \
+         OPTIONAL { <http://example.org/asset/7> ex:criticality ?c } }",
+    );
+    let rendered = rendered(&plan);
+    assert_eq!(
+        rendered.sql,
+        "SELECT t0.\"hostname\" AS \"h\", t0.\"criticality\" AS \"c\"\n\
+         FROM \"assets\" t0\n\
+         WHERE t0.\"id\" = $1 AND t0.\"hostname\" IS NOT NULL"
+    );
+    assert_eq!(rendered.params, ["7"]);
+}
+
+/// Conditions after the part read its columns where they are, in the
+/// `ON` clause of a later table, and `BOUND` and `ORDER BY` as well.
+#[test]
+fn later_conditions_read_the_columns_of_the_part() {
+    let plan = merged(
+        "SELECT ?a ?c ?b WHERE { ?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c } ?b ex:site ?c }",
+    );
+    let joined = sql(&plan);
+    assert!(
+        joined.contains(
+            "JOIN \"assets\" t2 ON (t0.\"criticality\" IS NULL OR t2.\"site\" = t0.\"criticality\")"
+        ),
+        "{joined}"
+    );
+    let plan = merged(
+        "SELECT ?a ?c WHERE { ?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c ; ex:site ?s } \
+         FILTER(!BOUND(?c)) } ORDER BY ?c",
+    );
+    let sql = sql(&plan);
+    assert!(
+        sql.contains(
+            "WHERE NOT ((CASE WHEN t0.\"site\" IS NOT NULL THEN t0.\"criticality\" END IS NOT NULL))"
+        ) && !sql.contains("t1"),
+        "{sql}"
+    );
+}
+
+#[test]
+fn optional_part_keeps_its_left_join_where_it_cannot_read_the_row() {
+    for query in [
+        // A FILTER and a constant render with parameters.
+        "SELECT ?a ?c WHERE { ?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c FILTER(?c = \"High\") } }",
+        "SELECT ?a WHERE { ?a ex:hostname ?h OPTIONAL { ?a ex:criticality \"High\" } }",
+        // Another table in the part.
+        "SELECT ?a ?f WHERE { ?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c . ?f ex:onAsset ?a } }",
+        // Two alerts of one asset are different rows.
+        "SELECT ?f ?g WHERE { ?f ex:onAsset ?a OPTIONAL { ?g ex:onAsset ?a } }",
+        // A view has no keys.
+        "SELECT ?v ?s WHERE { ?v ex:viewName ?n OPTIONAL { ?v ex:viewSite ?s } }",
+        // Only `src` of the key `(src, dst)` is compared.
+        "SELECT ?s ?n ?m WHERE { ?s ex:linkNote ?n OPTIONAL { ?s ex:linkNote ?m } }",
+    ] {
+        let original = plan_of(query);
+        let kept = eliminate_self_joins(&original, &keys()).unwrap_or(original);
+        assert!(
+            kept.branches[0]
+                .left_joins
+                .iter()
+                .all(|j| j.same_row.is_none()),
+            "{query}"
+        );
+        assert!(sql(&kept).contains("LEFT JOIN"), "{query}");
+    }
+}
+
+/// A part whose conditions all hold on the row extends every left row
+/// by it.
+#[test]
+fn optional_part_that_always_matches_reads_the_columns_as_they_are() {
+    let plan = merged("SELECT ?a ?h2 WHERE { ?a ex:hostname ?h OPTIONAL { ?a ex:hostname ?h2 } }");
+    assert_eq!(
+        plan.branches[0].left_joins[0]
+            .same_row
+            .as_ref()
+            .unwrap()
+            .guard,
+        []
+    );
+    assert!(sql(&plan).starts_with(
+        "SELECT t0.\"id\" AS \"a\", t0.\"hostname\" AS \"h2\"\nFROM \"assets\" t0\nWHERE"
+    ));
+}
+
+#[test]
+fn renaming_tables_renames_the_row_a_part_reads() {
+    let mut branch =
+        merged("SELECT ?a ?c WHERE { ?a a ex:Asset OPTIONAL { ?a ex:criticality ?c } }")
+            .branches
+            .remove(0);
+    branch.rename_tables(&|t| t + 3);
+    let same_row = branch.left_joins[0].same_row.as_ref().unwrap();
+    assert_eq!((same_row.scan, same_row.row_of), (4, 3));
+    assert_eq!(
+        same_row.guard,
+        [Condition::IsNotNull(SqlExpr::Column {
+            table: 3,
+            name: "criticality".into()
+        })]
+    );
 }
 
 #[test]
@@ -350,6 +563,68 @@ fn comparison_of_a_nullable_column_with_itself_stays() {
     assert!(
         sql.contains("t0.\"criticality\" = t0.\"criticality\"")
             || sql.contains("t0.\"criticality\" IS NOT NULL"),
+        "{sql}"
+    );
+}
+
+/// A `NOT NULL` constraint drops the guard's condition on the row read
+/// (#111): that row is a table row, or `NULL` where its own part does not
+/// match, which keeps the nested column `NULL` there.
+#[test]
+fn not_null_constraint_drops_the_condition_on_the_row_read() {
+    let not_null = [(LogicalTable::TableName("assets".into()), "site".to_owned())]
+        .into_iter()
+        .collect();
+    let plan = merged(
+        "SELECT ?a ?c ?s WHERE { ?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c ; ex:site ?s } }",
+    )
+    .without_implied_not_null(&not_null);
+    assert!(
+        sql(&plan).starts_with(
+            "SELECT t0.\"id\" AS \"a\", t0.\"criticality\" AS \"c\", \
+             CASE WHEN t0.\"criticality\" IS NOT NULL THEN t0.\"site\" END AS \"s\"\n"
+        ),
+        "{}",
+        sql(&plan)
+    );
+    let plan = merged(
+        "SELECT ?a ?c ?s WHERE { ?a ex:hostname ?h \
+         OPTIONAL { ?a ex:criticality ?c OPTIONAL { ?a ex:site ?s } } }",
+    )
+    .without_implied_not_null(&not_null);
+    assert_eq!(
+        plan.branches[0].left_joins[1]
+            .same_row
+            .as_ref()
+            .unwrap()
+            .guard,
+        []
+    );
+    assert!(
+        sql(&plan)
+            .contains("CASE WHEN t0.\"criticality\" IS NOT NULL THEN t0.\"site\" END AS \"s\""),
+        "{}",
+        sql(&plan)
+    );
+}
+
+/// A condition of the outer part on the nested part's column would make
+/// each guard read the other's columns: the outer part keeps its `LEFT
+/// JOIN`, and the nested one reads the outer part's row inside it.
+#[test]
+fn part_whose_conditions_read_a_nested_part_keeps_its_left_join() {
+    let plan = merged(
+        "SELECT ?a ?c ?s WHERE { ?a ex:hostname ?h \
+         OPTIONAL { ?a ex:criticality ?c OPTIONAL { ?a ex:site ?s } ?a ex:hostname ?s } }",
+    );
+    let [outer, nested] = plan.branches[0].left_joins.as_slice() else {
+        panic!("two parts");
+    };
+    assert_eq!(outer.same_row, None);
+    assert_eq!(nested.same_row.as_ref().map(|r| r.row_of), Some(1));
+    let sql = sql(&plan);
+    assert!(
+        sql.contains("LEFT JOIN \"assets\" t1 ON ") && !sql.contains("t2"),
         "{sql}"
     );
 }

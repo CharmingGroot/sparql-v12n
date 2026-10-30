@@ -3129,6 +3129,129 @@ async fn merged_scans_give_the_same_solutions() {
     );
 }
 
+/// The mapping of [`optional_parts_on_one_row_give_the_left_join_results`]
+/// over `logical_table`.
+fn optional_rows_mapping(logical_table: &str) -> String {
+    format!(
+        r#"@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+<#Asset> rr:logicalTable [ {logical_table} ] ;
+  rr:subjectMap [ rr:template "http://example.org/asset/{{id}}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:hostname ; rr:objectMap [ rr:column "hostname" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:criticality ; rr:objectMap [ rr:column "criticality" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:site ; rr:objectMap [ rr:column "site" ] ] .
+"#
+    )
+}
+
+/// An `OPTIONAL` part that reads the row of the left side (#151) gives
+/// the solutions of the `LEFT JOIN` that the same mapping over a view,
+/// which has no keys, keeps. `hostname` is `NOT NULL`, so its condition
+/// is dropped from the guards as well (#111).
+#[tokio::test]
+async fn optional_parts_on_one_row_give_the_left_join_results() {
+    let Some(url) = database_url() else { return };
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS v12n_opt151 CASCADE;
+            CREATE SCHEMA v12n_opt151;
+            CREATE TABLE v12n_opt151.assets (id int PRIMARY KEY, hostname text NOT NULL, criticality text, site text);
+            INSERT INTO v12n_opt151.assets VALUES
+              (1, 'a', 'High', 'x'), (2, 'b', 'High', NULL), (3, 'c', NULL, 'y'),
+              (4, 'd', NULL, NULL), (5, 'e', 'x', 'x');",
+        )
+        .await
+        .unwrap();
+    let table = optional_rows_mapping(r#"rr:tableName "v12n_opt151.assets""#);
+    let view = optional_rows_mapping(r#"rr:sqlQuery "SELECT * FROM v12n_opt151.assets""#);
+    let database = PostgresBackend::connect(&url, Limits::default())
+        .await
+        .unwrap();
+    let mut mismatches = Vec::new();
+    for (body, reads_row) in [
+        ("?a ex:criticality ?c OPTIONAL { ?a ex:hostname ?h }", true),
+        ("?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c }", true),
+        (
+            "?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c ; ex:site ?s }",
+            true,
+        ),
+        (
+            "?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c OPTIONAL { ?a ex:site ?s ; ex:hostname ?g } }",
+            true,
+        ),
+        (
+            "?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?x } OPTIONAL { ?a ex:site ?x }",
+            true,
+        ),
+        (
+            "<http://example.org/asset/3> ex:hostname ?h OPTIONAL { <http://example.org/asset/3> ex:criticality ?c }",
+            true,
+        ),
+        (
+            "?a ex:hostname ?h OPTIONAL { ?a ex:site ?c } ?b ex:criticality ?c",
+            true,
+        ),
+        (
+            "?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c ; ex:site ?s } FILTER(!BOUND(?s))",
+            true,
+        ),
+        (
+            "?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c FILTER(?c = \"High\") }",
+            false,
+        ),
+    ] {
+        let query = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {body} }}");
+        let merged = plan(&table, &query);
+        let snapshot = database
+            .load_catalog(&CatalogRequest::for_plan(&merged))
+            .await
+            .unwrap();
+        let completed = CatalogPlan::new(&merged, Arc::new(snapshot)).unwrap();
+        let sql = completed
+            .plan()
+            .to_sql_with(&PostgresDialect, &completed.render_options())
+            .unwrap()
+            .sql;
+        assert_eq!(!sql.contains("LEFT JOIN"), reads_row, "{body}\n{sql}");
+        let (got, _) = run(&url, Limits::default(), &merged).await.unwrap();
+        let (expected, _) = run(&url, Limits::default(), &plan(&view, &query))
+            .await
+            .unwrap();
+        if got != expected {
+            mismatches.push((body, got, expected));
+        }
+    }
+    let (got, _) = run(
+        &url,
+        Limits::default(),
+        &plan(
+            &table,
+            "PREFIX ex: <http://example.org/>\nSELECT * WHERE { ?a ex:hostname ?h \
+             OPTIONAL { ?a ex:criticality ?c ; ex:site ?s } }",
+        ),
+    )
+    .await
+    .unwrap();
+    client
+        .batch_execute("DROP SCHEMA v12n_opt151 CASCADE")
+        .await
+        .unwrap();
+    assert_eq!(mismatches, []);
+    let asset = |id: u32| format!("?a=<http://example.org/asset/{id}>");
+    assert_eq!(
+        got,
+        [
+            format!("{} ?c=\"High\" ?h=\"a\" ?s=\"x\"", asset(1)),
+            format!("{} ?h=\"b\"", asset(2)),
+            format!("{} ?h=\"c\"", asset(3)),
+            format!("{} ?h=\"d\"", asset(4)),
+            format!("{} ?c=\"x\" ?h=\"e\" ?s=\"x\"", asset(5)),
+        ]
+    );
+}
+
 /// Round trips between a client and PostgreSQL, counted by a proxy in
 /// front of the database ([`wire_counter`]) as `bench/bench.py` counts
 /// them: requests (frontend messages up to a Sync, or a simple Query) that
