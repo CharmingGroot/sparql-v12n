@@ -61,9 +61,13 @@ V12N_TEST_DATABASE_URL=postgresql://v12n:v12n-dev@127.0.0.1:55432/shop cargo tes
 ## TLS tests
 
 `tls.sh up` generates a test CA, a server certificate for the host name
-`localhost` signed by it, and a second CA that signed nothing, into
-`target/tls/`. It then starts a PostgreSQL container with `ssl=on` and the
-shop data, and prints the environment variables that enable the TLS tests
+`localhost` and a client certificate for the role `v12n_cert`, both signed
+by it, a second CA that signed nothing, and certificate revocation lists
+(none revoked, the server certificate revoked, and one from the second
+CA), into `target/tls/`. It then starts a PostgreSQL container with
+`ssl=on` and the shop data. The role `v12n` signs in with its password,
+with or without TLS; `v12n_cert` needs TLS and the client certificate.
+The script prints the environment variables that enable the TLS tests
 (`crates/v12n-postgres/tests/tls.rs` and one test in
 `crates/v12n-cli/tests/cli.rs`):
 

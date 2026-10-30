@@ -100,12 +100,15 @@ stderr 中的这一行会指明原因与上限。例如，结果被截断时输�
 | `sslmode` | TLS | 证书检查 |
 |---|---|---|
 | `disable` | 从不使用 | 无 |
+| `allow` | 服务器拒绝不使用 TLS 的会话时使用 | 无；`sslrootcert` 指定文件时检查证书链 |
 | `prefer`（默认） | 服务器支持时使用 | 无；`sslrootcert` 指定文件时检查证书链 |
 | `require` | 始终使用 | 无；`sslrootcert` 指定文件时检查证书链 |
 | `verify-ca` | 始终使用 | 证书链可追溯到受信任的 CA |
 | `verify-full` | 始终使用 | 同 `verify-ca`，并且证书包含 `host` 中的主机名 |
 
 `prefer` 与 `require` 会加密连接，但除非 `sslrootcert` 指定了文件，否则接受任何证书。因此它们能防止窃听，却不能防止冒充数据库的服务器。在不受自己控制的网络上，请使用 `verify-full`。
+
+`allow` 先不使用 TLS 连接，仅当服务器以错误应答该连接时，才使用 TLS 打开第二个连接，例如 `pg_hba.conf` 只允许该用户通过 `hostssl` 连接的情况。网络错误不会重试。若第二个连接也失败，则报告它的错误。
 
 `sslrootcert` 参数指定受信任的 CA：
 
@@ -123,15 +126,41 @@ v12n query mapping.ttl query.rq \
   --db 'postgresql://reader@db.internal/shop?sslmode=verify-full&sslrootcert=/etc/v12n/db-ca.pem'
 ```
 
+`sslcert` 与 `sslkey` 参数指定客户端证书及其私钥，用于通过证书认证客户端的服务器（`pg_hba.conf` 中的 `cert`，或 `clientcert=verify-ca`、`verify-full`）：
+
+- `sslcert`：包含客户端证书及其后所需中间证书的 PEM 文件。服务器使用自己的 CA 检查该证书。
+- `sslkey`：包含未加密私钥的 PEM 文件。在 Unix 上，与 libpq 一样，该文件不得被其他用户读取：权限须为 `0600` 或更严格，文件属于 root 时须为 `0640` 或更严格。
+
+两个参数必须同时设置。服务器请求时才发送证书。
+
+`sslcrl` 与 `sslcrldir` 参数为服务器证书指定证书吊销列表（CRL）：
+
+- `sslcrl`：包含一个或多个 CRL 的 PEM 文件。
+- `sslcrldir`：一个目录，其中的 PEM 文件按 `openssl rehash` 的方式命名（`<hash>.r0`、`<hash>.r1` 等）。目录中的其他文件不会被读取。
+
+两个参数可以同时设置。与 libpq 一样，受信任 CA 之下证书链中的每个证书都必须有其签发者的 CRL，超过下次更新时间的 CRL 会被拒绝。CRL 在检查证书链时生效：`verify-ca`、`verify-full`，或 `sslrootcert` 指定文件时。不检查证书链时 CRL 不起作用，因此作为配置错误拒绝。
+
+```sh
+# A server that authenticates the client by certificate
+v12n query mapping.ttl query.rq \
+  --db 'postgresql://reader@db.internal/shop?sslmode=verify-full&sslrootcert=/etc/v12n/db-ca.pem&sslcert=/etc/v12n/reader.pem&sslkey=/etc/v12n/reader.key'
+```
+
+所有文件都在打开连接时读取。
+
 当服务器提供 `SCRAM-SHA-256-PLUS` 时，密码认证会绑定到 TLS 会话。添加 `channel_binding=require` 可拒绝不提供该机制的服务器。
 
-TLS 连接失败属于数据库错误（退出码 3，kind 为 `database`）。错误消息会指出原因，例如证书链无法追溯到受信任的 CA 时为 `invalid peer certificate: UnknownIssuer`，证书不包含主机名时为 `certificate not valid for name "..."`。
+TLS 连接失败属于数据库错误（退出码 3，kind 为 `database`）。错误消息会指出原因，例如证书链无法追溯到受信任的 CA 时为 `invalid peer certificate: UnknownIssuer`，证书不包含主机名时为 `certificate not valid for name "..."`，证书被 CRL 列出时为 `invalid peer certificate: Revoked`。无法读取文件同样属于数据库错误，错误消息会指出该文件。
+
+设置只从连接字符串读取。不读取 libpq 的环境变量（`PGSSLMODE`、`PGSSLROOTCERT`、`PGSSLCERT`、`PGSSLKEY`、`PGSSLCRL`、`PGSSLCRLDIR`、`PGHOST` 等），因此为 `psql` 设置的变量不会改变 v12n 的连接方式。连接字符串在 `v12n query` 中依次取自 `--db`、`V12N_DATABASE_URL`，在 `v12n serve` 中依次取自 `V12N_DATABASE_URL`、`[database] url`。同一个 TLS 参数出现两次时使用最后一个值，未给出的参数使用本节所述的默认值。
 
 与 libpq 的不同之处如下：
 
 - 未设置 `sslrootcert` 时，libpq 读取 `~/.postgresql/root.crt`，v12n 则使用操作系统的根证书。
 - 使用 `prefer` 时，若 TLS 握手失败，libpq 会不使用 TLS 重试，v12n 则报告错误。
-- 不支持 `sslmode=allow`、客户端证书（`sslcert`、`sslkey`），以及 `PGSSLMODE` 等 `PG*` 环境变量。
+- 未设置 `sslcert` 与 `sslkey` 时，libpq 会在 `~/.postgresql/postgresql.crt` 与 `~/.postgresql/postgresql.key` 存在时读取它们，并跳过不存在的证书文件。v12n 仅在两个参数都设置时发送客户端证书，并报告缺失的文件。
+- 不检查证书链时，libpq 忽略 `sslcrl` 与 `sslcrldir`，v12n 则拒绝它们。
+- 不支持加密的私钥（`sslpassword`）与 `PG*` 环境变量。
 
 ## HTTP 端点
 

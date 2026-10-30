@@ -33,6 +33,9 @@ tokio-postgres = "0.7.18"
 # ring, not aws-lc-rs: it builds for the musl release targets without cmake.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.5"
+# The version rustls uses; its public API has no revocation check for a
+# chain without a host name, which verify-ca with sslcrl needs.
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["alloc"] }
 tokio-postgres-rustls = "0.14.0"
 toml = { version = "1.1", default-features = false, features = ["parse", "serde", "std"] }
 tower = { version = "0.5.3", default-features = false }

@@ -21,6 +21,10 @@ Design decisions are recorded in the `Decision:` Discussions.
   the database URL, with libpq's meaning and its default `prefer`.
   Certificates are checked against the system's root certificates or a CA
   file.
+- Client certificates (`sslcert`, `sslkey`), `sslmode=allow`, and
+  certificate revocation lists (`sslcrl`, `sslcrldir`) in the database
+  URL, with libpq's meaning. libpq's `PG*` environment variables are not
+  read.
 
 ## [0.0.1] - 2026-10-28
 
