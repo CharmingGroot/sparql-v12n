@@ -59,14 +59,19 @@ impl<B: Backend> Engine<B> {
     /// it reads, and read again once when the database no longer matches
     /// the snapshot.
     pub async fn execute(&self, plan: &SqlPlan) -> Result<B::Solutions, B::Error> {
-        let mut snapshot = self.catalog.snapshot();
-        if !snapshot.covers(plan) {
-            snapshot = self.reload(plan, &snapshot).await?;
-        }
-        match self.run(plan, Arc::clone(&snapshot)).await {
+        let snapshot = self.catalog.snapshot();
+        let (snapshot, read_now) = if snapshot.covers(plan) {
+            (snapshot, false)
+        } else {
+            (self.reload(plan, &snapshot).await?, true)
+        };
+        match self.run(plan, Arc::clone(&snapshot), read_now).await {
             Err(e) if matches!(e.kind(), ErrorKind::StaleCatalog) => {
+                // Checked again, so that a catalog that keeps changing, as
+                // during a migration, fails the query instead of running it
+                // on entries already out of date (Discussion #187).
                 let snapshot = self.reload(plan, &snapshot).await?;
-                self.run(plan, snapshot).await
+                self.run(plan, snapshot, false).await
             }
             result => result,
         }
@@ -84,12 +89,16 @@ impl<B: Backend> Engine<B> {
         Ok(self.catalog.update(fresh))
     }
 
+    /// `read_now` tells that the snapshot holds the plan's tables as read
+    /// in the round trip before, because the shared snapshot lacked them.
     async fn run(
         &self,
         plan: &SqlPlan,
         snapshot: Arc<CatalogSnapshot>,
+        read_now: bool,
     ) -> Result<B::Solutions, B::Error> {
         let plan = CatalogPlan::new(plan, snapshot)?;
+        let plan = if read_now { plan.without_check() } else { plan };
         self.backend.execute(&plan).await
     }
 }
