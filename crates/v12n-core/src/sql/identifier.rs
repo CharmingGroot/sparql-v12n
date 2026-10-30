@@ -4,7 +4,7 @@
 use crate::mapping::LogicalTable;
 
 /// A logical table for error messages.
-pub(super) fn describe_table(table: &LogicalTable) -> String {
+pub(crate) fn describe_table(table: &LogicalTable) -> String {
     match table {
         LogicalTable::TableName(t) => format!("table {t}"),
         LogicalTable::SqlQuery(_) => "an rr:sqlQuery".to_owned(),

@@ -4,6 +4,7 @@
 //! [`Backend`] port.
 
 mod bind;
+mod catalog;
 mod connector;
 mod decode;
 mod error;
@@ -22,6 +23,7 @@ use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Config, RowStream, Statement};
 use v12n_core::Limits;
 use v12n_core::backend::{Backend, SolutionStream};
+use v12n_core::catalog::{CatalogRequest, CatalogSnapshot};
 use v12n_core::dialect::PostgresDialect;
 use v12n_core::mapping::LogicalTable;
 use v12n_core::optimize;
@@ -608,6 +610,12 @@ impl Backend for PostgresBackend {
 
     fn execute(&self, plan: &SqlPlan) -> impl Future<Output = Result<Solutions, Error>> + Send {
         self.run(plan)
+    }
+
+    async fn load_catalog(&self, request: &CatalogRequest) -> Result<CatalogSnapshot, Error> {
+        catalog::load(&self.client, request)
+            .await
+            .map_err(|e| Error::from_postgres(e, self.limits.statement_timeout))
     }
 
     fn is_closed(&self) -> bool {

@@ -42,6 +42,31 @@ pub fn column_probe(columns: &[(LogicalTable, String)]) -> String {
     })
 }
 
+/// [`column_probe`] for `columns` of one logical table, which also names
+/// the table when `columns` is empty, so preparing it shows whether the
+/// database can read the table at all.
+///
+/// The columns are not qualified by the table: PostgreSQL reads `p0.f`
+/// as the function call `f(p0)` when there is no column `f`, which turns a
+/// missing column into an error about a function.
+pub fn table_probe(table: &LogicalTable, columns: &[String]) -> String {
+    let select: Vec<String> = columns
+        .iter()
+        .map(|name| {
+            if folded_identifier(name) {
+                name.clone()
+            } else {
+                quote_identifier(name)
+            }
+        })
+        .collect();
+    format!(
+        "SELECT {}\nFROM {} p0\nLIMIT 0",
+        select.join(", "),
+        logical_table(table)
+    )
+}
+
 fn probe(columns: &[(LogicalTable, String)], name_sql: impl Fn(&str) -> String) -> String {
     let mut tables: Vec<&LogicalTable> = Vec::new();
     let select: Vec<String> = columns
@@ -103,5 +128,18 @@ mod tests {
     #[should_panic(expected = "only regular identifiers")]
     fn column_name_probe_refuses_other_names() {
         column_name_probe(&[(LogicalTable::TableName("t".into()), "a; DROP".into())]);
+    }
+
+    #[test]
+    fn table_probe_names_the_table_without_columns() {
+        let table = LogicalTable::TableName("s.t".into());
+        assert_eq!(
+            table_probe(&table, &[]),
+            "SELECT \nFROM \"s\".\"t\" p0\nLIMIT 0"
+        );
+        assert_eq!(
+            table_probe(&table, &["Id".into(), "v".into()]),
+            "SELECT Id, \"v\"\nFROM \"s\".\"t\" p0\nLIMIT 0"
+        );
     }
 }

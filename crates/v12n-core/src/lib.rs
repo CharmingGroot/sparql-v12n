@@ -8,6 +8,7 @@
 //! adapters implement [`Backend`] and the other traits of [`backend`].
 
 pub mod backend;
+pub mod catalog;
 pub mod dialect;
 mod engine;
 mod error;

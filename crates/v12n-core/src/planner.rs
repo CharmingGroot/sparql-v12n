@@ -3,6 +3,7 @@
 //! listing its terms and planning queries.
 
 use crate::Error;
+use crate::catalog::CatalogRequest;
 use crate::mapping::{Mapping, MappingIndex};
 use crate::sparql;
 use crate::sql::SqlPlan;
@@ -16,12 +17,18 @@ use crate::unfold;
 pub struct Planner {
     mapping: Mapping,
     index: MappingIndex,
+    catalog_request: CatalogRequest,
 }
 
 impl Planner {
     pub fn new(mapping: Mapping) -> Self {
         let index = MappingIndex::new(&mapping);
-        Self { mapping, index }
+        let catalog_request = CatalogRequest::for_mapping(&mapping);
+        Self {
+            mapping,
+            index,
+            catalog_request,
+        }
     }
 
     pub fn mapping(&self) -> &Mapping {
@@ -30,6 +37,11 @@ impl Planner {
 
     pub fn index(&self) -> &MappingIndex {
         &self.index
+    }
+
+    /// The logical tables and columns the mapping reads.
+    pub fn catalog_request(&self) -> &CatalogRequest {
+        &self.catalog_request
     }
 
     /// Parses a SPARQL query and unfolds it into SQL branches.

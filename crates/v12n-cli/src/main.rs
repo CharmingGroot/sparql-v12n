@@ -66,7 +66,12 @@ const CHECK_HELP: &str = "Examples (from the repository root):
 JSON: {\"ok\":true,\"triples_maps\":N,\"classes\":N,\"properties\":N}.
 CSV: one record headed triples_maps,classes,properties.
 
-Exit codes: 0 valid, 1 invalid input, 2 invalid mapping.";
+With --db postgresql://reader@localhost/shop, every table and column the
+mapping reads must also exist and be readable. A missing one is an invalid mapping of kind \"catalog\", with
+details.problems listing each. V12N_DATABASE_URL is not read here, so that
+a check without --db never connects.
+
+Exit codes: 0 valid, 1 invalid input, 2 invalid mapping, 3 database error.";
 
 const TERMS_HELP: &str = "Examples (from the repository root):
   v12n terms examples/shop/mapping.ttl
@@ -197,6 +202,10 @@ enum Command {
     Check {
         /// R2RML mapping in Turtle, or `-` for stdin
         mapping: PathBuf,
+        /// Also check the tables and columns the mapping reads on this
+        /// PostgreSQL database, e.g. postgresql://reader@localhost/shop
+        #[arg(long, value_name = "URL")]
+        db: Option<String>,
     },
     /// List the classes and properties a mapping exposes
     #[command(after_help = TERMS_HELP)]
@@ -385,7 +394,11 @@ fn main() -> ExitCode {
                 ),
             ))
         }
-        Command::Check { mapping } => check(mapping, output),
+        Command::Check { mapping, db } => check(
+            mapping,
+            db.as_deref().map(|url| connector(url, None)),
+            output,
+        ),
         Command::Terms { mapping } => terms(mapping, output),
         Command::Explain {
             mapping,
@@ -472,8 +485,11 @@ fn print_csv<S: AsRef<str>>(records: &[Vec<S>]) -> Result<(), Failure> {
     }
 }
 
-fn check(path: &Path, output: Output) -> Result<(), Failure> {
-    let planner = Planner::new(load_mapping(path)?);
+fn check(path: &Path, connector: Option<impl Connector>, output: Output) -> Result<(), Failure> {
+    let planner = Arc::new(Planner::new(load_mapping(path)?));
+    if let Some(connector) = connector {
+        check_catalog(&planner, connector)?;
+    }
     let index = planner.index();
     let triples_maps = planner.mapping().triples_maps().len();
     let classes = index.classes().count();
@@ -506,6 +522,42 @@ fn check(path: &Path, output: Output) -> Result<(), Failure> {
         Format::Xml | Format::Tsv => unreachable!("refused in main"),
     }
     Ok(())
+}
+
+/// Fails, as an invalid mapping, when the database lacks a table or column
+/// that the mapping reads or refuses to read one.
+fn check_catalog(planner: &Arc<Planner>, connector: impl Connector) -> Result<(), Failure> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Failure::new(EXIT_DATABASE, "database", e.to_string()))?;
+    let snapshot = runtime
+        .block_on(async {
+            let backend = connector.connect(Limits::default()).await?;
+            Engine::new(Arc::clone(planner), backend)
+                .load_catalog()
+                .await
+        })
+        .map_err(|e| database_failure(&e))?;
+    let problems: Vec<String> = snapshot
+        .problems(planner.catalog_request())
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(Failure {
+        details: Some(json!({ "problems": problems })),
+        ..Failure::new(
+            EXIT_MAPPING,
+            "catalog",
+            format!(
+                "the database lacks what the mapping reads: {}",
+                problems.join("; ")
+            ),
+        )
+    })
 }
 
 fn terms(path: &Path, output: Output) -> Result<(), Failure> {

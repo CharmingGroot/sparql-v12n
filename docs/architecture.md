@@ -52,7 +52,7 @@ it.
 | `Planner` | Driving | Holds a mapping and its index; plans queries. Needs no database | `v12n-core` |
 | `Engine<B>` | Driving | Pairs a shared `Planner` with one database session `B`; renders and executes plans | `v12n-core` |
 | `Connector` | Driven | Opens a session with the query limits the front end passes | `PostgresConnector` |
-| `Backend` | Driven | One session: its SQL dialect, `execute`, `is_closed` | `PostgresBackend` |
+| `Backend` | Driven | One session: its SQL dialect, `execute`, `load_catalog`, `is_closed` | `PostgresBackend` |
 | `SolutionStream` | Driven | The solutions of one query, read one at a time; reports truncation | `v12n_postgres::Solutions` |
 | `BackendError` | Driven | Classifies an error as `Config`, `Database`, `Timeout` or `Core`, from which front ends choose exit codes and HTTP statuses | `v12n_postgres::Error` |
 | `Dialect` | Driven | The SQL text that differs between databases | `PostgresDialect` |
@@ -285,7 +285,7 @@ rows for `count(*) OVER ()` before it sends the first one
 |---|---|
 | `Dialect` trait for database-specific SQL ([#134](https://github.com/CharmingGroot/sparql-v12n/issues/134)) | Implemented; `PostgresDialect` is the only dialect |
 | `Engine`, `Backend`, `Connector`, `SolutionStream` ports ([#166](https://github.com/CharmingGroot/sparql-v12n/issues/166)) | Implemented; `v12n-postgres` is the only adapter |
-| Catalog reads as a snapshot taken by the engine instead of inside `PostgresBackend::run` ([#109](https://github.com/CharmingGroot/sparql-v12n/issues/109), [#110](https://github.com/CharmingGroot/sparql-v12n/issues/110)) | Planned |
+| Catalog reads as a snapshot taken by the engine instead of inside `PostgresBackend::run` ([#109](https://github.com/CharmingGroot/sparql-v12n/issues/109), [#110](https://github.com/CharmingGroot/sparql-v12n/issues/110), [Discussion #187](https://github.com/CharmingGroot/sparql-v12n/discussions/187)) | In progress; `CatalogSnapshot` is loaded by `v12n check --db`, and queries still read the catalog in `PostgresBackend::run` |
 | Ontology support ([#123](https://github.com/CharmingGroot/sparql-v12n/issues/123)–[#127](https://github.com/CharmingGroot/sparql-v12n/issues/127)) | Planned |
 | A second database ([#165](https://github.com/CharmingGroot/sparql-v12n/issues/165)) | Planned |
 | Truncation without materializing the limited rows ([#152](https://github.com/CharmingGroot/sparql-v12n/issues/152)) | Open; decided after measurement |
