@@ -1,0 +1,25 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#ItemMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "items" ] ;
+  rr:subjectMap [ rr:template "http://example.org/item/{id}" ; rr:class ex:Item ] ;
+  rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "label" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:note ; rr:objectMap [ rr:column "note" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:owner ;
+    rr:objectMap [ rr:template "http://example.org/owner/{owner}" ]
+  ] .
+
+<#OwnerMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "owners" ] ;
+  rr:subjectMap [ rr:template "http://example.org/owner/{id}" ; rr:class ex:Owner ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] .
+
+# A view over items whose label is NULL in every other row: the catalog
+# reports its columns as nullable, so the condition stays.
+<#LabelledMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "labelled" ] ;
+  rr:subjectMap [ rr:template "http://example.org/item/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:shownLabel ; rr:objectMap [ rr:column "label" ] ] .

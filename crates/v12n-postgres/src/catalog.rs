@@ -53,10 +53,13 @@ const FINGERPRINT_SQL: &str = "WITH t AS MATERIALIZED (
    FROM pg_constraint co WHERE co.conrelid = t.rel AND co.contype = 'f') l
  GROUP BY t.n, t.rel";
 
-/// The `NOT NULL` columns of the tables named in `$1`.
+/// The `NOT NULL` columns of the tables named in `$1`, of ordinary and
+/// partitioned tables only: PostgreSQL does not enforce `NOT NULL` on a
+/// foreign table, whose rows come from elsewhere.
 const NOT_NULL_SQL: &str = "SELECT t.n::int4, a.attname::text
  FROM unnest($1::text[]) WITH ORDINALITY AS t(name, n)
- JOIN pg_attribute a ON a.attrelid = to_regclass(t.name)
+ JOIN pg_class r ON r.oid = to_regclass(t.name) AND r.relkind IN ('r', 'p')
+ JOIN pg_attribute a ON a.attrelid = r.oid
  WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attnotnull";
 
 /// The validated foreign keys of the tables named in `$1`. A key added

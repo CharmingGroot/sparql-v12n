@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# Items 12 and 13 have no owner row; the owner's name is NOT NULL.
+SELECT ?i ?name WHERE {
+  ?i a ex:Item .
+  OPTIONAL { ?i ex:owner ?o . ?o ex:name ?name }
+}

@@ -132,7 +132,10 @@ flowchart TD
 - **Completing the plan.**
   [`CatalogPlan::new`](../crates/v12n-core/src/catalog/plan.rs) runs in
   `v12n-core` without the database. It resolves column names that
-  PostgreSQL folds to lower case. Keys show when a branch scans the same
+  PostgreSQL folds to lower case, and leaves out the `IS NOT NULL` that
+  each term column gets (R2RML §11 makes no term from a `NULL`) where a
+  `NOT NULL` constraint of a table makes it true; a view's columns and a
+  column that a `LEFT JOIN` can leave `NULL` keep it. Keys show when a branch scans the same
   row twice, so the scans merge, and when the result cannot have
   duplicates, so `DISTINCT` or a duplicate-removing `UNION` is dropped.
   Column types decide how branches of a `UNION` line up and how values
