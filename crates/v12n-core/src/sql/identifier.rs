@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Quoting of identifiers and table names, and the IRI-safe version of text.
+//! Quoting of identifiers and table names.
 
 use crate::mapping::LogicalTable;
-use crate::mapping::template::UCSCHAR;
 
 /// A logical table for error messages.
 pub(super) fn describe_table(table: &LogicalTable) -> String {
@@ -10,37 +9,6 @@ pub(super) fn describe_table(table: &LogicalTable) -> String {
         LogicalTable::TableName(t) => format!("table {t}"),
         LogicalTable::SqlQuery(_) => "an rr:sqlQuery".to_owned(),
     }
-}
-
-/// R2RML §7.3 IRI-safe version of a text expression: every character
-/// outside `iunreserved` becomes `%XX` per UTF-8 byte, upper case, as the
-/// engine encodes template values when it builds IRIs. NULL stays NULL.
-///
-/// A value made only of `iunreserved` characters is its own IRI-safe
-/// version, so the whole value is matched against the same class first;
-/// only the other values pay for the subquery that encodes them character
-/// by character.
-pub fn iri_safe_sql(text: &str) -> String {
-    let mut class = String::from("[-.0-9A-Z_a-z~");
-    for &(from, to) in UCSCHAR {
-        let escape = |c: u32| {
-            if c <= 0xFFFF {
-                format!("\\u{c:04X}")
-            } else {
-                format!("\\U{c:08X}")
-            }
-        };
-        class.push_str(&format!("{}-{}", escape(from), escape(to)));
-    }
-    class.push(']');
-    format!(
-        "CASE WHEN {text} ~ '^{class}*$' THEN {text} \
-         WHEN {text} IS NOT NULL THEN (SELECT coalesce(string_agg(\
-         CASE WHEN c ~ '^{class}$' THEN c \
-         ELSE regexp_replace(upper(encode(convert_to(c, 'UTF8'), 'hex')), '(..)', '%\\1', 'g') END, \
-         '' ORDER BY n), '') \
-         FROM generate_series(1, char_length({text})) AS n, substr({text}, n, 1) AS c) END"
-    )
 }
 
 pub(super) fn logical_table(table: &LogicalTable) -> String {
@@ -186,24 +154,6 @@ mod tests {
     fn quote_table_name_quotes_each_part() {
         assert_eq!(quote_table_name("shop.customers"), r#""shop"."customers""#);
         assert_eq!(quote_table_name(r#""my.schema".t"#), r#""my.schema"."t""#);
-    }
-
-    #[test]
-    fn iri_safe_sql_keeps_nulls_and_uses_the_iunreserved_ranges() {
-        let sql = iri_safe_sql("x");
-        // A value of `iunreserved` characters only is kept as it is; NULL
-        // matches neither case and stays NULL.
-        assert!(
-            sql.starts_with(r"CASE WHEN x ~ '^[-.0-9A-Z_a-z~\u00A0-\uD7FF"),
-            "{sql}"
-        );
-        assert!(
-            sql.contains(r"\U000E1000-\U000EFFFD]*$' THEN x WHEN x IS NOT NULL THEN (SELECT"),
-            "{sql}"
-        );
-        assert!(sql.contains(r"\U000E1000-\U000EFFFD]$' THEN c"), "{sql}");
-        assert!(sql.ends_with(" END"), "{sql}");
-        assert!(!sql.contains("ELSE NULL"), "{sql}");
     }
 
     #[test]

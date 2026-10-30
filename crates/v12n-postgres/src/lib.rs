@@ -18,6 +18,7 @@ use futures_util::future::{join, join4};
 use tls::Tls;
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Config, NoTls, RowStream, Statement};
+use v12n_core::dialect::PostgresDialect;
 use v12n_core::mapping::LogicalTable;
 use v12n_core::optimize;
 use v12n_core::solution::{Solution, SolutionBuilder, SqlValue};
@@ -192,7 +193,7 @@ impl Database {
         // column types tell whether a query is supported; such plans are
         // not remembered.
         let shape = plan
-            .to_sql_with(&RenderOptions::default())
+            .to_sql_with(&PostgresDialect, &RenderOptions::default())
             .ok()
             .map(|rendered| rendered.sql);
         let guesses = shape
@@ -307,7 +308,7 @@ impl Database {
             keys: keys.as_ref(),
             non_utf8: !self.utf8,
         };
-        let rendered = plan.to_sql_with(&options)?;
+        let rendered = plan.to_sql_with(&PostgresDialect, &options)?;
         let fetch = row_fetch(self.limits.row_limit, plan.limit);
         let mut used = vec![statement_sql(plan, &rendered, None, fetch.is_some())];
         let mut statement = self
@@ -353,12 +354,15 @@ impl Database {
             || !keyed_params.is_empty()
             || !normal_params.is_empty()
         {
-            let rendered = plan.to_sql_with(&RenderOptions {
-                text_params: &text_params,
-                keyed_params: &keyed_params,
-                normal_params: &normal_params,
-                ..options
-            })?;
+            let rendered = plan.to_sql_with(
+                &PostgresDialect,
+                &RenderOptions {
+                    text_params: &text_params,
+                    keyed_params: &keyed_params,
+                    normal_params: &normal_params,
+                    ..options
+                },
+            )?;
             let cast = cast_columns.then_some(decoders.as_slice());
             let sql = statement_sql(plan, &rendered, cast, fetch.is_some());
             statement = self
@@ -690,7 +694,7 @@ fn statement_sql(
     }
     let sliced = plan.limit.is_some() || plan.offset > 0;
     count_rows(&sql, rendered.params.len() + 1, sliced, |table| {
-        rendered.order_by_clause(table)
+        rendered.order_by_clause(&PostgresDialect, table)
     })
 }
 
@@ -758,7 +762,7 @@ fn cast_to_text(
         "SELECT {}\nFROM (\n{}\n) q{}",
         select.join(", "),
         rendered.sql,
-        rendered.order_by_clause("q")
+        rendered.order_by_clause(&PostgresDialect, "q")
     )
 }
 
@@ -1038,11 +1042,14 @@ mod tests {
         let types = database.column_types(&plan, false).await.unwrap();
         let keys = database.load_table_keys(&plan).await.unwrap();
         let rendered = plan
-            .to_sql_with(&RenderOptions {
-                column_types: types.as_ref(),
-                keys: keys.as_ref(),
-                ..RenderOptions::default()
-            })
+            .to_sql_with(
+                &PostgresDialect,
+                &RenderOptions {
+                    column_types: types.as_ref(),
+                    keys: keys.as_ref(),
+                    ..RenderOptions::default()
+                },
+            )
             .unwrap();
         let sql = statement_sql(&plan, &rendered, None, true);
         let explain: Vec<String> = client

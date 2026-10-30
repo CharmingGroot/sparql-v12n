@@ -6,6 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
 use crate::Error;
+use crate::dialect::SqlType;
 use crate::mapping::{LogicalTable, TermType};
 
 use super::identifier::describe_table;
@@ -332,7 +333,7 @@ impl SqlPlan {
         if classes(&present).len() < 2 {
             // `UNION` resolves the `NULL`s of two leading branches to text
             // before it sees a third, so they get the type of the others.
-            let null = SqlExpr::Null(column(first).2.sql_type.clone());
+            let null = SqlExpr::Null(SqlType::Named(column(first).2.sql_type.clone()));
             let exprs = exprs
                 .iter()
                 .map(|&e| match e {
@@ -391,9 +392,9 @@ impl SqlPlan {
             let typed = classes(members).len() == 1;
             let lexical_ok = lexical_ok(*key);
             let null = if typed {
-                SqlExpr::Null(column(members[0]).2.sql_type.clone())
+                SqlExpr::Null(SqlType::Named(column(members[0]).2.sql_type.clone()))
             } else {
-                SqlExpr::Null("\"pg_catalog\".\"text\"".to_owned())
+                SqlExpr::Null(SqlType::Text)
             };
             let mut exprs_k = Vec::with_capacity(columns.len());
             for (b, &expr) in exprs.iter().enumerate() {
@@ -483,6 +484,7 @@ mod tests {
     use super::super::renderer::tests::{column, unreserved};
     use super::super::{Comparison, ProjectedTerm, RenderOptions, ResultTerm};
     use super::*;
+    use crate::dialect::PostgresDialect;
     use crate::mapping::TemplatePart;
 
     const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -602,7 +604,7 @@ mod tests {
         let int = || union_type("integer", Some("integer"), Some(Lexical::Text));
         let typed = with_union_types(&plan, int(), int()).unwrap();
         let selects: Vec<&[SqlExpr]> = typed.branches.iter().map(|b| &b.select[..]).collect();
-        let null = SqlExpr::Null("pg_catalog.integer".into());
+        let null = SqlExpr::Null(SqlType::Named("pg_catalog.integer".into()));
         assert_eq!(
             selects,
             [
@@ -620,8 +622,8 @@ mod tests {
         assert_eq!(
             split.branches[0].select[..2],
             [
-                SqlExpr::Null("pg_catalog.integer".into()),
-                SqlExpr::Null("pg_catalog.text".into())
+                SqlExpr::Null(SqlType::Named("pg_catalog.integer".into())),
+                SqlExpr::Null(SqlType::Named("pg_catalog.text".into()))
             ]
         );
     }
@@ -802,7 +804,7 @@ mod tests {
         assert_eq!(plan.key_tables(), std::slice::from_ref(&table));
         assert!(!plan.has_duplicates(Some(&keys)));
         assert_eq!(
-            plan.to_sql_with(&options).unwrap().sql,
+            plan.to_sql_with(&PostgresDialect, &options).unwrap().sql,
             "SELECT t0.\"Id\" AS \"s\"\nFROM \"T\" t0"
         );
         // Not fixed by the solution, unknown keys, or no metadata.

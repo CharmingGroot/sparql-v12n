@@ -13,6 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::NoTls;
 use tokio_postgres::config::Host;
 use tokio_postgres::types::Type;
+use v12n_core::dialect::PostgresDialect;
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
 use v12n_core::solution::canonical_decimal;
 use v12n_core::sql::{
@@ -102,10 +103,13 @@ async fn constant_subject_binds_an_integer_parameter_that_uses_the_index() {
     let database = Database::connect(&url, Limits::default()).await.unwrap();
     let keys = database.table_keys(&plan).await.unwrap();
     let sql = plan
-        .to_sql_with(&RenderOptions {
-            keys: keys.as_ref(),
-            ..RenderOptions::default()
-        })
+        .to_sql_with(
+            &PostgresDialect,
+            &RenderOptions {
+                keys: keys.as_ref(),
+                ..RenderOptions::default()
+            },
+        )
         .unwrap()
         .sql;
     let statement = client.prepare(&sql).await.unwrap();
@@ -2340,11 +2344,14 @@ async fn order_by_a_column_keeps_its_index() {
         ]
         .into();
         let sql = plan
-            .to_sql_with(&RenderOptions {
-                keys: keys.as_ref(),
-                column_types: Some(&types),
-                ..RenderOptions::default()
-            })
+            .to_sql_with(
+                &PostgresDialect,
+                &RenderOptions {
+                    keys: keys.as_ref(),
+                    column_types: Some(&types),
+                    ..RenderOptions::default()
+                },
+            )
             .unwrap();
         let (rows, _) = run_in_order(&url, Limits::default(), &plan).await.unwrap();
         plans.push((sql, rows));
@@ -2487,10 +2494,13 @@ async fn zero_constants_match_only_rows_of_their_sign() {
         &format!("SELECT ?row WHERE {{ ?row <http://example.org/f> \"0.0E0\"^^<{xsd}double> }}"),
     );
     let sql = plan
-        .to_sql_with(&RenderOptions {
-            keyed_params: &[(0, TermKey::Text)],
-            ..RenderOptions::default()
-        })
+        .to_sql_with(
+            &PostgresDialect,
+            &RenderOptions {
+                keyed_params: &[(0, TermKey::Text)],
+                ..RenderOptions::default()
+            },
+        )
         .unwrap()
         .sql;
     assert!(
@@ -2673,10 +2683,13 @@ async fn midnight_as_24_00_is_the_term_00_00_00() {
         "SELECT ?m WHERE {{ ?m ex:moment {} }}",
         time("00:00:00")
     ))
-    .to_sql_with(&RenderOptions {
-        normal_params: &[(0, TermNormal::Time)],
-        ..RenderOptions::default()
-    })
+    .to_sql_with(
+        &PostgresDialect,
+        &RenderOptions {
+            normal_params: &[(0, TermNormal::Time)],
+            ..RenderOptions::default()
+        },
+    )
     .unwrap()
     .sql;
     client

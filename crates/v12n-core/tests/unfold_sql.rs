@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Snapshots of the SQL generated for example queries.
 
+use v12n_core::dialect::{Dialect, PostgresDialect, SqlType};
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
 use v12n_core::sql::{
-    ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, TableKeys, TermNormal,
+    ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, RenderedSql, SqlPlan, TableKeys,
+    TermNormal,
 };
 use v12n_core::{optimize, sparql, unfold};
 
@@ -11,6 +13,80 @@ const SHOP: &str = include_str!("../../../examples/shop/mapping.ttl");
 const VIP_ORDERS: &str = include_str!("../../../examples/shop/queries/vip-orders.rq");
 
 const PREFIXES: &str = "PREFIX ex: <http://example.org/>\n";
+
+/// PostgreSQL syntax that rendering only writes through [`Dialect`].
+const POSTGRES_SYNTAX: &[&str] = &[
+    "::",
+    "COLLATE",
+    "pg_",
+    " ~ ",
+    "regexp_",
+    "isfinite",
+    "trim_scale",
+    "interval",
+    "encode(",
+    "generate_series",
+];
+
+/// Writes each construct of [`Dialect`] as a marker, such as
+/// `<<CAST_TEXT x>>`, so that PostgreSQL syntax left in its output was
+/// written around the dialect.
+struct MarkerDialect;
+
+impl Dialect for MarkerDialect {
+    fn cast(&self, expr: &str, ty: &SqlType) -> String {
+        let ty = match ty {
+            SqlType::Named(_) => "NAMED".to_owned(),
+            ty => format!("{ty:?}").to_uppercase(),
+        };
+        format!("<<CAST_{ty} {expr}>>")
+    }
+
+    fn code_point_collation(&self) -> &str {
+        " <<CODE_POINT_COLLATION>>"
+    }
+
+    fn regex_match(&self, text: &str, pattern: &str) -> String {
+        format!("<<REGEX_MATCH {text}, {pattern}>>")
+    }
+
+    fn is_finite(&self, expr: &str) -> String {
+        format!("<<IS_FINITE {expr}>>")
+    }
+
+    fn type_of(&self, expr: &str) -> String {
+        format!("<<TYPE_OF {expr}>>")
+    }
+
+    fn iri_safe(&self, text: &str) -> String {
+        format!("<<IRI_SAFE {text}>>")
+    }
+
+    fn hex_lexical(&self, expr: &str) -> String {
+        format!("<<HEX_LEXICAL {expr}>>")
+    }
+
+    fn decimal_lexical(&self, expr: &str) -> String {
+        format!("<<DECIMAL_LEXICAL {expr}>>")
+    }
+
+    fn time_normal(&self, expr: &str) -> String {
+        format!("<<TIME_NORMAL {expr}>>")
+    }
+}
+
+/// The plan in PostgreSQL, after checking that the plan in
+/// [`MarkerDialect`] holds no PostgreSQL syntax.
+fn to_sql(plan: &SqlPlan, options: &RenderOptions<'_>) -> RenderedSql {
+    let marked = plan.to_sql_with(&MarkerDialect, options).unwrap().sql;
+    for syntax in POSTGRES_SYNTAX {
+        assert!(
+            !marked.contains(syntax),
+            "{syntax:?} outside the dialect:\n{marked}"
+        );
+    }
+    plan.to_sql_with(&PostgresDialect, options).unwrap()
+}
 
 fn explain(mapping: &str, query: &str) -> String {
     explain_with_keys(mapping, query, None)
@@ -24,12 +100,13 @@ fn render(mapping: Mapping, query: &str, keys: Option<&TableKeys>) -> String {
     let index = MappingIndex::new(&mapping);
     let query = sparql::parse(query).unwrap();
     let plan = unfold::unfold(&query, &mapping, &index).unwrap();
-    let rendered = plan
-        .to_sql_with(&RenderOptions {
+    let rendered = to_sql(
+        &plan,
+        &RenderOptions {
             keys,
             ..RenderOptions::default()
-        })
-        .unwrap();
+        },
+    );
     let mut out = rendered.sql;
     out.push_str("\n\n-- params\n");
     for (i, p) in rendered.params.iter().enumerate() {
@@ -195,11 +272,13 @@ fn explain_with_union_types(query: &str) -> String {
     .map(|((table, column), ty)| ((LogicalTable::TableName(table.into()), column.into()), ty))
     .collect();
     let plan = plan.with_union_types(&types).unwrap();
-    plan.to_sql_with(&RenderOptions {
-        column_types: Some(&types),
-        ..RenderOptions::default()
-    })
-    .unwrap()
+    to_sql(
+        &plan,
+        &RenderOptions {
+            column_types: Some(&types),
+            ..RenderOptions::default()
+        },
+    )
     .sql
 }
 
@@ -350,13 +429,14 @@ fn explain_shop_with_types(body: &str) -> String {
     .map(|((table, column), ty)| ((LogicalTable::TableName(table.into()), column.into()), ty))
     .collect();
     let keys = shop_keys();
-    let rendered = plan
-        .to_sql_with(&RenderOptions {
+    let rendered = to_sql(
+        &plan,
+        &RenderOptions {
             column_types: Some(&types),
             keys: Some(&keys),
             ..RenderOptions::default()
-        })
-        .unwrap();
+        },
+    );
     let mut out = rendered.sql;
     out.push_str("\n\n-- params\n");
     for (i, p) in rendered.params.iter().enumerate() {
@@ -550,12 +630,13 @@ fn explain_merged(query: &str) -> String {
     let plan = unfold::unfold(&query, &mapping, &index).unwrap();
     let keys = mdr_keys();
     let plan = optimize::eliminate_self_joins(&plan, &keys).unwrap_or(plan);
-    let rendered = plan
-        .to_sql_with(&RenderOptions {
+    let rendered = to_sql(
+        &plan,
+        &RenderOptions {
             keys: Some(&keys),
             ..RenderOptions::default()
-        })
-        .unwrap();
+        },
+    );
     let mut out = rendered.sql;
     out.push_str("\n\n-- params\n");
     for (i, p) in rendered.params.iter().enumerate() {
@@ -665,12 +746,14 @@ fn explain_with_time_types(query: &str, normal_params: &[(usize, TermNormal)]) -
     .into_iter()
     .map(|((table, column), ty)| ((LogicalTable::TableName(table.into()), column.into()), ty))
     .collect();
-    plan.to_sql_with(&RenderOptions {
-        column_types: Some(&types),
-        normal_params,
-        ..RenderOptions::default()
-    })
-    .unwrap()
+    to_sql(
+        &plan,
+        &RenderOptions {
+            column_types: Some(&types),
+            normal_params,
+            ..RenderOptions::default()
+        },
+    )
     .sql
 }
 
@@ -742,4 +825,87 @@ fn bind_copies_a_variable_and_binds_a_constant() {
     insta::assert_snapshot!(explain_shop_with_types(
         r#"SELECT ?d ?k WHERE { ?c ex:name ?n BIND(?c AS ?d) BIND("x" AS ?k) }"#
     ));
+}
+
+/// A table with one column of each type whose SQL the snapshot queries
+/// above do not reach.
+const TYPED: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#T> rr:logicalTable [ rr:tableName "t" ] ;
+  rr:subjectMap [ rr:template "http://example.org/t/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:dec ; rr:objectMap [ rr:column "dec" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:f8 ; rr:objectMap [ rr:column "f8" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:ts ; rr:objectMap [ rr:column "ts" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:bin ; rr:objectMap [ rr:column "bin" ] ] .
+"#;
+
+fn typed_column(name: &str, natural: &str, lexical: Option<Lexical>) -> ColumnType {
+    ColumnType {
+        name: name.to_owned(),
+        sql_type: format!("\"pg_catalog\".\"{name}\""),
+        union_class: name.to_owned(),
+        natural_datatype: Some(format!("http://www.w3.org/2001/XMLSchema#{natural}")),
+        group: name.to_owned(),
+        comparison: Comparison::Value,
+        lexical,
+        lexical_unreserved: false,
+        term_key: None,
+        term_normal: None,
+    }
+}
+
+/// Every method of [`Dialect`] is reached by some query, so the check of
+/// [`to_sql`] covers all of them.
+#[test]
+fn every_dialect_method_is_reached_without_postgres_syntax_around_it() {
+    let mapping = Mapping::from_turtle(TYPED).unwrap();
+    let index = MappingIndex::new(&mapping);
+    let types: ColumnTypes = [
+        ("id", typed_column("int4", "integer", Some(Lexical::Text))),
+        (
+            "dec",
+            typed_column("numeric", "decimal", Some(Lexical::Decimal)),
+        ),
+        ("f8", typed_column("float8", "double", None)),
+        ("ts", typed_column("timestamp", "dateTime", None)),
+        (
+            "bin",
+            typed_column("bytea", "hexBinary", Some(Lexical::Hex)),
+        ),
+    ]
+    .into_iter()
+    .map(|(column, ty)| ((LogicalTable::TableName("t".into()), column.into()), ty))
+    .collect();
+    let queries = [
+        r#"SELECT ?s WHERE { ?s ex:dec ?v FILTER(STR(?v) = "1.5") }"#,
+        r#"SELECT ?s WHERE { ?s ex:bin ?v FILTER(STR(?v) = "0AFF") }"#,
+        "SELECT ?s WHERE { ?s ex:f8 ?v FILTER(?v > 1.5e0) }",
+        r#"SELECT ?s WHERE { ?s ex:ts ?v FILTER(?v < "2020-01-01T00:00:00"^^xsd:dateTime) }"#,
+        "SELECT ?s ?v WHERE { ?s ex:ts ?v } ORDER BY ?v",
+    ];
+    let mut marked = String::new();
+    for query in queries {
+        let query = sparql::parse(&format!(
+            "{PREFIXES}PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n{query}"
+        ))
+        .unwrap();
+        let plan = unfold::unfold(&query, &mapping, &index).unwrap();
+        let options = RenderOptions {
+            column_types: Some(&types),
+            ..RenderOptions::default()
+        };
+        to_sql(&plan, &options);
+        marked.push_str(&plan.to_sql_with(&MarkerDialect, &options).unwrap().sql);
+    }
+    for marker in [
+        "<<CAST_DOUBLE ",
+        "<<CAST_TIMESTAMP ",
+        "<<IS_FINITE ",
+        "<<HEX_LEXICAL ",
+        "<<DECIMAL_LEXICAL ",
+    ] {
+        assert!(marked.contains(marker), "{marker} not reached:\n{marked}");
+    }
 }

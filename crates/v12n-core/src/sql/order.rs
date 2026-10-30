@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use super::filter::{Kind, Mode, Operand, Text, unsupported};
 use super::{Condition, Error, FilterValue, OrderValue, Renderer, SqlBranch, SqlPlan};
+use crate::dialect::SqlType;
 use crate::xsd::{Num, Value};
 
 /// The kinds of values in ascending order. SPARQL 1.1 §15.1 fixes the
@@ -322,7 +323,7 @@ impl<'a> Renderer<'a> {
                         self.filter(filter, Mode::Exact)?;
                         self.sql.push(')');
                     }
-                    _ => self.sql.push_str(&null(layout, slot)),
+                    _ => self.typed_null(&null_type(layout, slot)),
                 }
                 return Ok(());
             }
@@ -333,11 +334,11 @@ impl<'a> Renderer<'a> {
             return match cases.first() {
                 Some((_, value)) => self.slot_value(value, layout, slot),
                 None => {
-                    self.sql.push_str(&if slot == Slot::Rank {
-                        (Rank::Unbound as u8).to_string()
+                    if slot == Slot::Rank {
+                        self.sql.push_str(&(Rank::Unbound as u8).to_string());
                     } else {
-                        null(layout, slot)
-                    });
+                        self.typed_null(&null_type(layout, slot));
+                    }
                     Ok(())
                 }
             };
@@ -377,8 +378,8 @@ impl<'a> Renderer<'a> {
         // Infinite values of the column are plain literals.
         let (finite, infinite) = match &sort.infinite {
             Some(column) => (
-                Some(format!("isfinite({column})")),
-                Some(format!("NOT isfinite({column})")),
+                Some(self.dialect.is_finite(column)),
+                Some(format!("NOT {}", self.dialect.is_finite(column))),
             ),
             None => (None, None),
         };
@@ -421,7 +422,7 @@ impl<'a> Renderer<'a> {
             Slot::Language => sort.rank == Rank::Language,
         };
         if !uses {
-            self.sql.push_str(&null(layout, slot));
+            self.typed_null(&null_type(layout, slot));
             return Ok(());
         }
         match slot {
@@ -429,11 +430,11 @@ impl<'a> Renderer<'a> {
             Slot::Datatype => {
                 open(self, &finite);
                 match self.datatype(operand) {
-                    Text::Constant(datatype) | Text::NaturalDatatype { datatype, .. } => {
-                        self.expr(&super::SqlExpr::Param(datatype.as_str().into()));
-                        self.sql.push_str("::text");
-                    }
-                    Text::Term(_) | Text::Unknown => self.sql.push_str("NULL::text"),
+                    Text::Constant(datatype) | Text::NaturalDatatype { datatype, .. } => self
+                        .cast_rendered(&SqlType::Text, |this| {
+                            this.expr(&super::SqlExpr::Param(datatype.as_str().into()))
+                        }),
+                    Text::Term(_) | Text::Unknown => self.typed_null(&SqlType::Text),
                 }
                 close(self, &finite);
             }
@@ -452,15 +453,15 @@ impl<'a> Renderer<'a> {
                 };
                 self.number(operand, number.as_ref(), class, ty)?;
             }
-            Slot::Boolean => self.typed_value(operand, "bool")?,
+            Slot::Boolean => self.typed_value(operand, &SqlType::Boolean)?,
             Slot::DateTime => {
                 open(self, &finite);
                 let ty = if layout.zoned {
-                    "timestamptz"
+                    SqlType::TimestampTz
                 } else {
-                    "timestamp"
+                    SqlType::Timestamp
                 };
-                self.typed_value(operand, ty)?;
+                self.typed_value(operand, &ty)?;
                 close(self, &finite);
             }
             Slot::Date | Slot::Time => {
@@ -468,7 +469,7 @@ impl<'a> Renderer<'a> {
                 let (table, name) = term_column(operand).expect("date and time slots for columns");
                 let column = super::column_sql(table, name);
                 match self.column_type(table, name).and_then(|ty| ty.term_normal) {
-                    Some(normal) => self.sql.push_str(&normal.sql(&column)),
+                    Some(normal) => self.sql.push_str(&normal.sql(self.dialect, &column)),
                     None => self.sql.push_str(&column),
                 }
                 close(self, &finite);
@@ -476,9 +477,10 @@ impl<'a> Renderer<'a> {
             Slot::Text => match (&sort.infinite, &infinite) {
                 // The text output of the infinite values is their lexical
                 // form (see the decoder).
-                (Some(column), Some(infinite)) => self
-                    .sql
-                    .push_str(&format!("CASE WHEN {infinite} THEN {column}::text END")),
+                (Some(column), Some(infinite)) => self.sql.push_str(&format!(
+                    "CASE WHEN {infinite} THEN {} END",
+                    self.dialect.cast(column, &SqlType::Text)
+                )),
                 // Parenthesized where it is an expression, so a `COLLATE`
                 // after it applies to the whole of it.
                 _ => self.text(operand)?,
@@ -487,8 +489,9 @@ impl<'a> Renderer<'a> {
                 let Kind::Lang(tag) = &operand.kind else {
                     unreachable!("language slot for language-tagged literals")
                 };
-                self.expr(&super::SqlExpr::Param(tag.as_str().into()));
-                self.sql.push_str("::text");
+                self.cast_rendered(&SqlType::Text, |this| {
+                    this.expr(&super::SqlExpr::Param(tag.as_str().into()))
+                });
             }
         }
         Ok(())
@@ -506,21 +509,20 @@ fn term_column<'v>(operand: &Operand<'v>) -> Option<(usize, &'v str)> {
     }
 }
 
-/// A typed `NULL` for a slot a row has no value in, so that `UNION`
-/// resolves the slot's type from any branch.
-fn null(layout: &Layout, slot: Slot) -> String {
-    let ty = match slot {
-        Slot::Rank => "int4",
-        Slot::Datatype | Slot::Text | Slot::Language => "text",
-        Slot::Double => "float8",
+/// The type of the `NULL` for a slot a row has no value in, so that
+/// `UNION` resolves the slot's type from any branch.
+fn null_type(layout: &Layout, slot: Slot) -> SqlType {
+    match slot {
+        Slot::Rank => SqlType::Integer,
+        Slot::Datatype | Slot::Text | Slot::Language => SqlType::Text,
+        Slot::Double => SqlType::Double,
         Slot::Exact => layout.exact.sql_type(),
-        Slot::Boolean => "bool",
-        Slot::DateTime if layout.zoned => "timestamptz",
-        Slot::DateTime => "timestamp",
-        Slot::Date => "date",
-        Slot::Time => "time",
-    };
-    format!("NULL::{ty}")
+        Slot::Boolean => SqlType::Boolean,
+        Slot::DateTime if layout.zoned => SqlType::TimestampTz,
+        Slot::DateTime => SqlType::Timestamp,
+        Slot::Date => SqlType::Date,
+        Slot::Time => SqlType::Time,
+    }
 }
 
 /// The alias of a slot's result column.
@@ -544,6 +546,7 @@ mod tests {
     use super::super::filter::tests::{plan, types};
     use super::super::{RenderOptions, TableKeys};
     use crate::Error;
+    use crate::dialect::{Dialect, PostgresDialect};
     use crate::mapping::LogicalTable;
 
     /// The SQL of a query over table `t`, whose key `i4` the subject
@@ -556,12 +559,15 @@ mod tests {
         )]
         .into();
         Ok(plan(query)?
-            .to_sql_with(&RenderOptions {
-                column_types: Some(&types),
-                keys: Some(&keys),
-                non_utf8,
-                ..RenderOptions::default()
-            })?
+            .to_sql_with(
+                &PostgresDialect,
+                &RenderOptions {
+                    column_types: Some(&types),
+                    keys: Some(&keys),
+                    non_utf8,
+                    ..RenderOptions::default()
+                },
+            )?
             .sql)
     }
 
@@ -649,7 +655,7 @@ mod tests {
         assert_eq!(rest, "\"o1_text\" DESC");
         // After the columns of the template's values.
         let text = text.split_once(" AS \"x_2\", ").unwrap().1;
-        let encoded = super::super::iri_safe_sql("t0.\"txt\"::text");
+        let encoded = PostgresDialect.iri_safe("t0.\"txt\"::text");
         assert_eq!(
             text,
             format!(

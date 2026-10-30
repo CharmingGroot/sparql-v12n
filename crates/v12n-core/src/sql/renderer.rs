@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! PostgreSQL text rendering of a plan with bound parameters.
+//! Rendering of a plan as SQL text with bound parameters.
 
 use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
 
 use crate::Error;
+use crate::dialect::{Dialect, PostgresDialect, SqlType};
 use crate::mapping::{LogicalTable, SCHEME_REGEX, TemplatePart};
 
 use super::identifier::{describe_table, logical_table};
@@ -13,18 +14,18 @@ use super::required_columns::arm_has_duplicates;
 use super::{
     ColumnType, ColumnTypes, Comparison, Condition, Lexical, OrderColumn, RenderOptions,
     RenderedSql, SqlBranch, SqlExpr, SqlPlan, TermDatatype, TermKey, TermNormal, TermSql,
-    TermSqlValue, filter, iri_safe_sql, order, quote_identifier,
+    TermSqlValue, filter, order, quote_identifier,
 };
 
 impl RenderedSql {
     /// `\nORDER BY` over the sort keys as columns of table alias `table`,
     /// or nothing without `ORDER BY`.
-    pub fn order_by_clause(&self, table: &str) -> String {
-        order_by_clause(&self.order_by, table)
+    pub fn order_by_clause(&self, dialect: &dyn Dialect, table: &str) -> String {
+        order_by_clause(dialect, &self.order_by, table)
     }
 }
 
-fn order_by_clause(columns: &[OrderColumn], table: &str) -> String {
+fn order_by_clause(dialect: &dyn Dialect, columns: &[OrderColumn], table: &str) -> String {
     if columns.is_empty() {
         return String::new();
     }
@@ -33,7 +34,7 @@ fn order_by_clause(columns: &[OrderColumn], table: &str) -> String {
         .map(|c| {
             let mut key = format!("{table}.{}", quote_identifier(&c.alias));
             if c.collated {
-                key.push_str(" COLLATE \"C\"");
+                key.push_str(dialect.code_point_collation());
             }
             if c.descending {
                 key.push_str(" DESC");
@@ -63,10 +64,11 @@ impl SqlPlan {
     /// Rendering fails with [`Error::UnsupportedFeature`] for a plan whose
     /// SQL would not follow SPARQL's semantics, even without column types.
     pub fn to_sql(&self) -> Result<RenderedSql, Error> {
-        self.to_sql_with(&RenderOptions::default())
+        self.to_sql_with(&PostgresDialect, &RenderOptions::default())
     }
 
-    /// Like [`to_sql`](Self::to_sql), with what a database adapter knows:
+    /// Like [`to_sql`](Self::to_sql), in the SQL of `dialect` and with what
+    /// a database adapter knows:
     ///
     /// - The column compared with each parameter in `text_params` is cast
     ///   to text. An adapter uses this for column types whose values it
@@ -94,11 +96,12 @@ impl SqlPlan {
     /// (see `order.rs`): by expressions over the tables when the plan is
     /// one plain `SELECT`, otherwise by keys every branch selects, outside
     /// a subquery. `LIMIT` and `OFFSET` come last, as parameters.
-    pub fn to_sql_with(&self, options: &RenderOptions<'_>) -> Result<RenderedSql, Error> {
-        let mut r = Renderer {
-            options: *options,
-            ..Renderer::default()
-        };
+    pub fn to_sql_with(
+        &self,
+        dialect: &dyn Dialect,
+        options: &RenderOptions<'_>,
+    ) -> Result<RenderedSql, Error> {
+        let mut r = Renderer::new(dialect, *options);
         if self.branches.is_empty() {
             r.sql.push_str("SELECT 1 WHERE false");
         }
@@ -235,7 +238,7 @@ impl SqlPlan {
         // Sort keys and limits never empty a branch.
         r.required = false;
         if wrapped && ordered {
-            r.sql.push_str(&order_by_clause(&order_by, "q"));
+            r.sql.push_str(&order_by_clause(dialect, &order_by, "q"));
         } else if direct {
             // By the names of the selected keys, which stand for their
             // expressions, so an index on a sorted column serves the sort;
@@ -259,13 +262,15 @@ impl SqlPlan {
             let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX).to_string();
             if let Some(limit) = self.limit {
                 r.sql.push_str("\nLIMIT ");
-                r.expr(&SqlExpr::Param(count(limit).into()));
-                r.sql.push_str("::int8");
+                r.cast_rendered(&SqlType::BigInt, |r| {
+                    r.expr(&SqlExpr::Param(count(limit).into()))
+                });
             }
             if self.offset > 0 {
                 r.sql.push_str("\nOFFSET ");
-                r.expr(&SqlExpr::Param(count(self.offset).into()));
-                r.sql.push_str("::int8");
+                r.cast_rendered(&SqlType::BigInt, |r| {
+                    r.expr(&SqlExpr::Param(count(self.offset).into()))
+                });
             }
         }
         Ok(RenderedSql {
@@ -327,8 +332,8 @@ struct Select {
     /// The sort keys selected after the entries, for sorting outside:
     /// each alias, order comparator and slot.
     slots: Vec<(String, usize, order::Slot)>,
-    /// Whether the sort keys compared by code point are selected with
-    /// `COLLATE "C"`, for sorting by their names.
+    /// Whether the sort keys compared by code point are selected with the
+    /// code point collation, for sorting by their names.
     collate_slots: bool,
     /// Keys selected after the entries where duplicates are removed, each
     /// alias and the entry whose column it tells apart (see [`TermKey`]):
@@ -338,8 +343,8 @@ struct Select {
     term_keys: Vec<(String, usize)>,
 }
 
-#[derive(Default)]
 pub(super) struct Renderer<'a> {
+    pub(super) dialect: &'a dyn Dialect,
     pub(super) sql: String,
     params: Vec<String>,
     param_datatypes: Vec<Option<String>>,
@@ -359,6 +364,51 @@ pub(super) struct Renderer<'a> {
 }
 
 impl<'a> Renderer<'a> {
+    fn new(dialect: &'a dyn Dialect, options: RenderOptions<'a>) -> Self {
+        Self {
+            dialect,
+            sql: String::new(),
+            params: Vec::new(),
+            param_datatypes: Vec::new(),
+            param_branches: Vec::new(),
+            param_required: Vec::new(),
+            param_alternatives: Vec::new(),
+            alternatives: 0,
+            branch_index: 0,
+            required: false,
+            units: 0,
+            options,
+            from: &[],
+        }
+    }
+
+    /// Runs `render`, then replaces the SQL it wrote with `wrap` of it.
+    pub(super) fn wrapped<T>(
+        &mut self,
+        render: impl FnOnce(&mut Self) -> T,
+        wrap: impl FnOnce(&dyn Dialect, &str) -> String,
+    ) -> T {
+        let start = self.sql.len();
+        let out = render(self);
+        let inner = self.sql.split_off(start);
+        self.sql.push_str(&wrap(self.dialect, &inner));
+        out
+    }
+
+    /// `NULL` of type `ty`.
+    pub(super) fn typed_null(&mut self, ty: &SqlType) {
+        self.sql.push_str(&self.dialect.cast("NULL", ty));
+    }
+
+    /// Runs `render`, then casts the SQL it wrote to `ty`.
+    pub(super) fn cast_rendered<T>(
+        &mut self,
+        ty: &SqlType,
+        render: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.wrapped(render, |dialect, expr| dialect.cast(expr, ty))
+    }
+
     fn branch(
         &mut self,
         branch: &'a SqlBranch,
@@ -389,12 +439,16 @@ impl<'a> Renderer<'a> {
                 // value, hence the same term; the reverse can fail
                 // (`numeric` 1.0 and 1.00, or `varchar` and `text`), which
                 // only keeps a duplicate.
-                let start = self.sql.len();
-                self.select_expr(branch, &branch.select[entry])?;
-                let column = self.sql.split_off(start);
-                self.sql.push_str(&format!(
-                    "pg_typeof({column})::text || ' ' || {column}::text"
-                ));
+                self.wrapped(
+                    |this| this.select_expr(branch, &branch.select[entry]),
+                    |dialect, column| {
+                        format!(
+                            "{} || ' ' || {}",
+                            dialect.type_of(column),
+                            dialect.cast(column, &SqlType::Text)
+                        )
+                    },
+                )?;
             } else {
                 self.select_expr(branch, &branch.select[entry])?;
             }
@@ -409,17 +463,20 @@ impl<'a> Renderer<'a> {
             // Text in every branch, so that `UNION` combines them.
             match &branch.select[*entry] {
                 SqlExpr::Column { table, name } => {
-                    match self.column_type(*table, name).and_then(|ty| ty.term_key) {
-                        Some(TermKey::Text) => self
-                            .sql
-                            .push_str(&TermKey::Text.sql(&column_sql(*table, name))),
-                        Some(key) => self
-                            .sql
-                            .push_str(&format!("({})::text", key.sql(&column_sql(*table, name)))),
-                        None => self.sql.push_str("NULL::text"),
-                    }
+                    let column = column_sql(*table, name);
+                    let key = match self.column_type(*table, name).and_then(|ty| ty.term_key) {
+                        Some(TermKey::Text) => TermKey::Text.sql(self.dialect, &column),
+                        Some(key) => self.dialect.cast(
+                            &format!("({})", key.sql(self.dialect, &column)),
+                            &SqlType::Text,
+                        ),
+                        None => self.dialect.cast("NULL", &SqlType::Text),
+                    };
+                    self.sql.push_str(&key);
                 }
-                _ => self.sql.push_str("NULL::text"),
+                _ => self
+                    .sql
+                    .push_str(&self.dialect.cast("NULL", &SqlType::Text)),
             }
             self.sql.push_str(" AS ");
             self.sql.push_str(&quote_identifier(alias));
@@ -432,7 +489,7 @@ impl<'a> Renderer<'a> {
             selected += 1;
             self.order_slot(branch, *key, &layouts[*key], *slot)?;
             if select.collate_slots && slot.collated() {
-                self.sql.push_str(" COLLATE \"C\"");
+                self.sql.push_str(self.dialect.code_point_collation());
             }
             self.sql.push_str(" AS ");
             self.sql.push_str(&quote_identifier(alias));
@@ -593,22 +650,16 @@ impl<'a> Renderer<'a> {
                     if key.is_some() || normal.is_some() {
                         self.sql.push('(');
                     }
-                    self.expr(left);
-                    if as_text && matches!(left, SqlExpr::Column { .. }) {
-                        self.sql.push_str("::text");
-                    }
+                    self.side(left, as_text && matches!(left, SqlExpr::Column { .. }));
                     self.sql.push_str(" = ");
-                    self.expr(right);
-                    if as_text && matches!(right, SqlExpr::Column { .. }) {
-                        self.sql.push_str("::text");
-                    }
+                    self.side(right, as_text && matches!(right, SqlExpr::Column { .. }));
                     if let (Some(key), Some(column)) = (key, &column) {
                         // `=` came first, so PostgreSQL has typed the
                         // parameter as the column before the key reads it.
                         self.sql.push_str(&format!(
                             " AND {} = {})",
-                            key.sql(column),
-                            key.sql(&format!("${}", param + 1))
+                            key.sql(self.dialect, column),
+                            key.sql(self.dialect, &format!("${}", param + 1))
                         ));
                     }
                     if let (Some(normal), Some(column)) = (normal, column) {
@@ -634,10 +685,7 @@ impl<'a> Renderer<'a> {
                     if key.is_some() {
                         self.sql.push('(');
                     }
-                    self.expr(left);
-                    if as_text {
-                        self.sql.push_str("::text");
-                    }
+                    self.side(left, as_text);
                     self.sql.push_str(" IN (");
                     let group = self.alternatives;
                     self.alternatives += 1;
@@ -654,11 +702,11 @@ impl<'a> Renderer<'a> {
                     self.sql.push(')');
                     if let (Some(key), Some(column)) = (key, column) {
                         let keys: Vec<String> = (first..self.params.len())
-                            .map(|p| key.sql(&format!("${}", p + 1)))
+                            .map(|p| key.sql(self.dialect, &format!("${}", p + 1)))
                             .collect();
                         self.sql.push_str(&format!(
                             " AND {} IN ({}))",
-                            key.sql(&column),
+                            key.sql(self.dialect, &column),
                             keys.join(", ")
                         ));
                     }
@@ -751,18 +799,25 @@ impl<'a> Renderer<'a> {
         {
             let (l, r) = (column_sql(*lt, ln), column_sql(*rt, rn));
             if let Some(normal) = a.term_normal.or(b.term_normal) {
-                self.sql
-                    .push_str(&format!("{} = {}", normal.sql(&l), normal.sql(&r)));
+                self.sql.push_str(&format!(
+                    "{} = {}",
+                    normal.sql(self.dialect, &l),
+                    normal.sql(self.dialect, &r)
+                ));
                 return Ok(());
             }
             match (a.comparison, a.term_key.or(b.term_key)) {
                 (Comparison::Value, Some(key)) => self.sql.push_str(&format!(
                     "({l} = {r} AND {} = {})",
-                    key.sql(&l),
-                    key.sql(&r)
+                    key.sql(self.dialect, &l),
+                    key.sql(self.dialect, &r)
                 )),
                 (Comparison::Value, None) => self.sql.push_str(&format!("{l} = {r}")),
-                (Comparison::Text, _) => self.sql.push_str(&format!("{l}::text = {r}::text")),
+                (Comparison::Text, _) => self.sql.push_str(&format!(
+                    "{} = {}",
+                    self.dialect.cast(&l, &SqlType::Text),
+                    self.dialect.cast(&r, &SqlType::Text)
+                )),
             }
             return Ok(());
         }
@@ -823,9 +878,12 @@ impl<'a> Renderer<'a> {
         let Some(base) = &side.base_iri else {
             return self.term_string(side, types, text);
         };
-        self.sql.push_str("CASE WHEN (");
-        self.term_string(side, types, true)?;
-        self.sql.push_str(&format!(") ~ '{SCHEME_REGEX}' THEN ("));
+        self.sql.push_str("CASE WHEN ");
+        self.wrapped(
+            |this| this.term_string(side, types, true),
+            |dialect, s| dialect.regex_match(&format!("({s})"), &format!("'{SCHEME_REGEX}'")),
+        )?;
+        self.sql.push_str(" THEN (");
         self.term_string(side, types, true)?;
         self.sql.push_str(") ELSE ");
         self.expr(&SqlExpr::Param(base.as_str().into()));
@@ -847,7 +905,7 @@ impl<'a> Renderer<'a> {
             TermSqlValue::Column { table, name } => match types {
                 None if text => self
                     .sql
-                    .push_str(&format!("{}::text", column_sql(*table, name))),
+                    .push_str(&self.dialect.cast(&column_sql(*table, name), &SqlType::Text)),
                 None => self.sql.push_str(&column_sql(*table, name)),
                 Some(_) => {
                     let lexical = self.lexical(*table, name)?;
@@ -869,7 +927,10 @@ impl<'a> Renderer<'a> {
                         }
                         TemplatePart::Column(name) => {
                             let (value, unreserved) = match types {
-                                None => (format!("{}::text", column_sql(*table, name)), false),
+                                None => (
+                                    self.dialect.cast(&column_sql(*table, name), &SqlType::Text),
+                                    false,
+                                ),
                                 Some(_) => (
                                     self.lexical(*table, name)?,
                                     self.column_type(*table, name)
@@ -879,7 +940,7 @@ impl<'a> Renderer<'a> {
                             // IRI-safe encoding keeps a string of
                             // `iunreserved` characters as it is.
                             self.sql.push_str(&if *iri_safe && !unreserved {
-                                iri_safe_sql(&value)
+                                self.dialect.iri_safe(&value)
                             } else {
                                 value
                             });
@@ -896,10 +957,10 @@ impl<'a> Renderer<'a> {
     fn lexical(&self, table: usize, name: &str) -> Result<String, Error> {
         let column = column_sql(table, name);
         let Some(ty) = self.column_type(table, name) else {
-            return Ok(format!("{column}::text"));
+            return Ok(self.dialect.cast(&column, &SqlType::Text));
         };
         match ty.lexical {
-            Some(lexical) => Ok(lexical_sql(&column, lexical)),
+            Some(lexical) => Ok(lexical_sql(self.dialect, &column, lexical)),
             None => Err(Error::UnsupportedFeature(format!(
                 "comparing terms built from column {name} of {} ({}) with terms of a \
                  different SQL type or shape: its natural lexical form cannot be computed in SQL",
@@ -920,7 +981,8 @@ impl<'a> Renderer<'a> {
         {
             // Values with the same term are one value for `DISTINCT`,
             // `UNION` and the decoder.
-            self.sql.push_str(&normal.sql(&column_sql(*table, name)));
+            self.sql
+                .push_str(&normal.sql(self.dialect, &column_sql(*table, name)));
             return Ok(());
         }
         let SqlExpr::Term { term, guard } = expr else {
@@ -933,14 +995,24 @@ impl<'a> Renderer<'a> {
             self.sql.push_str(" IS NOT NULL THEN ");
         }
         // Text in every branch, so that `UNION` combines them.
-        self.sql.push('(');
         let types = self.options.column_types;
-        self.term_side(term, types, true)?;
-        self.sql.push_str(")::text");
+        self.wrapped(
+            |this| this.term_side(term, types, true),
+            |dialect, term| dialect.cast(&format!("({term})"), &SqlType::Text),
+        )?;
         if guard.is_some() {
             self.sql.push_str(" END");
         }
         Ok(())
+    }
+
+    /// `expr`, as text with `text`.
+    fn side(&mut self, expr: &SqlExpr, text: bool) {
+        if text {
+            self.cast_rendered(&SqlType::Text, |this| this.expr(expr));
+        } else {
+            self.expr(expr);
+        }
     }
 
     pub(super) fn expr(&mut self, expr: &SqlExpr) {
@@ -959,23 +1031,22 @@ impl<'a> Renderer<'a> {
                     if i > 0 {
                         self.sql.push_str(" || ");
                     }
-                    self.expr(part);
                     // An untyped parameter next to `||` already resolves to text.
-                    if matches!(part, SqlExpr::Column { .. }) {
-                        self.sql.push_str("::text");
-                    }
+                    self.side(part, matches!(part, SqlExpr::Column { .. }));
                 }
             }
             SqlExpr::Lexical {
                 table,
                 name,
                 lexical,
-            } => self
-                .sql
-                .push_str(&lexical_sql(&column_sql(*table, name), *lexical)),
+            } => self.sql.push_str(&lexical_sql(
+                self.dialect,
+                &column_sql(*table, name),
+                *lexical,
+            )),
             // Typed, since `UNION` resolves an untyped NULL of two branches
             // to text before it sees the third.
-            SqlExpr::Null(ty) => self.sql.push_str(&format!("NULL::{ty}")),
+            SqlExpr::Null(ty) => self.sql.push_str(&self.dialect.cast("NULL", ty)),
             SqlExpr::Unbound => self.sql.push_str("NULL"),
             SqlExpr::Matched(inner) => {
                 self.sql.push_str("CASE WHEN ");
@@ -995,18 +1066,14 @@ pub(super) fn column_sql(table: usize, name: &str) -> String {
 }
 
 /// SQL for the natural lexical form of `column`.
-fn lexical_sql(column: &str, lexical: Lexical) -> String {
+fn lexical_sql(dialect: &dyn Dialect, column: &str, lexical: Lexical) -> String {
     match lexical {
-        Lexical::Text => format!("{column}::text"),
+        Lexical::Text => dialect.cast(column, &SqlType::Text),
         Lexical::Boolean => {
             format!("CASE {column} WHEN true THEN 'true' WHEN false THEN 'false' END")
         }
-        Lexical::Hex => format!("upper(encode({column}, 'hex'))"),
-        // `numeric` output never uses an exponent, and trim_scale drops
-        // exactly the trailing fractional zeros, which is the XML Schema
-        // 1.1 decimalCanonicalMap (`3`, `12.5`); tested against
-        // `canonical_decimal` over many values in v12n-postgres.
-        Lexical::Decimal => format!("trim_scale({column})::text"),
+        Lexical::Hex => dialect.hex_lexical(column),
+        Lexical::Decimal => dialect.decimal_lexical(column),
     }
 }
 
@@ -1243,10 +1310,13 @@ pub(super) mod tests {
             base_iri: None,
         };
         let rendered = plan
-            .to_sql_with(&RenderOptions {
-                text_params: &[3],
-                ..RenderOptions::default()
-            })
+            .to_sql_with(
+                &PostgresDialect,
+                &RenderOptions {
+                    text_params: &[3],
+                    ..RenderOptions::default()
+                },
+            )
             .unwrap();
         assert_eq!(
             rendered.sql,
@@ -1304,10 +1374,13 @@ pub(super) mod tests {
             base_iri: None,
         };
         let rendered = plan
-            .to_sql_with(&RenderOptions {
-                keyed_params: &[(0, TermKey::Text), (2, TermKey::OctetLength)],
-                ..RenderOptions::default()
-            })
+            .to_sql_with(
+                &PostgresDialect,
+                &RenderOptions {
+                    keyed_params: &[(0, TermKey::Text), (2, TermKey::OctetLength)],
+                    ..RenderOptions::default()
+                },
+            )
             .unwrap();
         // The value comparison stays, so an index on the column finds the
         // candidates; the key only filters them.
@@ -1362,10 +1435,13 @@ pub(super) mod tests {
         ]
         .into();
         let rendered = plan
-            .to_sql_with(&RenderOptions {
-                column_types: Some(&types),
-                ..RenderOptions::default()
-            })
+            .to_sql_with(
+                &PostgresDialect,
+                &RenderOptions {
+                    column_types: Some(&types),
+                    ..RenderOptions::default()
+                },
+            )
             .unwrap();
         // `DISTINCT` would merge -0 and 0; the key is compared too, and
         // left out of the results.
@@ -1453,10 +1529,13 @@ pub(super) mod tests {
         };
         assert_eq!(plan.term_columns().len(), 2);
         let types: ColumnTypes = [((l, "a".to_owned()), a), ((r, "b".to_owned()), b)].into();
-        let rendered = plan.to_sql_with(&RenderOptions {
-            column_types: Some(&types),
-            ..RenderOptions::default()
-        })?;
+        let rendered = plan.to_sql_with(
+            &PostgresDialect,
+            &RenderOptions {
+                column_types: Some(&types),
+                ..RenderOptions::default()
+            },
+        )?;
         Ok(rendered.sql.split(" ON ").nth(1).unwrap().to_owned())
     }
 

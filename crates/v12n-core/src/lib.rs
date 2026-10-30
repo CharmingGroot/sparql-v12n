@@ -4,6 +4,7 @@
 //! SPARQL solutions. Nothing here touches a database, so every stage can be
 //! tested and explained offline.
 
+pub mod dialect;
 mod error;
 pub mod mapping;
 pub mod optimize;
