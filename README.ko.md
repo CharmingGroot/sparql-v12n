@@ -92,15 +92,95 @@ cd sparql-v12n
    <http://example.org/order/1004>  "15000"^^<http://www.w3.org/2001/XMLSchema#integer>
    ```
 
+   이 세 주문이 반환되는 이유는 [결과가 만들어지는 과정](#결과가-만들어지는-과정)에
+   있다.
+
 4. 데이터베이스를 멈추고 컨테이너와 네트워크를 지운다.
 
    ```sh
    docker compose -f testenv/docker-compose.yml down -v
    ```
 
-같은 매핑과 쿼리로 `v12n explain`을 실행하면 DB 없이 생성된 SQL을 볼 수 있다.
 테스트 환경은 [testenv/README.md](testenv/README.md)에 있다. 차등 테스트가 쓰는
 Ontop 엔드포인트도 여기서 설명하며, 이 예제에는 필요하지 않다.
+
+### 결과가 만들어지는 과정
+
+예제 데이터베이스에는 테이블이 두 개 있다. 아래는 두 테이블의 모든 행이다. 전체
+파일은 [schema.sql](examples/shop/schema.sql)과
+[data.sql](examples/shop/data.sql)이다.
+
+`customers`
+
+| id | name | tier |
+|---|---|---|
+| 7 | Kim | VIP |
+| 8 | Lee | REGULAR |
+| 9 | Park | VIP |
+
+`orders`
+
+| id | customer_id | amount |
+|---|---|---|
+| 1001 | 7 | 120000 |
+| 1002 | 8 | 30000 |
+| 1003 | 9 | 87000 |
+| 1004 | 7 | 15000 |
+
+R2RML 매핑은 각 행을 IRI와 속성으로 바꾼다. 아래 발췌에서는 prefix 선언,
+`a rr:TriplesMap`, `ex:name`을 생략했다. 전체 파일은
+[mapping.ttl](examples/shop/mapping.ttl)이다.
+
+```turtle
+<#CustomerMap>
+  rr:logicalTable [ rr:tableName "customers" ] ;
+  rr:subjectMap [ rr:template "http://example.org/customer/{id}" ; rr:class ex:Customer ] ;
+  rr:predicateObjectMap [ rr:predicate ex:tier ; rr:objectMap [ rr:column "tier" ] ] .
+
+<#OrderMap>
+  rr:logicalTable [ rr:tableName "orders" ] ;
+  rr:subjectMap [ rr:template "http://example.org/order/{id}" ; rr:class ex:Order ] ;
+  rr:predicateObjectMap [ rr:predicate ex:amount ; rr:objectMap [ rr:column "amount" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:placedBy ;
+    rr:objectMap [ rr:template "http://example.org/customer/{customer_id}" ]
+  ] .
+```
+
+- `id`가 7인 고객 행은 `<http://example.org/customer/7>`이 된다. 이 IRI는
+  `ex:Customer`이고 `ex:tier "VIP"`를 가진다.
+- `id`가 1001인 주문 행은 `<http://example.org/order/1001>`이 된다. 이 IRI는
+  `ex:Order`이고 `ex:amount 120000`을 가진다. `integer` 컬럼이므로 값은
+  `xsd:integer` 리터럴이다.
+- `ex:placedBy`는 고객 subject와 같은 템플릿으로 `customer_id`에서 고객 IRI를
+  만든다. 주문 1001의 `customer_id`는 7이므로 `<http://example.org/customer/7>`을
+  가리키고, 이는 고객 행 7의 IRI와 같다.
+
+쿼리 [vip-orders.rq](examples/shop/queries/vip-orders.rq):
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+# Orders placed by VIP customers.
+SELECT ?order ?amount WHERE {
+  ?customer a ex:Customer ; ex:tier "VIP" .
+  ?order ex:placedBy ?customer ; ex:amount ?amount .
+}
+```
+
+`?customer`가 두 패턴에 함께 나오므로, 주문의 `ex:placedBy` IRI가 등급이
+`"VIP"`인 고객의 IRI와 같을 때만 그 주문이 결과에 들어간다. SQL에서는
+`orders.customer_id = customers.id` 조인이 된다. VIP 고객은 7과 9이다. 고객 7의
+주문은 1001과 1004이고, 고객 9의 주문은 1003이다. 주문 1002는 등급이
+`"REGULAR"`인 고객 8의 주문이다.
+
+`v12n explain`은 DB 없이 생성된 SQL을 출력한다. 조인은
+`JOIN "orders" t1 ON t1."customer_id" = t0."id"`로 나타나고, `"VIP"`는
+파라미터 `$1`로 전달된다.
+
+```sh
+v12n explain examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq
+```
 
 ## 지원하는 SPARQL
 

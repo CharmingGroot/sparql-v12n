@@ -79,13 +79,78 @@ cd sparql-v12n
    <http://example.org/order/1004>  "15000"^^<http://www.w3.org/2001/XMLSchema#integer>
    ```
 
+   返回这三个订单的原因见[结果的构成](#结果的构成)。
+
 4. 停止数据库，并删除其容器和网络。
 
    ```sh
    docker compose -f testenv/docker-compose.yml down -v
    ```
 
-使用相同的映射和查询运行 `v12n explain`，可以在不连接数据库的情况下查看生成的 SQL。测试环境见 [testenv/README.md](testenv/README.md)，其中也介绍了差分测试使用的 Ontop 端点；本示例不需要它。
+测试环境见 [testenv/README.md](testenv/README.md)，其中也介绍了差分测试使用的 Ontop 端点；本示例不需要它。
+
+### 结果的构成
+
+示例数据库有两张表。下面列出两张表的全部行。完整文件见 [schema.sql](examples/shop/schema.sql) 和 [data.sql](examples/shop/data.sql)。
+
+`customers`
+
+| id | name | tier |
+|---|---|---|
+| 7 | Kim | VIP |
+| 8 | Lee | REGULAR |
+| 9 | Park | VIP |
+
+`orders`
+
+| id | customer_id | amount |
+|---|---|---|
+| 1001 | 7 | 120000 |
+| 1002 | 8 | 30000 |
+| 1003 | 9 | 87000 |
+| 1004 | 7 | 15000 |
+
+R2RML 映射将每一行转换为一个 IRI 及其属性。下面的摘录省略了前缀声明、`a rr:TriplesMap` 和 `ex:name`。完整文件见 [mapping.ttl](examples/shop/mapping.ttl)。
+
+```turtle
+<#CustomerMap>
+  rr:logicalTable [ rr:tableName "customers" ] ;
+  rr:subjectMap [ rr:template "http://example.org/customer/{id}" ; rr:class ex:Customer ] ;
+  rr:predicateObjectMap [ rr:predicate ex:tier ; rr:objectMap [ rr:column "tier" ] ] .
+
+<#OrderMap>
+  rr:logicalTable [ rr:tableName "orders" ] ;
+  rr:subjectMap [ rr:template "http://example.org/order/{id}" ; rr:class ex:Order ] ;
+  rr:predicateObjectMap [ rr:predicate ex:amount ; rr:objectMap [ rr:column "amount" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:placedBy ;
+    rr:objectMap [ rr:template "http://example.org/customer/{customer_id}" ]
+  ] .
+```
+
+- `id` 为 7 的客户行成为 `<http://example.org/customer/7>`，它是 `ex:Customer`，并具有 `ex:tier "VIP"`。
+- `id` 为 1001 的订单行成为 `<http://example.org/order/1001>`，它是 `ex:Order`，并具有 `ex:amount 120000`。由于该列是 `integer`，值为 `xsd:integer` 字面量。
+- `ex:placedBy` 使用与客户主语相同的模板，由 `customer_id` 构造客户 IRI。订单 1001 的 `customer_id` 为 7，因此它指向 `<http://example.org/customer/7>`，即客户行 7 的 IRI。
+
+查询 [vip-orders.rq](examples/shop/queries/vip-orders.rq)：
+
+```sparql
+PREFIX ex: <http://example.org/>
+
+# Orders placed by VIP customers.
+SELECT ?order ?amount WHERE {
+  ?customer a ex:Customer ; ex:tier "VIP" .
+  ?order ex:placedBy ?customer ; ex:amount ?amount .
+}
+```
+
+`?customer` 同时出现在两个模式中，因此只有当订单的 `ex:placedBy` IRI 等于等级为 `"VIP"` 的客户的 IRI 时，该订单才会出现在结果中。在 SQL 中，这是 `orders.customer_id = customers.id` 的连接。VIP 客户是 7 和 9：客户 7 的订单是 1001 和 1004，客户 9 的订单是 1003。订单 1002 属于等级为 `"REGULAR"` 的客户 8。
+
+`v12n explain` 在不连接数据库的情况下输出生成的 SQL。连接显示为 `JOIN "orders" t1 ON t1."customer_id" = t0."id"`，`"VIP"` 作为参数 `$1` 传递。
+
+```sh
+v12n explain examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq
+```
 
 ## 支持的 SPARQL
 
