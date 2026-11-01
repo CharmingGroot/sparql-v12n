@@ -23,7 +23,8 @@ data. Changes keep to these rules:
 ## Proposing a change
 
 1. Open an issue first, for bugs and features alike, to agree on the
-   scope before writing code. For a design question, list the options
+   scope before writing code. The bug report form asks for what a wrong
+   result needs to be reproduced. For a design question, list the options
    you considered.
 2. Name the branch `<type>/<issue>-<short-name>`, for example
    `fix/37-time-midnight`.
