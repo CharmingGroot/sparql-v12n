@@ -20,7 +20,8 @@ impl SqlPlan {
     /// part does not extend, so a condition on it from outside the part,
     /// such as the one `BOUND` renders, still tells whether the part
     /// matched. Conditions inside a disjunction, a filter or the cases of
-    /// a value are kept.
+    /// a value are kept. The guard of a part that reads a row
+    /// ([`SameRow`](super::SameRow)) drops those on that row.
     pub fn without_implied_not_null(&self, not_null: &HashSet<(LogicalTable, String)>) -> Self {
         let mut plan = self.clone();
         for branch in &mut plan.branches {
@@ -38,6 +39,12 @@ impl SqlBranch {
             let own = self.own_tables(Some(part));
             let conditions = &mut self.left_joins[part].conditions;
             retain_needed(conditions, &own, &self.from, not_null);
+            // Where the row read has no table row, every column read from
+            // it is `NULL` whatever the guard says.
+            if let Some(same_row) = &mut self.left_joins[part].same_row {
+                let row_of = [same_row.row_of];
+                retain_needed(&mut same_row.guard, &row_of, &self.from, not_null);
+            }
         }
     }
 

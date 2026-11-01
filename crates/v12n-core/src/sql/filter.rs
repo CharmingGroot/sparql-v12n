@@ -445,7 +445,7 @@ impl<'a> Renderer<'a> {
                     self.typed_null(&SqlType::Numeric);
                     return Ok(());
                 };
-                let column = super::column_sql(table, name);
+                let column = self.column(table, name);
                 match operand.kind {
                     // NaN and the infinities of a numeric column are not
                     // xsd:decimal values: an error.
@@ -887,7 +887,7 @@ impl<'a> Renderer<'a> {
         let mut float_columns = Vec::new();
         for (side, other) in [(l, r), (r, l)] {
             if let Some((table, name)) = side.column {
-                let column = super::column_sql(table, name);
+                let column = self.column(table, name);
                 match class(side) {
                     Num::Decimal
                         if !(op == CompareOp::Equal
@@ -983,7 +983,7 @@ impl<'a> Renderer<'a> {
         let (table, name) = operand
             .column
             .expect("a numeric operand is a column or a constant");
-        let column = super::column_sql(table, name);
+        let column = self.column(table, name);
         if class == Num::Decimal && ty == Num::Double {
             self.sql.push_str(&self.decimal_column_as_double(&column));
         } else if class < ty {
@@ -1004,7 +1004,7 @@ impl<'a> Renderer<'a> {
                 let (table, name) = operand
                     .column
                     .expect("a boolean or dateTime operand is a column or a constant");
-                self.sql.push_str(&super::column_sql(table, name));
+                self.sql.push_str(&self.column(table, name));
                 return Ok(());
             }
         };
@@ -1030,7 +1030,7 @@ impl<'a> Renderer<'a> {
             .iter()
             .filter(|o| special(o))
             .filter_map(|o| o.column)
-            .map(|(table, name)| guard(&super::column_sql(table, name)))
+            .map(|(table, name)| guard(&self.column(table, name)))
             .collect();
         if guards.is_empty() || (mode == Mode::Positive && op == CompareOp::Equal && has_constant) {
             return comparison(self);
@@ -1079,8 +1079,7 @@ impl<'a> Renderer<'a> {
             Text::NaturalDatatype { column, datatype } => {
                 self.sql.push_str(&format!(
                     "CASE WHEN {} THEN ",
-                    self.dialect
-                        .is_finite(&super::column_sql(column.0, column.1))
+                    self.dialect.is_finite(&self.column(column.0, column.1))
                 ));
                 self.cast_rendered(&SqlType::Text, |this| {
                     this.expr(&super::SqlExpr::Param(datatype.as_str().into()))
@@ -1145,9 +1144,7 @@ impl<'a> Renderer<'a> {
                  values are plain literals",
             ));
         }
-        let column = operand
-            .column
-            .map(|(table, name)| super::column_sql(table, name));
+        let column = operand.column.map(|(table, name)| self.column(table, name));
         match (&operand.kind, column) {
             (Kind::Boolean, Some(c)) => self.sql.push_str(&c),
             (Kind::Numeric(Num::Integer), Some(c)) => self.sql.push_str(&format!("{c} <> 0")),

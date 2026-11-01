@@ -1,0 +1,9 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_merged(\"SELECT ?a ?h ?c WHERE { ?a a ex:Asset \\\n         OPTIONAL { ?a ex:hostname ?h OPTIONAL { ?a ex:criticality ?c } } }\")"
+---
+SELECT t0."id" AS "a", t0."hostname" AS "h", CASE WHEN t0."hostname" IS NOT NULL THEN t0."criticality" END AS "c"
+FROM "assets" t0
+WHERE t0."id" IS NOT NULL
+
+-- params

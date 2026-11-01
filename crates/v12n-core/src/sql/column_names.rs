@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use crate::mapping::{LogicalTable, TemplatePart};
 
 use super::plan::{PartMut, visit_cases_mut};
-use super::{Condition, SqlBranch, SqlExpr, SqlPlan, TermSql, TermSqlValue, quote_identifier};
+use super::{
+    Condition, LeftJoin, SqlBranch, SqlExpr, SqlPlan, TermSql, TermSqlValue, quote_identifier,
+};
 
 impl SqlPlan {
     /// The plan with column names replaced by the names the database
@@ -102,10 +104,12 @@ impl SqlPlan {
                     }),
                 }
             }
-            let conditions = branch
-                .conditions
-                .iter_mut()
-                .chain(branch.left_joins.iter_mut().flat_map(|j| &mut j.conditions));
+            let conditions = branch.conditions.iter_mut().chain(
+                branch
+                    .left_joins
+                    .iter_mut()
+                    .flat_map(LeftJoin::conditions_mut),
+            );
             for c in conditions {
                 condition(c, from, &mut f);
             }
@@ -135,18 +139,20 @@ impl SqlPlan {
 }
 
 impl SqlBranch {
-    /// Replaces every table alias the select list, the conditions and the
-    /// order values refer to by `f` of it. `from`, `fixed_columns` and
-    /// the ranges of `left_joins` are left to the caller.
+    /// Replaces every table alias the select list, the conditions, the
+    /// order values and the rows that `OPTIONAL` parts read refer to by
+    /// `f` of it. `from`, `fixed_columns` and the ranges of `left_joins`
+    /// are left to the caller.
     pub(crate) fn rename_tables(&mut self, f: &impl Fn(usize) -> usize) {
         self.for_each_reference(&mut |table, _| *table = f(*table));
     }
 
     /// Calls `f` with every table alias that the select list, the
-    /// conditions, the order values and the computed values refer to,
-    /// with the names of the columns read from that table there: one for
-    /// a column, those of its parts for a template, none for a template
-    /// of constant parts only.
+    /// conditions, the order values, the computed values and the rows that
+    /// `OPTIONAL` parts read refer to, with the names of the columns read
+    /// from that table there: one for a column, those of its parts for a
+    /// template, none for a template of constant parts only or for a row
+    /// a part reads.
     pub(crate) fn for_each_reference(&mut self, f: &mut dyn FnMut(&mut usize, &mut [&mut String])) {
         fn expr(e: &mut SqlExpr, f: &mut dyn FnMut(&mut usize, &mut [&mut String])) {
             match e {
@@ -212,10 +218,19 @@ impl SqlBranch {
         for e in &mut self.select {
             expr(e, f);
         }
-        let conditions = self
-            .conditions
+        for same_row in self
+            .left_joins
             .iter_mut()
-            .chain(self.left_joins.iter_mut().flat_map(|j| &mut j.conditions));
+            .filter_map(|j| j.same_row.as_mut())
+        {
+            f(&mut same_row.scan, &mut []);
+            f(&mut same_row.row_of, &mut []);
+        }
+        let conditions = self.conditions.iter_mut().chain(
+            self.left_joins
+                .iter_mut()
+                .flat_map(LeftJoin::conditions_mut),
+        );
         for c in conditions {
             condition(c, f);
         }

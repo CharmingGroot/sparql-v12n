@@ -301,6 +301,14 @@ the left side is kept. Where the optional part has compatible solutions,
 the left solution is extended by each of them. The SQL has one
 `LEFT JOIN` per optional part.
 
+A part can also read a row of its left side instead. This happens when
+its only table is a table of the left side, joined on a `NOT NULL`
+unique key, and its other conditions are comparisons of columns. The
+part can then only match that row, so each of its columns is that row's
+column where the conditions hold and `NULL` elsewhere (`CASE WHEN … THEN
+… END`). A `FILTER` or a constant inside the part keeps the `LEFT JOIN`.
+`v12n explain` has no keys and always shows the `LEFT JOIN`.
+
 - The tables of a part are joined among themselves. When there are
   several, they are in parentheses. The `ON` clause holds the conditions
   of the part itself and the link to the left side.

@@ -2,9 +2,8 @@
 source: crates/v12n-core/tests/unfold_sql.rs
 expression: "explain_merged(\"SELECT ?a ?c ?f ?t WHERE { ?a ex:hostname ?h \\\n         OPTIONAL { ?a ex:criticality ?c } \\\n         OPTIONAL { ?f ex:onAsset ?a ; ex:title ?t } }\")"
 ---
-SELECT t0."id" AS "a", t1."criticality" AS "c", t2."id" AS "f", t2."title" AS "t"
+SELECT t0."id" AS "a", t0."criticality" AS "c", t2."id" AS "f", t2."title" AS "t"
 FROM "assets" t0
-LEFT JOIN "assets" t1 ON t1."id" = t0."id" AND t1."criticality" IS NOT NULL
 LEFT JOIN "alerts" t2 ON t2."asset_id" = t0."id" AND t2."title" IS NOT NULL
 WHERE t0."id" IS NOT NULL AND t0."hostname" IS NOT NULL
 

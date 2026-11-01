@@ -183,8 +183,18 @@ fn term_column_ref(term: &TermSql) -> Option<ColumnRef<'_>> {
 }
 
 /// Whether every column the branch reads of `t{parent}` is a referenced
-/// column of `key`, so that the child row gives all of them.
+/// column of `key`, so that the child row gives all of them. An
+/// `OPTIONAL` part that reads the row of `t{parent}` reads it by the names
+/// of its own scan's columns, which the child does not have.
 fn reads_only_key(branch: &SqlBranch, parent: usize, key: &ForeignKeyJoin) -> bool {
+    if branch
+        .left_joins
+        .iter()
+        .filter_map(|j| j.same_row.as_ref())
+        .any(|same_row| same_row.row_of == parent)
+    {
+        return false;
+    }
     let mut read = BTreeSet::new();
     branch.clone().for_each_reference(&mut |table, names| {
         if *table == parent {

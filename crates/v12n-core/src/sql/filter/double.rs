@@ -157,7 +157,7 @@ impl Renderer<'_> {
         let Some((table, name)) = operand.column else {
             return null();
         };
-        let column = super::super::column_sql(table, name);
+        let column = self.column(table, name);
         match operand.kind {
             Kind::Numeric(Num::Double) => Double::simple(column, true),
             Kind::Numeric(Num::Decimal) => {

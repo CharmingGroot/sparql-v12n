@@ -286,7 +286,7 @@ impl<'a> Renderer<'a> {
         // kind fails where its lexical form is needed.
         let infinite = match rank {
             Rank::DateTime | Rank::Other if operand.infinite => {
-                term_column(&operand).map(|(table, name)| super::column_sql(table, name))
+                term_column(&operand).map(|(table, name)| self.column(table, name))
             }
             _ => None,
         };
@@ -467,7 +467,7 @@ impl<'a> Renderer<'a> {
             Slot::Date | Slot::Time => {
                 open(self, &finite);
                 let (table, name) = term_column(operand).expect("date and time slots for columns");
-                let column = super::column_sql(table, name);
+                let column = self.column(table, name);
                 match self.column_type(table, name).and_then(|ty| ty.term_normal) {
                     Some(normal) => self.sql.push_str(&normal.sql(self.dialect, &column)),
                     None => self.sql.push_str(&column),
