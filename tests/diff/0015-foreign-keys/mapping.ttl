@@ -1,0 +1,102 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#RegionMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "regions" ] ;
+  rr:subjectMap [ rr:template "http://example.org/region/{code}" ; rr:class ex:Region ] ;
+  rr:predicateObjectMap [ rr:predicate ex:regionName ; rr:objectMap [ rr:column "name" ] ] .
+
+<#CustomerMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "customers" ] ;
+  rr:subjectMap [ rr:template "http://example.org/customer/{id}" ; rr:class ex:Customer ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:region ;
+    rr:objectMap [
+      rr:parentTriplesMap <#RegionMap> ;
+      rr:joinCondition [ rr:child "region" ; rr:parent "code" ]
+    ]
+  ] .
+
+<#OrderMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "orders" ] ;
+  rr:subjectMap [ rr:template "http://example.org/order/{id}" ; rr:class ex:Order ] ;
+  rr:predicateObjectMap [ rr:predicate ex:amount ; rr:objectMap [ rr:column "amount" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:placedBy ;
+    rr:objectMap [
+      rr:parentTriplesMap <#CustomerMap> ;
+      rr:joinCondition [ rr:child "customer_id" ; rr:parent "id" ]
+    ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:buyer ;
+    rr:objectMap [ rr:template "http://example.org/customer/{customer_id}" ]
+  ] .
+
+<#NoteMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "notes" ] ;
+  rr:subjectMap [ rr:template "http://example.org/note/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:body ; rr:objectMap [ rr:column "body" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:about ;
+    rr:objectMap [
+      rr:parentTriplesMap <#CustomerMap> ;
+      rr:joinCondition [ rr:child "customer_id" ; rr:parent "id" ]
+    ]
+  ] .
+
+<#LineMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "lines" ] ;
+  rr:subjectMap [ rr:template "http://example.org/line/{order_id}/{line_no}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:item ; rr:objectMap [ rr:column "item" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:ofOrder ;
+    rr:objectMap [
+      rr:parentTriplesMap <#OrderMap> ;
+      rr:joinCondition [ rr:child "order_id" ; rr:parent "id" ]
+    ]
+  ] .
+
+<#ShipmentMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "shipments" ] ;
+  rr:subjectMap [ rr:template "http://example.org/shipment/{id}" ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:ships ;
+    rr:objectMap [
+      rr:parentTriplesMap <#LineMap> ;
+      rr:joinCondition [ rr:child "order_id" ; rr:parent "order_id" ] ,
+        [ rr:child "line_no" ; rr:parent "line_no" ]
+    ]
+  ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:shipsSwapped ;
+    rr:objectMap [
+      rr:parentTriplesMap <#LineMap> ;
+      rr:joinCondition [ rr:child "order_id" ; rr:parent "line_no" ] ,
+        [ rr:child "line_no" ; rr:parent "order_id" ]
+    ]
+  ] .
+
+<#RefundMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "refunds" ] ;
+  rr:subjectMap [ rr:template "http://example.org/refund/{id}" ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:refunds ;
+    rr:objectMap [
+      rr:parentTriplesMap <#OrderMap> ;
+      rr:joinCondition [ rr:child "order_id" ; rr:parent "id" ]
+    ]
+  ] .
+
+<#EmployeeMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "employees" ] ;
+  rr:subjectMap [ rr:template "http://example.org/employee/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:employeeName ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:manager ;
+    rr:objectMap [
+      rr:parentTriplesMap <#EmployeeMap> ;
+      rr:joinCondition [ rr:child "manager_id" ; rr:parent "id" ]
+    ]
+  ] .

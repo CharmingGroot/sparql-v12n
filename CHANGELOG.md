@@ -34,6 +34,11 @@ Design decisions are recorded in the `Decision:` Discussions.
 - The generated SQL leaves out `IS NOT NULL` on term columns that a
   `NOT NULL` constraint of a table keeps from being `NULL`, except where a
   `LEFT JOIN` can make them `NULL`.
+- A scan of a referenced table is removed when a validated foreign key
+  on `NOT NULL` columns, to a unique key of the same column types and
+  under deterministic collations, joins it and the query reads only the key columns from it, as for the
+  parent of a referencing object map whose subject the query needs.
+  The terms are built from the referencing columns (#112).
 - Keys, column types and resolved column names come from a catalog
   snapshot instead of being read on every query (Discussion #187).
   `v12n serve` reads it at startup; each query checks a fingerprint of

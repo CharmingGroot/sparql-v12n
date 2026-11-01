@@ -138,6 +138,11 @@ flowchart TD
   column that a `LEFT JOIN` can leave `NULL` keep it. Keys show when a branch scans the same
   row twice, so the scans merge, and when the result cannot have
   duplicates, so `DISTINCT` or a duplicate-removing `UNION` is dropped.
+  A validated foreign key on `NOT NULL` columns, referencing a unique key
+  of the same column types under deterministic collations, shows that each row has exactly one
+  referenced row; a scan of the referenced table that the query joins
+  on the key and reads only for the key columns is removed, and its
+  terms are built from the referencing columns.
   Column types decide how branches of a `UNION` line up and how values
   compare as RDF terms; a comparison that SQL cannot answer as SPARQL
   does fails with `UnsupportedFeature`. A table or column that the
