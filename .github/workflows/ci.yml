@@ -294,6 +294,7 @@ jobs:
       - name: Report
         if: ${{ !cancelled() }}
         run: |
+          mkdir -p target/coverage
           cargo llvm-cov report --lcov --output-path target/coverage/lcov.info
           cargo llvm-cov report --html --output-dir target/coverage
           { echo '```'; cargo llvm-cov report --summary-only; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
