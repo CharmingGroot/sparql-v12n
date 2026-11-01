@@ -12,7 +12,8 @@ const MAPPING: &str = r#"@prefix rr: <http://www.w3.org/ns/r2rml#> .
 
 <#Customer> rr:logicalTable [ rr:tableName "customers" ] ;
   rr:subjectMap [ rr:template "http://example.org/customer/{id}" ; rr:class ex:Customer ] ;
-  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:number ; rr:objectMap [ rr:column "id" ] ] .
 
 <#Order> rr:logicalTable [ rr:tableName "orders" ] ;
   rr:subjectMap [ rr:template "http://example.org/order/{id}" ] ;
@@ -202,6 +203,18 @@ fn parent_in_the_optional_part_of_its_child_is_not_scanned() {
          LEFT JOIN \"orders\" t1 ON t1.\"customer_id\" = t0.\"id\" AND t1.\"id\" IS NOT NULL\n\
          WHERE t0.\"id\" IS NOT NULL AND t0.\"name\" IS NOT NULL"
     );
+}
+
+/// The `OPTIONAL` part reads `id` from the row of the parent scan (#151)
+/// with no guard on it, since the key is `NOT NULL`. Removing the parent
+/// would read `id` of `orders` for `?n`.
+#[test]
+fn parent_whose_row_an_optional_part_reads_is_kept() {
+    let plan = plan("SELECT ?o ?c ?n WHERE { ?o ex:placedBy ?c OPTIONAL { ?c ex:number ?n } }");
+    let merged = eliminate_self_joins(&plan, &primary_keys()).expect("the part reads a row");
+    let same_row = merged.branches[0].left_joins[0].same_row.as_ref();
+    assert_eq!(same_row.map(|s| s.row_of), Some(1));
+    assert_eq!(eliminate_foreign_key_joins(&merged, &keys()), None);
 }
 
 /// Across `OPTIONAL`, the parent scan tells whether the part matched.
