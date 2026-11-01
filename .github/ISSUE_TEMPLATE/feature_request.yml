@@ -1,0 +1,32 @@
+name: Feature request
+description: A SPARQL feature, a database or a behaviour that v12n does not support yet
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [supported SPARQL](https://github.com/CharmingGroot/sparql-v12n#supported-sparql) and the [roadmap](https://github.com/CharmingGroot/sparql-v12n#roadmap) first: planned work is grouped in [milestones](https://github.com/CharmingGroot/sparql-v12n/milestones).
+  - type: textarea
+    id: feature
+    attributes:
+      label: Feature
+      description: What v12n should support.
+    validations:
+      required: true
+  - type: input
+    id: specification
+    attributes:
+      label: Specification
+      description: The section of SPARQL 1.1, R2RML or another specification that defines the feature, with a link.
+      placeholder: SPARQL 1.1 Query, 11 Aggregates
+  - type: textarea
+    id: example
+    attributes:
+      label: Example
+      description: A query, and the mapping and data it runs on if needed, with the result you expect.
+    validations:
+      required: true
+  - type: textarea
+    id: use
+    attributes:
+      label: Use
+      description: Optional. What the feature is needed for, and how it is done today.

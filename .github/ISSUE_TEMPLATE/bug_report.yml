@@ -1,0 +1,74 @@
+name: Bug report
+description: A wrong result, a crash, or an error on a query or mapping that should work
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A wrong result can be reproduced only with the mapping, the query, the schema and the data. Reduce them to the smallest set that still shows the problem.
+        Security problems go to private vulnerability reporting, not to an issue (see `SECURITY.md`).
+  - type: input
+    id: version
+    attributes:
+      label: v12n version
+      description: Output of `v12n --version`, or the commit if built from source.
+      placeholder: v12n 0.0.1 (cedf7d3193b2)
+    validations:
+      required: true
+  - type: input
+    id: postgres
+    attributes:
+      label: PostgreSQL version
+      description: Output of `SELECT version();`
+      placeholder: PostgreSQL 17.11
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or request
+      description: The `v12n` command line, or the HTTP request sent to `/sparql`.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: mapping
+    attributes:
+      label: Mapping
+      description: The R2RML mapping in Turtle, or the triples maps it needs.
+      render: turtle
+    validations:
+      required: true
+  - type: textarea
+    id: query
+    attributes:
+      label: Query
+      render: sparql
+    validations:
+      required: true
+  - type: textarea
+    id: schema
+    attributes:
+      label: Schema and data
+      description: "`CREATE TABLE` and `INSERT` statements for the tables the query reads, or a minimal subset."
+      render: sql
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+      description: The solutions the query should return, and the section of the specification that requires them if known.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: The solutions, error message or exit code that v12n returned.
+    validations:
+      required: true
+  - type: textarea
+    id: ontop
+    attributes:
+      label: Ontop's result
+      description: Optional. The result of Ontop on the same mapping, data and query, if known.
