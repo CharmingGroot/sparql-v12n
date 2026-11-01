@@ -40,6 +40,12 @@ impl Dialect for PostgresDialect {
         format!("isfinite({expr})")
     }
 
+    /// `float8send` writes the IEEE 754 bits in network byte order, sign
+    /// first.
+    fn sign_bit(&self, expr: &str) -> String {
+        format!("get_byte(float8send({expr}), 0) >= 128")
+    }
+
     fn type_of(&self, expr: &str) -> String {
         format!("pg_typeof({expr})::text")
     }

@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Addition and subtraction of doubles and an integer.
+SELECT ?r WHERE { ?r ex:f ?f ; ex:g ?g FILTER(?f - ?g + 1 >= 0) }

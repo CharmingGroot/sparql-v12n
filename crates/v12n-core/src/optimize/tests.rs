@@ -347,6 +347,22 @@ fn nested_optional_part_reads_the_row_of_the_outer_part() {
     );
 }
 
+/// Double arithmetic (#99) reads a column of the part from the row, as
+/// every other expression does; the part's scan is gone from `FROM`.
+#[test]
+fn double_arithmetic_reads_the_column_of_a_part_from_the_row() {
+    let plan = merged(
+        "SELECT ?a ?c WHERE { ?a ex:hostname ?h \
+         OPTIONAL { ?a ex:criticality ?c ; ex:site ?s } FILTER(?c * 1.5e0 > 3e0) }",
+    );
+    let sql = sql(&plan);
+    assert!(
+        sql.contains("CASE WHEN t0.\"site\" IS NOT NULL THEN t0.\"criticality\" END::float8")
+            && !sql.contains("t1."),
+        "{sql}"
+    );
+}
+
 /// A nested part reads the row of a part that joins another table.
 #[test]
 fn nested_part_reads_the_row_of_an_outer_part_that_joins() {

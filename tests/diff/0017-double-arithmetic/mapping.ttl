@@ -1,0 +1,12 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#Measure> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "measures" ] ;
+  rr:subjectMap [ rr:template "http://example.org/measure/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:f ; rr:objectMap [ rr:column "f" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:g ; rr:objectMap [ rr:column "g" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:n ; rr:objectMap [ rr:column "n" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:i ; rr:objectMap [ rr:column "i" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:d ; rr:objectMap [ rr:column "d" ] ] .

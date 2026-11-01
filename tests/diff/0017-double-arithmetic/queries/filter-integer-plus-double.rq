@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# An integer plus a double is a double.
+SELECT ?r WHERE { ?r ex:i ?i FILTER(?i + 1.5e0 > 3) }

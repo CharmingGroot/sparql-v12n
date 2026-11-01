@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A double is true unless it is zero or NaN.
+SELECT ?r WHERE { ?r ex:f ?f ; ex:g ?g FILTER(?f * ?g) }
