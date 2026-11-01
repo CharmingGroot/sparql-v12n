@@ -140,11 +140,13 @@ flowchart TD
   the row of a scan on its left reads that row's columns, `NULL` where the
   part's conditions fail, instead of a `LEFT JOIN`. Keys also show when the result cannot have
   duplicates, so `DISTINCT` or a duplicate-removing `UNION` is dropped.
-  A validated foreign key on `NOT NULL` columns, referencing a unique key
-  of the same column types under deterministic collations, shows that each row has exactly one
-  referenced row; a scan of the referenced table that the query joins
-  on the key and reads only for the key columns is removed, and its
-  terms are built from the referencing columns.
+  A validated foreign key referencing a unique key of the same column
+  types under deterministic collations shows that each row whose key
+  columns are all non-`NULL` has exactly one referenced row; a scan of
+  the referenced table that the query joins on the key and reads only
+  for the key columns is removed, and its terms are built from the
+  referencing columns. A referencing column that may be `NULL` gets an
+  `IS NOT NULL` condition in place of the join.
   Column types decide how branches of a `UNION` line up and how values
   compare as RDF terms; a comparison that SQL cannot answer as SPARQL
   does fails with `UnsupportedFeature`. A table or column that the

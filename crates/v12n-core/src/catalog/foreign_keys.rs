@@ -10,8 +10,9 @@ use super::{CatalogSnapshot, Column, ForeignKey, Relation};
 
 impl CatalogSnapshot {
     /// The foreign keys between tables that `plan` scans that give every
-    /// row of the referencing table exactly one referenced row, whose
-    /// values give the same terms as the referencing ones.
+    /// row of the referencing table whose key columns are all non-`NULL`
+    /// exactly one referenced row, whose values give the same terms as the
+    /// referencing ones.
     pub(super) fn foreign_key_joins(&self, plan: &SqlPlan) -> Vec<ForeignKeyJoin> {
         let tables = plan.logical_tables();
         let mut out = Vec::new();
@@ -24,10 +25,11 @@ impl CatalogSnapshot {
                     let Some(parent_relation) = self.relation(parent) else {
                         continue;
                     };
-                    if pins_one_row(relation, key, parent_relation) {
+                    if let Some(nullable) = pins_one_row(relation, key, parent_relation) {
                         out.push(ForeignKeyJoin {
                             child: child.clone(),
                             columns: key.columns.clone(),
+                            nullable,
                             parent: parent.clone(),
                             parent_columns: key.referenced_columns.clone(),
                         });
@@ -51,27 +53,19 @@ fn is_referenced(key: &ForeignKey, table: &LogicalTable) -> bool {
     }
 }
 
-/// Whether every row of `child` has exactly one row of `parent` whose
-/// referenced columns `=` finds equal to its own, and equal values give
-/// the same terms on both sides.
-fn pins_one_row(child: &Relation, key: &ForeignKey, parent: &Relation) -> bool {
-    let (Some(columns), Some(referenced)) = (
-        columns_named(child, &key.columns),
-        columns_named(parent, &key.referenced_columns),
-    ) else {
-        return false;
-    };
-    references_every_row(&columns)
-        && references_one_row(parent, key)
+/// Whether every row of `child` whose key columns are all non-`NULL` has
+/// exactly one row of `parent` whose referenced columns `=` finds equal to
+/// its own, and equal values give the same terms on both sides; if so,
+/// whether each key column may be `NULL`. PostgreSQL checks a foreign key
+/// only on rows whose key columns are all non-`NULL` (`MATCH SIMPLE`).
+fn pins_one_row(child: &Relation, key: &ForeignKey, parent: &Relation) -> Option<Vec<bool>> {
+    let columns = columns_named(child, &key.columns)?;
+    let referenced = columns_named(parent, &key.referenced_columns)?;
+    (references_one_row(parent, key)
         && same_types(&columns, &referenced)
         && compares_exactly(&columns)
-        && compares_exactly(&referenced)
-}
-
-/// PostgreSQL checks a foreign key only on rows whose key columns are all
-/// non-`NULL` (`MATCH SIMPLE`), and a join on a `NULL` drops the row.
-fn references_every_row(columns: &[&Column]) -> bool {
-    columns.iter().all(|c| c.not_null)
+        && compares_exactly(&referenced))
+    .then(|| columns.iter().map(|c| !c.not_null).collect())
 }
 
 /// Whether the referenced columns are a unique key that decides equality

@@ -11,13 +11,16 @@ use crate::sql::{Condition, SqlBranch, SqlExpr, SqlPlan, TermSql, TermSqlValue, 
 use super::{column_of, dedup_conditions, scope_conditions, scope_of, term_column};
 
 /// A foreign key that the catalog shows to give every row of `child`
-/// exactly one row of `parent` with equal key values, of the same types
-/// on both sides (see [`eliminate_foreign_key_joins`]).
+/// whose key columns are all non-`NULL` exactly one row of `parent` with
+/// equal key values, of the same types on both sides (see
+/// [`eliminate_foreign_key_joins`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeignKeyJoin {
     pub child: LogicalTable,
     /// As the database stores them, in key order.
     pub columns: Vec<String>,
+    /// Whether each of `columns` may be `NULL`.
+    pub nullable: Vec<bool>,
     pub parent: LogicalTable,
     /// The referenced columns, as the database stores them, in the order
     /// of `columns`.
@@ -35,17 +38,21 @@ pub struct ForeignKeyJoin {
 /// the same `OPTIONAL` part), that scope's conditions, a conjunction,
 /// hold `tP.p = tC.c` for every pair of columns of the key (a column
 /// equality, or a term comparison of the two columns), and the plan reads
-/// no other column of `tP`. The key's columns are `NOT NULL` and it
-/// references a unique key, so each row of `tC` has exactly one row of
-/// `tP` that the scope can keep, and the scope keeps the same rows, each
-/// once, without `tP`. In each of them `tP.p` and `tC.c` are values of
-/// one type that `=` finds equal, which give the same term, so reading
-/// `tC.c` wherever the plan read `tP.p` gives the same results; where an
+/// no other column of `tP`. The key references a unique key, and
+/// PostgreSQL checks it on every row whose key columns are all non-`NULL`
+/// (`MATCH SIMPLE`), so each such row of `tC` has exactly one row of `tP`
+/// that the scope can keep. A row with a `NULL` key column has none,
+/// since `=` is not true on `NULL`. Without `tP`, the scope keeps the
+/// same rows, each once, where it requires every key column that may be
+/// `NULL` not to be. In each of them `tP.p` and `tC.c` are values of one
+/// type that `=` finds equal, which give the same term, so reading `tC.c`
+/// wherever the plan read `tP.p` gives the same results; where an
 /// `OPTIONAL` part does not match, both are `NULL`.
 ///
-/// The key equalities then compare a `NOT NULL` column with itself and are
-/// dropped. A scan of the parent in another scope than the child's is
-/// kept: across an `OPTIONAL` it decides whether the part matched.
+/// The key equalities then compare a column with itself. Each is dropped,
+/// and replaced by `tC.c IS NOT NULL` where the column may be `NULL`. A
+/// scan of the parent in another scope than the child's is kept: across
+/// an `OPTIONAL` it decides whether the part matched.
 pub fn eliminate_foreign_key_joins(plan: &SqlPlan, keys: &[ForeignKeyJoin]) -> Option<SqlPlan> {
     if keys.is_empty() {
         return None;
@@ -71,6 +78,8 @@ struct RedundantParent {
     /// For each referenced column, by the name the database stores, the
     /// child's column as the plan writes it.
     renamed: HashMap<String, String>,
+    /// The child's key columns that may be `NULL`, as the plan writes them.
+    nullable: Vec<String>,
 }
 
 fn redundant_parent(branch: &SqlBranch, keys: &[ForeignKeyJoin]) -> Option<RedundantParent> {
@@ -89,10 +98,18 @@ fn redundant_parent(branch: &SqlBranch, keys: &[ForeignKeyJoin]) -> Option<Redun
                     continue;
                 };
                 if reads_only_key(branch, parent, key) {
+                    let nullable = key
+                        .parent_columns
+                        .iter()
+                        .zip(&key.nullable)
+                        .filter(|(_, nullable)| **nullable)
+                        .map(|(p, _)| renamed[p].clone())
+                        .collect();
                     return Some(RedundantParent {
                         parent,
                         child,
                         renamed,
+                        nullable,
                     });
                 }
             }
@@ -246,6 +263,12 @@ fn remove_parent(branch: &mut SqlBranch, scan: &RedundantParent) {
         }
         _ => true,
     });
+    conditions.extend(scan.nullable.iter().map(|name| {
+        Condition::IsNotNull(SqlExpr::Column {
+            table: child,
+            name: name.clone(),
+        })
+    }));
 }
 
 #[cfg(test)]

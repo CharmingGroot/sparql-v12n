@@ -4002,7 +4002,9 @@ async fn a_query_does_not_trust_a_dropped_key() {
 /// ways (#112). Every referencing table has one row whose customer does
 /// not exist where its key allows it: `NULL` in `notes`, a row added
 /// before a key `NOT VALID` in `unchecked`, and a row of an inheritance
-/// child, which does not inherit the key, in `base`. In `labelled`, a
+/// child, which does not inherit the key, in `base`. In `bookings`, a
+/// composite key with one `NULL` column is not checked (`MATCH SIMPLE`),
+/// so its other column references no slot (#198). In `labelled`, a
 /// collation that ignores case lets `'abc'` reference `'ABC'`. Each test
 /// replaces the schema `v12n_fk112` with its own.
 const FOREIGN_KEYS_SQL: &str = "DROP SCHEMA IF EXISTS v12n_fk112 CASCADE;
@@ -4039,7 +4041,12 @@ const FOREIGN_KEYS_SQL: &str = "DROP SCHEMA IF EXISTS v12n_fk112 CASCADE;
     INSERT INTO v12n_fk112.labels VALUES ('ABC');
     CREATE TABLE v12n_fk112.labelled (id int PRIMARY KEY,
       label text COLLATE v12n_fk112.nocase NOT NULL REFERENCES v12n_fk112.labels (name));
-    INSERT INTO v12n_fk112.labelled VALUES (70, 'abc');";
+    INSERT INTO v12n_fk112.labelled VALUES (70, 'abc');
+    CREATE TABLE v12n_fk112.slots (a int, b int, PRIMARY KEY (a, b));
+    INSERT INTO v12n_fk112.slots VALUES (1, 1), (1, 2);
+    CREATE TABLE v12n_fk112.bookings (id int PRIMARY KEY, a int NOT NULL, b int,
+      FOREIGN KEY (a, b) REFERENCES v12n_fk112.slots);
+    INSERT INTO v12n_fk112.bookings VALUES (80, 1, 1), (81, 9, NULL);";
 
 /// A triples map per referencing table of [`FOREIGN_KEYS_SQL`] in
 /// `schema`, whose objects come from the referenced table through a
@@ -4052,7 +4059,15 @@ fn foreign_keys_mapping(schema: &str) -> String {
          <#codes> rr:logicalTable [ rr:tableName \"v12n_fk112.codes\" ] ;\n\
            rr:subjectMap [ rr:template \"http://example.org/code/{code}\" ] .\n\
          <#labels> rr:logicalTable [ rr:tableName \"v12n_fk112.labels\" ] ;\n\
-           rr:subjectMap [ rr:template \"http://example.org/label/{name}\" ] .\n"
+           rr:subjectMap [ rr:template \"http://example.org/label/{name}\" ] .\n\
+         <#slots> rr:logicalTable [ rr:tableName \"v12n_fk112.slots\" ] ;\n\
+           rr:subjectMap [ rr:template \"http://example.org/slot/{a}/{b}\" ] .\n\
+         <#bookings> rr:logicalTable [ rr:tableName \"v12n_fk112.bookings\" ] ;\n\
+           rr:subjectMap [ rr:template \"http://example.org/bookings/{id}\" ] ;\n\
+           rr:predicateObjectMap [ rr:predicate ex:bookings ;\n\
+             rr:objectMap [ rr:parentTriplesMap <#slots> ;\n\
+               rr:joinCondition [ rr:child \"a\" ; rr:parent \"a\" ] ,\n\
+                 [ rr:child \"b\" ; rr:parent \"b\" ] ] ] .\n"
         .to_owned();
     for (table, parent, column) in [
         ("orders", "customers", "customer_id"),
@@ -4080,9 +4095,10 @@ fn foreign_keys_mapping(schema: &str) -> String {
 }
 
 /// A parent scan goes only where the snapshot shows a validated key on
-/// `NOT NULL` columns of the referenced type, which no table with
-/// inheritance children has, to a unique key that decides `=` as the
-/// join does; the solutions are those of the join either way.
+/// columns of the referenced type, which no table with inheritance
+/// children has, to a unique key that decides `=` as the join does; a
+/// referencing column that may be `NULL` is then required not to be. The
+/// solutions are those of the join either way.
 #[tokio::test]
 async fn foreign_keys_remove_the_parent_scan_only_where_every_row_has_one_parent() {
     let Some(url) = database_url() else { return };
@@ -4102,6 +4118,7 @@ async fn foreign_keys_remove_the_parent_scan_only_where_every_row_has_one_parent
         "base",
         "tagged",
         "labelled",
+        "bookings",
     ] {
         let plan = plan(
             &mapping,
@@ -4135,7 +4152,7 @@ async fn foreign_keys_remove_the_parent_scan_only_where_every_row_has_one_parent
                     row("orders", 12, "customer/2"),
                 ]
             ),
-            ("notes", 2, vec![row("notes", 20, "customer/1")]),
+            ("notes", 1, vec![row("notes", 20, "customer/1")]),
             ("wide", 2, vec![row("wide", 30, "customer/3")]),
             ("unchecked", 2, vec![row("unchecked", 40, "customer/1")]),
             ("base", 2, vec![row("base", 50, "customer/2")]),
@@ -4147,6 +4164,7 @@ async fn foreign_keys_remove_the_parent_scan_only_where_every_row_has_one_parent
             // R2RML §8: the join finds the label by `=`, and the term is
             // the label's own value.
             ("labelled", 2, vec![row("labelled", 70, "label/ABC")]),
+            ("bookings", 1, vec![row("bookings", 80, "slot/1/1")]),
         ]
     );
 }
