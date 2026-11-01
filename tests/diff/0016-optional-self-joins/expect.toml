@@ -1,0 +1,9 @@
+# Known differences from Ontop. Each check fails once the difference is
+# gone, so these entries are removed together with the issue.
+
+# The nested part binds ?s to the site, which the outer part's hostname
+# pattern does not match (SPARQL 1.1 §18.5); Ontop binds ?s from the
+# hostname for assets 1 and 6.
+[query.nested-then-outer-pattern]
+expect = "mismatch"
+issue = 196
