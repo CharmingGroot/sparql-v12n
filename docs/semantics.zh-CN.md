@@ -240,7 +240,15 @@ SQL 以 `NULL` 表示错误。SQL 的 `AND`、`OR` 与 `NOT` 对 `NULL` 的处�
 | `xsd:dateTime` | 两个值都带时区或都不带时区时按时刻比较。带时区的值与不带时区的值之间的比较依赖隐式时区，因此被拒绝。 |
 | IRI、空白节点以及其他类型的字面量 | 仅支持 `=` 与 `!=`，作为 RDF term 比较（RDFterm-equal）。`<` 及其他运算符为错误。两个不同字面量之间的比较为错误。 |
 
-支持整数与 decimal 的算术（`+`、`-`、`*`、`/` 与一元负号）。结果类型遵循 XPath 的类型提升：整数除以整数得到 decimal（`7 / 2` 为 `3.5`）。SQL 以 `numeric` 计算，因此大整数之和不会使 `int8` 溢出。除以零、`numeric` 的 NaN 与无穷大，以及不是数字的操作数都是错误。`xsd:double` 值的算术，以及对算术结果使用 `STR`、`LANG`、`DATATYPE` 或 `sameTerm`，目前作为不支持的功能被拒绝（Discussion #144）。
+支持整数、decimal 与 double 的算术（`+`、`-`、`*`、`/` 与一元负号）。结果类型遵循 XPath 的类型提升：整数除以整数得到 decimal（`7 / 2` 为 `3.5`），带有 `xsd:double` 操作数的运算得到 double。SQL 以 `numeric` 计算整数与 decimal，因此大整数之和不会使 `int8` 溢出。整数与 decimal 的除以零、`numeric` 的 NaN 与无穷大，以及不是数字的操作数都是错误。对算术结果使用 `STR`、`LANG`、`DATATYPE` 或 `sameTerm`，目前作为不支持的功能被拒绝（Discussion #144）。
+
+double 按 XPath 的要求遵循 IEEE 754：
+
+- 除以零时，按两个操作数的符号（包括零的符号）得到 `INF` 或 `-INF`，`0e0 / 0` 得到 `NaN`。
+- 对 double 而言过大的结果为无穷大，过小的结果为带其符号的零。
+- NaN 不等于任何值，也不与任何值排序，因此对 NaN 而言 `!(?x * 2 > 0)` 成立。
+
+PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运算符的 SQL 先用精确的检查判定这些情形。PostgreSQL 测试在边界值、边界附近的操作数对以及随机操作数上，将每个运算符与 IEEE 754 对照。整数或 decimal 操作数变为最接近的 double。绝对值不小于 2^1024 − 2^970 的 decimal 变为无穷大，不大于 2^-1075 的 decimal 变为带其符号的零（XML Schema 1.1，`floatingPointRound`）。仅由常量构成的算术在发送查询之前计算。
 
 与列比较的常量，在能给出相同结果的情况下转换为列的类型。此时可以使用该列上的索引。例如，`?qty > 5` 即 `qty > $1::int8`，`?qty = 7.0` 即 `qty = $1::int8`。
 
@@ -278,12 +286,12 @@ SQL 以 `NULL` 表示错误。SQL 的 `AND`、`OR` 与 `NOT` 对 `NULL` 的处�
 
 - 当数据类型不在上表中时（例如 `xsd:date`），对该数据类型的两个字面量进行排序或比较；
 - 对两个带语言标签的字面量进行排序或比较，否定之外的 `=` 除外；
-- 涉及以下任一项的比较：
-  - `real` 列；
+- 涉及以下任一项的比较与算术：
+  - `real` 列，其 `xsd:double` 字面量的值是其最短十进制形式的值；
   - `rr:datatype` 为该列自然数据类型以外的数值、布尔或 dateTime 数据类型的列的值；
   - `xsd:float` 与派生整数类型；
   - 超出公元 1 至 9999 年范围或精度细于微秒的 dateTime 常量；
-- 其他函数、`xsd:double` 的算术、`IN`、`EXISTS`，以及以 term（变量、常量，以及它们的 `STR`、`LANG` 或 `DATATYPE`）和算术以外的表达式作为操作数；
+- 其他函数、`IN`、`EXISTS`，以及以 term（变量、常量，以及它们的 `STR`、`LANG` 或 `DATATYPE`）和算术以外的表达式作为操作数；
 - 在编码不是 UTF-8 的数据库中进行字符串排序和 `REGEX`。
 
 ## BIND 与 SELECT 表达式
@@ -291,7 +299,7 @@ SQL 以 `NULL` 表示错误。SQL 的 `AND`、`OR` 与 `NOT` 对 `NULL` 的处�
 `BIND(expr AS ?v)` 与 `SELECT (expr AS ?v)` 在每个解中将表达式的值绑定到 `?v`（SPARQL 1.1 §18.5，Extend）。表达式为变量、常量，或与 [`FILTER`](#filter) 中相同的算术：
 
 - 变量给出其 term，常量给出其自身。
-- 算术给出一个数，其数据类型遵循 XPath 的类型提升，并以规范形式写出（见[字面量](#字面量)）。在整数列上，`?qty * 2` 为 `xsd:integer`，`?qty / 4` 为 `xsd:decimal`。XPath 将 decimal 除法的精度留给实现决定，此处采用 PostgreSQL `numeric` 除法的精度。
+- 算术给出一个数，其数据类型遵循 XPath 的类型提升，并以规范形式写出（见[字面量](#字面量)）。在整数列上，`?qty * 2` 为 `xsd:integer`，`?qty / 4` 为 `xsd:decimal`。XPath 将 decimal 除法的精度留给实现决定，此处采用 PostgreSQL `numeric` 除法的精度。`?qty * 1.5e0` 为 `xsd:double`，例如 `1.5E0`、`-0.0E0`、`INF` 或 `NaN`。`SELECT DISTINCT` 区分 `-0.0E0` 与 `0.0E0`，它们是不同的 term。
 - 发生错误时（例如除以零，或操作数不是数字），`?v` 保持未绑定。该解仍被保留。
 
 SPARQL 在 `BIND` 所在组的解上对其求值。v12n 在连接之后，在整个模式的解上计算它。当表达式中该组可能未绑定的变量不被模式的其余部分绑定时，两者给出相同的值。

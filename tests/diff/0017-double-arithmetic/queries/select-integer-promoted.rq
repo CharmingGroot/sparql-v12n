@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Integers and decimals promoted to doubles.
+SELECT ?r (?i / 2e0 AS ?h) (?d + 1e0 AS ?e) WHERE { ?r ex:i ?i ; ex:d ?d }

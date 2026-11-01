@@ -1,0 +1,27 @@
+# Ontop sends the comparison to PostgreSQL, which orders NaN above every
+# number and finds NaN = NaN; XPath finds NaN neither equal to nor ordered
+# with anything (op:numeric-equal, op:numeric-less-than), so v12n keeps
+# rows 2 and 4 in `!(?n * 2 > 0)` and Ontop drops them (#99).
+[query.filter-nan-not-ordered]
+expect = "mismatch"
+issue = 99
+
+# Ontop writes an xsd:double as PostgreSQL's text output (`3`, `Infinity`);
+# v12n writes the canonical form (`3.0E0`, `INF`), as decided in
+# Discussion #35.
+[query.select-double-product]
+expect = "mismatch"
+issue = 25
+
+[query.select-integer-promoted]
+expect = "mismatch"
+issue = 25
+
+# Ontop writes the NaN test of a double's effective boolean value as an
+# unquoted `NaN`, which PostgreSQL reads as a column name ("column "nan"
+# does not exist"). v12n returns the rows whose product is neither zero
+# nor NaN (#99).
+[query.filter-effective-boolean-value]
+expect = "ontop-error"
+issue = 99
+solutions = 5

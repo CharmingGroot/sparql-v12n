@@ -795,9 +795,11 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
         }
         SparqlExpression::UnaryMinus(a) => Expression::Negate(operand(a)?),
         // op:numeric-unary-plus returns its operand, and is a type error
-        // for anything but a number, as adding zero is.
+        // for anything but a number, as subtracting zero is; adding zero
+        // would turn a double -0 into 0 (IEEE 754: -0 + 0 is 0, -0 - 0 is
+        // -0).
         SparqlExpression::UnaryPlus(a) => Expression::Arith(
-            ArithOp::Add,
+            ArithOp::Subtract,
             operand(a)?,
             Box::new(Expression::Constant(
                 Literal::new_typed_literal(
@@ -951,10 +953,10 @@ mod tests {
             matches!(product.as_ref(), Expression::Arith(ArithOp::Multiply, a, _)
             if matches!(a.as_ref(), Expression::Negate(_)))
         );
-        // Unary plus is adding zero.
+        // Unary plus is subtracting zero.
         assert!(
             matches!(quotient.as_ref(), Expression::Arith(ArithOp::Divide, a, _)
-            if matches!(a.as_ref(), Expression::Arith(ArithOp::Add, ..)))
+            if matches!(a.as_ref(), Expression::Arith(ArithOp::Subtract, ..)))
         );
         assert_eq!(filter.variables(), ["a", "a"]);
     }

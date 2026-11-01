@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# NaN is not greater than 0, so the negation keeps it.
+SELECT ?r WHERE { ?r ex:n ?n FILTER(!(?n * 2 > 0)) }
