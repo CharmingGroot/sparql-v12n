@@ -79,6 +79,26 @@ fn is_delimited(name: &str) -> bool {
 
 /// Quotes each part of a possibly schema-qualified `rr:tableName`.
 pub fn quote_table_name(name: &str) -> String {
+    table_name_parts(name)
+        .into_iter()
+        .map(quote_identifier)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The parts of a possibly schema-qualified table name, each as the
+/// database stores it. [`quote_table_name`] quotes every part of an
+/// `rr:tableName` as written, and PostgreSQL's `regclass` output quotes a
+/// part only where it would otherwise be read differently, so the two
+/// name one table when their parts are equal.
+pub(crate) fn stored_table_name(name: &str) -> Vec<String> {
+    table_name_parts(name)
+        .into_iter()
+        .map(identifier_name)
+        .collect()
+}
+
+fn table_name_parts(name: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut quoted = false;
@@ -94,10 +114,6 @@ pub fn quote_table_name(name: &str) -> String {
     }
     parts.push(&name[start..]);
     parts
-        .into_iter()
-        .map(quote_identifier)
-        .collect::<Vec<_>>()
-        .join(".")
 }
 
 #[cfg(test)]
@@ -162,5 +178,19 @@ mod tests {
         assert_eq!(identifier_name("\"Id\""), "Id");
         assert_eq!(identifier_name("\"a\"\"b\""), "a\"b");
         assert_eq!(identifier_name("a\"b"), "a\"b");
+    }
+
+    #[test]
+    fn stored_table_name_reads_mapping_and_regclass_spellings_alike() {
+        assert_eq!(stored_table_name("shop.orders"), ["shop", "orders"]);
+        assert_eq!(stored_table_name(r#""shop"."orders""#), ["shop", "orders"]);
+        assert_eq!(
+            stored_table_name(r#""my.schema"."Order""#),
+            ["my.schema", "Order"]
+        );
+        assert_ne!(
+            stored_table_name("orders"),
+            stored_table_name("shop.orders")
+        );
     }
 }

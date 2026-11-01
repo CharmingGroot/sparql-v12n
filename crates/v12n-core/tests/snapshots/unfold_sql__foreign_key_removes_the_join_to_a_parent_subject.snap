@@ -1,0 +1,8 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_on_snapshot(\"SELECT ?a ?b WHERE { ?a ex:connectsTo ?b }\")"
+---
+SELECT t0."src_id" AS "a", t0."dst_id" AS "b"
+FROM "links" t0
+
+-- params
