@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::sql::{TermKey, TermNormal};
+use crate::sql::{Condition, SqlBranch, SqlExpr, TermKey, TermNormal, identifier_name};
 
 use super::*;
 
@@ -344,6 +344,11 @@ impl Default for Reference {
 
 /// The tables `BUYERS` scans once its plan is completed from `reference`.
 fn scanned(reference: Reference) -> Vec<LogicalTable> {
+    completed(reference).from
+}
+
+/// The branch of `BUYERS` once its plan is completed from `reference`.
+fn completed(reference: Reference) -> SqlBranch {
     let mut orders = entry(
         &[
             ("id", int("int4"), true),
@@ -381,7 +386,7 @@ fn scanned(reference: Reference) -> Vec<LogicalTable> {
         [table("orders"), table("customers")],
         "the entries that justify the plan are checked"
     );
-    ready.plan().branches[0].from.clone()
+    ready.plan().branches[0].clone()
 }
 
 #[test]
@@ -394,14 +399,29 @@ fn foreign_key_on_not_null_columns_removes_the_parent_scan() {
     assert_eq!(scanned(quoted), [table("orders")]);
 }
 
+/// A row without a customer joins no customer row, so the referencing
+/// column must not be `NULL` where the parent scan is gone.
+#[test]
+fn foreign_key_on_a_nullable_column_requires_the_column_not_to_be_null() {
+    let not_null = |branch: &SqlBranch| {
+        branch.conditions.iter().any(|c| {
+            matches!(c, Condition::IsNotNull(SqlExpr::Column { table: 0, name })
+                if identifier_name(name) == "customer_id")
+        })
+    };
+    let nullable = completed(Reference {
+        not_null: false,
+        ..Reference::default()
+    });
+    assert_eq!(nullable.from, [table("orders")]);
+    assert!(not_null(&nullable), "{:?}", nullable.conditions);
+    assert!(!not_null(&completed(Reference::default())));
+}
+
 #[test]
 fn foreign_key_that_cannot_vouch_for_one_row_keeps_the_parent_scan() {
     let both = [table("orders"), table("customers")];
     let cases = [
-        Reference {
-            not_null: false,
-            ..Reference::default()
-        },
         // `=` under a nondeterministic collation finds another string equal.
         Reference {
             deterministic: false,

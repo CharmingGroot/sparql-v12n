@@ -61,12 +61,14 @@ fn keys() -> Vec<ForeignKeyJoin> {
         ForeignKeyJoin {
             child: table("orders"),
             columns: names(&["customer_id"]),
+            nullable: vec![false],
             parent: table("customers"),
             parent_columns: names(&["id"]),
         },
         ForeignKeyJoin {
             child: table("shipments"),
             columns: names(&["order_id", "line_no"]),
+            nullable: vec![false, false],
             parent: table("lines"),
             parent_columns: names(&["order_id", "line_no"]),
         },
@@ -153,6 +155,65 @@ fn parent_read_for_another_column_is_kept() {
     let merged = eliminate_self_joins(&plan, &primary_keys()).expect("the parent scans merge");
     assert_eq!(tables(&merged.branches[0]), ["orders", "customers"]);
     assert_eq!(eliminate_foreign_key_joins(&merged, &keys()), None);
+}
+
+/// The key with every column nullable.
+fn nullable_keys() -> Vec<ForeignKeyJoin> {
+    keys()
+        .into_iter()
+        .map(|key| ForeignKeyJoin {
+            nullable: vec![true; key.columns.len()],
+            ..key
+        })
+        .collect()
+}
+
+/// A row without a customer joins no customer row (`MATCH SIMPLE` does
+/// not check it), so the scope requires the referencing column instead.
+#[test]
+fn nullable_key_column_is_required_not_to_be_null() {
+    let plan = eliminate_foreign_key_joins(
+        &plan("SELECT ?o ?c WHERE { ?o ex:placedBy ?c }"),
+        &nullable_keys(),
+    )
+    .expect("a parent scan is removed");
+    assert_eq!(tables(&plan.branches[0]), ["orders"]);
+    assert_eq!(
+        sql(&plan),
+        "SELECT t0.\"id\" AS \"o\", t0.\"customer_id\" AS \"c\"\n\
+         FROM \"orders\" t0\n\
+         WHERE t0.\"id\" IS NOT NULL AND t0.\"customer_id\" IS NOT NULL"
+    );
+}
+
+/// Only the columns that may be `NULL` are required; a composite key
+/// with one `NULL` column is not checked, and the join drops the row.
+#[test]
+fn nullable_column_of_a_composite_key_is_required() {
+    let mut keys = keys();
+    keys[1].nullable = vec![false, true];
+    let plan = eliminate_foreign_key_joins(&plan("SELECT ?s ?l WHERE { ?s ex:line ?l }"), &keys)
+        .expect("a parent scan is removed");
+    let sql = sql(&plan);
+    assert!(sql.contains("t0.\"line_no\" IS NOT NULL"), "{sql}");
+    assert!(!sql.contains("t0.\"order_id\" IS NOT NULL"), "{sql}");
+}
+
+/// Inside an `OPTIONAL` part the condition joins the part's conditions,
+/// where the join it replaces was.
+#[test]
+fn nullable_key_inside_optional_is_required_in_the_part() {
+    let plan = eliminate_foreign_key_joins(
+        &plan("SELECT ?c ?n ?o WHERE { ?c ex:name ?n OPTIONAL { ?o ex:placedBy ?c } }"),
+        &nullable_keys(),
+    )
+    .expect("a parent scan is removed");
+    let sql = sql(&plan);
+    assert!(
+        sql.contains("LEFT JOIN \"orders\" t1 ON")
+            && sql.contains("t1.\"customer_id\" IS NOT NULL\nWHERE"),
+        "{sql}"
+    );
 }
 
 #[test]
