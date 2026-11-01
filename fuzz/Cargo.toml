@@ -1,0 +1,40 @@
+[package]
+name = "v12n-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "cargo-fuzz targets for the query and mapping parsers and the SQL translation"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Outside the repository's workspace: the targets need nightly and
+# libFuzzer, which the stable builds and the MSRV check do not have.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+v12n-core = { path = "../crates/v12n-core" }
+
+[[bin]]
+name = "query_parse"
+path = "fuzz_targets/query_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mapping_parse"
+path = "fuzz_targets/mapping_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "query_plan"
+path = "fuzz_targets/query_plan.rs"
+test = false
+doc = false
+bench = false

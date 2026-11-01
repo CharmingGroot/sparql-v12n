@@ -43,6 +43,7 @@ lcov.info
 /fuzz/artifacts/
 /fuzz/corpus/
 /fuzz/coverage/
+/fuzz/target/
 
 # ── Differential test environment (downloaded) ──
 /testenv/ontop/*.jar
