@@ -92,6 +92,8 @@ The `coverage` job measures which code the tests reach and uploads the
 report (lcov and HTML) as an artifact; it sets no threshold. Locally,
 `cargo llvm-cov --workspace --html` gives the same report for the tests
 that need no database.
+The `CodeQL` workflow analyzes the Rust code and the workflows on every
+pull request; its results appear in code scanning under the Security tab.
 
 ### PostgreSQL tests
 

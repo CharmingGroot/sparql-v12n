@@ -1,0 +1,40 @@
+name: CodeQL
+
+# Static analysis of the Rust code and of these workflows (#213). Results
+# go to code scanning in the Security tab. Rust needs no build
+# (build-mode: none); it reads Cargo.toml with the runner's cargo.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Mondays 05:00 KST, so new queries also check an unchanged main.
+    - cron: "0 20 * * 0"
+
+concurrency:
+  group: codeql-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:${{ matrix.language }}
