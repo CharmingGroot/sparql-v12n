@@ -1,22 +1,13 @@
 name: Differential
 
 # L4: the same queries through this engine and Ontop (testenv/difftest.sh).
-# Pull requests run it only when they change what produces or checks the
-# results; the weekly run covers everything else.
+# Every pull request runs the workflow, so that `ontop` always reports and
+# can be a required check; `changes` skips it when the pull request changes
+# nothing that produces or checks the results. A paths filter would skip the
+# whole workflow, and the check would never report. The weekly and manual
+# runs cover everything.
 on:
   pull_request:
-    paths:
-      - "crates/v12n-core/**"
-      - "crates/v12n-postgres/**"
-      - "crates/v12n-difftest/**"
-      - "examples/**"
-      - "tests/diff/**"
-      - "tests/w3c/**"
-      - "testenv/difftest.sh"
-      - "testenv/fetch-jdbc.sh"
-      - "Cargo.lock"
-      - ".config/nextest.toml"
-      - ".github/workflows/differential.yml"
   schedule:
     # Mondays 03:00 KST.
     - cron: "0 18 * * 0"
@@ -36,7 +27,38 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.paths.outputs.run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # If the diff cannot be read, the tests run.
+      - name: Detect changes that the differential tests cover
+        id: paths
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          dirs='^(crates/v12n-core|crates/v12n-postgres|crates/v12n-difftest|examples|tests/diff|tests/w3c)/'
+          files='^(testenv/difftest\.sh|testenv/fetch-jdbc\.sh|Cargo\.lock|\.config/nextest\.toml|\.github/workflows/differential\.yml)$'
+          if changed=$(git diff --name-only "$BASE...$HEAD") && ! printf '%s\n' "$changed" | grep -qE "$dirs|$files"; then
+            run=false
+          else
+            run=true
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "differential tests: $run"
+
+  # Skipped, which a required check counts as passed, only when `changes`
+  # found nothing to test; if `changes` fails, the tests run.
   ontop:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     # One job compiles the tests once and runs every case in batches of
