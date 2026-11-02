@@ -294,6 +294,36 @@ output of its columns. Equal terms can therefore still count twice:
 - values of one type whose text output differs, such as `numeric` 1.0 and
   1.00.
 
+## Subjects from several logical tables
+
+Two triples maps over different logical tables can have subject templates
+that produce the same IRI, for example `http://example.org/person/{id}`
+over the tables `src0` and `src1`. An IRI names one RDF node, so the rows
+of both tables describe the same subjects. A mapping combines sources in
+this way. The generated SQL joins the two tables on the template columns,
+for example `JOIN "src1" t1 ON t1."id" = t0."id"`.
+
+This has the following consequences:
+
+- Rows of different tables whose template columns hold the same values
+  become one subject. When the two sources number their records
+  independently, unrelated records are merged.
+- A subject takes every value of a property from every source. A basic
+  graph pattern returns every combination of these values. With four
+  properties and a different value in each of two sources, a subject has
+  2⁴ = 16 solutions. When both sources hold the same value, the two rows
+  give the same triple, which counts once (see
+  [Duplicate triples](#duplicate-triples)).
+- Each triple pattern that both triples maps match has two candidates. A
+  basic graph pattern of n such triple patterns therefore unfolds into
+  2ⁿ SQL branches. A query of more than 64 branches is refused.
+
+`v12n check` reports each such pair of triples maps as a warning. The
+warning does not change the exit code. Two templates whose fixed text
+differs, such as `http://example.org/person/{id}` and
+`http://example.org/order/{id}`, never produce the same IRI and are not
+reported.
+
 ## OPTIONAL
 
 `OPTIONAL` follows the LeftJoin of the SPARQL algebra. Every solution of
