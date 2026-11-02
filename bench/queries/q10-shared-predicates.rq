@@ -1,0 +1,9 @@
+PREFIX ex: <http://example.org/>
+
+# Four predicates that two triples maps with the same subject template
+# define: each pattern has two candidates, so the basic graph pattern has
+# 2^4 = 16 combinations of triples maps (issue #222). Customers in both
+# tables mostly have equal values, which every combination produces again.
+SELECT ?customer ?name ?email ?country ?segment WHERE {
+  ?customer ex:name ?name ; ex:email ?email ; ex:country ?country ; ex:segment ?segment .
+}
