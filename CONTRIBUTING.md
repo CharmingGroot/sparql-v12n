@@ -113,6 +113,10 @@ testenv/fetch-jdbc.sh    # once: the PostgreSQL JDBC driver for Ontop
 testenv/difftest.sh      # every case; DIFF_CASES="0011-time" picks cases
 ```
 
+CI runs the same tests as the `ontop` check on every pull request that
+changes what produces or checks the results, and weekly on `main`. On
+other pull requests the check is skipped, which counts as passed.
+
 A change in behavior needs a case in `tests/diff/`: a schema, data, a
 mapping and one `.rq` file per query. When v12n deliberately differs
 from Ontop, or rejects a query, record it in the case's `expect.toml`
