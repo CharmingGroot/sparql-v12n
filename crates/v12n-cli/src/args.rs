@@ -45,8 +45,15 @@ pub(crate) const CHECK_HELP: &str = "Examples (from the repository root):
   v12n check examples/shop/mapping.ttl
   cat examples/shop/mapping.ttl | v12n check - --format json
 
-JSON: {\"ok\":true,\"triples_maps\":N,\"classes\":N,\"properties\":N}.
+JSON: {\"ok\":true,\"triples_maps\":N,\"classes\":N,\"properties\":N,\"warnings\":[...]}.
 CSV: one record headed triples_maps,classes,properties.
+
+Warnings leave the exit code at 0. Each one is a \"warning: ...\" line on
+stderr and, in JSON, an object in \"warnings\" with \"kind\" and \"message\".
+Kind \"shared_subject\" names, in \"triples_maps\" and \"subject_templates\",
+two triples maps over different logical tables whose subject templates can
+produce the same IRI. Their rows describe the same subjects, and a basic
+graph pattern returns every combination of their values.
 
 With --db postgresql://reader@localhost/shop, every table and column the
 mapping reads must also exist and be readable. A missing one is an invalid mapping of kind \"catalog\", with

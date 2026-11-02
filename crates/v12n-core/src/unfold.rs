@@ -13,7 +13,8 @@ use oxrdf::Term;
 use crate::Error;
 use crate::dialect::SqlType;
 use crate::mapping::{
-    BaseIri, LogicalTable, Mapping, MappingIndex, ObjectMap, TemplatePart, TermType, TriplesMap,
+    BaseIri, LogicalTable, Mapping, MappingIndex, ObjectMap, TemplatePart, TermMapValue, TermType,
+    TriplesMap,
 };
 use crate::sparql::{
     ArithOp, Expression, Pattern, PatternTerm, RDF_TYPE, SelectQuery, TriplePattern,
@@ -81,6 +82,44 @@ pub fn unfold(
         }
     }
     plan(query, branches, mapping.base_iri())
+}
+
+/// Pairs of triples maps over different logical tables whose subject
+/// templates can render the same IRI, in document order.
+///
+/// An IRI names one RDF node, so such triples maps describe the same
+/// nodes. A subject takes the property values of both, and a triple
+/// pattern that both can match unfolds into one branch per triples map.
+/// Pairs over the same logical table (R2RML §8) read the same rows and are
+/// left out.
+pub fn shared_subject_templates(mapping: &Mapping) -> Vec<(&TriplesMap, &TriplesMap)> {
+    let base = mapping.base_iri();
+    let subjects: Vec<_> = mapping
+        .triples_maps()
+        .iter()
+        .filter(|tm| {
+            let term_map = &tm.subject_map.term_map;
+            term_map.term_type == TermType::Iri
+                && matches!(term_map.value, TermMapValue::Template(_))
+        })
+        .map(|tm| (tm, tm.logical_table.effective_sql_query()))
+        .collect();
+    let mut pairs = Vec::new();
+    for (i, (left, left_table)) in subjects.iter().enumerate() {
+        for (right, right_table) in &subjects[i + 1..] {
+            if left_table == right_table {
+                continue;
+            }
+            let equality = term_eq(
+                &TermExpr::from_term_map(&left.subject_map.term_map, 0, base),
+                &TermExpr::from_term_map(&right.subject_map.term_map, 1, base),
+            );
+            if !matches!(equality, Equality::Never) {
+                pairs.push((*left, *right));
+            }
+        }
+    }
+    pairs
 }
 
 struct Context<'m> {
