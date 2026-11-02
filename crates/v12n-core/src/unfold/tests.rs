@@ -1159,3 +1159,86 @@ fn unfold_union_counts_arms_towards_the_branch_limit() {
         }
     );
 }
+
+/// `count` triples maps over one table, the i-th with the subject template
+/// `http://example.org/c{i}/{id}` and a column object for each predicate.
+fn many_subject_templates(count: usize, predicates: &[&str]) -> String {
+    let maps: String = (0..count)
+        .map(|i| {
+            let properties: String = predicates
+                .iter()
+                .map(|p| {
+                    format!(
+                        " ;\n  rr:predicateObjectMap [ rr:predicate ex:{p} ; \
+                         rr:objectMap [ rr:column \"{p}\" ] ]"
+                    )
+                })
+                .collect();
+            format!(
+                "<#M{i}> rr:logicalTable [ rr:tableName \"t\" ] ;\n  \
+                 rr:subjectMap [ rr:template \"http://example.org/c{i}/{{id}}\" ]{properties} .\n"
+            )
+        })
+        .collect();
+    with_prefixes(&maps)
+}
+
+#[test]
+fn unfold_counts_branches_after_discarding_unmatched_constants() {
+    let mapping = many_subject_templates(MAX_BRANCHES + 1, &["p1"]);
+    let plan = unfold_query(
+        &mapping,
+        "SELECT ?v WHERE { <http://example.org/c0/7> ex:p1 ?v }",
+    )
+    .unwrap();
+    assert_eq!(plan.branches.len(), 1);
+    assert_eq!(plan.branches[0].from.len(), 1);
+}
+
+#[test]
+fn unfold_counts_branches_after_discarding_disjoint_templates() {
+    let query = "SELECT * WHERE { ?s ex:p1 ?v . ?s ex:p2 ?w }";
+    // 81 choices, of which only the 9 with the same template can match.
+    let plan = unfold_query(&many_subject_templates(9, &["p1", "p2"]), query).unwrap();
+    assert_eq!(plan.branches.len(), 9);
+    // The limit applies to the choices that remain.
+    let mapping = many_subject_templates(MAX_BRANCHES + 1, &["p1", "p2"]);
+    assert_eq!(
+        unfold_query(&mapping, query).unwrap_err(),
+        Error::TooManyBranches {
+            limit: MAX_BRANCHES
+        }
+    );
+    // Patterns without a shared variable discard nothing, and their
+    // choices are refused before all of them are tried.
+    let unlinked = "SELECT * WHERE { ?a ex:p1 ?b . ?c ex:p1 ?d . ?e ex:p1 ?f . ?g ex:p1 ?h }";
+    assert_eq!(
+        unfold_query(&mapping, unlinked).unwrap_err(),
+        Error::TooManyBranches {
+            limit: MAX_BRANCHES
+        }
+    );
+}
+
+#[test]
+fn unfold_counts_optional_choices_after_discarding_unmatched_ones() {
+    let mapping = many_subject_templates(MAX_BRANCHES + 1, &["p1", "p2"]);
+    let plan = unfold_query(
+        &mapping,
+        "SELECT * WHERE { <http://example.org/c0/7> ex:p1 ?v \
+         OPTIONAL { <http://example.org/c0/7> ex:p2 ?w } }",
+    )
+    .unwrap();
+    assert_eq!(plan.branches.len(), 1);
+    assert_eq!(plan.branches[0].left_joins.len(), 1);
+    // 81 choices for the OPTIONAL part, of which 9 can match. The branch
+    // splits into one per choice and one where none matched.
+    let mapping = many_subject_templates(9, &["p1", "p2", "p3"]);
+    let plan = unfold_query(
+        &mapping,
+        "SELECT * WHERE { <http://example.org/c0/7> ex:p1 ?v \
+         OPTIONAL { ?s ex:p2 ?w . ?s ex:p3 ?u } }",
+    )
+    .unwrap();
+    assert_eq!(plan.branches.len(), 10);
+}
