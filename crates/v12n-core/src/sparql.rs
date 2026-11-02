@@ -377,7 +377,7 @@ pub struct TriplePattern {
 }
 
 impl TriplePattern {
-    fn variables(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn variables(&self) -> impl Iterator<Item = &str> {
         [&self.subject, &self.object]
             .into_iter()
             .filter_map(|term| match term {

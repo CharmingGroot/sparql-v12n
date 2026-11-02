@@ -78,7 +78,11 @@ flowchart LR
 3. [`Planner::plan`](../crates/v12n-core/src/planner.rs)은 [`sparql::parse`](../crates/v12n-core/src/sparql.rs)와 [`unfold::unfold`](../crates/v12n-core/src/unfold.rs)를 차례로 호출한다.
    `sparql::parse`는 텍스트를 SPARQL 대수로 바꾸고 지원하지 않는 기능을 거절한다. `unfold::unfold`는 `SqlPlan`을 만든다.
    트리플 패턴은 일치하는 triples map의 논리 테이블 스캔이 되고, 공유 변수는 조인 조건이 되며, `OPTIONAL`은 `LEFT JOIN`이 된다.
-   후보 triples map의 조합 하나가 `UNION ALL`의 SQL 브랜치 하나가 된다. 브랜치가 `MAX_BRANCHES`(64)개를 넘으면 거절한다.
+   후보 triples map의 조합 하나가 SQL 브랜치 하나가 된다. 브랜치가 `MAX_BRANCHES`(64)개를 넘으면 거절한다.
+   브랜치는 arm별로 묶인다. arm은 쿼리의 모든 `UNION`에서 한쪽씩 고른 조합이다([UNION](semantics.ko.md#union) 참고).
+   SQL은 arm 사이를 `UNION ALL`로 합친다. SPARQL `UNION`은 중복 해를 유지하기 때문이다(SPARQL 1.1 §18.5).
+   한 arm의 브랜치 사이는 `UNION`으로 합친다. 여러 triples map이 만드는 같은 트리플은 한 번으로 세기 때문이다. 브랜치가 하나인 arm은 `UNION` 대신 `DISTINCT`를 사용한다.
+   `SELECT DISTINCT`에서는 모든 브랜치를 `UNION`으로 합친다.
 4. [`SqlPlan::to_sql`](../crates/v12n-core/src/sql/renderer.rs)은 DB 정보 없이 PostgreSQL용 SQL을 렌더링한다.
    `v12n explain`이 출력하는 SQL이 이것이다. 중복 제거가 필요 없다는 것은 테이블 키로만 알 수 있으므로, 이 SQL은 중복을 제거하는 단계를 모두 유지한다.
 
@@ -109,7 +113,7 @@ flowchart TD
 - **계획 완성.** [`CatalogPlan::new`](../crates/v12n-core/src/catalog/plan.rs)는 `v12n-core`에서 DB 없이 실행된다.
   PostgreSQL이 소문자로 바꾸는 컬럼 이름을 해석한다.
   term 컬럼마다 붙는 `IS NOT NULL`(R2RML §11에 따라 `NULL`에서는 항을 만들지 않음)은 테이블의 `NOT NULL` 제약으로 항상 참이면 뺀다. 뷰의 컬럼과 `LEFT JOIN` 때문에 `NULL`이 될 수 있는 컬럼에는 남긴다.
-  키가 있으면 한 브랜치가 같은 행을 두 번 스캔하는지 알 수 있어 스캔을 합친다. 왼쪽 스캔의 행에만 일치할 수 있는 `OPTIONAL` 부분은 `LEFT JOIN` 대신 그 행의 컬럼을 읽고, 부분의 조건이 성립하지 않는 곳에서는 `NULL`로 둔다. 또 키로 결과에 중복이 생길 수 없는지 알 수 있어 `DISTINCT`나 중복을 제거하는 `UNION`을 생략한다.
+  키가 있으면 한 브랜치가 같은 행을 두 번 스캔하는지 알 수 있어 스캔을 합친다. 왼쪽 스캔의 행에만 일치할 수 있는 `OPTIONAL` 부분은 `LEFT JOIN` 대신 그 행의 컬럼을 읽고, 부분의 조건이 성립하지 않는 곳에서는 `NULL`로 둔다. 또 키로 브랜치가 하나인 arm의 결과에 중복이 생길 수 없음을 알 수 있으면 해당 arm의 `DISTINCT`를 생략한다.
   검증된 외래 키가 같은 컬럼 타입·결정적 collation의 유일 키를 참조하면, 키 컬럼이 모두 `NULL`이 아닌 각 행에 참조되는 행이 정확히 하나 있다. 쿼리가 그 키로 조인하고 키 컬럼만 읽는 참조 테이블 스캔은 없애고, 그 항은 참조하는 컬럼으로 만든다. `NULL`일 수 있는 참조 컬럼에는 조인 대신 `IS NOT NULL` 조건을 추가한다.
   컬럼 타입에 따라 `UNION` 브랜치를 맞추는 방법과 값을 RDF 항으로 비교하는 방법이 정해진다. 이 타입에서 SQL이 SPARQL과 같은 답을 낼 수 없는 비교는 `UnsupportedFeature`로 실패한다.
   스냅샷에 없다고 나온 테이블이나 컬럼은 `Catalog`로 실패한다.
