@@ -60,7 +60,10 @@ jobs:
           case "$SECONDS_PER_TARGET" in
             ''|*[!0-9]*) echo "seconds must be a number: $SECONDS_PER_TARGET"; exit 1 ;;
           esac
-          cargo +nightly fuzz run "$TARGET" -- -max_total_time="$SECONDS_PER_TARGET"
+          # cargo-fuzz defaults to the target it was built for, which for the
+          # prebuilt binary is musl; the runner's toolchain is for its host.
+          host=$(rustc +nightly -vV | sed -n 's/^host: //p')
+          cargo +nightly fuzz run --target "$host" "$TARGET" -- -max_total_time="$SECONDS_PER_TARGET"
       - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
