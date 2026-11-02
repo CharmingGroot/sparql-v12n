@@ -67,7 +67,7 @@ flowchart LR
 
 1. [`Mapping::from_turtle`](../crates/v12n-core/src/mapping.rs) 解析 R2RML 映射。`with_base_iri` 设置解析相对 IRI 所用的基础 IRI。
 2. [`Planner::new`](../crates/v12n-core/src/planner.rs) 构建 `MappingIndex`，用于查找能产生某个类或属性的 triples map。每个 `Planner` 只构建一次。
-3. [`Planner::plan`](../crates/v12n-core/src/planner.rs) 依次调用 [`sparql::parse`](../crates/v12n-core/src/sparql.rs) 和 [`unfold::unfold`](../crates/v12n-core/src/unfold.rs)。前者将文本转换为 SPARQL 代数并拒绝不支持的功能，后者生成 `SqlPlan`。每个三元组模式成为对匹配 triples map 的逻辑表的扫描，共享变量成为连接条件，`OPTIONAL` 成为 `LEFT JOIN`，候选 triples map 的每种组合成为 `UNION ALL` 中的一个 SQL 分支。分支超过 `MAX_BRANCHES`（64）个时拒绝。
+3. [`Planner::plan`](../crates/v12n-core/src/planner.rs) 依次调用 [`sparql::parse`](../crates/v12n-core/src/sparql.rs) 和 [`unfold::unfold`](../crates/v12n-core/src/unfold.rs)。前者将文本转换为 SPARQL 代数并拒绝不支持的功能，后者生成 `SqlPlan`。每个三元组模式成为对匹配 triples map 的逻辑表的扫描，共享变量成为连接条件，`OPTIONAL` 成为 `LEFT JOIN`，候选 triples map 的每种组合成为一个 SQL 分支。分支超过 `MAX_BRANCHES`（64）个时拒绝。分支按 arm 分组。arm 即对查询中每个 `UNION` 各选一侧所得的组合（见 [UNION](semantics.zh-CN.md#union)）。SQL 以 `UNION ALL` 合并各 arm，因为 SPARQL `UNION` 保留重复的解（SPARQL 1.1 §18.5）。同一 arm 的分支以 `UNION` 合并，因为多个 triples map 产生的同一三元组只计一次。只有一个分支的 arm 改用 `DISTINCT`。在 `SELECT DISTINCT` 下，所有分支以 `UNION` 合并。
 4. [`SqlPlan::to_sql`](../crates/v12n-core/src/sql/renderer.rs) 在没有数据库信息的情况下为 PostgreSQL 渲染计划。`v12n explain` 输出的就是这段 SQL。由于只有表的键才能说明某个去重步骤是多余的，这段 SQL 保留所有去重步骤。
 
 这一阶段的错误来自查询或映射：`QuerySyntax`、`UnsupportedFeature` 和 `TooManyBranches`。
@@ -91,7 +91,7 @@ flowchart TD
 ```
 
 - **快照。** 每个逻辑表记录：是否存在；映射读取的列及其解析后的名称、类型和 `NOT NULL`；对每一行始终成立的唯一键（有效、不可延迟、非部分索引、建在普通列上，且所在表没有继承子表）；已验证的外键；以及指纹，即 PostgreSQL 对上述信息所来自的目录行计算的 SHA-256 哈希。`v12n serve` 在启动时读取映射中所有表的快照；`v12n query` 只读取其计划涉及的表。
-- **完善计划。** [`CatalogPlan::new`](../crates/v12n-core/src/catalog/plan.rs) 在 `v12n-core` 中运行，不访问数据库。它解析被 PostgreSQL 转为小写的列名；每个 term 列都带有的 `IS NOT NULL`（R2RML §11 规定 `NULL` 不产生项），在表的 `NOT NULL` 约束使其恒为真时省略，视图的列以及 `LEFT JOIN` 可能置为 `NULL` 的列则保留。借助键可以判断一个分支是否两次扫描同一行，从而合并扫描；只能匹配左侧某个扫描那一行的 `OPTIONAL` 部分不再使用 `LEFT JOIN`，而是读取该行的列，在部分的条件不成立时为 `NULL`；也可以判断结果不会有重复，从而省略 `DISTINCT` 或去重的 `UNION`。已验证且引用相同列类型、确定性排序规则（collation）唯一键的外键，表明键列均非 `NULL` 的每一行恰有一个被引用行；查询按该键连接、且只读取键列的被引用表扫描会被移除，其项改由引用列构造。可能为 `NULL` 的引用列以 `IS NOT NULL` 条件代替连接。列类型决定 `UNION` 各分支如何对齐，以及值如何作为 RDF 项比较；对于这些类型 SQL 无法给出与 SPARQL 相同答案的比较以 `UnsupportedFeature` 失败。快照显示不存在的表或列以 `Catalog` 失败。
+- **完善计划。** [`CatalogPlan::new`](../crates/v12n-core/src/catalog/plan.rs) 在 `v12n-core` 中运行，不访问数据库。它解析被 PostgreSQL 转为小写的列名；每个 term 列都带有的 `IS NOT NULL`（R2RML §11 规定 `NULL` 不产生项），在表的 `NOT NULL` 约束使其恒为真时省略，视图的列以及 `LEFT JOIN` 可能置为 `NULL` 的列则保留。借助键可以判断一个分支是否两次扫描同一行，从而合并扫描；只能匹配左侧某个扫描那一行的 `OPTIONAL` 部分不再使用 `LEFT JOIN`，而是读取该行的列，在部分的条件不成立时为 `NULL`；也可以判断只有一个分支的 arm 不会有重复，从而省略该 arm 的 `DISTINCT`。已验证且引用相同列类型、确定性排序规则（collation）唯一键的外键，表明键列均非 `NULL` 的每一行恰有一个被引用行；查询按该键连接、且只读取键列的被引用表扫描会被移除，其项改由引用列构造。可能为 `NULL` 的引用列以 `IS NOT NULL` 条件代替连接。列类型决定 `UNION` 各分支如何对齐，以及值如何作为 RDF 项比较；对于这些类型 SQL 无法给出与 SPARQL 相同答案的比较以 `UnsupportedFeature` 失败。快照显示不存在的表或列以 `Catalog` 失败。
 - **检查。** [`PostgresBackend::run`](../crates/v12n-postgres/src/lib.rs) 在一次流水线往返中发送计划所涉及表的指纹查询和语句准备。读取 `rr:sqlQuery` 的计划也在该往返中解析其探测语句，并将列名和类型与快照比较。只要有不同，语句就不会执行：引擎重新读取这些表并再规划一次。第二次仍不同时，以可重试的错误（HTTP 503）失败。刚读取过其表的查询（如每次 `v12n query`）不再重复检查。
 - **参数。** 查询中的每个常量都是绑定参数。PostgreSQL 为参数推断的类型可能改变 SQL，例如需要与没有解码器的类型的文本输出进行比较。此时语句会重新渲染并再次准备。连接以首次渲染的 SQL 为键记住重新渲染的 SQL，下次与第一条语句一起准备，并且只有当它与类型所要求的语句完全相同时才使用。
 - **行数限制。** 当行数限制可能截断结果时，语句比限制多读取一行，并在额外的一列中带上 `count(*) OVER ()`，这样第一行就能说明结果是否被截断。
