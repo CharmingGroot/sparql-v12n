@@ -89,8 +89,15 @@ flowchart LR
    the `SqlPlan`. Each triple pattern becomes a scan of the logical
    tables of matching triples maps, shared variables become join
    conditions, `OPTIONAL` becomes `LEFT JOIN`, and each combination of
-   candidate triples maps becomes one SQL branch of a `UNION ALL`. More
-   than `MAX_BRANCHES` (64) branches is refused.
+   candidate triples maps becomes one SQL branch. More than
+   `MAX_BRANCHES` (64) branches is refused. Branches are grouped by arm.
+   An arm is a choice of one side of every `UNION` in the query (see
+   [UNION](semantics.md#union)). The SQL combines the arms with
+   `UNION ALL`, since a SPARQL `UNION` keeps duplicate solutions
+   (SPARQL 1.1 §18.5). It combines the branches of one arm with `UNION`,
+   since a triple that several triples maps produce counts once. An arm
+   with one branch uses `DISTINCT` instead. Under `SELECT DISTINCT`, all
+   branches are combined with `UNION`.
 4. [`SqlPlan::to_sql`](../crates/v12n-core/src/sql/renderer.rs) renders
    the plan for PostgreSQL with no database information. `v12n explain`
    prints this SQL. It keeps every duplicate-removing step, since only
@@ -138,8 +145,8 @@ flowchart TD
   column that a `LEFT JOIN` can leave `NULL` keep it. Keys show when a branch scans the same
   row twice, so the scans merge; an `OPTIONAL` part that can only match
   the row of a scan on its left reads that row's columns, `NULL` where the
-  part's conditions fail, instead of a `LEFT JOIN`. Keys also show when the result cannot have
-  duplicates, so `DISTINCT` or a duplicate-removing `UNION` is dropped.
+  part's conditions fail, instead of a `LEFT JOIN`. Keys also show when an
+  arm with one branch cannot have duplicates, so its `DISTINCT` is dropped.
   A validated foreign key referencing a unique key of the same column
   types under deterministic collations shows that each row whose key
   columns are all non-`NULL` has exactly one referenced row; a scan of
