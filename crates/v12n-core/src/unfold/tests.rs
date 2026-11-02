@@ -315,10 +315,16 @@ fn unfold_too_many_branches_errors() {
     let mapping = with_prefixes(&maps);
     let err =
         unfold_query(&mapping, "SELECT * WHERE { ?x a ex:Thing . ?y a ex:Thing }").unwrap_err();
+    let thing = |v: &str| PatternCandidates {
+        pattern: format!("?{v} <{RDF_TYPE}> <http://example.org/Thing>"),
+        triples_maps: 9,
+    };
     assert_eq!(
         err,
         Error::TooManyBranches {
-            limit: MAX_BRANCHES
+            limit: MAX_BRANCHES,
+            patterns: vec![thing("x"), thing("y")],
+            omitted: 0,
         }
     );
     assert_eq!(
@@ -1152,11 +1158,9 @@ fn unfold_union_counts_arms_towards_the_branch_limit() {
         .map(|_| "{ ?x ex:p ?v }".to_owned())
         .collect();
     let err = union_query(&format!("SELECT ?x WHERE {{ {} }}", sides.join(" UNION "))).unwrap_err();
-    assert_eq!(
-        err,
-        Error::TooManyBranches {
-            limit: MAX_BRANCHES
-        }
+    assert!(
+        matches!(err, Error::TooManyBranches { limit, .. } if limit == MAX_BRANCHES),
+        "{err}"
     );
 }
 
@@ -1203,21 +1207,17 @@ fn unfold_counts_branches_after_discarding_disjoint_templates() {
     assert_eq!(plan.branches.len(), 9);
     // The limit applies to the choices that remain.
     let mapping = many_subject_templates(MAX_BRANCHES + 1, &["p1", "p2"]);
-    assert_eq!(
-        unfold_query(&mapping, query).unwrap_err(),
-        Error::TooManyBranches {
-            limit: MAX_BRANCHES
-        }
-    );
+    assert!(matches!(
+        unfold_query(&mapping, query),
+        Err(Error::TooManyBranches { .. })
+    ));
     // Patterns without a shared variable discard nothing, and their
     // choices are refused before all of them are tried.
     let unlinked = "SELECT * WHERE { ?a ex:p1 ?b . ?c ex:p1 ?d . ?e ex:p1 ?f . ?g ex:p1 ?h }";
-    assert_eq!(
-        unfold_query(&mapping, unlinked).unwrap_err(),
-        Error::TooManyBranches {
-            limit: MAX_BRANCHES
-        }
-    );
+    assert!(matches!(
+        unfold_query(&mapping, unlinked),
+        Err(Error::TooManyBranches { .. })
+    ));
 }
 
 #[test]
@@ -1241,4 +1241,64 @@ fn unfold_counts_optional_choices_after_discarding_unmatched_ones() {
     )
     .unwrap();
     assert_eq!(plan.branches.len(), 10);
+}
+
+#[test]
+fn unfold_too_many_branches_names_the_patterns_and_their_candidates() {
+    let mapping = many_subject_templates(MAX_BRANCHES + 1, &["p1", "p2"]);
+    let err = unfold_query(
+        &mapping,
+        "SELECT * WHERE { ?s ex:p1 ?v . ?s ex:p2 ?w . <http://example.org/c0/7> ex:p1 ?u }",
+    )
+    .unwrap_err();
+    // The pattern with a constant subject has one candidate left.
+    assert_eq!(
+        err.to_string(),
+        "query unfolds into more than 64 UNION branches; \
+         ?s <http://example.org/p1> ?v: 65 triples maps; \
+         ?s <http://example.org/p2> ?w: 65 triples maps"
+    );
+}
+
+#[test]
+fn unfold_too_many_branches_bounds_the_patterns_it_names() {
+    let predicates: Vec<String> = (0..=MAX_REPORTED_PATTERNS + 1)
+        .map(|i| format!("p{i}"))
+        .collect();
+    let names: Vec<&str> = predicates.iter().map(String::as_str).collect();
+    let mapping = many_subject_templates(2, &names);
+    let patterns: Vec<String> = (0..names.len())
+        .map(|i| format!("?s{i} ex:p{i} ?o{i}"))
+        .collect();
+    // A string literal longer than the limit, with 2 candidates as well.
+    let long = "x".repeat(MAX_PATTERN_CHARS);
+    let query = format!(
+        "SELECT * WHERE {{ {} . ?l ex:p0 \"{long}\" }}",
+        patterns.join(" . ")
+    );
+    let Err(Error::TooManyBranches {
+        patterns, omitted, ..
+    }) = unfold_query(&mapping, &query)
+    else {
+        panic!("expected too many branches");
+    };
+    assert_eq!(patterns.len(), MAX_REPORTED_PATTERNS);
+    assert_eq!(omitted, names.len() + 1 - MAX_REPORTED_PATTERNS);
+    assert!(patterns.iter().all(|p| p.triples_maps == 2));
+    let err = Error::TooManyBranches {
+        limit: MAX_BRANCHES,
+        patterns: Vec::new(),
+        omitted: 3,
+    };
+    assert!(
+        err.to_string()
+            .ends_with("; 3 more patterns with several triples maps")
+    );
+    let mapping = many_subject_templates(MAX_BRANCHES + 1, &["p0"]);
+    let query = format!("SELECT * WHERE {{ ?l ex:p0 \"{long}\" }}");
+    let Err(Error::TooManyBranches { patterns, .. }) = unfold_query(&mapping, &query) else {
+        panic!("expected too many branches");
+    };
+    assert_eq!(patterns[0].pattern.chars().count(), MAX_PATTERN_CHARS + 3);
+    assert!(patterns[0].pattern.ends_with("..."));
 }

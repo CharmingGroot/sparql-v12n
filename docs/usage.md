@@ -99,7 +99,7 @@ if any.
 
 | `kind` | Exit code | `details` |
 |---|---|---|
-| `input`, `query`, `unsupported`, `output`, `runtime` | 1 | `{"path": ...}` when a file cannot be read |
+| `input`, `query`, `unsupported`, `output`, `runtime` | 1 | `{"path": ...}` when a file cannot be read. `{"limit": ..., "patterns": [{"pattern": ..., "triples_maps": ...}], "omitted": ...}` for a query that unfolds into too many SQL branches |
 | `mapping` | 2 | |
 | `database`, `data` | 3 | |
 | `timeout` | 4 | `{"timeout_ms": ..., "rows": ...}` |
@@ -272,7 +272,7 @@ the dataset is the one that the mapping defines.
 | Status | When |
 |---|---|
 | `200` | Results. When a row limit applies and the result is cut off, the response carries `V12N-Truncated: <row limit>` and holds exactly that many solutions. In the same case, `v12n query` exits with 5 |
-| `400` | A query syntax error, a missing or repeated `query`, dataset parameters, or a query that unfolds into too many SQL branches |
+| `400` | A query syntax error, a missing or repeated `query`, dataset parameters, or a query that unfolds into too many SQL branches. For too many branches, the body names the triple patterns with more than one candidate triples map and their counts |
 | `406` / `413` / `414` / `415` | `406`: a format that is not offered. `413`: a query over `max_query_bytes` in a `POST`. `414`: a query over `max_query_bytes` in a `GET`. `415`: any other content type |
 | `501` | A SPARQL feature that is not supported yet |
 | `503` | A statement timeout before the first row (`v12n query` exits with 4 in this case), or `max_concurrent_requests` reached (the response carries `Retry-After`), or a catalog that changed again while the query was planned anew after a change, as during a migration |

@@ -10,7 +10,6 @@ use std::ops::Range;
 
 use oxrdf::Term;
 
-use crate::Error;
 use crate::dialect::SqlType;
 use crate::mapping::{
     BaseIri, LogicalTable, Mapping, MappingIndex, ObjectMap, RefObjectMap, TemplatePart, TermType,
@@ -23,6 +22,7 @@ use crate::sql::{
     Condition, LeftJoin, OrderKey, ProjectedTerm, ResultTerm, ResultValue, SqlBranch, SqlExpr,
     SqlPlan, ValueKind,
 };
+use crate::{Error, PatternCandidates};
 use term::{Equality, LiteralType, TermExpr, TermValue, is_injective, literal_type, term_eq};
 
 /// Most SQL branches one query may unfold into. Each `UNION` adds its
@@ -30,6 +30,14 @@ use term::{Equality, LiteralType, TermExpr, TermValue, is_injective, literal_typ
 /// can produce a row adds one. The same limit applies to the choices
 /// tried for each `OPTIONAL` part.
 pub const MAX_BRANCHES: usize = 64;
+
+/// Most triple patterns an [`Error::TooManyBranches`] names, so that its
+/// message stays short for a query with many patterns.
+pub const MAX_REPORTED_PATTERNS: usize = 8;
+
+/// Most characters of a triple pattern an [`Error::TooManyBranches`]
+/// shows. A longer one is cut after them and ends in `...`.
+pub const MAX_PATTERN_CHARS: usize = 200;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -45,15 +53,33 @@ const XSD_DOUBLE: &str = "http://www.w3.org/2001/XMLSchema#double";
 /// so each `OPTIONAL` part becomes a `LEFT JOIN` inside the branch, and a
 /// part that several choices can match splits the branch (see
 /// [`Branch::optional`]).
+///
+/// A query over [`MAX_BRANCHES`] fails with [`Error::TooManyBranches`],
+/// which names the triple patterns with several candidates.
 pub fn unfold(
     query: &SelectQuery,
     mapping: &Mapping,
     index: &MappingIndex,
 ) -> Result<SqlPlan, Error> {
+    unfold_branches(query, mapping, index).map_err(|error| match error {
+        Error::TooManyBranches { limit, .. } => {
+            let (patterns, omitted) = branch_sources(&query.pattern, mapping, index);
+            Error::TooManyBranches {
+                limit,
+                patterns,
+                omitted,
+            }
+        }
+        error => error,
+    })
+}
+
+fn unfold_branches(
+    query: &SelectQuery,
+    mapping: &Mapping,
+    index: &MappingIndex,
+) -> Result<SqlPlan, Error> {
     let context = Context { mapping, index };
-    let too_many = || Error::TooManyBranches {
-        limit: MAX_BRANCHES,
-    };
     let arms = query.pattern.arms(MAX_BRANCHES).ok_or_else(too_many)?;
     let mut total = 0usize;
     let mut branches = Vec::new();
@@ -72,6 +98,63 @@ pub fn unfold(
         }
     }
     plan(query, branches, mapping.base_iri())
+}
+
+/// An [`Error::TooManyBranches`] without its patterns, which [`unfold`]
+/// adds.
+fn too_many() -> Error {
+    Error::TooManyBranches {
+        limit: MAX_BRANCHES,
+        patterns: Vec::new(),
+        omitted: 0,
+    }
+}
+
+/// The triple patterns of `pattern`, `OPTIONAL` parts and every `UNION`
+/// side included, that more than one candidate can produce, with the
+/// number of candidates left after those that cannot match the pattern
+/// are discarded (see [`choices`]). The patterns with the most candidates
+/// come first; beyond [`MAX_REPORTED_PATTERNS`], only their number is
+/// returned.
+fn branch_sources(
+    pattern: &Pattern,
+    mapping: &Mapping,
+    index: &MappingIndex,
+) -> (Vec<PatternCandidates>, usize) {
+    let mut seen: Vec<&TriplePattern> = Vec::new();
+    let mut out = Vec::new();
+    for triple in pattern.triple_patterns() {
+        if seen.contains(&triple) {
+            continue;
+        }
+        seen.push(triple);
+        // A pattern that fails here fails the query with another error
+        // once it is no longer over the limit.
+        let Ok(candidates) = candidates(triple, mapping, index) else {
+            continue;
+        };
+        let count = candidates
+            .into_iter()
+            .filter(|c| can_match(triple, &c.terms(mapping, 0, 0)))
+            .count();
+        if count > 1 {
+            out.push(PatternCandidates {
+                pattern: shorten(&triple.to_string()),
+                triples_maps: count,
+            });
+        }
+    }
+    out.sort_by_key(|p| std::cmp::Reverse(p.triples_maps));
+    let omitted = out.len().saturating_sub(MAX_REPORTED_PATTERNS);
+    out.truncate(MAX_REPORTED_PATTERNS);
+    (out, omitted)
+}
+
+fn shorten(text: &str) -> String {
+    match text.char_indices().nth(MAX_PATTERN_CHARS) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text.to_owned(),
+    }
 }
 
 struct Context<'m> {
@@ -200,9 +283,6 @@ fn choices<'m>(
     mapping: &'m Mapping,
     index: &MappingIndex,
 ) -> Result<Vec<Vec<Candidate<'m>>>, Error> {
-    let too_many = || Error::TooManyBranches {
-        limit: MAX_BRANCHES,
-    };
     let mut lists: Vec<Vec<(Candidate<'m>, Terms<'m>)>> = Vec::with_capacity(patterns.len());
     for &pattern in patterns {
         // Only the shape of the terms decides whether they can match, so
@@ -601,9 +681,7 @@ impl<'a> Branch<'a> {
         node: usize,
         context: &Context<'a>,
     ) -> Result<Vec<Fork<'a>>, Error> {
-        let arms = right.arms(MAX_BRANCHES).ok_or(Error::TooManyBranches {
-            limit: MAX_BRANCHES,
-        })?;
+        let arms = right.arms(MAX_BRANCHES).ok_or_else(too_many)?;
         // Each choice that matches, with what identifies it among the
         // outcomes of `attempt`, and the arm of an empty one.
         let mut matched: Vec<(Fork<'a>, usize, usize)> = Vec::new();
@@ -1043,9 +1121,7 @@ fn skip(pattern: &Pattern, sides: &mut Sides<'_>, chosen: &mut Chosen<'_, '_>) {
 
 fn check_count(count: usize) -> Result<(), Error> {
     if count > MAX_BRANCHES {
-        return Err(Error::TooManyBranches {
-            limit: MAX_BRANCHES,
-        });
+        return Err(too_many());
     }
     Ok(())
 }

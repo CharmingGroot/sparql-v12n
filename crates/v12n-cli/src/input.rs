@@ -66,7 +66,25 @@ pub(crate) fn load_plan(
             v12n_core::Error::QuerySyntax(_) => "query",
             _ => "unsupported",
         };
-        Failure::new(EXIT_INPUT, kind, e.to_string())
+        let details = match &e {
+            v12n_core::Error::TooManyBranches {
+                limit,
+                patterns,
+                omitted,
+            } => Some(json!({
+                "limit": limit,
+                "patterns": patterns
+                    .iter()
+                    .map(|p| json!({ "pattern": p.pattern, "triples_maps": p.triples_maps }))
+                    .collect::<Vec<_>>(),
+                "omitted": omitted,
+            })),
+            _ => None,
+        };
+        Failure {
+            details,
+            ..Failure::new(EXIT_INPUT, kind, e.to_string())
+        }
     })?;
     Ok((planner, plan))
 }

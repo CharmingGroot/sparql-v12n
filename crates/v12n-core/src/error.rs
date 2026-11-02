@@ -29,8 +29,20 @@ pub enum Error {
     #[error("query syntax error: {0}")]
     QuerySyntax(String),
     /// The query would unfold into more UNION branches than the limit.
-    #[error("query unfolds into more than {limit} UNION branches")]
-    TooManyBranches { limit: usize },
+    #[error(
+        "query unfolds into more than {limit} UNION branches{}",
+        branch_sources(.patterns, *.omitted)
+    )]
+    TooManyBranches {
+        limit: usize,
+        /// The triple patterns of the query with more than one candidate,
+        /// most candidates first, at most
+        /// [`MAX_REPORTED_PATTERNS`](crate::unfold::MAX_REPORTED_PATTERNS).
+        patterns: Vec<PatternCandidates>,
+        /// The patterns with more than one candidate left out of
+        /// `patterns`.
+        omitted: usize,
+    },
     /// A result row cannot be turned into an RDF term, such as a relative
     /// IRI without a base IRI (an R2RML data error).
     #[error("invalid term: {0}")]
@@ -42,4 +54,29 @@ pub enum Error {
     /// A valid construct this engine does not support yet.
     #[error("unsupported feature: {0}")]
     UnsupportedFeature(String),
+}
+
+/// A triple pattern and the number of ways the mapping can produce it,
+/// for [`Error::TooManyBranches`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatternCandidates {
+    /// The pattern with full IRIs, cut after
+    /// [`MAX_PATTERN_CHARS`](crate::unfold::MAX_PATTERN_CHARS) characters.
+    pub pattern: String,
+    /// The triples maps that can produce the pattern, counted once per
+    /// object map of the predicate.
+    pub triples_maps: usize,
+}
+
+fn branch_sources(patterns: &[PatternCandidates], omitted: usize) -> String {
+    let mut out: String = patterns
+        .iter()
+        .map(|p| format!("; {}: {} triples maps", p.pattern, p.triples_maps))
+        .collect();
+    if omitted > 0 {
+        out.push_str(&format!(
+            "; {omitted} more patterns with several triples maps"
+        ));
+    }
+    out
 }
