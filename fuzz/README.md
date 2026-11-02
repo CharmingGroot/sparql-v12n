@@ -21,6 +21,10 @@ fuzz/seed.sh                                  # queries and mappings of tests/di
 cargo +nightly fuzz run query_plan -- -max_total_time=600
 ```
 
+The `Fuzz` workflow runs every target for ten minutes each week, and for
+one minute on pull requests that change `fuzz/`. A crash fails the job
+and its input is uploaded as the artifact `fuzz-<target>`.
+
 `seed.sh` copies the test queries and mappings into `fuzz/corpus/`, and
 crashes go to `fuzz/artifacts/`; neither is committed. A panic, or an
 input that exceeds a time or memory bound, is a bug: fix it and add the
