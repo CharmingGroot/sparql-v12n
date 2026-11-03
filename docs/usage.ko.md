@@ -109,6 +109,11 @@ CLI는 사람이 직접 실행하는 경우뿐 아니라 셸 도구가 호출하
 
 행 제한 `warning: ...`(종료 코드 5)은 항상 stderr로 출력된다.
 
+`v12n check`는 서로 다른 논리 테이블 위에서 같은 IRI를 만들 수 있는 subject
+템플릿을 쓰는 triples map 쌍마다 stderr에 `warning: ...` 한 줄을 출력한다
+([의미 규칙](semantics.ko.md#여러-논리-테이블의-subject)). JSON에서는
+`warnings`가 같은 경고를 나열한다. 경고는 종료 코드를 0으로 유지한다.
+
 `v12n <command> --help`는 각 명령의 JSON과 CSV 형태를 나열한다. 도움말의 예제는
 저장소 루트에서 실행하는 것을 기준으로 한다.
 

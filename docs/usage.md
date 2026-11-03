@@ -112,6 +112,12 @@ Some errors go to stderr as one `error: ...` line instead of to stdout:
 
 The row-limit `warning: ...` (exit code 5) always goes to stderr.
 
+`v12n check` prints a `warning: ...` line on stderr for each pair of
+triples maps over different logical tables whose subject templates can
+produce the same IRI
+([semantics](semantics.md#subjects-from-several-logical-tables)). In
+JSON, `warnings` lists the same warnings. They leave the exit code at 0.
+
 `v12n <command> --help` lists the JSON and CSV shapes of each command. Its
 examples run from the repository root.
 

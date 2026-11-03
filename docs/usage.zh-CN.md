@@ -87,6 +87,8 @@ stderr 中的这一行会指明原因与上限。例如，结果被截断时输�
 
 行数上限的 `warning: ...`（退出码 5）始终写入 stderr。
 
+对于不同逻辑表上主语模板能产生同一 IRI 的每一对 triples map，`v12n check` 在 stderr 输出一行 `warning: ...`（见[查询语义](semantics.zh-CN.md#来自多个逻辑表的主语)）。在 JSON 中，`warnings` 列出相同的警告。警告使退出码保持为 0。
+
 `v12n <command> --help` 列出每个命令的 JSON 与 CSV 结构。其中的示例在仓库根目录运行。
 
 ## 数据库连接

@@ -1302,3 +1302,76 @@ fn unfold_too_many_branches_bounds_the_patterns_it_names() {
     assert_eq!(patterns[0].pattern.chars().count(), MAX_PATTERN_CHARS + 3);
     assert!(patterns[0].pattern.ends_with("..."));
 }
+
+fn shared_subject_ids(body: &str) -> Vec<(String, String)> {
+    let mapping = Mapping::from_turtle(&with_prefixes(body)).unwrap();
+    shared_subject_templates(&mapping)
+        .into_iter()
+        .map(|(l, r)| (l.id.to_string(), r.id.to_string()))
+        .collect()
+}
+
+fn subject_triples_map(id: &str, table: &str, subject: &str) -> String {
+    format!(
+        "<#{id}> rr:logicalTable [ {table} ] ;
+            rr:subjectMap [ {subject} ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column \"name\" ] ] .\n"
+    )
+}
+
+#[test]
+fn shared_subject_templates_pairs_overlapping_templates_over_different_tables() {
+    let body = [
+        subject_triples_map(
+            "A",
+            "rr:tableName \"src0\"",
+            "rr:template \"http://example.org/person/{id}\"",
+        ),
+        subject_triples_map(
+            "B",
+            "rr:tableName \"src1\"",
+            "rr:template \"http://example.org/person/{pid}\"",
+        ),
+        subject_triples_map(
+            "C",
+            "rr:sqlQuery \"SELECT * FROM src2\"",
+            "rr:template \"http://example.org/{kind}/{id}\"",
+        ),
+    ]
+    .concat();
+    assert_eq!(
+        shared_subject_ids(&body),
+        [("<#A>", "<#B>"), ("<#A>", "<#C>"), ("<#B>", "<#C>")]
+            .map(|(l, r)| (l.to_owned(), r.to_owned()))
+    );
+}
+
+#[test]
+fn shared_subject_templates_leaves_out_disjoint_templates_and_one_table() {
+    let body = [
+        subject_triples_map(
+            "Person",
+            "rr:tableName \"src0\"",
+            "rr:template \"http://example.org/person/{id}\"",
+        ),
+        subject_triples_map(
+            "Order",
+            "rr:tableName \"src1\"",
+            "rr:template \"http://example.org/order/{id}\"",
+        ),
+        // The same logical table as Person reads the same rows.
+        subject_triples_map(
+            "PersonAgain",
+            "rr:tableName \"src0\"",
+            "rr:template \"http://example.org/person/{id}\"",
+        ),
+        subject_triples_map("ByColumn", "rr:tableName \"src2\"", "rr:column \"iri\""),
+        subject_triples_map(
+            "Blank",
+            "rr:tableName \"src3\"",
+            "rr:template \"person/{id}\" ; rr:termType rr:BlankNode",
+        ),
+    ]
+    .concat();
+    assert_eq!(shared_subject_ids(&body), Vec::<(String, String)>::new());
+}
