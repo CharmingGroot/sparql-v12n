@@ -97,7 +97,7 @@ CLI는 사람이 직접 실행하는 경우뿐 아니라 셸 도구가 호출하
 
 | `kind` | 종료 코드 | `details` |
 |---|---|---|
-| `input`, `query`, `unsupported`, `output`, `runtime` | 1 | 파일을 읽을 수 없을 때 `{"path": ...}` |
+| `input`, `query`, `unsupported`, `output`, `runtime` | 1 | 파일을 읽을 수 없을 때 `{"path": ...}`. 너무 많은 SQL branch로 unfold되는 쿼리에는 `{"limit": ..., "patterns": [{"pattern": ..., "triples_maps": ...}], "omitted": ...}` |
 | `mapping` | 2 | |
 | `database`, `data` | 3 | |
 | `timeout` | 4 | `{"timeout_ms": ..., "rows": ...}` |
@@ -108,6 +108,11 @@ CLI는 사람이 직접 실행하는 경우뿐 아니라 셸 도구가 호출하
 - JSON이 아닌 형식에서 발생한 모든 오류
 
 행 제한 `warning: ...`(종료 코드 5)은 항상 stderr로 출력된다.
+
+`v12n check`는 서로 다른 논리 테이블 위에서 같은 IRI를 만들 수 있는 subject
+템플릿을 쓰는 triples map 쌍마다 stderr에 `warning: ...` 한 줄을 출력한다
+([의미 규칙](semantics.ko.md#여러-논리-테이블의-subject)). JSON에서는
+`warnings`가 같은 경고를 나열한다. 경고는 종료 코드를 0으로 유지한다.
 
 `v12n <command> --help`는 각 명령의 JSON과 CSV 형태를 나열한다. 도움말의 예제는
 저장소 루트에서 실행하는 것을 기준으로 한다.
@@ -260,7 +265,7 @@ libpq와 다른 점은 다음과 같다.
 | 상태 | 조건 |
 |---|---|
 | `200` | 결과. 행 제한이 적용되어 결과가 잘리면 응답에 `V12N-Truncated: <row limit>`가 포함되고, 응답은 정확히 그 수만큼의 해를 담는다. 같은 경우 `v12n query`는 5로 종료한다 |
-| `400` | 쿼리 문법 오류, `query`가 없거나 두 번 이상 지정된 경우, 데이터셋 파라미터, 너무 많은 SQL branch로 unfold되는 쿼리 |
+| `400` | 쿼리 문법 오류, `query`가 없거나 두 번 이상 지정된 경우, 데이터셋 파라미터, 너무 많은 SQL branch로 unfold되는 쿼리. branch가 너무 많으면 본문에 후보 triples map이 둘 이상인 트리플 패턴과 그 수를 명시한다 |
 | `406` / `413` / `414` / `415` | `406`: 제공하지 않는 형식. `413`: `POST`에서 `max_query_bytes`를 넘는 쿼리. `414`: `GET`에서 `max_query_bytes`를 넘는 쿼리. `415`: 그 밖의 content type |
 | `501` | 아직 지원하지 않는 SPARQL 기능 |
 | `503` | 첫 행 이전에 발생한 statement timeout(이 경우 `v12n query`는 4로 종료한다), 또는 `max_concurrent_requests` 도달(응답에 `Retry-After`가 포함된다), 또는 카탈로그가 바뀌어 쿼리 계획을 다시 세우는 동안 카탈로그가 또 바뀐 경우(마이그레이션 중 등) |

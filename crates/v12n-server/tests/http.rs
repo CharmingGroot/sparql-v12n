@@ -103,6 +103,34 @@ async fn syntax_error_is_400_and_unsupported_feature_is_501() {
     assert!(text(response).await.contains("ASK"));
 }
 
+#[tokio::test]
+async fn too_many_branches_is_400_and_names_the_patterns() {
+    let mapping: String = (0..9)
+        .map(|i| {
+            format!(
+                "<#M{i}> <http://www.w3.org/ns/r2rml#logicalTable> \
+                 [ <http://www.w3.org/ns/r2rml#tableName> \"t{i}\" ] ;\n  \
+                 <http://www.w3.org/ns/r2rml#subjectMap> \
+                 [ <http://www.w3.org/ns/r2rml#template> \"http://ex/{{id}}\" ; \
+                 <http://www.w3.org/ns/r2rml#class> <http://example.org/Thing> ] .\n"
+            )
+        })
+        .collect();
+    let app = new_app(&mapping, NO_DATABASE, ServerLimits::default());
+    let query = "SELECT * WHERE { ?x a <http://example.org/Thing> . \
+                 ?y a <http://example.org/Thing> }";
+    let response = send(&app, get(query)).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = text(response).await;
+    assert!(
+        body.contains(
+            "; ?x <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://example.org/Thing>: 9 triples maps; ?y "
+        ),
+        "{body}"
+    );
+}
+
 fn get_as(query: &str, accept: &str) -> Request<Body> {
     Request::get(format!("/sparql?query={}", encode(query)))
         .header(header::ACCEPT, accept)

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! SPARQL parsing into algebra and the supported-feature gate.
 
+use std::fmt;
+
 use oxrdf::{Literal, NamedNode, Term};
 use spargebra::algebra::{Expression as SparqlExpression, Function, GraphPattern, OrderExpression};
 use spargebra::term::{NamedNodePattern, TermPattern};
@@ -377,13 +379,31 @@ pub struct TriplePattern {
 }
 
 impl TriplePattern {
-    fn variables(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn variables(&self) -> impl Iterator<Item = &str> {
         [&self.subject, &self.object]
             .into_iter()
             .filter_map(|term| match term {
                 PatternTerm::Variable(name) => Some(name.as_str()),
                 PatternTerm::Constant(_) => None,
             })
+    }
+}
+
+/// The pattern in SPARQL syntax with full IRIs, such as
+/// `?c <http://example.org/p1> ?v`.
+impl fmt::Display for TriplePattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} <{}> {}", self.subject, self.predicate, self.object)
+    }
+}
+
+impl fmt::Display for PatternTerm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Variable(name) if name.starts_with("_:") => f.write_str(name),
+            Self::Variable(name) => write!(f, "?{name}"),
+            Self::Constant(term) => write!(f, "{term}"),
+        }
     }
 }
 

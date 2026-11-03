@@ -10,10 +10,10 @@ use std::ops::Range;
 
 use oxrdf::Term;
 
-use crate::Error;
 use crate::dialect::SqlType;
 use crate::mapping::{
-    BaseIri, LogicalTable, Mapping, MappingIndex, ObjectMap, TemplatePart, TermType, TriplesMap,
+    BaseIri, LogicalTable, Mapping, MappingIndex, ObjectMap, RefObjectMap, TemplatePart,
+    TermMapValue, TermType, TriplesMap,
 };
 use crate::sparql::{
     ArithOp, Expression, Pattern, PatternTerm, RDF_TYPE, SelectQuery, TriplePattern,
@@ -22,13 +22,22 @@ use crate::sql::{
     Condition, LeftJoin, OrderKey, ProjectedTerm, ResultTerm, ResultValue, SqlBranch, SqlExpr,
     SqlPlan, ValueKind,
 };
+use crate::{Error, PatternCandidates};
 use term::{Equality, LiteralType, TermExpr, TermValue, is_injective, literal_type, term_eq};
 
 /// Most SQL branches one query may unfold into. Each `UNION` adds its
-/// arms, and each pattern with several candidate triples maps multiplies
-/// the count. The same limit applies to the combinations tried for each
-/// `OPTIONAL` part.
+/// arms, and each choice of triples maps for the patterns of an arm that
+/// can produce a row adds one. The same limit applies to the choices
+/// tried for each `OPTIONAL` part.
 pub const MAX_BRANCHES: usize = 64;
+
+/// Most triple patterns an [`Error::TooManyBranches`] names, so that its
+/// message stays short for a query with many patterns.
+pub const MAX_REPORTED_PATTERNS: usize = 8;
+
+/// Most characters of a triple pattern an [`Error::TooManyBranches`]
+/// shows. A longer one is cut after them and ends in `...`.
+pub const MAX_PATTERN_CHARS: usize = 200;
 
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -44,36 +53,44 @@ const XSD_DOUBLE: &str = "http://www.w3.org/2001/XMLSchema#double";
 /// so each `OPTIONAL` part becomes a `LEFT JOIN` inside the branch, and a
 /// part that several choices can match splits the branch (see
 /// [`Branch::optional`]).
+///
+/// A query over [`MAX_BRANCHES`] fails with [`Error::TooManyBranches`],
+/// which names the triple patterns with several candidates.
 pub fn unfold(
     query: &SelectQuery,
     mapping: &Mapping,
     index: &MappingIndex,
 ) -> Result<SqlPlan, Error> {
+    unfold_branches(query, mapping, index).map_err(|error| match error {
+        Error::TooManyBranches { limit, .. } => {
+            let (patterns, omitted) = branch_sources(&query.pattern, mapping, index);
+            Error::TooManyBranches {
+                limit,
+                patterns,
+                omitted,
+            }
+        }
+        error => error,
+    })
+}
+
+fn unfold_branches(
+    query: &SelectQuery,
+    mapping: &Mapping,
+    index: &MappingIndex,
+) -> Result<SqlPlan, Error> {
     let context = Context { mapping, index };
-    let too_many = || Error::TooManyBranches {
-        limit: MAX_BRANCHES,
-    };
     let arms = query.pattern.arms(MAX_BRANCHES).ok_or_else(too_many)?;
     let mut total = 0usize;
     let mut branches = Vec::new();
     for (a, arm) in arms.iter().enumerate() {
-        let candidates = query
-            .pattern
-            .required_triple_patterns(arm)
-            .into_iter()
-            .map(|p| candidates(p, mapping, index))
-            .collect::<Result<Vec<_>, _>>()?;
-        let choices = combinations(&candidates)?;
+        let patterns = query.pattern.required_triple_patterns(arm);
+        let choices = choices(&patterns, mapping, index)?;
         total += choices.len();
         if total > MAX_BRANCHES {
             return Err(too_many());
         }
-        for choice in choices {
-            let chosen: Vec<_> = candidates
-                .iter()
-                .zip(choice)
-                .map(|(list, c)| list[c])
-                .collect();
+        for chosen in choices {
             branches.extend(Branch::build(&query.pattern, a, arm, &chosen, &context)?);
             if branches.len() > MAX_BRANCHES {
                 return Err(too_many());
@@ -81,6 +98,101 @@ pub fn unfold(
         }
     }
     plan(query, branches, mapping.base_iri())
+}
+
+/// Pairs of triples maps over different logical tables whose subject
+/// templates can render the same IRI, in document order.
+///
+/// An IRI names one RDF node, so such triples maps describe the same
+/// nodes. A subject takes the property values of both, and a triple
+/// pattern that both can match unfolds into one branch per triples map.
+/// Pairs over the same logical table (R2RML §8) read the same rows and are
+/// left out.
+pub fn shared_subject_templates(mapping: &Mapping) -> Vec<(&TriplesMap, &TriplesMap)> {
+    let base = mapping.base_iri();
+    let subjects: Vec<_> = mapping
+        .triples_maps()
+        .iter()
+        .filter(|tm| {
+            let term_map = &tm.subject_map.term_map;
+            term_map.term_type == TermType::Iri
+                && matches!(term_map.value, TermMapValue::Template(_))
+        })
+        .map(|tm| (tm, tm.logical_table.effective_sql_query()))
+        .collect();
+    let mut pairs = Vec::new();
+    for (i, (left, left_table)) in subjects.iter().enumerate() {
+        for (right, right_table) in &subjects[i + 1..] {
+            if left_table == right_table {
+                continue;
+            }
+            let equality = term_eq(
+                &TermExpr::from_term_map(&left.subject_map.term_map, 0, base),
+                &TermExpr::from_term_map(&right.subject_map.term_map, 1, base),
+            );
+            if !matches!(equality, Equality::Never) {
+                pairs.push((*left, *right));
+            }
+        }
+    }
+    pairs
+}
+
+/// An [`Error::TooManyBranches`] without its patterns, which [`unfold`]
+/// adds.
+fn too_many() -> Error {
+    Error::TooManyBranches {
+        limit: MAX_BRANCHES,
+        patterns: Vec::new(),
+        omitted: 0,
+    }
+}
+
+/// The triple patterns of `pattern`, `OPTIONAL` parts and every `UNION`
+/// side included, that more than one candidate can produce, with the
+/// number of candidates left after those that cannot match the pattern
+/// are discarded (see [`choices`]). The patterns with the most candidates
+/// come first; beyond [`MAX_REPORTED_PATTERNS`], only their number is
+/// returned.
+fn branch_sources(
+    pattern: &Pattern,
+    mapping: &Mapping,
+    index: &MappingIndex,
+) -> (Vec<PatternCandidates>, usize) {
+    let mut seen: Vec<&TriplePattern> = Vec::new();
+    let mut out = Vec::new();
+    for triple in pattern.triple_patterns() {
+        if seen.contains(&triple) {
+            continue;
+        }
+        seen.push(triple);
+        // A pattern that fails here fails the query with another error
+        // once it is no longer over the limit.
+        let Ok(candidates) = candidates(triple, mapping, index) else {
+            continue;
+        };
+        let count = candidates
+            .into_iter()
+            .filter(|c| can_match(triple, &c.terms(mapping, 0, 0)))
+            .count();
+        if count > 1 {
+            out.push(PatternCandidates {
+                pattern: shorten(&triple.to_string()),
+                triples_maps: count,
+            });
+        }
+    }
+    out.sort_by_key(|p| std::cmp::Reverse(p.triples_maps));
+    let omitted = out.len().saturating_sub(MAX_REPORTED_PATTERNS);
+    out.truncate(MAX_REPORTED_PATTERNS);
+    (out, omitted)
+}
+
+fn shorten(text: &str) -> String {
+    match text.char_indices().nth(MAX_PATTERN_CHARS) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text.to_owned(),
+    }
 }
 
 struct Context<'m> {
@@ -107,6 +219,38 @@ impl<'m> Candidate<'m> {
             Self::Property { triples_map, .. } => triples_map,
         }
     }
+
+    /// The subject and object of the candidate's triples, read from the
+    /// row of `table`, and the object of a referencing object map from the
+    /// parent's row in `parent_table`. A class has no object term: the
+    /// pattern's object is the class.
+    fn terms(&self, mapping: &'m Mapping, table: usize, parent_table: usize) -> Terms<'m> {
+        let base = mapping.base_iri();
+        let subject =
+            TermExpr::from_term_map(&self.triples_map().subject_map.term_map, table, base);
+        let object = match self {
+            Self::Class(_) => None,
+            Self::Property {
+                object_map: ObjectMap::Term(term_map),
+                ..
+            } => Some(TermExpr::from_term_map(term_map, table, base)),
+            Self::Property {
+                object_map: ObjectMap::Reference(reference),
+                ..
+            } => Some(TermExpr::from_term_map(
+                &parent(mapping, reference).subject_map.term_map,
+                parent_table,
+                base,
+            )),
+        };
+        (subject, object)
+    }
+}
+
+fn parent<'m>(mapping: &'m Mapping, reference: &RefObjectMap) -> &'m TriplesMap {
+    mapping
+        .triples_map(&reference.parent_triples_map)
+        .expect("parent triples maps are checked when the mapping is parsed")
 }
 
 fn candidates<'m>(
@@ -153,29 +297,160 @@ fn candidates<'m>(
     Ok(out)
 }
 
-/// Every choice of one candidate per pattern, in a fixed order: the last
-/// pattern's choice varies fastest.
-fn combinations<T>(candidates: &[Vec<T>]) -> Result<Vec<Vec<usize>>, Error> {
-    let total = candidates
-        .iter()
-        .try_fold(1usize, |acc, c| acc.checked_mul(c.len()))
-        .filter(|&n| n <= MAX_BRANCHES)
-        .ok_or(Error::TooManyBranches {
-            limit: MAX_BRANCHES,
-        })?;
-    let mut out = Vec::with_capacity(total);
-    let mut choice = vec![0; candidates.len()];
-    for _ in 0..total {
-        out.push(choice.clone());
-        for (slot, c) in choice.iter_mut().zip(candidates).rev() {
-            *slot += 1;
-            if *slot < c.len() {
-                break;
-            }
-            *slot = 0;
-        }
+/// The subject and object terms of a candidate's triples (see
+/// [`Candidate::terms`]).
+type Terms<'m> = (TermExpr<'m>, Option<TermExpr<'m>>);
+
+/// Most partial choices [`choices`] keeps at once. It bounds the work of
+/// discarding choices that cannot match, which grows with the product of
+/// the candidate counts.
+const MAX_PARTIAL_CHOICES: usize = MAX_BRANCHES * MAX_BRANCHES;
+
+/// Every choice of one candidate per pattern that can produce a row, in a
+/// fixed order: the last pattern's choice varies fastest.
+///
+/// A candidate whose terms can never be a constant of its pattern, or the
+/// same term where the pattern repeats a variable, is discarded, and so is
+/// a choice in which two candidates bind a variable to terms that can
+/// never be the same. Such a choice has no solutions, since the terms
+/// bound to a variable are all the same RDF term, so it does not count
+/// towards [`MAX_BRANCHES`]. The patterns are chosen in the order of
+/// [`placing_order`], so that choices are discarded before they multiply.
+fn choices<'m>(
+    patterns: &[&TriplePattern],
+    mapping: &'m Mapping,
+    index: &MappingIndex,
+) -> Result<Vec<Vec<Candidate<'m>>>, Error> {
+    let mut lists: Vec<Vec<(Candidate<'m>, Terms<'m>)>> = Vec::with_capacity(patterns.len());
+    for &pattern in patterns {
+        // Only the shape of the terms decides whether they can match, so
+        // any table alias does.
+        lists.push(
+            candidates(pattern, mapping, index)?
+                .into_iter()
+                .map(|candidate| (candidate, candidate.terms(mapping, 0, 0)))
+                .filter(|(_, terms)| can_match(pattern, terms))
+                .collect(),
+        );
     }
-    Ok(out)
+    let order = placing_order(patterns, &lists);
+    // Each partial choice holds the index into `lists[order[k]]` of its
+    // k-th pattern.
+    let mut partial: Vec<Vec<usize>> = vec![Vec::new()];
+    for (k, &p) in order.iter().enumerate() {
+        let mut next = Vec::new();
+        for choice in &partial {
+            for (i, (_, terms)) in lists[p].iter().enumerate() {
+                let fits = order[..k].iter().zip(choice).all(|(&q, &j)| {
+                    compatible((patterns[p], terms), (patterns[q], &lists[q][j].1))
+                });
+                if fits {
+                    let mut extended = choice.clone();
+                    extended.push(i);
+                    next.push(extended);
+                }
+            }
+            if next.len() > MAX_PARTIAL_CHOICES {
+                return Err(too_many());
+            }
+        }
+        partial = next;
+    }
+    if partial.len() > MAX_BRANCHES {
+        return Err(too_many());
+    }
+    let mut out: Vec<Vec<usize>> = partial
+        .into_iter()
+        .map(|choice| {
+            let mut indices = vec![0; patterns.len()];
+            for (&p, i) in order.iter().zip(choice) {
+                indices[p] = i;
+            }
+            indices
+        })
+        .collect();
+    out.sort_unstable();
+    Ok(out
+        .into_iter()
+        .map(|indices| {
+            indices
+                .into_iter()
+                .zip(&lists)
+                .map(|(i, list)| list[i].0)
+                .collect()
+        })
+        .collect())
+}
+
+/// The order in which [`choices`] chooses the patterns' candidates: the
+/// pattern with the fewest candidates first, then repeatedly the one with
+/// the fewest among those sharing a variable with a pattern already
+/// chosen, where some do. A shared variable is what discards a choice.
+fn placing_order<T>(patterns: &[&TriplePattern], lists: &[Vec<T>]) -> Vec<usize> {
+    let mut order: Vec<usize> = Vec::with_capacity(patterns.len());
+    let mut rest: Vec<usize> = (0..patterns.len()).collect();
+    while !rest.is_empty() {
+        let (at, _) = rest
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &p)| {
+                let linked = order.iter().any(|&q| {
+                    patterns[p]
+                        .variables()
+                        .any(|v| patterns[q].variables().any(|w| v == w))
+                });
+                (!linked, lists[p].len())
+            })
+            .expect("patterns are left");
+        order.push(rest.remove(at));
+    }
+    order
+}
+
+/// `false` when the candidate's triples can never match the pattern on
+/// their own.
+fn can_match(pattern: &TriplePattern, (subject, object): &Terms<'_>) -> bool {
+    let fits = |term: &PatternTerm, expr: &TermExpr<'_>| match term {
+        PatternTerm::Constant(constant) => !matches!(
+            term_eq(expr, &TermExpr::constant(constant)),
+            Equality::Never
+        ),
+        PatternTerm::Variable(_) => true,
+    };
+    let Some(object) = object else {
+        return fits(&pattern.subject, subject);
+    };
+    let repeated =
+        matches!(pattern.subject, PatternTerm::Variable(_)) && pattern.subject == pattern.object;
+    fits(&pattern.subject, subject)
+        && fits(&pattern.object, object)
+        && !(repeated && matches!(term_eq(object, subject), Equality::Never))
+}
+
+/// `false` when the candidates of two patterns bind a variable of both to
+/// terms that can never be the same.
+fn compatible(
+    (left, left_terms): (&TriplePattern, &Terms<'_>),
+    (right, right_terms): (&TriplePattern, &Terms<'_>),
+) -> bool {
+    bound(left, *left_terms).all(|(variable, l)| {
+        bound(right, *right_terms)
+            .filter(|&(v, _)| v == variable)
+            .all(|(_, r)| !matches!(term_eq(&l, &r), Equality::Never))
+    })
+}
+
+/// The variables of a pattern with the terms a candidate binds them to.
+fn bound<'p, 'm>(
+    pattern: &'p TriplePattern,
+    (subject, object): Terms<'m>,
+) -> impl Iterator<Item = (&'p str, TermExpr<'m>)> {
+    [(&pattern.subject, Some(subject)), (&pattern.object, object)]
+        .into_iter()
+        .filter_map(|(term, expr)| match (term, expr) {
+            (PatternTerm::Variable(name), Some(expr)) => Some((name.as_str(), expr)),
+            _ => None,
+        })
 }
 
 /// Where a condition applies and which rows bind a term: the whole branch
@@ -444,26 +719,15 @@ impl<'a> Branch<'a> {
         node: usize,
         context: &Context<'a>,
     ) -> Result<Vec<Fork<'a>>, Error> {
-        let arms = right.arms(MAX_BRANCHES).ok_or(Error::TooManyBranches {
-            limit: MAX_BRANCHES,
-        })?;
+        let arms = right.arms(MAX_BRANCHES).ok_or_else(too_many)?;
         // Each choice that matches, with what identifies it among the
         // outcomes of `attempt`, and the arm of an empty one.
         let mut matched: Vec<(Fork<'a>, usize, usize)> = Vec::new();
-        let mut choices: Vec<(usize, Vec<Candidate<'a>>, usize)> = Vec::new();
+        let mut matching: Vec<(usize, Vec<Candidate<'a>>, usize)> = Vec::new();
         let mut empty: Option<usize> = None;
         for (a, arm) in arms.iter().enumerate() {
-            let candidates = right
-                .required_triple_patterns(arm)
-                .into_iter()
-                .map(|p| candidates(p, context.mapping, context.index))
-                .collect::<Result<Vec<_>, _>>()?;
-            for choice in combinations(&candidates)? {
-                let chosen: Vec<Candidate<'a>> = candidates
-                    .iter()
-                    .zip(choice)
-                    .map(|(list, c)| list[c])
-                    .collect();
+            let patterns = right.required_triple_patterns(arm);
+            for chosen in choices(&patterns, context.mapping, context.index)? {
                 let attempts = self
                     .clone()
                     .attempt(&left, right, expression, scope, node, arm, &chosen, context)?;
@@ -473,7 +737,7 @@ impl<'a> Branch<'a> {
                         Attempt::NoMatch => {}
                         Attempt::Matched(fork, group) => {
                             matched.push((fork, group, a));
-                            choices.push((a, chosen.clone(), k));
+                            matching.push((a, chosen.clone(), k));
                         }
                     }
                 }
@@ -513,7 +777,7 @@ impl<'a> Branch<'a> {
             }
             None => {
                 let mut rest = self;
-                for (a, chosen, k) in choices {
+                for (a, chosen, k) in matching {
                     let arm = &arms[a];
                     let attempt = rest
                         .attempt(&left, right, expression, scope, node, arm, &chosen, context)?
@@ -721,28 +985,18 @@ impl<'a> Branch<'a> {
     ) -> bool {
         let tm = candidate.triples_map();
         let table = self.push_table(&tm.logical_table);
-        let base = mapping.base_iri();
-        let subject = TermExpr::from_term_map(&tm.subject_map.term_map, table, base);
-        let object = match candidate {
-            Candidate::Class(_) => None,
-            Candidate::Property {
-                object_map: ObjectMap::Term(term_map),
-                ..
-            } => Some(TermExpr::from_term_map(term_map, table, base)),
+        let parent_table = match candidate {
             Candidate::Property {
                 object_map: ObjectMap::Reference(reference),
                 ..
             } => {
-                let parent = mapping
-                    .triples_map(&reference.parent_triples_map)
-                    .expect("parent triples maps are checked when the mapping is parsed");
                 // R2RML §8: without join conditions the joint SQL query is
                 // the child query alone, so the parent subject comes from the
                 // same row. Parsing checks both use the same logical table.
                 let parent_table = if reference.join_conditions.is_empty() {
                     table
                 } else {
-                    self.push_table(&parent.logical_table)
+                    self.push_table(&parent(mapping, reference).logical_table)
                 };
                 for join in &reference.join_conditions {
                     self.conditions_mut(scope).push(Condition::Eq(
@@ -750,13 +1004,11 @@ impl<'a> Branch<'a> {
                         column(table, &join.child),
                     ));
                 }
-                Some(TermExpr::from_term_map(
-                    &parent.subject_map.term_map,
-                    parent_table,
-                    base,
-                ))
+                parent_table
             }
+            Candidate::Class(_) | Candidate::Property { .. } => table,
         };
+        let (subject, object) = candidate.terms(mapping, table, parent_table);
         if !self.bind(&pattern.subject, subject, scope, env) {
             return false;
         }
@@ -907,9 +1159,7 @@ fn skip(pattern: &Pattern, sides: &mut Sides<'_>, chosen: &mut Chosen<'_, '_>) {
 
 fn check_count(count: usize) -> Result<(), Error> {
     if count > MAX_BRANCHES {
-        return Err(Error::TooManyBranches {
-            limit: MAX_BRANCHES,
-        });
+        return Err(too_many());
     }
     Ok(())
 }

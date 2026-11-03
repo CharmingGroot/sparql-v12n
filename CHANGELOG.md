@@ -10,6 +10,10 @@ Design decisions are recorded in the `Decision:` Discussions.
 
 ### Added
 
+- `v12n check` warns about triples maps over different logical tables
+  whose subject templates can produce the same IRI. Each warning is a
+  `warning: ...` line on stderr and an entry of `warnings` in JSON, and
+  the exit code stays 0.
 - `BIND` and `SELECT (expr AS ?v)` over variables, constants and arithmetic
   on integers and decimals. An error leaves the variable unbound.
 - Arithmetic on `xsd:double` values in `FILTER`, `BIND` and `SELECT`, with

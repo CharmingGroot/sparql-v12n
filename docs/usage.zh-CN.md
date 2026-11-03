@@ -75,7 +75,7 @@ stderr 中的这一行会指明原因与上限。例如，结果被截断时输�
 
 | `kind` | 退出码 | `details` |
 |---|---|---|
-| `input`、`query`、`unsupported`、`output`、`runtime` | 1 | 无法读取文件时为 `{"path": ...}` |
+| `input`、`query`、`unsupported`、`output`、`runtime` | 1 | 无法读取文件时为 `{"path": ...}`；展开后 SQL 分支过多的查询为 `{"limit": ..., "patterns": [{"pattern": ..., "triples_maps": ...}], "omitted": ...}` |
 | `mapping` | 2 | |
 | `database`、`data` | 3 | |
 | `timeout` | 4 | `{"timeout_ms": ..., "rows": ...}` |
@@ -86,6 +86,8 @@ stderr 中的这一行会指明原因与上限。例如，结果被截断时输�
 - 使用 JSON 以外格式时的所有错误。
 
 行数上限的 `warning: ...`（退出码 5）始终写入 stderr。
+
+对于不同逻辑表上主语模板能产生同一 IRI 的每一对 triples map，`v12n check` 在 stderr 输出一行 `warning: ...`（见[查询语义](semantics.zh-CN.md#来自多个逻辑表的主语)）。在 JSON 中，`warnings` 列出相同的警告。警告使退出码保持为 0。
 
 `v12n <command> --help` 列出每个命令的 JSON 与 CSV 结构。其中的示例在仓库根目录运行。
 
@@ -190,7 +192,7 @@ TLS 连接失败属于数据库错误（退出码 3，kind 为 `database`）。�
 | 状态码 | 情形 |
 |---|---|
 | `200` | 结果。适用行数上限且结果被截断时，响应带有 `V12N-Truncated: <row limit>`，并恰好包含该数量的解。同样情况下，`v12n query` 以 5 退出 |
-| `400` | 查询语法错误、缺失或重复的 `query`、数据集参数，或展开后 SQL 分支过多的查询 |
+| `400` | 查询语法错误、缺失或重复的 `query`、数据集参数，或展开后 SQL 分支过多的查询。分支过多时，响应体列出候选 triples map 多于一个的三元组模式及其数量 |
 | `406` / `413` / `414` / `415` | `406`：未提供的格式。`413`：`POST` 中超过 `max_query_bytes` 的查询。`414`：`GET` 中超过 `max_query_bytes` 的查询。`415`：其他任何内容类型 |
 | `501` | 尚不支持的 SPARQL 功能 |
 | `503` | 第一行之前发生的语句超时（此时 `v12n query` 以 4 退出），或达到 `max_concurrent_requests`（响应带有 `Retry-After`），或在目录变化后重新规划查询期间目录再次变化（如迁移期间） |

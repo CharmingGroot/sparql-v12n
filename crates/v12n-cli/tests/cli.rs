@@ -49,8 +49,54 @@ fn check_valid_mapping_exits_zero_with_json_summary() {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         stdout_json(&output),
-        json!({ "ok": true, "triples_maps": 2, "classes": 2, "properties": 4 })
+        json!({
+            "ok": true,
+            "triples_maps": 2,
+            "classes": 2,
+            "properties": 4,
+            "warnings": [],
+        })
     );
+    assert!(output.stderr.is_empty());
+}
+
+const SHARED_SUBJECT: &str = r#"@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+<#A> rr:logicalTable [ rr:tableName "src0" ] ;
+  rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+<#B> rr:logicalTable [ rr:tableName "src1" ] ;
+  rr:subjectMap [ rr:template "http://example.org/person/{pid}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+"#;
+
+#[test]
+fn check_warns_about_a_subject_template_shared_across_tables_and_exits_zero() {
+    let output = v12n(&["check", "--format", "json", "-"], SHARED_SUBJECT);
+    assert_eq!(output.status.code(), Some(0));
+    let summary = stdout_json(&output);
+    assert_eq!(summary["ok"], json!(true));
+    let [warning] = summary["warnings"].as_array().unwrap().as_slice() else {
+        panic!("expected one warning: {summary}");
+    };
+    assert_eq!(warning["kind"], json!("shared_subject"));
+    assert_eq!(warning["triples_maps"], json!(["<#A>", "<#B>"]));
+    assert_eq!(
+        warning["subject_templates"],
+        json!([
+            "http://example.org/person/{id}",
+            "http://example.org/person/{pid}"
+        ])
+    );
+    let message = warning["message"].as_str().unwrap();
+    assert!(message.contains("can produce the same IRI"), "{message}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr, format!("warning: {message}\n"));
+
+    let output = v12n(&["check", "--format", "table", "-"], SHARED_SUBJECT);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("ok: 2 triples maps"));
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("warning: <#A> and <#B> "));
 }
 
 #[test]
@@ -209,6 +255,45 @@ fn explain_unsupported_feature_exits_one() {
             .as_str()
             .unwrap()
             .contains("property paths")
+    );
+}
+
+#[test]
+fn explain_too_many_branches_lists_the_patterns_in_details() {
+    let mapping: String = (0..9)
+        .map(|i| {
+            format!(
+                "<#M{i}> <http://www.w3.org/ns/r2rml#logicalTable> \
+                 [ <http://www.w3.org/ns/r2rml#tableName> \"t{i}\" ] ;\n  \
+                 <http://www.w3.org/ns/r2rml#subjectMap> \
+                 [ <http://www.w3.org/ns/r2rml#template> \"http://ex/{{id}}\" ; \
+                 <http://www.w3.org/ns/r2rml#class> <http://example.org/Thing> ] .\n"
+            )
+        })
+        .collect();
+    let query = "SELECT * WHERE { ?x a <http://example.org/Thing> . \
+                 ?y a <http://example.org/Thing> }";
+    let output = v12n(&["explain", "-", "--query", query], &mapping);
+    assert_eq!(output.status.code(), Some(1));
+    let error = stdout_json(&output);
+    assert_eq!(error["error"]["kind"], json!("unsupported"));
+    let pattern = |v: &str| {
+        json!({
+            "pattern": format!(
+                "?{v} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Thing>"
+            ),
+            "triples_maps": 9,
+        })
+    };
+    assert_eq!(
+        error["error"]["details"],
+        json!({ "limit": 64, "patterns": [pattern("x"), pattern("y")], "omitted": 0 })
+    );
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("<http://example.org/Thing>: 9 triples maps")
     );
 }
 

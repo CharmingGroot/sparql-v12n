@@ -315,10 +315,16 @@ fn unfold_too_many_branches_errors() {
     let mapping = with_prefixes(&maps);
     let err =
         unfold_query(&mapping, "SELECT * WHERE { ?x a ex:Thing . ?y a ex:Thing }").unwrap_err();
+    let thing = |v: &str| PatternCandidates {
+        pattern: format!("?{v} <{RDF_TYPE}> <http://example.org/Thing>"),
+        triples_maps: 9,
+    };
     assert_eq!(
         err,
         Error::TooManyBranches {
-            limit: MAX_BRANCHES
+            limit: MAX_BRANCHES,
+            patterns: vec![thing("x"), thing("y")],
+            omitted: 0,
         }
     );
     assert_eq!(
@@ -1152,10 +1158,220 @@ fn unfold_union_counts_arms_towards_the_branch_limit() {
         .map(|_| "{ ?x ex:p ?v }".to_owned())
         .collect();
     let err = union_query(&format!("SELECT ?x WHERE {{ {} }}", sides.join(" UNION "))).unwrap_err();
-    assert_eq!(
-        err,
-        Error::TooManyBranches {
-            limit: MAX_BRANCHES
-        }
+    assert!(
+        matches!(err, Error::TooManyBranches { limit, .. } if limit == MAX_BRANCHES),
+        "{err}"
     );
+}
+
+/// `count` triples maps over one table, the i-th with the subject template
+/// `http://example.org/c{i}/{id}` and a column object for each predicate.
+fn many_subject_templates(count: usize, predicates: &[&str]) -> String {
+    let maps: String = (0..count)
+        .map(|i| {
+            let properties: String = predicates
+                .iter()
+                .map(|p| {
+                    format!(
+                        " ;\n  rr:predicateObjectMap [ rr:predicate ex:{p} ; \
+                         rr:objectMap [ rr:column \"{p}\" ] ]"
+                    )
+                })
+                .collect();
+            format!(
+                "<#M{i}> rr:logicalTable [ rr:tableName \"t\" ] ;\n  \
+                 rr:subjectMap [ rr:template \"http://example.org/c{i}/{{id}}\" ]{properties} .\n"
+            )
+        })
+        .collect();
+    with_prefixes(&maps)
+}
+
+#[test]
+fn unfold_counts_branches_after_discarding_unmatched_constants() {
+    let mapping = many_subject_templates(MAX_BRANCHES + 1, &["p1"]);
+    let plan = unfold_query(
+        &mapping,
+        "SELECT ?v WHERE { <http://example.org/c0/7> ex:p1 ?v }",
+    )
+    .unwrap();
+    assert_eq!(plan.branches.len(), 1);
+    assert_eq!(plan.branches[0].from.len(), 1);
+}
+
+#[test]
+fn unfold_counts_branches_after_discarding_disjoint_templates() {
+    let query = "SELECT * WHERE { ?s ex:p1 ?v . ?s ex:p2 ?w }";
+    // 81 choices, of which only the 9 with the same template can match.
+    let plan = unfold_query(&many_subject_templates(9, &["p1", "p2"]), query).unwrap();
+    assert_eq!(plan.branches.len(), 9);
+    // The limit applies to the choices that remain.
+    let mapping = many_subject_templates(MAX_BRANCHES + 1, &["p1", "p2"]);
+    assert!(matches!(
+        unfold_query(&mapping, query),
+        Err(Error::TooManyBranches { .. })
+    ));
+    // Patterns without a shared variable discard nothing, and their
+    // choices are refused before all of them are tried.
+    let unlinked = "SELECT * WHERE { ?a ex:p1 ?b . ?c ex:p1 ?d . ?e ex:p1 ?f . ?g ex:p1 ?h }";
+    assert!(matches!(
+        unfold_query(&mapping, unlinked),
+        Err(Error::TooManyBranches { .. })
+    ));
+}
+
+#[test]
+fn unfold_counts_optional_choices_after_discarding_unmatched_ones() {
+    let mapping = many_subject_templates(MAX_BRANCHES + 1, &["p1", "p2"]);
+    let plan = unfold_query(
+        &mapping,
+        "SELECT * WHERE { <http://example.org/c0/7> ex:p1 ?v \
+         OPTIONAL { <http://example.org/c0/7> ex:p2 ?w } }",
+    )
+    .unwrap();
+    assert_eq!(plan.branches.len(), 1);
+    assert_eq!(plan.branches[0].left_joins.len(), 1);
+    // 81 choices for the OPTIONAL part, of which 9 can match. The branch
+    // splits into one per choice and one where none matched.
+    let mapping = many_subject_templates(9, &["p1", "p2", "p3"]);
+    let plan = unfold_query(
+        &mapping,
+        "SELECT * WHERE { <http://example.org/c0/7> ex:p1 ?v \
+         OPTIONAL { ?s ex:p2 ?w . ?s ex:p3 ?u } }",
+    )
+    .unwrap();
+    assert_eq!(plan.branches.len(), 10);
+}
+
+#[test]
+fn unfold_too_many_branches_names_the_patterns_and_their_candidates() {
+    let mapping = many_subject_templates(MAX_BRANCHES + 1, &["p1", "p2"]);
+    let err = unfold_query(
+        &mapping,
+        "SELECT * WHERE { ?s ex:p1 ?v . ?s ex:p2 ?w . <http://example.org/c0/7> ex:p1 ?u }",
+    )
+    .unwrap_err();
+    // The pattern with a constant subject has one candidate left.
+    assert_eq!(
+        err.to_string(),
+        "query unfolds into more than 64 UNION branches; \
+         ?s <http://example.org/p1> ?v: 65 triples maps; \
+         ?s <http://example.org/p2> ?w: 65 triples maps"
+    );
+}
+
+#[test]
+fn unfold_too_many_branches_bounds_the_patterns_it_names() {
+    let predicates: Vec<String> = (0..=MAX_REPORTED_PATTERNS + 1)
+        .map(|i| format!("p{i}"))
+        .collect();
+    let names: Vec<&str> = predicates.iter().map(String::as_str).collect();
+    let mapping = many_subject_templates(2, &names);
+    let patterns: Vec<String> = (0..names.len())
+        .map(|i| format!("?s{i} ex:p{i} ?o{i}"))
+        .collect();
+    // A string literal longer than the limit, with 2 candidates as well.
+    let long = "x".repeat(MAX_PATTERN_CHARS);
+    let query = format!(
+        "SELECT * WHERE {{ {} . ?l ex:p0 \"{long}\" }}",
+        patterns.join(" . ")
+    );
+    let Err(Error::TooManyBranches {
+        patterns, omitted, ..
+    }) = unfold_query(&mapping, &query)
+    else {
+        panic!("expected too many branches");
+    };
+    assert_eq!(patterns.len(), MAX_REPORTED_PATTERNS);
+    assert_eq!(omitted, names.len() + 1 - MAX_REPORTED_PATTERNS);
+    assert!(patterns.iter().all(|p| p.triples_maps == 2));
+    let err = Error::TooManyBranches {
+        limit: MAX_BRANCHES,
+        patterns: Vec::new(),
+        omitted: 3,
+    };
+    assert!(
+        err.to_string()
+            .ends_with("; 3 more patterns with several triples maps")
+    );
+    let mapping = many_subject_templates(MAX_BRANCHES + 1, &["p0"]);
+    let query = format!("SELECT * WHERE {{ ?l ex:p0 \"{long}\" }}");
+    let Err(Error::TooManyBranches { patterns, .. }) = unfold_query(&mapping, &query) else {
+        panic!("expected too many branches");
+    };
+    assert_eq!(patterns[0].pattern.chars().count(), MAX_PATTERN_CHARS + 3);
+    assert!(patterns[0].pattern.ends_with("..."));
+}
+
+fn shared_subject_ids(body: &str) -> Vec<(String, String)> {
+    let mapping = Mapping::from_turtle(&with_prefixes(body)).unwrap();
+    shared_subject_templates(&mapping)
+        .into_iter()
+        .map(|(l, r)| (l.id.to_string(), r.id.to_string()))
+        .collect()
+}
+
+fn subject_triples_map(id: &str, table: &str, subject: &str) -> String {
+    format!(
+        "<#{id}> rr:logicalTable [ {table} ] ;
+            rr:subjectMap [ {subject} ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column \"name\" ] ] .\n"
+    )
+}
+
+#[test]
+fn shared_subject_templates_pairs_overlapping_templates_over_different_tables() {
+    let body = [
+        subject_triples_map(
+            "A",
+            "rr:tableName \"src0\"",
+            "rr:template \"http://example.org/person/{id}\"",
+        ),
+        subject_triples_map(
+            "B",
+            "rr:tableName \"src1\"",
+            "rr:template \"http://example.org/person/{pid}\"",
+        ),
+        subject_triples_map(
+            "C",
+            "rr:sqlQuery \"SELECT * FROM src2\"",
+            "rr:template \"http://example.org/{kind}/{id}\"",
+        ),
+    ]
+    .concat();
+    assert_eq!(
+        shared_subject_ids(&body),
+        [("<#A>", "<#B>"), ("<#A>", "<#C>"), ("<#B>", "<#C>")]
+            .map(|(l, r)| (l.to_owned(), r.to_owned()))
+    );
+}
+
+#[test]
+fn shared_subject_templates_leaves_out_disjoint_templates_and_one_table() {
+    let body = [
+        subject_triples_map(
+            "Person",
+            "rr:tableName \"src0\"",
+            "rr:template \"http://example.org/person/{id}\"",
+        ),
+        subject_triples_map(
+            "Order",
+            "rr:tableName \"src1\"",
+            "rr:template \"http://example.org/order/{id}\"",
+        ),
+        // The same logical table as Person reads the same rows.
+        subject_triples_map(
+            "PersonAgain",
+            "rr:tableName \"src0\"",
+            "rr:template \"http://example.org/person/{id}\"",
+        ),
+        subject_triples_map("ByColumn", "rr:tableName \"src2\"", "rr:column \"iri\""),
+        subject_triples_map(
+            "Blank",
+            "rr:tableName \"src3\"",
+            "rr:template \"person/{id}\" ; rr:termType rr:BlankNode",
+        ),
+    ]
+    .concat();
+    assert_eq!(shared_subject_ids(&body), Vec::<(String, String)>::new());
 }
