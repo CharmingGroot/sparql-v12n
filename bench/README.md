@@ -30,9 +30,12 @@ requests.
 
 `mdr/` is the MDR case of `tests/diff/0001-mdr` (assets, alerts, links)
 scaled by `generate.sql`, plus `observables`, a table without a key where
-the same row can appear twice. The generator uses no `random()`, so every
-run loads the same rows. Per `N` alerts: `N/10` assets, about `N/5` links
-and `2.2 N` observables. Indexes are the keys plus one per foreign key and
+the same row can appear twice, and `crm_customers` and `billing_customers`,
+two sources of customers whose triples maps define the same predicates
+with the same subject template. The generator uses no `random()`, so every
+run loads the same rows. Per `N` alerts: `N/10` assets, about `N/5` links,
+`2.2 N` observables and `N/10` rows in each customer table, half of whose
+ids are in both. Indexes are the keys plus one per foreign key and
 filtered column, created after loading, followed by `VACUUM ANALYZE`.
 
 ## Queries
@@ -48,6 +51,7 @@ filtered column, created after loading, followed by `VACUUM ANALYZE`.
 | `q07-order-limit` | `ORDER BY` on an integer and an IRI, `LIMIT 100` |
 | `q08-distinct-keyless` | `DISTINCT` over the table without a key |
 | `q09-keyless-set` | no `DISTINCT`, but duplicate rows must count once (set semantics) |
+| `q10-shared-predicates` | four predicates that two triples maps with one subject template define: 16 combinations of triples maps |
 
 ## What is measured
 

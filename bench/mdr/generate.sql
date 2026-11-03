@@ -4,6 +4,10 @@
 --   alerts       N; severity 5 for 2%, 4 for 8%, 3 for 15%, 2 for 25%, 1 for 50%
 --   links        about 2 per asset
 --   observables  2 per alert, every fifth alert records its first one twice
+--   crm_customers      N / 10, ids 1 .. N / 10
+--   billing_customers  N / 10, ids N / 20 + 1 .. N / 20 + N / 10: half of them
+--                      also in crm_customers, with the same values except the
+--                      segment of every fourth id
 \set ON_ERROR_STOP on
 
 INSERT INTO assets (id, hostname, criticality)
@@ -43,6 +47,22 @@ FROM generate_series(1, :alerts) AS i, (VALUES (7), (11)) AS m(k);
 INSERT INTO observables (alert_id, value)
 SELECT i, 'ioc-' || (i::bigint * 7 + 7) % (:alerts / 20)
 FROM generate_series(5, :alerts, 5) AS i;
+
+INSERT INTO crm_customers (id, name, email, country, segment)
+SELECT i,
+       'customer-' || lpad(i::text, 7, '0'),
+       'c' || i || '@example.org',
+       (ARRAY['KR', 'JP', 'DE', 'US', 'BR'])[1 + i % 5],
+       (ARRAY['smb', 'mid-market', 'enterprise'])[1 + i % 3]
+FROM generate_series(1, :alerts / 10) AS i;
+
+INSERT INTO billing_customers (id, name, email, country, segment)
+SELECT i,
+       'customer-' || lpad(i::text, 7, '0'),
+       'c' || i || '@example.org',
+       (ARRAY['KR', 'JP', 'DE', 'US', 'BR'])[1 + i % 5],
+       (ARRAY['smb', 'mid-market', 'enterprise'])[1 + (i + (i % 4 = 0)::integer) % 3]
+FROM generate_series(:alerts / 20 + 1, :alerts / 20 + :alerts / 10) AS i;
 
 CREATE INDEX alerts_asset_id ON alerts (asset_id);
 CREATE INDEX alerts_severity_id ON alerts (severity_id);

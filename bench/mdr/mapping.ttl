@@ -1,7 +1,8 @@
 @prefix rr: <http://www.w3.org/ns/r2rml#> .
 @prefix ex: <http://example.org/> .
 
-# tests/diff/0001-mdr/mapping.ttl with ObservableMap added.
+# tests/diff/0001-mdr/mapping.ttl with ObservableMap and the customer maps
+# added.
 
 <#AssetMap> a rr:TriplesMap ;
   rr:logicalTable [ rr:tableName "assets" ] ;
@@ -36,3 +37,22 @@
   rr:logicalTable [ rr:tableName "observables" ] ;
   rr:subjectMap [ rr:template "http://example.org/alert/{alert_id}" ] ;
   rr:predicateObjectMap [ rr:predicate ex:observable ; rr:objectMap [ rr:column "value" ] ] .
+
+# Two triples maps with the same predicates and the same subject template:
+# a customer in both tables is one subject, and a triple both give counts
+# once.
+<#CrmCustomerMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "crm_customers" ] ;
+  rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:email ; rr:objectMap [ rr:column "email" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:country ; rr:objectMap [ rr:column "country" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:segment ; rr:objectMap [ rr:column "segment" ] ] .
+
+<#BillingCustomerMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "billing_customers" ] ;
+  rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:email ; rr:objectMap [ rr:column "email" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:country ; rr:objectMap [ rr:column "country" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:segment ; rr:objectMap [ rr:column "segment" ] ] .
