@@ -259,6 +259,45 @@ fn explain_unsupported_feature_exits_one() {
 }
 
 #[test]
+fn explain_too_many_branches_lists_the_patterns_in_details() {
+    let mapping: String = (0..9)
+        .map(|i| {
+            format!(
+                "<#M{i}> <http://www.w3.org/ns/r2rml#logicalTable> \
+                 [ <http://www.w3.org/ns/r2rml#tableName> \"t{i}\" ] ;\n  \
+                 <http://www.w3.org/ns/r2rml#subjectMap> \
+                 [ <http://www.w3.org/ns/r2rml#template> \"http://ex/{{id}}\" ; \
+                 <http://www.w3.org/ns/r2rml#class> <http://example.org/Thing> ] .\n"
+            )
+        })
+        .collect();
+    let query = "SELECT * WHERE { ?x a <http://example.org/Thing> . \
+                 ?y a <http://example.org/Thing> }";
+    let output = v12n(&["explain", "-", "--query", query], &mapping);
+    assert_eq!(output.status.code(), Some(1));
+    let error = stdout_json(&output);
+    assert_eq!(error["error"]["kind"], json!("unsupported"));
+    let pattern = |v: &str| {
+        json!({
+            "pattern": format!(
+                "?{v} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Thing>"
+            ),
+            "triples_maps": 9,
+        })
+    };
+    assert_eq!(
+        error["error"]["details"],
+        json!({ "limit": 64, "patterns": [pattern("x"), pattern("y")], "omitted": 0 })
+    );
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("<http://example.org/Thing>: 9 triples maps")
+    );
+}
+
+#[test]
 fn explain_plan_that_cannot_be_rendered_exits_one() {
     let case = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/diff/0006-filter");
     let output = v12n(

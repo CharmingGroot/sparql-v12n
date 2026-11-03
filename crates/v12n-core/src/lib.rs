@@ -26,5 +26,5 @@ mod xsd;
 pub use backend::{Backend, Limits};
 pub use catalog::Catalog;
 pub use engine::Engine;
-pub use error::Error;
+pub use error::{Error, PatternCandidates};
 pub use planner::Planner;
