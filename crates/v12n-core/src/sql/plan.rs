@@ -8,7 +8,7 @@ use oxrdf::Term;
 
 use crate::dialect::{Dialect, SqlType};
 use crate::mapping::{BaseIri, LogicalTable, TemplatePart, TermType};
-use crate::sparql::{ArithOp, CompareOp, QueryForm, TermTest};
+use crate::sparql::{ArithOp, CompareOp, NumericFunction, QueryForm, TermTest};
 
 pub(super) const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -361,6 +361,9 @@ pub enum FilterValue {
     Arith(ArithOp, Box<FilterValue>, Box<FilterValue>),
     /// The negation of a number (op:numeric-unary-minus).
     Negate(Box<FilterValue>),
+    /// `ABS`, `ROUND`, `CEIL` or `FLOOR` of a number (SPARQL 1.1 §17.4.4),
+    /// of the number's class, and an error for anything else.
+    Numeric(NumericFunction, Box<FilterValue>),
 }
 
 impl FilterValue {
@@ -369,7 +372,11 @@ impl FilterValue {
         match self {
             Self::Term(t) => vec![t],
             Self::Constant(_) => Vec::new(),
-            Self::Str(v) | Self::Lang(v) | Self::Datatype(v) | Self::Negate(v) => v.terms(),
+            Self::Str(v)
+            | Self::Lang(v)
+            | Self::Datatype(v)
+            | Self::Negate(v)
+            | Self::Numeric(_, v) => v.terms(),
             Self::Arith(_, a, b) => {
                 let mut terms = a.terms();
                 terms.extend(b.terms());
@@ -382,7 +389,11 @@ impl FilterValue {
         match self {
             Self::Term(t) => vec![t],
             Self::Constant(_) => Vec::new(),
-            Self::Str(v) | Self::Lang(v) | Self::Datatype(v) | Self::Negate(v) => v.terms_mut(),
+            Self::Str(v)
+            | Self::Lang(v)
+            | Self::Datatype(v)
+            | Self::Negate(v)
+            | Self::Numeric(_, v) => v.terms_mut(),
             Self::Arith(_, a, b) => {
                 let mut terms = a.terms_mut();
                 terms.extend(b.terms_mut());

@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# An integer is its own ceiling, floor and rounding: every row.
+SELECT ?r WHERE { ?r ex:i ?i FILTER(ROUND(?i) = ?i && CEIL(?i) = ?i && FLOOR(?i) = ?i) }

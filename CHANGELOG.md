@@ -10,6 +10,10 @@ Design decisions are recorded in the `Decision:` Discussions.
 
 ### Added
 
+- `ABS`, `ROUND`, `CEIL` and `FLOOR` in `FILTER`, `BIND` and
+  `SELECT (expr AS ?v)`, with a result of the argument's datatype.
+  `ROUND` rounds halves towards positive infinity, as `fn:round` does,
+  for decimals and doubles. `RAND` is rejected as unsupported.
 - `ASK` queries. The SQL reads at most one row and removes no duplicates.
   The answer is the JSON or XML boolean result from the endpoint and from
   `v12n query`, which prints `true` or `false` in the table format and

@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# fn:round(2.5e0) is 3: row 1. PostgreSQL's round(float8) rounds halves to
+# even and gives 2.
+SELECT ?r WHERE { ?r ex:f ?f FILTER(ROUND(?f) = 3) }

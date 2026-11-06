@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# A string is not a number, so each comparison is an error: no row, also
+# under negation.
+SELECT ?r WHERE { ?r ex:name ?n FILTER(ROUND(?n) = 1 || !(ABS(?n) > 0)) }

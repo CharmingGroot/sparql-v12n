@@ -508,6 +508,25 @@ SQL에서 `IF`와 `COALESCE`는 인자마다 case가 하나인 `CASE` 식이다.
 비교들의 `OR`이고 각 비교는 `=`와 같은 형태로 쓴다. 따라서 `?qty IN (5, 7)`은
 `qty = $1::int8 OR qty = $2::int8`이고 컬럼의 인덱스를 사용할 수 있다.
 
+`ABS`, `ROUND`, `CEIL`, `FLOOR`(SPARQL 1.1 §17.4.4)는 `fn:abs`, `fn:round`,
+`fn:ceiling`, `fn:floor`(XPath F&O 3.1 §4.4)를 따른다. 결과의 데이터타입은
+인자의 데이터타입과 같다. 정수의 결과는 정수, decimal의 결과는 decimal,
+double의 결과는 double이다. 숫자가 아닌 인자는 오류이고, `numeric`의 NaN과
+무한대도 오류다. `ROUND`는 .5를 양의 무한대 쪽으로 반올림한다.
+`ROUND(2.5)`는 `3`, `ROUND(-2.5)`는 `-2`, `ROUND(-0.5e0)`은 `-0.0E0`이다.
+
+SQL에서 정수의 반올림, 올림, 내림은 정수 자신이다. decimal은 `numeric`으로
+계산한다. PostgreSQL의 `round(numeric)`은 .5를 0에서 먼 쪽으로 반올림하므로
+decimal의 `ROUND`는 `floor(x + 0.5)`다. double에서 `float8`의 `abs`, `ceil`,
+`floor`는 XPath의 규정대로 NaN, 무한대, 0의 부호를 유지한다. PostgreSQL의
+`round(float8)`은 .5를 짝수 쪽으로 반올림하고, `floor(x + 0.5)`는
+0.49999999999999994처럼 합이 반올림되는 값에서 틀린다. 따라서 double의
+`ROUND`는 모든 double에서 정확한 `CASE` 식이다. NaN, 무한대, 크기가 2^52
+이상인 값은 반올림 결과가 값 자신이고, -0.5부터 -0까지의 값은 -0이며, 나머지
+값은 `x - floor(x)`를 0.5와 비교한다.
+
+`RAND`는 미지원으로 거부한다. `RAND`의 값은 행마다, 실행마다 다르다.
+
 컬럼에 대한 `STR`과 `DATATYPE`은 조인과 마찬가지로 SQL에서 그 컬럼의 문자열
 표기나 자연 데이터타입을 알 수 있을 때 동작한다. `date`와 `timestamp`의
 무한대 값은 일반 리터럴이므로 그 `DATATYPE`은 `xsd:string`이다.
@@ -551,8 +570,9 @@ SQL에서 `IF`와 `COALESCE`는 인자마다 case가 하나인 `CASE` 식이다.
     데이터타입인 컬럼의 값
   - `xsd:float`와 파생 정수 타입
   - 1년부터 9999년 범위를 벗어나거나 마이크로초보다 정밀한 dateTime 상수
-- 그 밖의 함수, `EXISTS`, 그리고 term(변수, 상수, 산술, 이들에 대한
-  `STR`, `LANG`, `DATATYPE`, `IF`, `COALESCE`)이 아닌 식을 피연산자로 쓰는 것.
+- `RAND`를 포함한 그 밖의 함수, `EXISTS`, 그리고 term(변수, 상수, 산술,
+  이들에 대한 `STR`, `LANG`, `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`,
+  `IF`, `COALESCE`)이 아닌 식을 피연산자로 쓰는 것.
   `IF`, `COALESCE`, `IN`의 인자로 쓰는 비교가 그 예다
 - 인코딩이 UTF-8이 아닌 데이터베이스에서의 문자열 정렬과 `REGEX`
 
@@ -560,8 +580,8 @@ SQL에서 `IF`와 `COALESCE`는 인자마다 case가 하나인 `CASE` 식이다.
 
 `BIND(expr AS ?v)`와 `SELECT (expr AS ?v)`는 각 해에서 식의 값을 `?v`에
 바인딩한다(SPARQL 1.1 §18.5, Extend). 식은 변수, 상수,
-[`FILTER`](#filter)와 같은 산술, 또는 결과가 산술이나 숫자 상수인 `IF`와
-`COALESCE`다.
+[`FILTER`](#filter)와 같은 산술과 숫자 함수, 또는 결과가 산술이나 숫자
+상수인 `IF`와 `COALESCE`다.
 
 - 변수는 그 변수의 term을, 상수는 상수 자신을 값으로 한다.
 - 산술은 XPath의 타입 승격에 따른 데이터타입의 숫자를 정규 표기로 쓴다
@@ -570,6 +590,9 @@ SQL에서 `IF`와 `COALESCE`는 인자마다 case가 하나인 `CASE` 식이다.
   정밀도는 PostgreSQL `numeric` 나눗셈의 정밀도를 따른다.
   `?qty * 1.5e0`은 `1.5E0`, `-0.0E0`, `INF`, `NaN` 같은 `xsd:double`이다.
   `SELECT DISTINCT`는 서로 다른 term인 `-0.0E0`과 `0.0E0`을 구분한다.
+- `ABS`, `ROUND`, `CEIL`, `FLOOR`는 인자의 데이터타입인 숫자를 값으로
+  한다. `numeric` 컬럼에 대한 `ROUND(?price)`는 `3` 같은 `xsd:decimal`이고,
+  정수 컬럼에 대한 `ROUND(?qty)`는 `?qty`다.
 - `IF`와 `COALESCE`는 선택한 인자의 숫자를 값으로 한다.
   `COALESCE(?qty / ?n, 0)`은 `?n`이 0이거나 바인딩되지 않은 해에서 `0`이다.
   `IF(?n > 0, ?qty / ?n, 0)`은 `?n`이 바인딩되지 않은 해에서 조건이 오류이므로
@@ -583,8 +606,8 @@ SPARQL은 `BIND`를 그것이 쓰인 그룹의 해에 대해 평가한다. v12n�
 
 다음은 미지원으로 거부한다.
 
-- 변수, 상수, 산술, 그리고 산술과 숫자 상수에 대한 `IF`와 `COALESCE`가
-  아닌 식. `STR`, 비교, `IN`, 결과가 임의의 term일 수 있는
+- 변수, 상수, 산술, 숫자 함수, 그리고 산술과 숫자 상수에 대한 `IF`와
+  `COALESCE`가 아닌 식. `STR`, 비교, `IN`, 결과가 임의의 term일 수 있는
   `COALESCE(?x, 0)`이 그 예다. SQL에서 계산된 변수는 숫자만 담는다
 - `OPTIONAL`이나 `UNION` 안의 `BIND`
 - 그룹이 바인딩하지 않을 수 있고 패턴의 뒷부분이 바인딩하는 변수에 대한 `BIND`
@@ -740,5 +763,5 @@ SPARQL이 순서를 정하지 않은 경우에는 엔진이 정한 고정 순서
 - 시간대가 있는 값과 없는 값에 대한 정렬 기준
 - `real` 컬럼에 대한 정렬 기준
 - 인코딩이 UTF-8이 아닌 데이터베이스의 문자열에 대한 정렬 기준
-- `FILTER`와 마찬가지로 그 밖의 함수, 산술, `IF`, `COALESCE`, SQL이 계산할
-  수 없는 문자열 형태
+- `FILTER`와 마찬가지로 그 밖의 함수, 산술, `ABS`, `ROUND`, `CEIL`,
+  `FLOOR`, `IF`, `COALESCE`, SQL이 계산할 수 없는 문자열 형태

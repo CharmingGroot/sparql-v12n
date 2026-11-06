@@ -1712,7 +1712,7 @@ fn value_kinds(expression: &Expression) -> Vec<ValueKind> {
 fn exact_kinds(expression: &Expression) -> Vec<ValueKind> {
     let choices: Vec<&Expression> = match expression {
         Expression::Arith(ArithOp::Divide, ..) => return vec![ValueKind::Decimal],
-        Expression::Negate(inner) => return exact_kinds(inner),
+        Expression::Negate(inner) | Expression::Numeric(_, inner) => return exact_kinds(inner),
         Expression::If(_, a, b) => vec![a, b],
         Expression::Coalesce(args) => args.iter().collect(),
         _ => return vec![ValueKind::Integer, ValueKind::Decimal],
@@ -1729,7 +1729,7 @@ fn exact_kinds(expression: &Expression) -> Vec<ValueKind> {
 fn chooses_double(expression: &Expression) -> bool {
     match expression {
         Expression::Arith(_, a, b) => chooses_double(a) || chooses_double(b),
-        Expression::Negate(inner) => chooses_double(inner),
+        Expression::Negate(inner) | Expression::Numeric(_, inner) => chooses_double(inner),
         Expression::If(_, a, b) => [a, b]
             .iter()
             .any(|e| has_double_constant(e) || chooses_double(e)),
@@ -1747,7 +1747,7 @@ fn has_double_constant(expression: &Expression) -> bool {
             crate::xsd::Value::Numeric(n) if n.class == crate::xsd::Num::Double
         ),
         Expression::Arith(_, a, b) => has_double_constant(a) || has_double_constant(b),
-        Expression::Negate(inner) => has_double_constant(inner),
+        Expression::Negate(inner) | Expression::Numeric(_, inner) => has_double_constant(inner),
         _ => false,
     }
 }

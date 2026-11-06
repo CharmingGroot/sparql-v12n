@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# fn:round(-2.5e0) is -2: row 2.
+SELECT ?r WHERE { ?r ex:f ?f FILTER(ROUND(?f) = -2) }
