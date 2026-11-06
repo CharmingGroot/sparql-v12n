@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# A timestamp has no time zone and NOW has one: their order depends on
+# an implicit time zone (Discussion #57).
+SELECT ?e WHERE { ?e ex:ts ?u FILTER(?u < NOW()) }

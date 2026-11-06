@@ -12,7 +12,7 @@ use crate::Error;
 use crate::dialect::{Dialect, SqlType};
 use crate::mapping::TermType;
 use crate::solution::canonical_double;
-use crate::sparql::{ArithOp, CompareOp, NumericFunction, StrTest, TermTest};
+use crate::sparql::{ArithOp, CompareOp, DateTimeFunction, NumericFunction, StrTest, TermTest};
 use crate::xsd::{self, Num, Number, Value, XSD};
 
 mod double;
@@ -99,10 +99,14 @@ pub(super) struct Operand<'v> {
     /// A `date`, `timestamp` or `timestamptz` column, whose infinite
     /// values are plain literals (`"infinity"`, see the decoder).
     pub(super) infinite: bool,
+    /// A `timestamp` or `timestamptz` column that a function of SPARQL 1.1
+    /// §17.4.5 reads: the value is an error where the column is infinite,
+    /// since that is a plain literal and not an `xsd:dateTime`.
+    pub(super) finite: Option<(usize, &'v str)>,
 }
 
 /// Whether the value is a number computed in SQL, by arithmetic, a
-/// numeric function or `STRLEN`.
+/// numeric function, `STRLEN` or a component of a dateTime.
 fn is_arith(value: &FilterValue) -> bool {
     matches!(
         value,
@@ -110,8 +114,11 @@ fn is_arith(value: &FilterValue) -> bool {
             | FilterValue::Negate(_)
             | FilterValue::Numeric(..)
             | FilterValue::StrLen(_)
-    )
+    ) || matches!(value, FilterValue::DateTime(function, _) if function.is_numeric())
 }
+
+const XSD_DATE_TIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
+const XSD_DAY_TIME_DURATION: &str = "http://www.w3.org/2001/XMLSchema#dayTimeDuration";
 
 /// What a string function sees in an argument, which must be a string
 /// literal (SPARQL 1.1 §17.4.3.1.1): `String` or `Lang`, an error for any
@@ -241,6 +248,11 @@ impl<'a> Renderer<'a> {
                                  not compute yet",
                             ));
                         }
+                        if [left, right].contains(&&FilterValue::Now) {
+                            return Err(unsupported(
+                                "sameTerm of NOW, whose lexical form SQL does not compute yet",
+                            ));
+                        }
                         self.same_strings(&l, &r)?
                     }
                 }
@@ -261,7 +273,14 @@ impl<'a> Renderer<'a> {
                     TermTest::IsBlank => term_type == TermType::BlankNode,
                     TermTest::IsLiteral => term_type == TermType::Literal,
                 };
-                self.sql.push_str(if holds { "true" } else { "false" });
+                let holds = if holds { "true" } else { "false" };
+                match operand.finite {
+                    Some((table, name)) => self.sql.push_str(&format!(
+                        "CASE WHEN {} THEN {holds} END",
+                        self.dialect.is_finite(&self.column(table, name))
+                    )),
+                    None => self.sql.push_str(holds),
+                }
             }
             Filter::Ebv(value) => self.ebv(value)?,
             Filter::NoError(value) => self.no_error(value)?,
@@ -269,9 +288,9 @@ impl<'a> Renderer<'a> {
         Ok(())
     }
 
-    /// Whether `value` is not an error. Only arithmetic is an error that
-    /// depends on the row, such as a division by zero, and its SQL is
-    /// `NULL` exactly there.
+    /// Whether `value` is not an error. Only arithmetic and the functions
+    /// of dateTimes are errors that depend on the row, such as a division
+    /// by zero or an infinite timestamp.
     fn no_error(&mut self, value: &FilterValue) -> Result<(), Error> {
         let operand = self.operand(value);
         match operand.kind {
@@ -282,7 +301,12 @@ impl<'a> Renderer<'a> {
                 self.class_value(value, class)?;
                 self.sql.push_str(" IS NOT NULL)");
             }
-            _ => self.sql.push_str("true"),
+            _ => match operand.finite {
+                Some((table, name)) => self
+                    .sql
+                    .push_str(&self.dialect.is_finite(&self.column(table, name))),
+                None => self.sql.push_str("true"),
+            },
         }
         Ok(())
     }
@@ -297,6 +321,7 @@ impl<'a> Renderer<'a> {
             column: None,
             constant: None,
             infinite: false,
+            finite: None,
         };
         match value {
             FilterValue::Constant(Term::NamedNode(iri)) => {
@@ -333,6 +358,15 @@ impl<'a> Renderer<'a> {
             }
             FilterValue::Negate(a) | FilterValue::Numeric(_, a) => {
                 return self.arith(value, None, &[self.operand(a)]);
+            }
+            FilterValue::DateTime(function, a) => {
+                return self.date_time(value, *function, self.operand(a));
+            }
+            FilterValue::Now => {
+                let now = self.now();
+                operand.kind = Kind::DateTime { zoned: true };
+                operand.text = Text::Constant(now.canonical.clone());
+                operand.constant = Some(Value::DateTime(now));
             }
             FilterValue::StrLen(a) => {
                 return match string_argument(&self.operand(a)) {
@@ -479,6 +513,7 @@ impl<'a> Renderer<'a> {
             column: None,
             constant: None,
             infinite: false,
+            finite: None,
         }
     }
 
@@ -492,6 +527,7 @@ impl<'a> Renderer<'a> {
             column: None,
             constant: None,
             infinite: false,
+            finite: None,
         };
         let error = Operand {
             kind: Kind::Error,
@@ -506,6 +542,7 @@ impl<'a> Renderer<'a> {
                 ..operand
             };
         }
+        operand.finite = inner.finite;
         let literal = inner.term_type == Some(TermType::Literal);
         match value {
             FilterValue::Str(_) if literal || inner.term_type == Some(TermType::Iri) => {
@@ -527,6 +564,130 @@ impl<'a> Renderer<'a> {
         operand
     }
 
+    /// `function` (SPARQL 1.1 §17.4.5) of `inner`, which must be an
+    /// `xsd:dateTime` from a column or `NOW`; constants are computed
+    /// before rendering. The engine writes `timestamptz` values in UTC
+    /// with `Z`, so their components are those in UTC, their `TZ` is `Z`
+    /// and their `TIMEZONE` is `PT0S`. A `timestamp` value has no time
+    /// zone: its `TZ` is empty and its `TIMEZONE` an error.
+    fn date_time<'v>(
+        &self,
+        value: &'v FilterValue,
+        function: DateTimeFunction,
+        inner: Operand<'v>,
+    ) -> Operand<'v> {
+        let mut operand = Operand {
+            value,
+            kind: Kind::Error,
+            term_type: None,
+            text: Text::Unknown,
+            column: None,
+            constant: None,
+            infinite: false,
+            finite: None,
+        };
+        let zoned = match (&inner.kind, inner.value) {
+            (Kind::Unsupported(reason), _) => {
+                operand.kind = Kind::Unsupported(reason.clone());
+                return operand;
+            }
+            (Kind::DateTime { zoned }, FilterValue::Term(_) | FilterValue::Now) => *zoned,
+            // Without column types, as if the column were a timestamp.
+            (Kind::Unknown, FilterValue::Term(_)) => false,
+            (Kind::Other(datatype), _) if xsd::is_date_or_time(datatype) => {
+                operand.kind = Kind::Unsupported(xsd::DATE_OR_TIME_ARGUMENT.to_owned());
+                return operand;
+            }
+            _ => return operand,
+        };
+        if inner.infinite {
+            operand.finite = inner.column;
+        }
+        operand.term_type = Some(TermType::Literal);
+        operand.kind = match function {
+            DateTimeFunction::Seconds => Kind::Numeric(Num::Decimal),
+            DateTimeFunction::Tz => {
+                operand.text = Text::Constant(if zoned { "Z" } else { "" }.to_owned());
+                Kind::String
+            }
+            DateTimeFunction::Timezone if zoned => {
+                operand.text = Text::Constant("PT0S".to_owned());
+                Kind::Other(XSD_DAY_TIME_DURATION.to_owned())
+            }
+            DateTimeFunction::Timezone => {
+                return Operand {
+                    kind: Kind::Error,
+                    term_type: None,
+                    finite: None,
+                    ..operand
+                };
+            }
+            _ => Kind::Numeric(Num::Integer),
+        };
+        operand
+    }
+
+    /// A component of a dateTime (SPARQL 1.1 §17.4.5) as `numeric`. A
+    /// `timestamptz` is read in UTC, as the engine writes it.
+    fn date_time_number(
+        &mut self,
+        function: DateTimeFunction,
+        value: &FilterValue,
+    ) -> Result<(), Error> {
+        let inner = self.operand(value);
+        let zoned = match inner.kind {
+            Kind::DateTime { zoned } => zoned,
+            Kind::Unknown => false,
+            _ => {
+                self.typed_null(&SqlType::Numeric);
+                return Ok(());
+            }
+        };
+        let start = self.sql.len();
+        if zoned {
+            self.sql.push('(');
+        }
+        self.typed_value(&inner, &SqlType::TimestampTz)?;
+        if zoned {
+            self.sql.push_str(" AT TIME ZONE 'UTC')");
+        }
+        let x = self.sql.split_off(start);
+        let field = match function {
+            DateTimeFunction::Year => "year",
+            DateTimeFunction::Month => "month",
+            DateTimeFunction::Day => "day",
+            DateTimeFunction::Hours => "hour",
+            DateTimeFunction::Minutes => "minute",
+            DateTimeFunction::Seconds => "second",
+            DateTimeFunction::Timezone | DateTimeFunction::Tz => {
+                unreachable!("TIMEZONE and TZ are not numbers")
+            }
+        };
+        // PostgreSQL 13 extracts a float8, which is exact for these
+        // components; 14 and later extract a numeric.
+        let mut sql = self
+            .dialect
+            .cast(&format!("extract({field} FROM {x})"), &SqlType::Numeric);
+        // PostgreSQL calls the year before 1 the year -1, which the engine
+        // writes as 0000 (XML Schema 1.1 Part 2 §3.3.7).
+        if function == DateTimeFunction::Year {
+            let first = self
+                .dialect
+                .cast("'0001-01-01T00:00:00'", &SqlType::Timestamp);
+            sql = format!("CASE WHEN {x} < {first} THEN {sql} + 1 ELSE {sql} END");
+        }
+        if inner.infinite
+            && let Some((table, name)) = inner.column
+        {
+            sql = format!(
+                "CASE WHEN {} THEN {sql} END",
+                self.dialect.is_finite(&self.column(table, name))
+            );
+        }
+        self.sql.push_str(&sql);
+        Ok(())
+    }
+
     /// The result of `op` over `operands`, or of negation without `op`:
     /// a number whose class follows XPath's type promotion (an integer
     /// divided by an integer is a decimal, op:numeric-divide; anything
@@ -546,6 +707,7 @@ impl<'a> Renderer<'a> {
             column: None,
             constant: None,
             infinite: false,
+            finite: None,
         };
         let mut class = Num::Integer;
         for o in operands {
@@ -617,6 +779,9 @@ impl<'a> Renderer<'a> {
                     self.sql.push_str(" + 0.5");
                 }
                 self.sql.push(')');
+            }
+            FilterValue::DateTime(function, a) if self.operand(value).kind != Kind::Error => {
+                self.date_time_number(*function, a)?;
             }
             // Characters are code points in a UTF-8 database.
             FilterValue::StrLen(a) => {
@@ -761,7 +926,11 @@ impl<'a> Renderer<'a> {
                 }
                 _ => Text::Unknown,
             },
-            // The results of STR and LANG are simple literals.
+            FilterValue::Now => Text::Constant(XSD_DATE_TIME.to_owned()),
+            FilterValue::DateTime(DateTimeFunction::Timezone, _) => {
+                Text::Constant(XSD_DAY_TIME_DURATION.to_owned())
+            }
+            // The results of STR, LANG and TZ are simple literals.
             _ => Text::Constant(XSD_STRING.to_owned()),
         }
     }
@@ -971,7 +1140,7 @@ impl<'a> Renderer<'a> {
                 self.typed_null(&SqlType::Boolean);
                 return Ok(());
             }
-            (Kind::Lang(a), Kind::Lang(b)) => a == b,
+            (Kind::Lang(a), Kind::Lang(b)) | (Kind::Other(a), Kind::Other(b)) => a == b,
             (Kind::Iri, Kind::Iri)
             | (Kind::BlankNode, Kind::BlankNode)
             | (Kind::String | Kind::Unknown, Kind::String | Kind::Unknown) => true,
@@ -1260,6 +1429,18 @@ impl<'a> Renderer<'a> {
     /// The operand's string as text: an IRI, a blank node's label or a
     /// literal's lexical form.
     pub(super) fn text(&mut self, operand: &Operand<'_>) -> Result<(), Error> {
+        if let Some((table, name)) = operand.finite {
+            self.sql.push_str(&format!(
+                "CASE WHEN {} THEN ",
+                self.dialect.is_finite(&self.column(table, name))
+            ));
+            self.text(&Operand {
+                finite: None,
+                ..operand.clone()
+            })?;
+            self.sql.push_str(" END");
+            return Ok(());
+        }
         match &operand.text {
             Text::Constant(text) => {
                 if text.contains('\0') {
@@ -2672,6 +2853,252 @@ pub(super) mod tests {
             );
         }
         assert!(rejected("?s ex:bpc ?x", "UCASE(?x) = \"A\"").contains("bpchar"));
+    }
+
+    #[test]
+    fn date_time_functions_read_timestamptz_in_utc() {
+        // A timestamp has no time zone; a timestamptz is written in UTC
+        // with `Z`, so its components are those in UTC.
+        assert_eq!(
+            x("ts", "HOURS(?x) = 3"),
+            "CASE WHEN isfinite(t0.\"ts\") THEN extract(hour FROM t0.\"ts\")::numeric END = $1::int8"
+        );
+        assert_eq!(
+            x("tz", "MINUTES(?x) = 3"),
+            "CASE WHEN isfinite(t0.\"tz\") THEN extract(minute FROM (t0.\"tz\" AT TIME ZONE \
+             'UTC'))::numeric END = $1::int8"
+        );
+        // The year before 1 is 0000 in the engine's lexical forms.
+        assert_eq!(
+            x("ts", "YEAR(?x) = 0"),
+            "CASE WHEN isfinite(t0.\"ts\") THEN CASE WHEN t0.\"ts\" < \
+             '0001-01-01T00:00:00'::timestamp THEN extract(year FROM t0.\"ts\")::numeric + 1 \
+             ELSE extract(year FROM t0.\"ts\")::numeric END END = $1::int8"
+        );
+        // SECONDS is a decimal with the fraction.
+        assert_eq!(
+            x("ts", "SECONDS(?x) = 1.5"),
+            "CASE WHEN isfinite(t0.\"ts\") THEN extract(second FROM t0.\"ts\")::numeric END = \
+             $1::numeric"
+        );
+        assert!(x("ts", "SECONDS(?x) < 1e0").contains("extract(second FROM t0.\"ts\")"));
+        assert_eq!(
+            x("tz", "MONTH(?x) + DAY(?x) > 2"),
+            "(CASE WHEN isfinite(t0.\"tz\") THEN extract(month FROM (t0.\"tz\" AT TIME ZONE \
+             'UTC'))::numeric END + CASE WHEN isfinite(t0.\"tz\") THEN extract(day FROM \
+             (t0.\"tz\" AT TIME ZONE 'UTC'))::numeric END) > $1::int8"
+        );
+        // TZ is the zone the engine writes, TIMEZONE its duration.
+        assert_eq!(
+            x("tz", "TZ(?x) = \"Z\""),
+            "(CASE WHEN isfinite(t0.\"tz\") THEN $1::text END = $2::text)"
+        );
+        assert_eq!(
+            params("SELECT ?s WHERE { ?s ex:tz ?x FILTER(TZ(?x) = \"Z\") }"),
+            ["Z", "Z"]
+        );
+        assert_eq!(
+            params("SELECT ?s WHERE { ?s ex:ts ?x FILTER(TZ(?x) = \"\") }"),
+            ["", ""]
+        );
+        assert_eq!(
+            params("SELECT ?s WHERE { ?s ex:tz ?x FILTER(STR(TIMEZONE(?x)) = \"PT0S\") }"),
+            ["PT0S", "PT0S"]
+        );
+        assert_eq!(
+            params(
+                "SELECT ?s WHERE { ?s ex:tz ?x \
+                 FILTER(DATATYPE(TIMEZONE(?x)) = xsd:dayTimeDuration) }"
+            )[0],
+            format!("{XSD}dayTimeDuration")
+        );
+        assert_eq!(
+            x(
+                "tz",
+                "sameTerm(TIMEZONE(?x), \"PT0S\"^^xsd:dayTimeDuration)"
+            ),
+            "(CASE WHEN isfinite(t0.\"tz\") THEN $1::text END = $2::text)"
+        );
+        assert_eq!(
+            x("tz", "TZ(?x)"),
+            "(CASE WHEN isfinite(t0.\"tz\") THEN $1::text END <> '')"
+        );
+    }
+
+    #[test]
+    fn date_time_functions_of_infinite_values_are_errors() {
+        assert_eq!(
+            x("tz", "isLiteral(TIMEZONE(?x))"),
+            "CASE WHEN isfinite(t0.\"tz\") THEN true END"
+        );
+        assert_eq!(
+            x("ts", "!isLiteral(YEAR(?x))"),
+            "NOT (CASE WHEN isfinite(t0.\"ts\") THEN true END)"
+        );
+        assert_eq!(
+            x("ts", "COALESCE(TZ(?x), \"none\") = \"none\""),
+            "CASE WHEN isfinite(t0.\"ts\") THEN (CASE WHEN isfinite(t0.\"ts\") THEN $1::text END \
+             = $2::text) WHEN true THEN true END"
+        );
+        let sql = x("ts", "COALESCE(DAY(?x), 0) = 0");
+        assert!(
+            sql.starts_with("CASE WHEN (CASE WHEN isfinite(t0.\"ts\") THEN extract(day"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn date_time_functions_of_anything_but_date_times_are_type_errors() {
+        for (column, filter) in [
+            ("txt", "YEAR(?x) = 1"),
+            ("i4", "HOURS(?x) = 1"),
+            ("b", "TZ(?x) = \"\""),
+            ("link", "SECONDS(?x) > 0"),
+            ("dec", "STR(TIMEZONE(?x)) = \"PT0S\""),
+            // A timestamp has no time zone.
+            ("ts", "STR(TIMEZONE(?x)) = \"PT0S\""),
+            ("ts", "isLiteral(TIMEZONE(?x))"),
+            // A number is not a string.
+            ("tz", "YEAR(?x) = \"2024\""),
+            ("tz", "TZ(?x) = 0"),
+            ("i4", "YEAR(STR(NOW())) = 1"),
+        ] {
+            assert_eq!(x(column, filter), "NULL::bool", "{column}: {filter}");
+        }
+        assert_eq!(x("ts", "!(TZ(YEAR(?x)) = \"\")"), "NOT (NULL::bool)");
+        assert_eq!(x("tz", "TIMEZONE(?x)"), "NULL::bool");
+        assert!(rejected("?s ex:tz ?x", "STR(YEAR(?x)) = \"1\"").contains("STR, LANG"));
+        assert!(rejected("?s ex:tz ?x", "sameTerm(YEAR(?x), 1)").contains("sameTerm"));
+        assert!(
+            rejected(
+                "?s ex:tz ?x",
+                "TIMEZONE(?x) = \"PT0S\"^^xsd:dayTimeDuration"
+            )
+            .contains("dayTimeDuration")
+        );
+    }
+
+    #[test]
+    fn date_time_functions_of_dates_and_times_are_rejected() {
+        for (patterns, filter) in [
+            ("?s ex:d ?x", "YEAR(?x) = 2024"),
+            ("?s ex:d ?x", "TZ(?x) = \"\""),
+            ("?s ex:i4 ?x", "MONTH(\"2024-01-01\"^^xsd:date) = ?x"),
+            ("?s ex:i4 ?x", "HOURS(\"10:00:00\"^^xsd:time) = ?x"),
+        ] {
+            assert!(
+                rejected(patterns, filter).contains("xsd:date and xsd:time"),
+                "{filter}"
+            );
+        }
+        assert!(
+            rejected(
+                "?s ex:i4 ?x",
+                "YEAR(\"10000-01-01T00:00:00\"^^xsd:dateTime) = ?x"
+            )
+            .contains("after year 9999")
+        );
+    }
+
+    #[test]
+    fn date_time_functions_of_constants_are_computed_in_their_time_zone() {
+        let one = |function: &str, constant: &str| {
+            params(&format!(
+                "SELECT ?s WHERE {{ ?s ex:i4 ?x \
+                 FILTER(?x = {function}(\"{constant}\"^^xsd:dateTime)) }}"
+            ))
+        };
+        let zoned = "2024-01-01T02:30:07.250-05:30";
+        assert_eq!(one("YEAR", zoned), ["2024"]);
+        assert_eq!(one("MONTH", zoned), ["1"]);
+        assert_eq!(one("DAY", zoned), ["1"]);
+        assert_eq!(one("HOURS", zoned), ["2"]);
+        assert_eq!(one("MINUTES", zoned), ["30"]);
+        assert_eq!(one("SECONDS", zoned), ["7.25"]);
+        // 24:00:00 is the first instant of the next day.
+        let end = "1999-12-31T24:00:00";
+        assert_eq!(one("YEAR", end), ["2000"]);
+        assert_eq!(one("MONTH", end), ["1"]);
+        assert_eq!(one("HOURS", end), ["0"]);
+        assert_eq!(one("SECONDS", end), ["0"]);
+        let text = |function: &str, constant: &str| {
+            params(&format!(
+                "SELECT ?s WHERE {{ ?s ex:txt ?x \
+                 FILTER(?x = STR({function}(\"{constant}\"^^xsd:dateTime))) }}"
+            ))
+        };
+        assert_eq!(text("TZ", zoned), ["-05:30"]);
+        assert_eq!(text("TIMEZONE", zoned), ["-PT5H30M"]);
+        assert_eq!(text("TZ", "2024-01-01T00:00:00Z"), ["Z"]);
+        assert_eq!(text("TIMEZONE", "2024-01-01T00:00:00Z"), ["PT0S"]);
+        assert_eq!(text("TZ", "2024-01-01T00:00:00+00:00"), ["+00:00"]);
+        assert_eq!(text("TIMEZONE", "2024-01-01T00:00:00+14:00"), ["PT14H"]);
+        assert_eq!(text("TZ", end), [""]);
+        // Without a time zone, TIMEZONE is an error.
+        assert_eq!(
+            x(
+                "txt",
+                "?x = STR(TIMEZONE(\"2024-01-01T00:00:00\"^^xsd:dateTime))"
+            ),
+            "NULL::bool"
+        );
+        // Ill-typed literals and other terms are errors.
+        for constant in [
+            "\"2024-13-01T00:00:00\"^^xsd:dateTime",
+            "\"2024-01-01T00:00:00\"",
+            "<http://example.org/t>",
+            "1",
+        ] {
+            assert_eq!(
+                x("i4", &format!("?x = YEAR({constant})")),
+                "NULL::bool",
+                "{constant}"
+            );
+        }
+    }
+
+    #[test]
+    fn now_is_one_utc_parameter_per_rendering() {
+        assert_eq!(
+            x("tz", "?x < NOW()"),
+            "(t0.\"tz\" < $1::timestamptz AND isfinite(t0.\"tz\"))"
+        );
+        let values = params(
+            "SELECT ?s WHERE { ?s ex:tz ?x FILTER(?x < NOW() && ?x <= NOW() \
+             && STR(NOW()) != \"\") }",
+        );
+        assert_eq!(values.len(), 4, "{values:?}");
+        assert!(values[..3].iter().all(|v| v == &values[0]), "{values:?}");
+        assert!(
+            matches!(
+                xsd::value(&values[0], &format!("{XSD}dateTime")),
+                Value::DateTime(xsd::DateTime { zoned: true, .. })
+            ),
+            "{values:?}"
+        );
+        assert!(values[0].ends_with('Z'), "{values:?}");
+        assert_eq!(
+            x("i4", "YEAR(NOW()) > ?x"),
+            "CASE WHEN ($1::timestamptz AT TIME ZONE 'UTC') < '0001-01-01T00:00:00'::timestamp \
+             THEN extract(year FROM ($1::timestamptz AT TIME ZONE 'UTC'))::numeric + 1 ELSE \
+             extract(year FROM ($1::timestamptz AT TIME ZONE 'UTC'))::numeric END > t0.\"i4\""
+        );
+        assert_eq!(
+            params("SELECT ?s WHERE { ?s ex:txt ?x FILTER(TZ(NOW()) = ?x) }"),
+            ["Z"]
+        );
+        assert_eq!(
+            params("SELECT ?s WHERE { ?s ex:txt ?x FILTER(STR(TIMEZONE(NOW())) = ?x) }"),
+            ["PT0S"]
+        );
+        assert_eq!(
+            params("SELECT ?s WHERE { ?s ex:txt ?x FILTER(STR(DATATYPE(NOW())) = ?x) }"),
+            [format!("{XSD}dateTime")]
+        );
+        // The effective boolean value of a dateTime is an error.
+        assert_eq!(x("i4", "NOW()"), "NULL::bool");
+        assert!(rejected("?s ex:ts ?x", "?x < NOW()").contains("implicit time zone"));
+        assert!(rejected("?s ex:tz ?x", "sameTerm(?x, NOW())").contains("sameTerm of NOW"));
     }
 
     #[test]

@@ -2,10 +2,10 @@
 //! `FILTER` expressions over the terms a branch binds.
 
 use super::{Branch, Env, Scope, Source};
-use oxrdf::{Literal, Term};
+use oxrdf::{Literal, Term, vocab};
 
 use crate::Error;
-use crate::sparql::{CompareOp, Expression, StrTest};
+use crate::sparql::{CompareOp, DateTimeFunction, Expression, StrTest};
 use crate::sql::{Condition, Filter, FilterTerm, FilterValue, OrderValue, TermMatch, ValueCases};
 use crate::xpath_regex::{Untranslated, translate, translate_replace};
 use crate::xsd::{self, Num, Value};
@@ -339,6 +339,31 @@ impl<'a> Context<'_, 'a> {
                     (guards, Leaf { value, term: None })
                 })
                 .collect()),
+            // A constant argument is computed here, and a case whose value
+            // is an error is no case (SPARQL 1.1 §17.4.5).
+            Expression::DateTime(function, a) => {
+                let mut out = Vec::new();
+                for (guards, leaf) in self.operand(a)? {
+                    let value = match leaf.value {
+                        FilterValue::Constant(term) => {
+                            match date_time_constant(*function, &term)? {
+                                Some(result) => FilterValue::Constant(result),
+                                None => continue,
+                            }
+                        }
+                        value => FilterValue::DateTime(*function, Box::new(value)),
+                    };
+                    out.push((guards, Leaf { value, term: None }));
+                }
+                Ok(out)
+            }
+            Expression::Now => Ok(vec![(
+                Vec::new(),
+                Leaf {
+                    value: FilterValue::Now,
+                    term: None,
+                },
+            )]),
             // One case per pair of ways the operands are bound, as for a
             // comparison.
             Expression::Arith(op, a, b) => {
@@ -589,4 +614,51 @@ fn same_term(left: &Leaf<'_>, right: &Leaf<'_>) -> Option<TermMatch> {
         Equality::Never => TermMatch::Never,
         Equality::When(conditions) => TermMatch::When(conditions),
     })
+}
+
+/// `function` (SPARQL 1.1 §17.4.5) of a constant, in its own time zone
+/// (XPath F&O 3.1 §9.5); `None` for an error, as for any term that is not
+/// an `xsd:dateTime`.
+fn date_time_constant(function: DateTimeFunction, term: &Term) -> Result<Option<Term>, Error> {
+    let Term::Literal(literal) = term else {
+        return Ok(None);
+    };
+    let datatype = literal.datatype().as_str();
+    if xsd::is_date_or_time(datatype) {
+        return Err(Error::UnsupportedFeature(
+            xsd::DATE_OR_TIME_ARGUMENT.to_owned(),
+        ));
+    }
+    if datatype != vocab::xsd::DATE_TIME.as_str() {
+        return Ok(None);
+    }
+    let parts = match xsd::date_time_parts(literal.value()) {
+        Ok(Some(parts)) => parts,
+        Ok(None) => return Ok(None),
+        Err(reason) => return Err(Error::UnsupportedFeature(reason.to_owned())),
+    };
+    let integer = |n: i64| Literal::new_typed_literal(n.to_string(), vocab::xsd::INTEGER);
+    Ok(Some(
+        match function {
+            DateTimeFunction::Year => integer(parts.year),
+            DateTimeFunction::Month => integer(parts.month),
+            DateTimeFunction::Day => integer(parts.day),
+            DateTimeFunction::Hours => integer(parts.hours),
+            DateTimeFunction::Minutes => integer(parts.minutes),
+            DateTimeFunction::Seconds => {
+                Literal::new_typed_literal(parts.seconds, vocab::xsd::DECIMAL)
+            }
+            DateTimeFunction::Timezone => match parts.zone {
+                Some((_, minutes)) => Literal::new_typed_literal(
+                    xsd::zone_duration(minutes),
+                    vocab::xsd::DAY_TIME_DURATION,
+                ),
+                None => return Ok(None),
+            },
+            DateTimeFunction::Tz => {
+                Literal::new_simple_literal(parts.zone.map(|(zone, _)| zone).unwrap_or_default())
+            }
+        }
+        .into(),
+    ))
 }

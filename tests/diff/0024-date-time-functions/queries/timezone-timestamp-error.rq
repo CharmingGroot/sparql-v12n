@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# TIMEZONE of a value without a time zone is an error, which COALESCE
+# skips.
+SELECT ?e WHERE { ?e ex:ts ?u FILTER(COALESCE(STR(TIMEZONE(?u)), "none") = "none") }

@@ -1,0 +1,14 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_events(\"SELECT ?e (YEAR(?z) AS ?y) (SECONDS(?u) AS ?s) (HOURS(?u) + 1 AS ?h) \\\n         WHERE { ?e ex:ts ?u ; ex:tz ?z BIND(MONTH(?z) AS ?m) }\")"
+---
+SELECT q."e", q."y", q."s", q."h", q."h_1"
+FROM (
+SELECT DISTINCT t0."id" AS "e", t0."ts" AS "u", t1."tz" AS "z", CASE WHEN isfinite(t1."tz") THEN CASE WHEN (t1."tz" AT TIME ZONE 'UTC') < '0001-01-01T00:00:00'::timestamp THEN extract(year FROM (t1."tz" AT TIME ZONE 'UTC'))::numeric + 1 ELSE extract(year FROM (t1."tz" AT TIME ZONE 'UTC'))::numeric END END AS "y", CASE WHEN isfinite(t0."ts") THEN extract(second FROM t0."ts")::numeric END AS "s", (CASE WHEN isfinite(t0."ts") THEN extract(hour FROM t0."ts")::numeric END + $1::numeric) AS "h", NULL::numeric AS "h_1"
+FROM "events" t0
+JOIN "events" t1 ON t1."id" = t0."id"
+WHERE t0."ts" IS NOT NULL AND t1."tz" IS NOT NULL
+) q
+
+-- params
+$1 = "1"
