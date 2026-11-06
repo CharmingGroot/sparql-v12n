@@ -1,0 +1,22 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?c WHERE { ?c ex:name ?n ; \\\n         ex:tier ?t FILTER(xsd:integer(?t) > 1 || xsd:boolean(?n) || xsd:double(?t) = 0) }\")"
+---
+SELECT t0."id" AS "c"
+FROM "customers" t0
+JOIN "customers" t1 ON t1."id" = t0."id" AND (((SELECT CASE WHEN char_length(s) <= 1000 AND s ~ $1::text THEN s::numeric END FROM (SELECT (t1."tier"::text) COLLATE "C" AS s) AS c) > $2::int8 OR (SELECT CASE WHEN s ~ $3::text THEN true WHEN s ~ $4::text THEN false END FROM (SELECT (t0."name"::text) COLLATE "C" AS s) AS c)) OR (SELECT (x = $12::float8 AND x <> 'NaN'::float8) FROM (SELECT (SELECT (SELECT CASE WHEN v THEN CASE WHEN s ~ $7::text THEN 'NaN'::float8 WHEN s ~ $8::text THEN CASE WHEN n THEN '-Infinity'::float8 ELSE 'Infinity'::float8 END WHEN s ~ $11::text OR s ~ $10::text THEN CASE WHEN n THEN '-0e0'::float8 ELSE '0e0'::float8 END WHEN s ~ $9::text THEN CASE WHEN n THEN '-Infinity'::float8 ELSE 'Infinity'::float8 END ELSE (SELECT CASE WHEN d = 0 THEN CASE WHEN n THEN '-0e0'::float8 ELSE '0e0'::float8 END ELSE CASE WHEN abs(d) >= 2::numeric ^ 1024 - 2::numeric ^ 970 THEN CASE WHEN d < 0 THEN '-Infinity'::float8 ELSE 'Infinity'::float8 END WHEN d <> 0 AND abs(d) * 2::numeric ^ 1075 <= 1 THEN CASE WHEN d < 0 THEN '-0e0'::float8 ELSE '0e0'::float8 END ELSE d::float8 END END FROM (SELECT s::numeric AS d) AS r) END END FROM (SELECT char_length(s) <= 1000 AND s ~ $5::text AS v, s ~ $6::text AS n) AS f) FROM (SELECT (t1."tier"::text) COLLATE "C" AS s) AS c) AS x) AS d))
+WHERE t0."name" IS NOT NULL AND t1."tier" IS NOT NULL
+
+-- params
+$1 = "^[\\t\\n\\r ]*[+-]?[0-9]+[\\t\\n\\r ]*$"
+$2 = "1"
+$3 = "^[\\t\\n\\r ]*(true|1)[\\t\\n\\r ]*$"
+$4 = "^[\\t\\n\\r ]*(false|0)[\\t\\n\\r ]*$"
+$5 = "^[\\t\\n\\r ]*([+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?|[+-]?INF|NaN)[\\t\\n\\r ]*$"
+$6 = "^[\\t\\n\\r ]*-"
+$7 = "NaN"
+$8 = "INF"
+$9 = "[eE][+]?0*[1-9][0-9]{4}"
+$10 = "[eE]-0*[1-9][0-9]{4}"
+$11 = "^[\\t\\n\\r ]*[+-]?[0.]*([eE]|[\\t\\n\\r ]*$)"
+$12 = "0.0E0"

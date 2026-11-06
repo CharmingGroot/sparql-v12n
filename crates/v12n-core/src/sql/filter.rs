@@ -12,9 +12,12 @@ use crate::Error;
 use crate::dialect::{Dialect, SqlType};
 use crate::mapping::TermType;
 use crate::solution::canonical_double;
-use crate::sparql::{ArithOp, CompareOp, DateTimeFunction, NumericFunction, StrTest, TermTest};
+use crate::sparql::{
+    ArithOp, Cast, CompareOp, DateTimeFunction, NumericFunction, StrTest, TermTest,
+};
 use crate::xsd::{self, Num, Number, Value, XSD};
 
+mod cast;
 mod double;
 
 const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
@@ -106,7 +109,8 @@ pub(super) struct Operand<'v> {
 }
 
 /// Whether the value is a number computed in SQL, by arithmetic, a
-/// numeric function, `STRLEN` or a component of a dateTime.
+/// numeric function, `STRLEN`, a component of a dateTime or a cast to a
+/// numeric datatype.
 fn is_arith(value: &FilterValue) -> bool {
     matches!(
         value,
@@ -115,6 +119,7 @@ fn is_arith(value: &FilterValue) -> bool {
             | FilterValue::Numeric(..)
             | FilterValue::StrLen(_)
     ) || matches!(value, FilterValue::DateTime(function, _) if function.is_numeric())
+        || matches!(value, FilterValue::Cast(cast, _) if *cast != Cast::Boolean)
 }
 
 const XSD_DATE_TIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
@@ -242,6 +247,14 @@ impl<'a> Renderer<'a> {
                     Some(same_term) => self.term_match(same_term, mode)?,
                     None => {
                         let (l, r) = (self.operand(left), self.operand(right));
+                        if [left, right]
+                            .iter()
+                            .any(|v| matches!(v, FilterValue::Cast(..)))
+                        {
+                            return Err(unsupported(
+                                "sameTerm of a cast, whose lexical form SQL does not compute yet",
+                            ));
+                        }
                         if is_arith(left) || is_arith(right) {
                             return Err(unsupported(
                                 "sameTerm of an arithmetic result, whose lexical form SQL does \
@@ -274,6 +287,13 @@ impl<'a> Renderer<'a> {
                     TermTest::IsLiteral => term_type == TermType::Literal,
                 };
                 let holds = if holds { "true" } else { "false" };
+                // A cast is an error where the lexical form is not valid.
+                if let FilterValue::Cast(..) = value {
+                    self.sql.push_str("CASE WHEN ");
+                    self.no_error(value)?;
+                    self.sql.push_str(&format!(" THEN {holds} END"));
+                    return Ok(());
+                }
                 match operand.finite {
                     Some((table, name)) => self.sql.push_str(&format!(
                         "CASE WHEN {} THEN {holds} END",
@@ -299,6 +319,11 @@ impl<'a> Renderer<'a> {
             Kind::Numeric(class) if is_arith(value) => {
                 self.sql.push('(');
                 self.class_value(value, class)?;
+                self.sql.push_str(" IS NOT NULL)");
+            }
+            Kind::Boolean if matches!(value, FilterValue::Cast(..)) => {
+                self.sql.push('(');
+                self.boolean_value(value)?;
                 self.sql.push_str(" IS NOT NULL)");
             }
             _ => match operand.finite {
@@ -362,6 +387,7 @@ impl<'a> Renderer<'a> {
             FilterValue::DateTime(function, a) => {
                 return self.date_time(value, *function, self.operand(a));
             }
+            FilterValue::Cast(cast, a) => return self.cast(value, *cast, self.operand(a)),
             FilterValue::Now => {
                 let now = self.now();
                 operand.kind = Kind::DateTime { zoned: true };
@@ -534,6 +560,17 @@ impl<'a> Renderer<'a> {
             term_type: None,
             ..operand.clone()
         };
+        if let FilterValue::Cast(..) = inner.value
+            && inner.kind != Kind::Error
+        {
+            return Operand {
+                kind: match inner.kind {
+                    Kind::Unsupported(reason) => Kind::Unsupported(reason),
+                    _ => Kind::Unsupported("STR, LANG and DATATYPE of a cast".to_owned()),
+                },
+                ..operand
+            };
+        }
         if is_arith(inner.value) && inner.kind != Kind::Error {
             return Operand {
                 kind: Kind::Unsupported(
@@ -783,6 +820,11 @@ impl<'a> Renderer<'a> {
             FilterValue::DateTime(function, a) if self.operand(value).kind != Kind::Error => {
                 self.date_time_number(*function, a)?;
             }
+            FilterValue::Cast(cast, a) => match self.operand(value).kind {
+                Kind::Unsupported(reason) => return Err(unsupported(&reason)),
+                Kind::Numeric(_) => self.cast_number(*cast, a)?,
+                _ => self.typed_null(&SqlType::Numeric),
+            },
             // Characters are code points in a UTF-8 database.
             FilterValue::StrLen(a) => {
                 let operand = self.operand(a);
@@ -1371,6 +1413,9 @@ impl<'a> Renderer<'a> {
 
     /// A boolean or dateTime operand as a value of SQL type `ty`.
     pub(super) fn typed_value(&mut self, operand: &Operand<'_>, ty: &SqlType) -> Result<(), Error> {
+        if let FilterValue::Cast(..) = operand.value {
+            return self.boolean_value(operand.value);
+        }
         let value = match &operand.constant {
             Some(Value::Boolean(b)) => b.to_string(),
             Some(Value::DateTime(d)) => d.canonical.clone(),
@@ -1662,6 +1707,12 @@ impl<'a> Renderer<'a> {
         if operand.kind == Kind::Error {
             self.typed_null(&SqlType::Boolean);
             return Ok(());
+        }
+        if let FilterValue::Cast(Cast::Boolean, _) = value {
+            if let Kind::Unsupported(reason) = &operand.kind {
+                return Err(unsupported(reason));
+            }
+            return self.boolean_value(value);
         }
         if is_arith(value) {
             if let Kind::Unsupported(reason) = &operand.kind {
@@ -3212,5 +3263,153 @@ pub(super) mod tests {
         assert!(
             rejected("?s ex:txt ?x", "REPLACE(?x, \"a\", \"b\", \"q\") = \"b\"").contains("q flag")
         );
+    }
+
+    #[test]
+    fn casts_of_strings_match_the_lexical_space_before_reading() {
+        // The lexical form is matched before PostgreSQL reads it, so an
+        // invalid one is an error and not a failed statement.
+        let string = "(SELECT CASE WHEN char_length(s) <= 1000 AND s ~ $1::text THEN s::numeric \
+                      END FROM (SELECT (t0.\"txt\"::text) COLLATE \"C\" AS s) AS c)";
+        assert_eq!(
+            x("txt", "xsd:integer(?x) = 1"),
+            format!("{string} = $2::int8")
+        );
+        assert_eq!(
+            x("txt", "xsd:decimal(?x) > 1"),
+            format!("{string} > $2::numeric")
+        );
+        assert_eq!(
+            filter_params("xsd:integer(?x) = 1")[0],
+            "^[\\t\\n\\r ]*[+-]?[0-9]+[\\t\\n\\r ]*$"
+        );
+        assert_eq!(
+            filter_params("xsd:decimal(?x) = 1")[0],
+            "^[\\t\\n\\r ]*[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)[\\t\\n\\r ]*$"
+        );
+        assert_eq!(
+            x("txt", "xsd:boolean(?x)"),
+            "(SELECT CASE WHEN s ~ $1::text THEN true WHEN s ~ $2::text THEN false END FROM \
+             (SELECT (t0.\"txt\"::text) COLLATE \"C\" AS s) AS c)"
+        );
+        // A double is read as numeric and rounded as decimals are, so an
+        // overflow is an infinity; a zero keeps its sign.
+        let double = x("txt", "xsd:double(?x) = 1");
+        assert!(
+            double
+                .contains("WHEN d = 0 THEN CASE WHEN n THEN '-0e0'::float8 ELSE '0e0'::float8 END")
+                && double.contains("FROM (SELECT s::numeric AS d) AS r)"),
+            "{double}"
+        );
+        // Unlike a comparison, a type test sees the error.
+        assert_eq!(
+            x("txt", "isLiteral(xsd:integer(?x))"),
+            format!("CASE WHEN ({string} IS NOT NULL) THEN true END")
+        );
+        assert_eq!(
+            x("txt", "COALESCE(xsd:boolean(?x), false)"),
+            "CASE WHEN ((SELECT CASE WHEN s ~ $1::text THEN true WHEN s ~ $2::text THEN false END \
+             FROM (SELECT (t0.\"txt\"::text) COLLATE \"C\" AS s) AS c) IS NOT NULL) THEN (SELECT \
+             CASE WHEN s ~ $3::text THEN true WHEN s ~ $4::text THEN false END FROM (SELECT \
+             (t0.\"txt\"::text) COLLATE \"C\" AS s) AS c) WHEN true THEN false END"
+        );
+    }
+
+    #[test]
+    fn casts_of_numbers_and_booleans_follow_xpath() {
+        // A decimal loses its fraction; a double too, exactly at every
+        // magnitude, and NaN and the infinities are errors.
+        assert_eq!(
+            x("dec", "xsd:integer(?x) = 1"),
+            "trunc(CASE WHEN t0.\"dec\"::text NOT IN ('NaN', 'Infinity', '-Infinity') THEN \
+             t0.\"dec\" END) = $1::int8"
+        );
+        assert_eq!(
+            x("f8", "xsd:integer(?x) = 1"),
+            "CASE WHEN t0.\"f8\" >= '-9.223372036854776e18'::float8 AND t0.\"f8\" < \
+             '9.223372036854776e18'::float8 THEN trunc(t0.\"f8\")::int8::numeric WHEN \
+             abs(t0.\"f8\") <= '1.7976931348623157e308'::float8 THEN (SELECT trunc((t0.\"f8\" / \
+             2::float8 ^ e)::int8::numeric * 2::numeric ^ e) FROM (SELECT \
+             (floor(ln(abs(t0.\"f8\")) / ln(2::float8)) - 57)::int4 AS e) AS p) END = $1::int8"
+        );
+        assert_eq!(
+            x("i4", "xsd:double(?x) = 1"),
+            "(t0.\"i4\"::float8 = $1::float8)"
+        );
+        assert_eq!(
+            x("i4", "xsd:decimal(?x) = 1"),
+            "t0.\"i4\"::numeric = $1::numeric"
+        );
+        assert_eq!(x("i4", "xsd:boolean(?x)"), "(t0.\"i4\"::numeric <> 0)");
+        assert_eq!(
+            x("f8", "xsd:boolean(?x)"),
+            "(t0.\"f8\" <> 0 AND t0.\"f8\" <> 'NaN'::float8)"
+        );
+        assert_eq!(
+            x("b", "xsd:integer(?x) = 1"),
+            "CASE t0.\"b\" WHEN true THEN 1::numeric WHEN false THEN 0::numeric END = $1::int8"
+        );
+        assert_eq!(x("b", "xsd:boolean(?x) = ?x"), "t0.\"b\" = t0.\"b\"");
+        // Constants are cast before the query is sent.
+        assert_eq!(
+            x("i4", "xsd:integer(\" +01 \") = ?x"),
+            "$1::int8 = t0.\"i4\""
+        );
+        assert_eq!(
+            params("SELECT ?s WHERE { ?s ex:i4 ?x FILTER(xsd:integer(\" +01 \") = ?x) }"),
+            ["1"]
+        );
+        assert_eq!(x("i4", "xsd:integer(\"1.0\") = ?x"), "NULL::bool");
+    }
+
+    #[test]
+    fn casts_the_table_does_not_allow_are_errors() {
+        for (predicate, filter) in [
+            ("ts", "xsd:integer(?x) = 1"),
+            ("tz", "xsd:boolean(?x)"),
+            ("d", "xsd:double(?x) = 1"),
+            ("label", "xsd:integer(?x) = 1"),
+            ("link", "xsd:decimal(?x) = 1"),
+            ("i4", "xsd:integer(ex:a) = ?x"),
+            ("i4", "xsd:integer(\"1\"@en) = ?x"),
+            (
+                "i4",
+                "xsd:double(\"2024-01-01T00:00:00\"^^xsd:dateTime) = ?x",
+            ),
+        ] {
+            assert_eq!(x(predicate, filter), "NULL::bool", "{filter}");
+        }
+        assert_eq!(x("ts", "!(xsd:integer(?x) = 1)"), "NOT (NULL::bool)");
+    }
+
+    #[test]
+    fn casts_whose_results_engines_compute_differently_are_rejected() {
+        for (patterns, filter, reason) in [
+            (
+                "?s ex:f8 ?x",
+                "xsd:decimal(?x) = 1",
+                "xsd:decimal of an xsd:double",
+            ),
+            (
+                "?s ex:f8 ?x",
+                "xsd:decimal(1e0) = 1",
+                "xsd:decimal of an xsd:double",
+            ),
+            ("?s ex:f4 ?x", "xsd:integer(?x) = 1", "float4"),
+            ("?s ex:txt ?x", "xsd:integer(\"1\"^^xsd:int) = 1", "xsd:int"),
+            (
+                "?s ex:txt ?x",
+                "STR(xsd:integer(?x)) = \"1\"",
+                "STR, LANG and DATATYPE of a cast",
+            ),
+            (
+                "?s ex:txt ?x",
+                "sameTerm(xsd:boolean(?x), true)",
+                "sameTerm of a cast",
+            ),
+        ] {
+            let message = rejected(patterns, filter);
+            assert!(message.contains(reason), "{filter}: {message}");
+        }
     }
 }

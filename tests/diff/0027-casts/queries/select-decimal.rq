@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Canonical decimals of strings: 1.50 is 1.5. Row 2, with whitespace, is
+# in string-integer-whitespace.
+SELECT ?r (xsd:decimal(?s) AS ?m) WHERE { ?r ex:s ?s FILTER(?r != ex:val\/2) }

@@ -1,0 +1,12 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#Val> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "vals" ] ;
+  rr:subjectMap [ rr:template "http://example.org/val/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:s ; rr:objectMap [ rr:column "s" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:i ; rr:objectMap [ rr:column "i" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:d ; rr:objectMap [ rr:column "d" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:f ; rr:objectMap [ rr:column "f" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:b ; rr:objectMap [ rr:column "b" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:t ; rr:objectMap [ rr:column "t" ] ] .

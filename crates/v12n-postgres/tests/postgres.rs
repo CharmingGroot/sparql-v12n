@@ -1059,6 +1059,260 @@ async fn date_time_functions_follow_the_written_lexical_forms() {
     }
 }
 
+/// `xsd:integer`, `xsd:decimal`, `xsd:double` and `xsd:boolean` (#107)
+/// of strings, numbers and booleans (SPARQL 1.1 §17.5). A string is read
+/// in the lexical space of the target datatype, whitespace stripped; a
+/// lexical form that is not valid, NaN and the infinities as integers,
+/// and a dateTime are errors, which PostgreSQL never raises and which
+/// stay errors under negation.
+#[tokio::test]
+async fn casts_follow_xpath_casting() {
+    let Some(url) = database_url() else { return };
+    let long = "1".repeat(1001);
+    let mapping = sql_query_mapping(
+        &format!(
+            "SELECT * FROM (VALUES \
+               (1, E' +01\\t\\n', 7::int8, 2.50::numeric, 1.5::float8, true, \
+                TIMESTAMP '2024-01-01 00:00:00'), \
+               (2, '1.50', -3::int8, -2.50::numeric, '-0'::float8, false, 'infinity'), \
+               (3, '1e3', 0::int8, 0::numeric, 'NaN'::float8, true, 'infinity'), \
+               (4, 'abc', 12::int8, 'NaN'::numeric, 'Infinity'::float8, false, 'infinity'), \
+               (5, ' true ', 1::int8, -0.5::numeric, '1180591620717411303424'::float8, true, \
+                'infinity'), \
+               (6, '1.', 2::int8, 0.5::numeric, '-1.9e0'::float8, false, 'infinity'), \
+               (7, '{long}', 3::int8, 1::numeric, 1e308::float8, true, 'infinity'), \
+               (8, '1 2', 4::int8, 1::numeric, 0::float8, true, 'infinity'), \
+               (9, '+INF', 5::int8, 1::numeric, 0::float8, true, 'infinity'), \
+               (10, '1e99999', 6::int8, 1::numeric, 0::float8, true, 'infinity'), \
+               (11, '-1e-99999', 6::int8, 1::numeric, 0::float8, true, 'infinity'), \
+               (12, '1.7976931348623159e308', 6::int8, 1::numeric, 0::float8, true, \
+                'infinity'), \
+               (13, '1.7976931348623158E308', 6::int8, 1::numeric, 0::float8, true, \
+                'infinity'), \
+               (14, '2.4703282292062328e-324', 6::int8, 1::numeric, 0::float8, true, \
+                'infinity'), \
+               (15, '2.4703282292062327e-324', 6::int8, 1::numeric, 0::float8, true, \
+                'infinity'), \
+               (16, '0', 6::int8, 1::numeric, 0::float8, true, 'infinity'), \
+               (17, '-0.0e99999', 6::int8, 1::numeric, 0::float8, true, 'infinity'), \
+               (18, 'NaN', 6::int8, 1::numeric, 0::float8, true, 'infinity'), \
+               (19, '.5e-1', 6::int8, 1::numeric, 0::float8, true, 'infinity'), \
+               (20, 'TRUE', 6::int8, 1::numeric, 0::float8, true, 'infinity'), \
+               (21, 'inf', 6::int8, 1::numeric, 0::float8, true, 'infinity'), \
+               (22, '1e', 6::int8, 1::numeric, 0::float8, true, 'infinity')) \
+               v(id, s, i, d, f, b, t)"
+        ),
+        &["s", "i", "d", "f", "b", "t"],
+    );
+    let rows = |filter: &str| {
+        let (url, mapping, filter) = (url.clone(), mapping.clone(), filter.to_owned());
+        async move {
+            let mut rows = filtered_rows(
+                &url,
+                &mapping,
+                "?row ex:s ?s ; ex:i ?i ; ex:d ?d ; ex:f ?f ; ex:b ?b ; ex:t ?t",
+                &filter,
+            )
+            .await;
+            rows.sort_by_key(|row| row.parse::<u32>().unwrap());
+            rows
+        }
+    };
+    let none = Vec::<String>::new();
+    let all: Vec<String> = (1..=22).map(|i| i.to_string()).collect();
+    // Strings: the lexical space of the target, whitespace stripped.
+    assert_eq!(rows("xsd:integer(?s) = 1").await, ["1"]);
+    assert_eq!(rows("xsd:integer(?s) = 0").await, ["16"]);
+    assert_eq!(rows("isLiteral(xsd:integer(?s))").await, ["1", "16"]);
+    assert_eq!(rows("!(xsd:integer(?s) = 1)").await, ["16"]);
+    assert_eq!(
+        rows("COALESCE(xsd:integer(?s), -1) = -1").await,
+        all.iter()
+            .filter(|i| !["1", "16"].contains(&i.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(rows("xsd:decimal(?s) = 1.5").await, ["2"]);
+    assert_eq!(rows("xsd:decimal(?s) = 1").await, ["1", "6"]);
+    assert_eq!(
+        rows("isLiteral(xsd:decimal(?s))").await,
+        ["1", "2", "6", "16"]
+    );
+    assert_eq!(rows("xsd:double(?s) = 1000").await, ["3"]);
+    assert_eq!(rows("xsd:double(?s) = 0.05").await, ["19"]);
+    assert_eq!(rows("xsd:double(?s) = 1.5").await, ["2"]);
+    assert_eq!(
+        rows("xsd:double(?s) = \"INF\"^^xsd:double").await,
+        ["9", "10", "12"]
+    );
+    assert_eq!(
+        rows("xsd:double(?s) = 1.7976931348623157e308").await,
+        ["13"]
+    );
+    // The smallest subnormal and the halfway point below it, which
+    // rounds to even, that is to zero.
+    assert_eq!(rows("xsd:double(?s) = 4.9e-324").await, ["14"]);
+    assert_eq!(rows("xsd:double(?s) = 0").await, ["11", "15", "16", "17"]);
+    // The sign of a zero.
+    assert_eq!(rows("1 / xsd:double(?s) < 0").await, ["11", "17"]);
+    assert_eq!(rows("xsd:double(?s) != xsd:double(?s)").await, ["18"]);
+    assert_eq!(
+        rows("isLiteral(xsd:double(?s))").await,
+        [
+            "1", "2", "3", "6", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"
+        ]
+    );
+    assert_eq!(rows("xsd:boolean(?s)").await, ["5"]);
+    assert_eq!(rows("xsd:boolean(?s) = true").await, ["5"]);
+    assert_eq!(rows("!xsd:boolean(?s)").await, ["16"]);
+    assert_eq!(rows("isLiteral(xsd:boolean(?s))").await, ["5", "16"]);
+    // Numbers: a fraction is discarded; NaN and the infinities are not
+    // integers.
+    assert_eq!(rows("xsd:integer(?d) = 2").await, ["1"]);
+    assert_eq!(rows("xsd:integer(?d) = -2").await, ["2"]);
+    assert_eq!(rows("xsd:integer(?d) = 0").await, ["3", "5", "6"]);
+    assert_eq!(rows("xsd:integer(?f) = 1").await, ["1"]);
+    assert_eq!(rows("xsd:integer(?f) = -1").await, ["6"]);
+    assert_eq!(
+        rows("xsd:integer(?f) = 1180591620717411303424").await,
+        ["5"]
+    );
+    assert_eq!(rows("xsd:integer(?f) = xsd:integer(1e308)").await, ["7"]);
+    assert_eq!(rows("COALESCE(xsd:integer(?f), 9) = 9").await, ["3", "4"]);
+    assert_eq!(rows("!(xsd:integer(?f) = 0)").await, ["1", "5", "6", "7"]);
+    assert_eq!(rows("xsd:decimal(?i) / 2 = 3.5").await, ["1"]);
+    let ints: Vec<String> = [1, 4]
+        .into_iter()
+        .chain(6..=22)
+        .map(|i| i.to_string())
+        .collect();
+    assert_eq!(rows("xsd:double(?i) * 1e308 > 1e308").await, ints);
+    assert_eq!(rows("xsd:double(?d) = 2.5").await, ["1"]);
+    assert_eq!(rows("COALESCE(xsd:double(?d), 9) = 9").await, ["4"]);
+    assert_eq!(rows("!xsd:boolean(?i)").await, ["3"]);
+    let false_doubles: Vec<String> = [2, 3]
+        .into_iter()
+        .chain(8..=22)
+        .map(|i| i.to_string())
+        .collect();
+    assert_eq!(rows("!xsd:boolean(?f)").await, false_doubles);
+    assert_eq!(rows("xsd:boolean(?d) = false").await, ["3"]);
+    // Booleans are 1 and 0.
+    assert_eq!(rows("xsd:integer(?b) = 0").await, ["2", "4", "6"]);
+    assert_eq!(rows("xsd:double(?b) + xsd:decimal(?b) = 2").await.len(), 19);
+    assert_eq!(rows("xsd:boolean(?b) = ?b").await, all);
+    // A dateTime, and its infinite values, which are plain literals, cast
+    // to none of these.
+    assert_eq!(
+        rows("xsd:integer(?t) = 1 || xsd:boolean(?t) || !(xsd:double(?t) = 1)").await,
+        none
+    );
+    assert_eq!(rows("COALESCE(xsd:decimal(?t), 0) = 0").await, all);
+    // Constants are cast before the query is sent.
+    assert_eq!(
+        rows("xsd:integer(?s) = xsd:integer(\" 1 \") && xsd:boolean(\"1\")").await,
+        ["1"]
+    );
+
+    let query = "PREFIX ex: <http://example.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?row (xsd:integer(?s) AS ?n) (xsd:decimal(?s) AS ?m) (xsd:double(?s) AS ?x)
+          (xsd:integer(?f) AS ?k) (xsd:double(?b) AS ?y)
+        WHERE { ?row ex:s ?s ; ex:f ?f ; ex:b ?b FILTER(xsd:integer(STRAFTER(STR(?row), \"row/\")) IN (1, 2, 3, 4, 5, 11)) }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    let xsd = |lexical: &str, datatype: &str| {
+        format!("\"{lexical}\"^^<http://www.w3.org/2001/XMLSchema#{datatype}>")
+    };
+    // Sorted as text, so row 11 comes first.
+    assert_eq!(
+        rows,
+        [
+            format!(
+                "?row=<http://example.org/row/11> ?x={} ?k={} ?y={}",
+                xsd("-0.0E0", "double"),
+                xsd("0", "integer"),
+                xsd("1.0E0", "double")
+            ),
+            format!(
+                "?row=<http://example.org/row/1> ?n={} ?m={} ?x={} ?k={} ?y={}",
+                xsd("1", "integer"),
+                xsd("1", "decimal"),
+                xsd("1.0E0", "double"),
+                xsd("1", "integer"),
+                xsd("1.0E0", "double")
+            ),
+            format!(
+                "?row=<http://example.org/row/2> ?m={} ?x={} ?k={} ?y={}",
+                xsd("1.5", "decimal"),
+                xsd("1.5E0", "double"),
+                xsd("0", "integer"),
+                xsd("0.0E0", "double")
+            ),
+            format!(
+                "?row=<http://example.org/row/3> ?x={} ?y={}",
+                xsd("1.0E3", "double"),
+                xsd("1.0E0", "double")
+            ),
+            format!(
+                "?row=<http://example.org/row/4> ?y={}",
+                xsd("0.0E0", "double")
+            ),
+            format!(
+                "?row=<http://example.org/row/5> ?k={} ?y={}",
+                xsd("1180591620717411303424", "integer"),
+                xsd("1.0E0", "double")
+            ),
+        ]
+    );
+
+    // xsd:decimal of a double depends on the precision of the decimals of
+    // an engine; xsd:float values are not supported; a computed variable
+    // holds only numbers; ORDER BY takes no expressions yet (#108).
+    for query in [
+        "SELECT ?row WHERE { ?row ex:f ?f FILTER(xsd:decimal(?f) = 1) }",
+        "SELECT ?row WHERE { ?row ex:r ?r FILTER(xsd:integer(?r) = 1) }",
+        "SELECT ?row WHERE { ?row ex:f ?f FILTER(xsd:float(?f) = 1) }",
+        "SELECT ?row WHERE { ?row ex:s ?s FILTER(STR(xsd:integer(?s)) = \"1\") }",
+        "SELECT ?row WHERE { ?row ex:s ?s FILTER(sameTerm(xsd:boolean(?s), true)) }",
+        "SELECT ?row (xsd:boolean(?s) AS ?b) WHERE { ?row ex:s ?s }",
+        "SELECT ?row WHERE { ?row ex:s ?s } ORDER BY xsd:integer(?s)",
+        "SELECT ?row WHERE { ?row ex:s ?s FILTER(xsd:string(?s) = \"1\") }",
+        "SELECT ?row WHERE { ?row ex:s ?s FILTER(xsd:dateTime(?s) < NOW()) }",
+        "SELECT ?row WHERE { ?row ex:s ?s FILTER(xsd:integer(\"1\"^^xsd:int) = 1) }",
+    ] {
+        let mapping = sql_query_mapping(
+            "SELECT 1 AS id, '1'::text AS s, 1.5::float8 AS f, 1.5::float4 AS r",
+            &["s", "f", "r"],
+        );
+        let query = format!(
+            "PREFIX ex: <http://example.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             {query}"
+        );
+        let result = match sparql::parse(&query) {
+            Err(e) => Err(Error::Core(e)),
+            Ok(parsed) => {
+                let parsed_mapping = Mapping::from_turtle(&mapping).unwrap();
+                match unfold::unfold(
+                    &parsed,
+                    &parsed_mapping,
+                    &MappingIndex::new(&parsed_mapping),
+                ) {
+                    Err(e) => Err(Error::Core(e)),
+                    Ok(plan) => run(&url, Limits::default(), &plan).await,
+                }
+            }
+        };
+        assert!(
+            matches!(
+                &result,
+                Err(Error::Core(v12n_core::Error::UnsupportedFeature(_)))
+            ),
+            "{query}: {result:?}"
+        );
+    }
+}
+
 /// fn:round (XPath F&O 3.1 §4.4.4) from Rust's `round`, which rounds
 /// halves away from zero: halves towards positive infinity, and `-0` for
 /// values from -0.5 to -0.

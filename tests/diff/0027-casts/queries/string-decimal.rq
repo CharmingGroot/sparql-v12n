@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# 1.50 is the decimal 1.5: row 3.
+SELECT ?r WHERE { ?r ex:s ?s FILTER(xsd:decimal(?s) = 1.5) }

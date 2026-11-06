@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Expressions in ORDER BY come with #108.
+SELECT ?r WHERE { ?r ex:s ?s } ORDER BY xsd:integer(?s)

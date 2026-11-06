@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A decimal divided by an integer is a decimal: row 1.
+SELECT ?r WHERE { ?r ex:i ?i FILTER(xsd:decimal(?i) / 2 = 3.5) }

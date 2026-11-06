@@ -9,7 +9,7 @@ use oxrdf::Term;
 use crate::dialect::{Dialect, SqlType};
 use crate::mapping::{BaseIri, LogicalTable, TemplatePart, TermType};
 use crate::sparql::{
-    ArithOp, CompareOp, DateTimeFunction, NumericFunction, QueryForm, StrTest, TermTest,
+    ArithOp, Cast, CompareOp, DateTimeFunction, NumericFunction, QueryForm, StrTest, TermTest,
 };
 
 pub(super) const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
@@ -376,6 +376,10 @@ pub enum FilterValue {
     /// A function of SPARQL 1.1 §17.4.5 of an `xsd:dateTime`, and an error
     /// for anything else.
     DateTime(DateTimeFunction, Box<FilterValue>),
+    /// A cast of a term that is not a constant (SPARQL 1.1 §17.5), and an
+    /// error where the cast is not allowed or the lexical form is not
+    /// valid for the target datatype.
+    Cast(Cast, Box<FilterValue>),
     /// `NOW()`: one `xsd:dateTime` in UTC per rendering of the plan, sent
     /// as a parameter (SPARQL 1.1 §17.4.5.1).
     Now,
@@ -429,7 +433,8 @@ impl FilterValue {
             | Self::EncodeForUri(v)
             | Self::Replace { text: v, .. }
             | Self::Numeric(_, v)
-            | Self::DateTime(_, v) => v.terms(),
+            | Self::DateTime(_, v)
+            | Self::Cast(_, v) => v.terms(),
             Self::Arith(_, a, b) | Self::StrBefore(a, b) | Self::StrAfter(a, b) => {
                 let mut terms = a.terms();
                 terms.extend(b.terms());
@@ -454,7 +459,8 @@ impl FilterValue {
             | Self::EncodeForUri(v)
             | Self::Replace { text: v, .. }
             | Self::Numeric(_, v)
-            | Self::DateTime(_, v) => v.terms_mut(),
+            | Self::DateTime(_, v)
+            | Self::Cast(_, v) => v.terms_mut(),
             Self::Arith(_, a, b) | Self::StrBefore(a, b) | Self::StrAfter(a, b) => {
                 let mut terms = a.terms_mut();
                 terms.extend(b.terms_mut());

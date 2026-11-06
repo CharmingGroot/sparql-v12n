@@ -10,6 +10,14 @@ Design decisions are recorded in the `Decision:` Discussions.
 
 ### Added
 
+- The casts `xsd:integer`, `xsd:decimal`, `xsd:double` and `xsd:boolean`
+  (SPARQL 1.1 §17.5) in `FILTER`, and the numeric ones also in `BIND` and
+  `SELECT (expr AS ?v)`. A string is read in the lexical space of the
+  target datatype, whitespace stripped, and the SQL matches it against a
+  regular expression before PostgreSQL reads it, so an invalid lexical
+  form is an error and never a failed statement. Results are in canonical
+  form. `xsd:decimal` of a double, `xsd:float`, `xsd:string`,
+  `xsd:dateTime` and casts in `ORDER BY` are rejected.
 - `YEAR`, `MONTH`, `DAY`, `HOURS`, `MINUTES`, `SECONDS`, `TIMEZONE`, `TZ`
   and `NOW` in `FILTER`, and `YEAR` to `SECONDS` also in `BIND` and
   `SELECT (expr AS ?v)`. They read `xsd:dateTime` values from `timestamp`

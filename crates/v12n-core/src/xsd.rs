@@ -3,7 +3,8 @@
 //! read from their lexical forms (XML Schema 1.1 Part 2).
 
 use crate::dialect::SqlType;
-use crate::solution::canonical_decimal;
+use crate::solution::{canonical_decimal, canonical_double};
+use crate::sparql::Cast;
 
 pub(crate) const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
@@ -451,6 +452,138 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (yoe + era * 400 + i64::from(month <= 2), month, day)
 }
 
+/// The longest string that is cast to a number. Longer strings are an
+/// error, as XPath F&O 1.0 §17.1.3 allows for values beyond the limits of
+/// an implementation (err:FOCA0003, err:FOCA0006); within it, PostgreSQL's
+/// `numeric` input holds every valid lexical form whose exponent has at
+/// most four digits.
+pub(crate) const MAX_CAST_LENGTH: usize = 1000;
+
+/// Why casting an `xsd:double` to `xsd:decimal` is rejected.
+pub(crate) const DOUBLE_TO_DECIMAL: &str = "xsd:decimal of an xsd:double: XPath F&O 1.0 \
+     §17.1.3.3 gives the decimal closest to the double that the implementation can represent, \
+     which differs between engines";
+
+/// The characters of the XML Schema `whiteSpace` facet `collapse`, which
+/// a cast from a string strips around the lexical form (XPath F&O 1.0
+/// §17.1.1).
+fn is_xml_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
+/// The lexical form and datatype of `cast` applied to a literal with
+/// `lexical` and `datatype` (SPARQL 1.1 §17.5, XPath F&O 1.0 §17.1):
+/// `Ok(None)` for an error, a cast the table does not allow or a lexical
+/// form not valid for the target datatype, and `Err` with the reason for
+/// one that is not supported.
+pub(crate) fn cast(
+    cast: Cast,
+    lexical: &str,
+    datatype: &str,
+) -> Result<Option<(String, &'static str)>, String> {
+    let lexical = match value(lexical, datatype) {
+        Value::String => cast_string(cast, lexical),
+        Value::Numeric(n) => cast_number(cast, &n)?,
+        Value::Boolean(b) => Some(match cast {
+            Cast::Boolean => b.to_string(),
+            Cast::Integer | Cast::Decimal => u8::from(b).to_string(),
+            Cast::Double => canonical_double(f64::from(u8::from(b))),
+        }),
+        Value::Unsupported(reason) => return Err(reason),
+        Value::DateTime(_) | Value::Other | Value::IllTyped => None,
+    };
+    Ok(lexical.map(|lexical| (lexical, cast.datatype())))
+}
+
+/// A string cast to `cast`: its lexical form, whitespace stripped, read
+/// in the lexical space of the target datatype (XML Schema 1.1 Part 2).
+fn cast_string(cast: Cast, lexical: &str) -> Option<String> {
+    if cast != Cast::Boolean && lexical.chars().count() > MAX_CAST_LENGTH {
+        return None;
+    }
+    let lexical = lexical.trim_matches(is_xml_space);
+    match cast {
+        Cast::Boolean => match lexical {
+            "true" | "1" => Some("true".to_owned()),
+            "false" | "0" => Some("false".to_owned()),
+            _ => None,
+        },
+        Cast::Integer => canonical_integer(lexical),
+        Cast::Decimal if is_decimal(lexical) => canonical_decimal(lexical),
+        Cast::Decimal => None,
+        Cast::Double => double(lexical).map(canonical_double),
+    }
+}
+
+/// A number cast to `cast`. A decimal or a double becomes an integer by
+/// discarding its fraction, and is an error for NaN and the infinities;
+/// a number becomes a boolean that is false for zero and NaN (XPath F&O
+/// 1.0 §17.1.3, §17.1.6).
+fn cast_number(cast: Cast, n: &Number) -> Result<Option<String>, String> {
+    let exact = n.decimal.as_deref();
+    Ok(match (cast, exact) {
+        (Cast::Boolean, Some(decimal)) => Some((decimal != "0").to_string()),
+        (Cast::Boolean, None) => Some((n.double != 0.0 && !n.double.is_nan()).to_string()),
+        (Cast::Integer, Some(decimal)) => {
+            let integer = decimal.split('.').next().unwrap_or(decimal);
+            canonical_decimal(integer)
+        }
+        (Cast::Integer, None) => exact_integer(n.double.trunc()),
+        (Cast::Decimal, Some(decimal)) => Some(decimal.to_owned()),
+        (Cast::Decimal, None) => return Err(DOUBLE_TO_DECIMAL.to_owned()),
+        (Cast::Double, _) => Some(canonical_double(n.double)),
+    })
+}
+
+/// The decimal digits of an integral double, `None` for NaN and the
+/// infinities.
+fn exact_integer(x: f64) -> Option<String> {
+    if !x.is_finite() {
+        return None;
+    }
+    if x.abs() < 2f64.powi(63) {
+        return Some((x as i64).to_string());
+    }
+    // `x` is the 53-bit significand times 2^exponent, with an exponent of
+    // at least 11 here; the digits are in base 10^9, least significant
+    // first.
+    let bits = x.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) - 1075;
+    let significand = (bits & ((1 << 52) - 1)) | (1 << 52);
+    let mut limbs = vec![
+        (significand % 1_000_000_000) as u32,
+        (significand / 1_000_000_000 % 1_000_000_000) as u32,
+        (significand / 1_000_000_000_000_000_000) as u32,
+    ];
+    for _ in 0..exponent {
+        let mut carry = 0;
+        for limb in &mut limbs {
+            let doubled = u64::from(*limb) * 2 + carry;
+            *limb = (doubled % 1_000_000_000) as u32;
+            carry = doubled / 1_000_000_000;
+        }
+        if carry > 0 {
+            limbs.push(carry as u32);
+        }
+    }
+    while limbs.last() == Some(&0) {
+        limbs.pop();
+    }
+    let mut digits = if x < 0.0 {
+        "-".to_owned()
+    } else {
+        String::new()
+    };
+    let mut limbs = limbs.iter().rev();
+    if let Some(first) = limbs.next() {
+        digits.push_str(&first.to_string());
+    }
+    for limb in limbs {
+        digits.push_str(&format!("{limb:09}"));
+    }
+    Some(digits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +766,168 @@ mod tests {
             let (y, m, d) = civil_from_days(days);
             assert_eq!(days_from_civil(y, m, d), days);
         }
+    }
+
+    fn cast_of(target: Cast, lexical: &str, datatype: &str) -> Option<String> {
+        cast(target, lexical, &xsd(datatype))
+            .unwrap()
+            .map(|(lexical, datatype)| {
+                assert_eq!(datatype, target.datatype());
+                lexical
+            })
+    }
+
+    #[test]
+    fn strings_cast_by_the_lexical_space_of_the_target() {
+        let integer = |s| cast_of(Cast::Integer, s, "string");
+        assert_eq!(integer(" +01\t\n").as_deref(), Some("1"));
+        assert_eq!(integer("-0").as_deref(), Some("0"));
+        for invalid in ["1.0", "1e0", "", " ", "1 2", "0x1", "+-1", "\u{a0}1", "١"] {
+            assert_eq!(integer(invalid), None, "{invalid:?}");
+        }
+        let decimal = |s| cast_of(Cast::Decimal, s, "string");
+        assert_eq!(decimal("1.50").as_deref(), Some("1.5"));
+        assert_eq!(decimal("1.").as_deref(), Some("1"));
+        assert_eq!(decimal("-.5").as_deref(), Some("-0.5"));
+        assert_eq!(decimal("-0.0").as_deref(), Some("0"));
+        assert_eq!(decimal("1e3"), None);
+        assert_eq!(decimal("INF"), None);
+        let double = |s| cast_of(Cast::Double, s, "string");
+        assert_eq!(double("1").as_deref(), Some("1.0E0"));
+        assert_eq!(double(" 1e3 ").as_deref(), Some("1.0E3"));
+        assert_eq!(double(".5E-1").as_deref(), Some("5.0E-2"));
+        assert_eq!(double("1.e2").as_deref(), Some("1.0E2"));
+        assert_eq!(double("-0").as_deref(), Some("-0.0E0"));
+        assert_eq!(double("+INF").as_deref(), Some("INF"));
+        assert_eq!(double("-INF").as_deref(), Some("-INF"));
+        assert_eq!(double("NaN").as_deref(), Some("NaN"));
+        // floatingPointRound: an infinity past the largest double, a zero
+        // of the sign below half the smallest subnormal.
+        assert_eq!(double("1e99999").as_deref(), Some("INF"));
+        assert_eq!(double("1.7976931348623159e308").as_deref(), Some("INF"));
+        assert_eq!(
+            double("1.7976931348623158e308").as_deref(),
+            Some("1.7976931348623157E308")
+        );
+        assert_eq!(double("-1e-99999").as_deref(), Some("-0.0E0"));
+        assert_eq!(
+            double("2.4703282292062328e-324").as_deref(),
+            Some("5.0E-324")
+        );
+        assert_eq!(double("2.4703282292062327e-324").as_deref(), Some("0.0E0"));
+        for invalid in [
+            "inf", "Infinity", "-NaN", "1e", "e1", "1e1.5", "1d0", "0x1p3",
+        ] {
+            assert_eq!(double(invalid), None, "{invalid:?}");
+        }
+        let boolean = |s| cast_of(Cast::Boolean, s, "string");
+        assert_eq!(boolean(" true ").as_deref(), Some("true"));
+        assert_eq!(boolean("1").as_deref(), Some("true"));
+        assert_eq!(boolean("0").as_deref(), Some("false"));
+        assert_eq!(boolean("TRUE"), None);
+        assert_eq!(boolean("01"), None);
+        // An implementation limit on the length of strings read as numbers.
+        let long = "1".repeat(MAX_CAST_LENGTH);
+        assert_eq!(integer(&long).as_deref(), Some(long.as_str()));
+        assert_eq!(integer(&format!("{long}1")), None);
+        assert_eq!(double(&format!(" {long}")), None);
+    }
+
+    #[test]
+    fn numbers_and_booleans_cast_by_value() {
+        assert_eq!(
+            cast_of(Cast::Integer, "-2.75", "decimal").as_deref(),
+            Some("-2")
+        );
+        assert_eq!(
+            cast_of(Cast::Integer, "-0.5", "decimal").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            cast_of(Cast::Integer, "1.9e0", "double").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            cast_of(Cast::Integer, "-0e0", "double").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            cast_of(Cast::Integer, "1e21", "double").as_deref(),
+            Some("1000000000000000000000")
+        );
+        assert_eq!(
+            cast_of(Cast::Integer, "-1.2345678901234567e18", "double").as_deref(),
+            Some("-1234567890123456768")
+        );
+        assert_eq!(
+            cast_of(Cast::Integer, "9.223372036854775807e18", "double").as_deref(),
+            Some("9223372036854775808")
+        );
+        let max = cast_of(Cast::Integer, "1.7976931348623157e308", "double").unwrap();
+        assert_eq!(max.len(), 309);
+        assert!(
+            max.starts_with("17976931348623157081452742373170435679"),
+            "{max}"
+        );
+        assert!(max.ends_with("858368"), "{max}");
+        for special in ["NaN", "INF", "-INF"] {
+            assert_eq!(cast_of(Cast::Integer, special, "double"), None);
+        }
+        assert_eq!(
+            cast_of(Cast::Decimal, "007", "integer").as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            cast(Cast::Decimal, "1.5e0", &xsd("double")).unwrap_err(),
+            DOUBLE_TO_DECIMAL
+        );
+        assert_eq!(
+            cast_of(Cast::Double, "0.1", "decimal").as_deref(),
+            Some("1.0E-1")
+        );
+        assert_eq!(
+            cast_of(Cast::Double, "9007199254740993", "integer").as_deref(),
+            Some("9.007199254740992E15")
+        );
+        assert_eq!(
+            cast_of(Cast::Boolean, "0.0", "decimal").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            cast_of(Cast::Boolean, "-0e0", "double").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            cast_of(Cast::Boolean, "NaN", "double").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            cast_of(Cast::Boolean, "-INF", "double").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            cast_of(Cast::Integer, "true", "boolean").as_deref(),
+            Some("1")
+        );
+        assert_eq!(cast_of(Cast::Decimal, "0", "boolean").as_deref(), Some("0"));
+        assert_eq!(
+            cast_of(Cast::Double, "1", "boolean").as_deref(),
+            Some("1.0E0")
+        );
+        assert_eq!(
+            cast_of(Cast::Boolean, "1", "boolean").as_deref(),
+            Some("true")
+        );
+        // Ill-typed literals, dateTimes and other datatypes are errors;
+        // derived integer types and xsd:float are not supported.
+        assert_eq!(cast_of(Cast::Integer, "abc", "integer"), None);
+        assert_eq!(
+            cast_of(Cast::Integer, "2024-01-01T00:00:00", "dateTime"),
+            None
+        );
+        assert_eq!(cast_of(Cast::Integer, "2024-01-01", "date"), None);
+        assert_eq!(cast_of(Cast::Boolean, "1", "hexBinary"), None);
+        assert!(cast(Cast::Integer, "1", &xsd("int")).is_err());
+        assert!(cast(Cast::Double, "1", &xsd("float")).is_err());
     }
 }

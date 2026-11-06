@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Zero is false: -0, row 6.
+SELECT ?r WHERE { ?r ex:f ?f FILTER(!xsd:boolean(?f)) }

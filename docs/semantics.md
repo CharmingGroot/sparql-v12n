@@ -612,6 +612,59 @@ them differ. Comparing a `TIMEZONE` result with an `xsd:dayTimeDuration`
 constant is rejected as for other datatypes outside the operator mapping;
 `STR(TIMEZONE(?t)) = "PT0S"` compares its lexical form.
 
+The XPath constructor functions `xsd:integer`, `xsd:decimal`,
+`xsd:double` and `xsd:boolean` (SPARQL 1.1 §17.5) cast a term to their
+datatype, as XPath F&O 1.0 §17.1 defines:
+
+| From | `xsd:integer` | `xsd:decimal` | `xsd:double` | `xsd:boolean` |
+|---|---|---|---|---|
+| String (simple literal, `xsd:string`) | Lexical form | Lexical form | Lexical form | `true`, `1`, `false`, `0` |
+| `xsd:integer` | Itself | Same value | Nearest double | `false` for 0 |
+| `xsd:decimal` | Fraction discarded | Itself | Nearest double | `false` for 0 |
+| `xsd:double` | Fraction discarded; error for NaN and infinities | Rejected | Itself | `false` for 0, -0 and NaN |
+| `xsd:boolean` | 1 or 0 | 1 or 0 | `1.0E0` or `0.0E0` | Itself |
+| `xsd:dateTime`, IRIs, literals with a language tag, other datatypes | Error | Error | Error | Error |
+
+- A string is read in the lexical space of the target datatype (XML
+  Schema 1.1 Part 2), after the spaces, tabs and line breaks around it
+  are stripped, as the facet `whiteSpace` `collapse` does.
+  `xsd:integer(" +01 ")` is `1`, `xsd:double("1e3")` is `1000`, and
+  `xsd:integer("1.50")`, `xsd:integer("abc")` and `xsd:boolean("TRUE")`
+  are errors (err:FORG0001). `xsd:double` reads `INF`, `+INF`, `-INF` and
+  `NaN`, keeps the sign of `-0`, and rounds to the nearest double as
+  literals are read, so `"1e400"` is `INF` and `"1e-400"` is `0`.
+- A string of more than 1000 characters is an error for the numeric
+  datatypes, a limit of the implementation that XPath allows
+  (err:FOCA0003, err:FOCA0006).
+- `xsd:integer` of a double is exact at every magnitude: `xsd:integer(1e20)`
+  is `100000000000000000000`.
+- An error leaves `FILTER` false, also under negation, and `COALESCE`
+  skips it.
+- The result is a literal of the target datatype, written in canonical
+  form in `BIND` and `SELECT` (see [Literals](#literals)): `1`, `1.5`,
+  `1.0E3`.
+
+In SQL, a string is first matched against a regular expression of the
+lexical space, under `COLLATE "C"`, and its length checked. Only then is
+it cast to `numeric`, so a lexical form that is not valid is `NULL` and
+never fails the statement. A string read as a double is converted from
+`numeric` as decimals are, because PostgreSQL's `float8` input raises an
+error for `1e400`, and an exponent of five digits or more gives an
+infinity or a zero. A double becomes an integer through `int8` below 2^63
+in magnitude, and through `int8` and an exact power of two above. A cast
+of a constant is computed before the query is sent.
+
+The following casts are rejected as unsupported:
+
+- `xsd:decimal` of an `xsd:double`. XPath gives the decimal closest to the
+  double among those the implementation can represent, which differs
+  between engines.
+- `xsd:float`, whose values the engine does not have, and casts of
+  derived integer types and `real` columns, as for comparisons.
+- `xsd:string`, `xsd:dateTime` and the other constructor functions.
+- `STR`, `LANG`, `DATATYPE` and `sameTerm` of a cast, whose lexical form
+  SQL does not compute yet, and casts in `ORDER BY` (#108).
+
 `STR` and `DATATYPE` of a column work where its lexical form or natural
 datatype is known in SQL, as for joins. The infinities of `date` and
 `timestamp` are plain literals, so their `DATATYPE` is `xsd:string`.
@@ -738,7 +791,8 @@ differently from engines that extend SPARQL:
 - other functions, `RAND` among them, `EXISTS`, and expressions other
   than terms (variables, constants, arithmetic, `NOW`, and `STR`, `LANG`,
   `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`, `IF`, `COALESCE`, the
-  functions on strings or the functions of dateTimes of them) as operands,
+  functions on strings, the functions of dateTimes or the casts of them)
+  as operands,
   such as a comparison as an argument of `IF`, `COALESCE` or `IN`;
 - `REPLACE` with a pattern whose matches XPath and PostgreSQL can choose
   differently (see above), with a reference to a group after the ninth,
@@ -778,6 +832,9 @@ arithmetic or numeric constants:
 - `YEAR`, `MONTH`, `DAY`, `HOURS` and `MINUTES` give an `xsd:integer`,
   and `SECONDS` an `xsd:decimal`, such as `58.25` or `0`. An infinite
   timestamp leaves `?v` unbound.
+- `xsd:integer`, `xsd:decimal` and `xsd:double` give a number of their
+  datatype, and leave `?v` unbound where the cast is an error, such as
+  `xsd:integer(?name)` for a name that is not an integer.
 - `IF` and `COALESCE` give the number of the argument they choose.
   `COALESCE(?qty / ?n, 0)` is `0` where `?n` is zero or unbound, and
   `IF(?n > 0, ?qty / ?n, 0)` leaves `?v` unbound where `?n` is unbound,
@@ -793,11 +850,12 @@ of the variables of the expression that the group may leave unbound.
 The following are rejected as unsupported:
 
 - expressions other than variables, constants, arithmetic, numeric
-  functions, `STRLEN`, `YEAR` to `SECONDS`, and `IF` and `COALESCE` over
-  arithmetic and numeric constants. `STR`, comparisons, `IN`, `UCASE` and
-  the other functions on strings, `TZ`, `TIMEZONE`, `NOW`, and
-  `COALESCE(?x, 0)`, whose result can be any term, are
-  examples. A computed variable holds only numbers in SQL;
+  functions, `STRLEN`, `YEAR` to `SECONDS`, casts to `xsd:integer`,
+  `xsd:decimal` and `xsd:double`, and `IF` and `COALESCE` over arithmetic
+  and numeric constants. `STR`, comparisons, `IN`, `UCASE` and the other
+  functions on strings, `TZ`, `TIMEZONE`, `NOW`, `xsd:boolean`, and
+  `COALESCE(?x, 0)`, whose result can be any term, are examples. A
+  computed variable holds only numbers in SQL;
 - `BIND` inside `OPTIONAL` or `UNION`;
 - `BIND` over a variable that its group may leave unbound and a later
   part of the pattern binds;

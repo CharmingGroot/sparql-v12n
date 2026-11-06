@@ -5,7 +5,7 @@ use super::{Branch, Env, Scope, Source};
 use oxrdf::{Literal, Term, vocab};
 
 use crate::Error;
-use crate::sparql::{CompareOp, DateTimeFunction, Expression, StrTest};
+use crate::sparql::{Cast, CompareOp, DateTimeFunction, Expression, StrTest};
 use crate::sql::{Condition, Filter, FilterTerm, FilterValue, OrderValue, TermMatch, ValueCases};
 use crate::xpath_regex::{Untranslated, translate, translate_replace};
 use crate::xsd::{self, Num, Value};
@@ -364,6 +364,22 @@ impl<'a> Context<'_, 'a> {
                     term: None,
                 },
             )]),
+            // A constant argument is cast here, and a case whose value is
+            // an error is no case (SPARQL 1.1 §17.5).
+            Expression::Cast(cast, a) => {
+                let mut out = Vec::new();
+                for (guards, leaf) in self.operand(a)? {
+                    let value = match leaf.value {
+                        FilterValue::Constant(term) => match cast_constant(*cast, &term)? {
+                            Some(result) => FilterValue::Constant(result),
+                            None => continue,
+                        },
+                        value => FilterValue::Cast(*cast, Box::new(value)),
+                    };
+                    out.push((guards, Leaf { value, term: None }));
+                }
+                Ok(out)
+            }
             // One case per pair of ways the operands are bound, as for a
             // comparison.
             Expression::Arith(op, a, b) => {
@@ -614,6 +630,26 @@ fn same_term(left: &Leaf<'_>, right: &Leaf<'_>) -> Option<TermMatch> {
         Equality::Never => TermMatch::Never,
         Equality::When(conditions) => TermMatch::When(conditions),
     })
+}
+
+/// `cast` (SPARQL 1.1 §17.5) of a constant; `None` for an error. IRIs
+/// and literals with a language tag cast to none of the supported
+/// datatypes.
+fn cast_constant(cast: Cast, term: &Term) -> Result<Option<Term>, Error> {
+    let Term::Literal(literal) = term else {
+        return Ok(None);
+    };
+    if literal.language().is_some() {
+        return Ok(None);
+    }
+    Ok(
+        xsd::cast(cast, literal.value(), literal.datatype().as_str())
+            .map_err(Error::UnsupportedFeature)?
+            .map(|(lexical, datatype)| {
+                Literal::new_typed_literal(lexical, oxrdf::NamedNode::new_unchecked(datatype))
+                    .into()
+            }),
+    )
 }
 
 /// `function` (SPARQL 1.1 §17.4.5) of a constant, in its own time zone

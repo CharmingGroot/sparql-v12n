@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# An integer as a double: row 1.
+SELECT ?r WHERE { ?r ex:i ?i FILTER(xsd:double(?i) = 7.0e0) }

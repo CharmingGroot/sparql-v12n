@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Canonical doubles, such as 7.0E0 and -3.0E0.
+SELECT ?r (xsd:double(?i) AS ?x) WHERE { ?r ex:i ?i }

@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# COALESCE skips the strings that are not integers: rows 3 to 6.
+SELECT ?r WHERE { ?r ex:s ?s FILTER(COALESCE(xsd:integer(?s), -1) = -1) }

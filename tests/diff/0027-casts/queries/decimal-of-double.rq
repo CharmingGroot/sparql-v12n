@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# xsd:decimal of a double depends on the precision of the decimals
+# of an engine.
+SELECT ?r WHERE { ?r ex:f ?f FILTER(xsd:decimal(?f) = 2.5) }

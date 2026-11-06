@@ -1,0 +1,73 @@
+# xsd:decimal of an xsd:double is the decimal closest to the double that
+# the implementation can represent (XPath F&O 1.0 §17.1.3.3), which
+# differs between engines.
+[query.decimal-of-double]
+expect = "rejected"
+
+# The engine has no xsd:float values.
+[query.float]
+expect = "rejected"
+
+# A computed variable holds only numbers (#100).
+[query.select-boolean]
+expect = "rejected"
+
+# Casts in ORDER BY come with the other expressions there (#108).
+[query.order-by-cast]
+expect = "rejected"
+
+# A cast from a string strips the whitespace around the lexical form, as
+# the whiteSpace facet collapse of the target datatype does (XPath F&O 1.0
+# §17.1.1); Ontop does not, so " +7 " is no integer there. Ontop
+# also casts "1.50", which is not in the lexical space of xsd:integer, to
+# the integer 1, where XPath raises err:FORG0001, and does not accept the
+# sign of "+7" (#107).
+[query.string-integer-whitespace]
+expect = "mismatch"
+issue = 107
+
+[query.string-integer-coalesce]
+expect = "mismatch"
+issue = 107
+
+[query.select-integer]
+expect = "mismatch"
+issue = 107
+
+[query.constant-integer-sign]
+expect = "mismatch"
+issue = 107
+
+# xsd:integer has no bound, and the double 1e20 is the integer
+# 100000000000000000000 (XPath F&O 1.0 §17.1.3.4); Ontop leaves it
+# unbound (#107).
+[query.double-integer-large]
+expect = "mismatch"
+issue = 107
+
+[query.select-integer-of-double]
+expect = "mismatch"
+issue = 107
+
+# Ontop writes the cast of a boolean to a number with a CASE whose
+# condition is text, which PostgreSQL refuses ("argument of CASE/WHEN must
+# be type boolean, not type text"). v12n returns rows 1, 3, 5 and 7 (#107).
+[query.boolean-integer]
+expect = "ontop-error"
+issue = 107
+solutions = 4
+
+# Ontop writes an xsd:double as PostgreSQL's text output (`7`, `1000`) and
+# keeps the scale of a numeric (`1.50`); v12n writes the canonical forms
+# (`7.0E0`, `1.0E3`, `1.5`), as decided in Discussion #35.
+[query.select-double]
+expect = "mismatch"
+issue = 25
+
+[query.select-double-string]
+expect = "mismatch"
+issue = 25
+
+[query.select-decimal]
+expect = "mismatch"
+issue = 25

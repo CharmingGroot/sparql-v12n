@@ -105,6 +105,10 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0024-date-time-functions/order-by-year` | `YEAR` in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0024-date-time-functions/select-tz`, `select-now` | `TZ` and `NOW` as the value of `SELECT`: a computed variable holds only numbers (#100). |
 | `0024-date-time-functions/now-timestamp` | `NOW`, which has a time zone, against a `timestamp`, which has none: their order depends on an implicit time zone (Discussion #57). |
+| `0027-casts/decimal-of-double` | `xsd:decimal` of an `xsd:double`: the decimal closest to the double that the implementation can represent (XPath F&O 1.0 §17.1.3.3), which differs between engines. |
+| `0027-casts/float` | `xsd:float`: the engine has no `xsd:float` values. |
+| `0027-casts/select-boolean` | `xsd:boolean` as the value of `SELECT`: a computed variable holds only numbers (#100). |
+| `0027-casts/order-by-cast` | A cast in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0008-order/distinct-over-hidden` | `ORDER BY` over a variable that `SELECT DISTINCT` does not project: one solution stands for several that the order puts at different places (Discussion #63). |
 | `w3c/R2RMLTC0012e/type-ious` | A self-join on blank nodes from a template over a `float8` column: no SQL computes the canonical `xsd:double` form (Discussion #35). Removing self-joins on keys (#28, V6) would make the comparison unnecessary. |
 
@@ -119,6 +123,10 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0024-date-time-functions/constant-local-hours` | #105 | Ontop gives the hour of a dateTime constant in UTC (`3` for `2024-12-31T22:59:00-05:00`); `fn:hours-from-dateTime` gives the hour in the value's own time zone, `22` (XPath F&O 3.1 §9.5.4). |
 | `0024-date-time-functions/timezone-timestamptz`, `timezone-timestamp-error`, `constant-timezone` (Ontop error) | #105 | Ontop does not support `TIMEZONE`. |
 | `0024-date-time-functions/select-seconds` | #25 | Ontop keeps the scale of the `numeric` that PostgreSQL extracts (`58.250000`); v12n writes the canonical form (`58.25`). |
+| `0027-casts/select-double`, `select-double-string`, `select-decimal` | #25 | Ontop writes a cast to `xsd:double` as PostgreSQL's text output (`7`, `1000`) and a cast to `xsd:decimal` with the scale of the string (`1.50`); v12n writes the canonical forms (`7.0E0`, `1.0E3`, `1.5`). |
+| `0027-casts/string-integer-whitespace`, `string-integer-coalesce`, `select-integer`, `constant-integer-sign` | #107 | Ontop does not strip the whitespace around a lexical form, refuses the sign of `+7` and casts `"1.50"` to the integer 1. A cast from a string strips the whitespace, as the facet `whiteSpace` `collapse` of the target datatype does (XPath F&O 1.0 §17.1.1), and `"1.50"` is not in the lexical space of `xsd:integer`, so its cast is an error (err:FORG0001). |
+| `0027-casts/double-integer-large`, `select-integer-of-double` | #107 | Ontop leaves the cast of the double `1e20` to `xsd:integer` unbound; `xsd:integer` has no bound, and the result is `100000000000000000000` (XPath F&O 1.0 §17.1.3.4). |
+| `0027-casts/boolean-integer` (Ontop error) | #107 | Ontop writes the cast of a boolean to a number with a `CASE` whose condition is text, which PostgreSQL refuses. |
 | `0017-double-arithmetic/filter-nan-not-ordered` | #99 | Ontop compares computed doubles in PostgreSQL, which orders NaN above every number; XPath orders NaN with nothing, so `!(?n * 2 > 0)` holds for a NaN. |
 | `0011-time/time-results`, `time-constant-midnight`, `time-constant-24`, `time-join`, `time-distinct`, `time-key-subject`, `time-order` | #37 | Ontop writes a `time` of `24:00:00` as is and treats it as another term than `00:00:00`; v12n writes the canonical form `00:00:00` for both and treats them as one term, as decided in Discussion #91. |
 | `0012-arithmetic/big-no-overflow`, `0013-bind/big-no-overflow` (Ontop error) | #99 | Ontop adds `bigint` values as `bigint` and fails with "bigint out of range"; `xsd:integer` has no bound, and v12n computes in `numeric`. |

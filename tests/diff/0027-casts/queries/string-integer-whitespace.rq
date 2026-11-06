@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Whitespace around the lexical form is stripped, and a sign is
+# allowed: row 2.
+SELECT ?r WHERE { ?r ex:s ?s FILTER(xsd:integer(?s) = 7) }

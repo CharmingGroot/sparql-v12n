@@ -1055,6 +1055,27 @@ fn filter_strbefore_strafter_encode_for_uri_and_replace() {
     ));
 }
 
+/// A cast of a string matches the lexical form against the lexical space
+/// of the target datatype before PostgreSQL reads it, so an invalid one is
+/// an error and never a failed statement (SPARQL 1.1 §17.5).
+#[test]
+fn filter_casts_of_strings_match_the_lexical_form_first() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?c WHERE { ?c ex:name ?n ; \
+         ex:tier ?t FILTER(xsd:integer(?t) > 1 || xsd:boolean(?n) || xsd:double(?t) = 0) }"
+    ));
+}
+
+/// Casts to numeric datatypes are the value of `BIND` and `SELECT`
+/// expressions, in the result column of their class.
+#[test]
+fn bind_casts_to_numbers() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?o (xsd:decimal(?a) / 3 AS ?d) \
+         (xsd:integer(?a * 1.5e0) AS ?i) (xsd:double(\" 2 \") AS ?x) WHERE { ?o ex:amount ?a }"
+    ));
+}
+
 /// `ABS`, `ROUND`, `CEIL` and `FLOOR` keep the class of their argument:
 /// an integer is its own ceiling, and a decimal rounds halves towards
 /// positive infinity as `floor(x + 0.5)`.

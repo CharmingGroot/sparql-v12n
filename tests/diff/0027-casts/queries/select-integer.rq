@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Canonical integers, unbound for strings that are not integers.
+SELECT ?r (xsd:integer(?s) AS ?n) WHERE { ?r ex:s ?s }

@@ -198,6 +198,9 @@ pub enum Expression {
     /// `REPLACE(arg, pattern, replacement, flags)` (SPARQL 1.1 §17.4.3.15),
     /// with the pattern, the replacement and the flags constants.
     Replace(Box<Expression>, Term, Term, Option<Term>),
+    /// An XPath constructor function (SPARQL 1.1 §17.5), such as
+    /// `xsd:integer(?x)`.
+    Cast(Cast, Box<Expression>),
 }
 
 impl Expression {
@@ -237,7 +240,8 @@ impl Expression {
             | Self::EncodeForUri(a)
             | Self::Replace(a, ..)
             | Self::Numeric(_, a)
-            | Self::DateTime(_, a) => a.collect_variables(out),
+            | Self::DateTime(_, a)
+            | Self::Cast(_, a) => a.collect_variables(out),
             Self::If(c, a, b) => {
                 c.collect_variables(out);
                 a.collect_variables(out);
@@ -278,6 +282,7 @@ impl Expression {
                 | Self::StrAfter(..)
                 | Self::EncodeForUri(_)
                 | Self::Replace(..)
+                | Self::Cast(..)
         )
     }
 }
@@ -356,6 +361,40 @@ impl DateTimeFunction {
     /// `SECONDS`.
     pub fn is_numeric(self) -> bool {
         !matches!(self, Self::Timezone | Self::Tz)
+    }
+}
+
+/// The XPath constructor functions of SPARQL 1.1 §17.5 that the engine
+/// supports: casts to these XML Schema datatypes, following XPath F&O
+/// 1.0 §17.1 (Casting from primitive types to primitive types).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cast {
+    /// `xsd:boolean`.
+    Boolean,
+    /// `xsd:integer`.
+    Integer,
+    /// `xsd:decimal`.
+    Decimal,
+    /// `xsd:double`.
+    Double,
+}
+
+impl Cast {
+    /// The IRI of the target datatype.
+    pub fn datatype(self) -> &'static str {
+        match self {
+            Self::Boolean => "http://www.w3.org/2001/XMLSchema#boolean",
+            Self::Integer => "http://www.w3.org/2001/XMLSchema#integer",
+            Self::Decimal => "http://www.w3.org/2001/XMLSchema#decimal",
+            Self::Double => "http://www.w3.org/2001/XMLSchema#double",
+        }
+    }
+
+    /// The constructor function named `iri`, if the engine supports it.
+    fn of(iri: &str) -> Option<Self> {
+        [Self::Boolean, Self::Integer, Self::Decimal, Self::Double]
+            .into_iter()
+            .find(|cast| cast.datatype() == iri)
     }
 }
 
@@ -800,7 +839,10 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
         | Expression::Arith(..)
         | Expression::Negate(_)
         | Expression::StrLen(_)
-        | Expression::Numeric(..) => return Ok(expression),
+        | Expression::Numeric(..)
+        | Expression::Cast(Cast::Integer | Cast::Decimal | Cast::Double, _) => {
+            return Ok(expression);
+        }
         Expression::DateTime(function, _) if function.is_numeric() => return Ok(expression),
         // The value of a computed variable is a number in SQL, so every
         // result must be one or an error.
@@ -834,6 +876,8 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
         Expression::DateTime(DateTimeFunction::Timezone, _) => "TIMEZONE",
         Expression::DateTime(..) => "TZ",
         Expression::Now => "NOW",
+        // A computed variable holds only numbers in SQL (#100).
+        Expression::Cast(Cast::Boolean, _) => "xsd:boolean",
     };
     Err(unsupported(&format!(
         "{what} as the value of BIND and SELECT expressions"
@@ -849,6 +893,7 @@ fn numeric_results(expression: &Expression) -> bool {
         | Expression::Negate(_)
         | Expression::StrLen(_)
         | Expression::Numeric(..) => true,
+        Expression::Cast(cast, _) => *cast != Cast::Boolean,
         Expression::DateTime(function, _) => function.is_numeric(),
         Expression::Constant(Term::Literal(literal)) => matches!(
             crate::xsd::value(literal.value(), literal.datatype().as_str()),
@@ -1238,6 +1283,11 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
             | Function::Replace),
             args,
         ) => string_function(function, args, site)?,
+        SparqlExpression::FunctionCall(Function::Custom(iri), args)
+            if iri.as_str().starts_with(crate::xsd::XSD) =>
+        {
+            cast(iri, args, site)?
+        }
         SparqlExpression::FunctionCall(function, args) => {
             let [arg] = args.as_slice() else {
                 return Err(match function {
@@ -1358,6 +1408,34 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
             )),
         ),
     })
+}
+
+/// An XPath constructor function (SPARQL 1.1 §17.5) of one term.
+fn cast(iri: &NamedNode, args: &[SparqlExpression], site: Site) -> Result<Expression, Error> {
+    let local = &iri.as_str()[crate::xsd::XSD.len()..];
+    let Some(cast) = Cast::of(iri.as_str()) else {
+        return Err(unsupported(&match local {
+            // The engine has no xsd:float values: comparisons and arithmetic
+            // reject them too.
+            "float" => {
+                "the xsd:float constructor function: xsd:float values are not supported".to_owned()
+            }
+            _ => format!("the xsd:{local} constructor function in {}", site.name()),
+        }));
+    };
+    // Expressions in ORDER BY come with #108.
+    if matches!(site, Site::OrderBy) {
+        return Err(unsupported(&format!(
+            "the xsd:{local} constructor function in {}",
+            site.name()
+        )));
+    }
+    let [arg] = args else {
+        return Err(Error::QuerySyntax(format!(
+            "xsd:{local} takes one argument"
+        )));
+    };
+    Ok(Expression::Cast(cast, operand(arg, site)?))
 }
 
 /// A function on strings (SPARQL 1.1 §17.4.3), whose arguments are terms.
@@ -2254,6 +2332,78 @@ mod tests {
         assert!(matches!(
             parse("SELECT * WHERE { ?e ex:at ?t FILTER(YEAR(?t, ?t) = 1) }"),
             Err(Error::QuerySyntax(_))
+        ));
+    }
+
+    #[test]
+    fn parse_casts() {
+        let q = parse_ok(
+            "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT * WHERE { ?o ex:amount ?a \
+             FILTER(xsd:integer(?a) = xsd:decimal(\"1.5\") && xsd:boolean(xsd:double(?a))) }",
+        );
+        let Pattern::Filter(_, Expression::And(compare, ebv)) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        let Expression::Compare(CompareOp::Equal, integer, decimal) = compare.as_ref() else {
+            panic!("{compare:?}")
+        };
+        assert_eq!(**integer, Expression::Cast(Cast::Integer, variable("a")));
+        assert!(matches!(**decimal, Expression::Cast(Cast::Decimal, _)));
+        assert_eq!(
+            **ebv,
+            Expression::Cast(
+                Cast::Boolean,
+                Box::new(Expression::Cast(Cast::Double, variable("a")))
+            )
+        );
+        assert!(ebv.is_term());
+        assert_eq!(
+            Cast::Double.datatype(),
+            "http://www.w3.org/2001/XMLSchema#double"
+        );
+
+        // Numbers, the value of BIND and SELECT; booleans are not yet.
+        let q = parse_ok(
+            "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?o (xsd:integer(?a) AS ?i) (COALESCE(xsd:double(?a), 0) AS ?d) \
+             WHERE { ?o ex:amount ?a BIND(xsd:decimal(?a) AS ?m) }",
+        );
+        assert_eq!(q.bindings.len(), 3);
+        for (query, reason) in [
+            (
+                "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (xsd:boolean(?a) AS ?b) WHERE { ?o ex:amount ?a }",
+                "xsd:boolean as the value of BIND",
+            ),
+            (
+                "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT * WHERE { ?o ex:amount ?a } ORDER BY xsd:integer(?a)",
+                "xsd:integer constructor function in ORDER BY",
+            ),
+            (
+                "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT * WHERE { ?o ex:amount ?a FILTER(xsd:float(?a) = 1) }",
+                "xsd:float values are not supported",
+            ),
+            (
+                "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT * WHERE { ?o ex:amount ?a FILTER(xsd:string(?a) = \"1\") }",
+                "xsd:string constructor function in FILTER",
+            ),
+            (
+                "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT * WHERE { ?o ex:amount ?a FILTER(xsd:dateTime(?a) = ?a) }",
+                "xsd:dateTime constructor function in FILTER",
+            ),
+            (
+                "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT * WHERE { ?o ex:amount ?a FILTER(xsd:int(?a) = 1) }",
+                "xsd:int constructor function in FILTER",
+            ),
+        ] {
+            match parse_err(query) {
+                Error::UnsupportedFeature(message) => {
+                    assert!(message.contains(reason), "{query}: {message}")
+                }
+                other => panic!("{query}: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            parse_err("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT * WHERE { ?o ex:amount ?a FILTER(xsd:integer(?a, ?a) = 1) }"),
+            Error::QuerySyntax(message) if message == "xsd:integer takes one argument"
         ));
     }
 
