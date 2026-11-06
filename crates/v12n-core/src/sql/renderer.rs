@@ -363,6 +363,8 @@ pub(super) struct Renderer<'a> {
     pub(super) options: RenderOptions<'a>,
     /// Logical tables of the branch being rendered.
     pub(super) from: &'a [LogicalTable],
+    /// The branch being rendered, whose `EXISTS` parts a filter reads.
+    branch: Option<&'a SqlBranch>,
     /// For each table of the branch being rendered, the row it reads
     /// when it is the table of an `OPTIONAL` part that reads a row of its
     /// left side.
@@ -394,6 +396,7 @@ impl<'a> Renderer<'a> {
             units: 0,
             options,
             from: &[],
+            branch: None,
             row_of: Vec::new(),
         }
     }
@@ -433,6 +436,7 @@ impl<'a> Renderer<'a> {
         distinct: bool,
     ) -> Result<(), Error> {
         self.from = &branch.from;
+        self.branch = Some(branch);
         // Constants of the select list are strings of terms, never
         // compared, so binding one cannot empty the branch.
         self.required = false;
@@ -614,7 +618,8 @@ impl<'a> Renderer<'a> {
     /// rather than a nested part: a condition on a nested part's columns
     /// (its variables being unbound, or compatible) filters the rows of
     /// `scope` after the left join and must not decide whether the part
-    /// matches.
+    /// matches. The parts of `EXISTS` are not joined: a filter reads them
+    /// (see [`exists`](Self::exists)).
     fn join_tree(
         &mut self,
         branch: &'a SqlBranch,
@@ -637,6 +642,10 @@ impl<'a> Renderer<'a> {
                     j.parent == scope && j.tables.start == t && !j.tables.is_empty()
                 });
             let end = match nested {
+                Some((_, join)) if join.exists => {
+                    t = join.tables.end;
+                    continue;
+                }
                 Some((j, join)) => {
                     members.push(Member::Part(j));
                     join.tables.end
@@ -658,11 +667,16 @@ impl<'a> Renderer<'a> {
             let tables = condition_tables(condition);
             let owners: Option<BTreeSet<usize>> =
                 tables.iter().map(|&table| member_of[table]).collect();
+            // An `EXISTS` subquery may read any table of the scope, which
+            // the `ON` clause of an earlier one cannot.
+            let exists = matches!(condition, Condition::Filter(f) if f.has_exists());
             match owners
                 .as_ref()
                 .and_then(|o| o.last().map(|&m| (o.len(), m)))
             {
-                Some((n, last)) if n > 1 && matches!(members[last], Member::Table(_)) => {
+                Some((n, last))
+                    if n > 1 && !exists && matches!(members[last], Member::Table(_)) =>
+                {
                     on[last].push(condition)
                 }
                 _ => rest.push(condition),
@@ -716,6 +730,43 @@ impl<'a> Renderer<'a> {
             }
         }
         Ok(rest)
+    }
+
+    /// `EXISTS` (SPARQL 1.1 §17.4.1.4) over `parts`: one correlated
+    /// `EXISTS (SELECT 1 FROM … WHERE …)` subquery per part, any of which
+    /// has a row. Its conditions read the tables of the rows filtered,
+    /// which every scope the filter can be in has joined.
+    pub(super) fn exists(&mut self, parts: &[usize]) -> Result<(), Error> {
+        let branch = self
+            .branch
+            .expect("EXISTS is rendered in the conditions of a branch");
+        if parts.is_empty() {
+            self.sql.push_str("false");
+            return Ok(());
+        }
+        // A constant that binds to NULL makes a part match nothing, which
+        // never empties the branch.
+        let required = std::mem::replace(&mut self.required, false);
+        if parts.len() > 1 {
+            self.sql.push('(');
+        }
+        for (i, &part) in parts.iter().enumerate() {
+            if i > 0 {
+                self.sql.push_str(" OR ");
+            }
+            self.sql.push_str("EXISTS (SELECT 1 FROM ");
+            let rest = self.join_tree(branch, Some(part))?;
+            if !rest.is_empty() {
+                self.sql.push_str(" WHERE ");
+                self.conditions(&rest)?;
+            }
+            self.sql.push(')');
+        }
+        if parts.len() > 1 {
+            self.sql.push(')');
+        }
+        self.required = required;
+        Ok(())
     }
 
     pub(super) fn conditions(&mut self, conditions: &[&Condition]) -> Result<(), Error> {
@@ -1179,7 +1230,7 @@ fn lexical_sql(dialect: &dyn Dialect, column: &str, lexical: Lexical) -> String 
 fn joins_one_table(branch: &SqlBranch, part: usize) -> bool {
     let mut tables = branch.left_joins[part].tables.len();
     for nested in branch.left_joins.iter().filter(|j| j.parent == Some(part)) {
-        if nested.same_row.is_none() {
+        if nested.same_row.is_none() && !nested.exists {
             return false;
         }
         tables -= nested.tables.len();

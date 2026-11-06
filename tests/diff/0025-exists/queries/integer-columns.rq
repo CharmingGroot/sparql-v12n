@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# smallint and integer values are xsd:integer terms of one lexical form.
+SELECT ?o ?v WHERE { ?o ex:amount ?v FILTER EXISTS { ?p ex:score ?v } }

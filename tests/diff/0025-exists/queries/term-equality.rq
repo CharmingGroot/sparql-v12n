@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# The string "3" is not the integer 3.
+SELECT ?p ?v WHERE { ?p ex:code ?v FILTER EXISTS { ?o ex:amount ?v } }

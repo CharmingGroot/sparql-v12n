@@ -147,7 +147,9 @@ pub enum ValueKind {
 /// a variable bound only by it is then unbound. The right side of a
 /// `MINUS` is a part as well, with a condition of the branch that one of
 /// its columns `IS NULL`, so only the rows it does not extend are kept
-/// (SPARQL 1.1 §18.5, Minus).
+/// (SPARQL 1.1 §18.5, Minus). So is the pattern of an `EXISTS`, which
+/// [`exists`](Self::exists) marks: it is not joined, and a
+/// [`Filter::Exists`] reads it as a correlated subquery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeftJoin {
     /// The tables of the part, those nested in it included: aliases
@@ -164,6 +166,13 @@ pub struct LeftJoin {
     /// Set when the part can only match one row of a table of its left
     /// side, which it then reads instead of joining.
     pub same_row: Option<SameRow>,
+    /// The part is the pattern of an `EXISTS` (SPARQL 1.1 §8.1): rendered
+    /// as `EXISTS (SELECT 1 FROM tables WHERE conditions)` where a
+    /// [`Filter::Exists`] reads it, never joined, so it adds no rows and
+    /// its columns are read nowhere else. Its conditions compare the
+    /// variables of the current solution with the terms of its tables,
+    /// which correlates the subquery with the rows filtered.
+    pub exists: bool,
 }
 
 /// How an `OPTIONAL` part reads a row of its left side: its one table of
@@ -339,6 +348,10 @@ pub enum Filter {
         text: FilterValue,
         pattern: String,
     },
+    /// `EXISTS` (SPARQL 1.1 §17.4.1.4): whether one of these parts, indices
+    /// into [`SqlBranch::left_joins`] marked [`LeftJoin::exists`], has a
+    /// row; `false` for none. Never an error.
+    Exists(Vec<usize>),
 }
 
 /// An RDF term in a `FILTER` expression, bound in every row where it is
@@ -445,7 +458,8 @@ impl Filter {
             }
         }
         match self {
-            Self::Constant(_) => {}
+            // The conditions of the parts belong to the parts.
+            Self::Constant(_) | Self::Exists(_) => {}
             Self::And(a, b) | Self::Or(a, b) => {
                 a.visit(f);
                 b.visit(f);
@@ -488,7 +502,7 @@ impl Filter {
             }
         }
         match self {
-            Self::Constant(_) => {}
+            Self::Constant(_) | Self::Exists(_) => {}
             Self::And(a, b) | Self::Or(a, b) => {
                 a.visit_mut(f);
                 b.visit_mut(f);
@@ -521,6 +535,24 @@ impl Filter {
             Self::Test(_, v) | Self::Ebv(v) | Self::NoError(v) | Self::Regex { text: v, .. } => {
                 value(v, f)
             }
+        }
+    }
+
+    /// Whether a [`Filter::Exists`] is inside, outside conditions.
+    pub(super) fn has_exists(&self) -> bool {
+        match self {
+            Self::Exists(_) => true,
+            Self::And(a, b) | Self::Or(a, b) => a.has_exists() || b.has_exists(),
+            Self::Not(a) => a.has_exists(),
+            Self::Cases(cases) => cases.iter().any(|(_, filter)| filter.has_exists()),
+            Self::Constant(_)
+            | Self::Any(_)
+            | Self::Compare { .. }
+            | Self::SameTerm { .. }
+            | Self::Test(..)
+            | Self::Ebv(_)
+            | Self::NoError(_)
+            | Self::Regex { .. } => false,
         }
     }
 

@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+
+# SPARQL 1.1 §8.3.3: unlike MINUS, the FILTER inside NOT EXISTS sees ?s,
+# whose value is substituted, and removes the people with an order larger
+# than their score.
+SELECT ?p ?s WHERE { ?p ex:score ?s FILTER NOT EXISTS { ?o ex:buyer ?p ; ex:amount ?a FILTER(?a > ?s) } }

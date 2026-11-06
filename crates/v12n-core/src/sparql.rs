@@ -169,6 +169,11 @@ pub enum Expression {
     /// e2) || …` and false for an empty list. `NOT IN` is its negation
     /// (§17.4.1.10).
     In(Box<Expression>, Vec<Expression>),
+    /// `EXISTS { P }` (SPARQL 1.1 §8.1, §17.4.1.4): whether `P` has a
+    /// solution once the variables of the current solution are replaced
+    /// by their values (substitution, §18.6). Never an error, and it binds
+    /// no variable. `NOT EXISTS` is its negation.
+    Exists(Box<Pattern>),
 }
 
 impl Expression {
@@ -208,6 +213,48 @@ impl Expression {
             Self::In(a, list) => {
                 a.collect_variables(out);
                 list.iter().for_each(|b| b.collect_variables(out));
+            }
+            Self::Exists(pattern) => out.extend(pattern.mentioned_variables()),
+        }
+    }
+
+    /// The patterns of the `EXISTS` and `NOT EXISTS` in the expression, in
+    /// the order they are written.
+    pub(crate) fn exists_patterns(&self) -> Vec<&Pattern> {
+        let mut out = Vec::new();
+        self.collect_exists(&mut out);
+        out
+    }
+
+    fn collect_exists<'e>(&'e self, out: &mut Vec<&'e Pattern>) {
+        match self {
+            Self::Exists(pattern) => out.push(pattern),
+            Self::Constant(_) | Self::Variable(_) | Self::Bound(_) => {}
+            Self::Or(a, b)
+            | Self::And(a, b)
+            | Self::Compare(_, a, b)
+            | Self::SameTerm(a, b)
+            | Self::Arith(_, a, b) => {
+                a.collect_exists(out);
+                b.collect_exists(out);
+            }
+            Self::Not(a)
+            | Self::Test(_, a)
+            | Self::Str(a)
+            | Self::Lang(a)
+            | Self::Datatype(a)
+            | Self::Regex(a, _, _)
+            | Self::Negate(a)
+            | Self::Numeric(_, a) => a.collect_exists(out),
+            Self::If(c, a, b) => {
+                c.collect_exists(out);
+                a.collect_exists(out);
+                b.collect_exists(out);
+            }
+            Self::Coalesce(args) => args.iter().for_each(|a| a.collect_exists(out)),
+            Self::In(a, list) => {
+                a.collect_exists(out);
+                list.iter().for_each(|b| b.collect_exists(out));
             }
         }
     }
@@ -455,6 +502,39 @@ impl Pattern {
         }
     }
 
+    /// Every variable the pattern mentions, in its triple patterns and its
+    /// `FILTER` expressions, those of `EXISTS` included.
+    pub(crate) fn mentioned_variables(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .triple_patterns()
+            .into_iter()
+            .flat_map(TriplePattern::variables)
+            .collect();
+        out.extend(self.filter_variables());
+        out
+    }
+
+    /// Whether a `FILTER` expression of the pattern, or of an `OPTIONAL`
+    /// in it, holds `EXISTS` or `NOT EXISTS`.
+    fn has_exists(&self) -> bool {
+        match self {
+            Self::Bgp(_) => false,
+            Self::Join(left, right) | Self::Union(left, right) | Self::Minus(left, right) => {
+                left.has_exists() || right.has_exists()
+            }
+            Self::LeftJoin(left, right, expression) => {
+                left.has_exists()
+                    || right.has_exists()
+                    || expression
+                        .as_ref()
+                        .is_some_and(|e| !e.exists_patterns().is_empty())
+            }
+            Self::Filter(inner, expression) => {
+                inner.has_exists() || !expression.exists_patterns().is_empty()
+            }
+        }
+    }
+
     /// Number of `LeftJoin` and `Minus` nodes in the pattern. The right
     /// side of each is a `LEFT JOIN` when unfolded.
     pub fn left_joins(&self) -> usize {
@@ -671,11 +751,13 @@ fn check_extends(
 /// Where a group is written, for the `BIND`s it may hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Place {
-    /// Outside `OPTIONAL`, `UNION` and the right side of `MINUS`.
+    /// Outside `OPTIONAL`, `UNION`, the right side of `MINUS` and the
+    /// pattern of `EXISTS`.
     Required,
     Optional,
     Union,
     Minus,
+    Exists,
 }
 
 impl Place {
@@ -686,6 +768,7 @@ impl Place {
             Self::Optional => "OPTIONAL",
             Self::Union => "UNION",
             Self::Minus => "MINUS",
+            Self::Exists => "EXISTS",
         }
     }
 }
@@ -716,6 +799,7 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
             "IF and COALESCE with a result other than arithmetic or a numeric constant"
         }
         Expression::In(..) => "IN and NOT IN",
+        Expression::Exists(_) => "EXISTS and NOT EXISTS",
         Expression::Or(..) | Expression::And(..) | Expression::Not(_) => "logical operators",
         Expression::Compare(..) | Expression::SameTerm(..) => "comparisons",
         Expression::Bound(_) => "BOUND",
@@ -866,6 +950,9 @@ fn group(
             }
             let left = nested(left, place)?;
             let right = nested(right, Place::Minus)?;
+            if right.has_exists() {
+                return Err(unsupported("EXISTS and NOT EXISTS inside MINUS"));
+            }
             Ok(Pattern::Minus(Box::new(left), Box::new(right)))
         }
         other => Err(unsupported(describe(other))),
@@ -1119,7 +1206,11 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
             }));
         }
         SparqlExpression::If(condition, a, b) => {
-            Expression::If(boxed(condition)?, operand(a)?, operand(b)?)
+            let condition = boxed(condition)?;
+            if !condition.exists_patterns().is_empty() {
+                return Err(unsupported("EXISTS and NOT EXISTS inside IF"));
+            }
+            Expression::If(condition, operand(a)?, operand(b)?)
         }
         SparqlExpression::Coalesce(args) => Expression::Coalesce(
             args.iter()
@@ -1132,7 +1223,10 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
                 .map(|b| operand(b).map(|b| *b))
                 .collect::<Result<_, _>>()?,
         ),
-        SparqlExpression::Exists(_) => return Err(unsupported("EXISTS and NOT EXISTS")),
+        SparqlExpression::Exists(pattern) => match site {
+            Site::Filter => Expression::Exists(Box::new(exists_pattern(pattern)?)),
+            Site::OrderBy | Site::Bind => return Err(in_site("EXISTS and NOT EXISTS")),
+        },
         SparqlExpression::UnaryMinus(inner) | SparqlExpression::UnaryPlus(inner)
             if numeric_literal(inner).is_some() =>
         {
@@ -1181,6 +1275,23 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
             )),
         ),
     })
+}
+
+/// The pattern of an `EXISTS`, or an error for one that unfolding cannot
+/// evaluate with substitution (SPARQL 1.1 §18.6). `BIND`, `VALUES` and
+/// `MINUS` inside it are rejected with [`Place::Exists`]: the first two are
+/// computed for the whole query, and substitution would also replace the
+/// variables of the right side of `MINUS`, which are evaluated on their own
+/// (§8.3.3).
+fn exists_pattern(pattern: &GraphPattern) -> Result<Pattern, Error> {
+    let pattern = group(pattern, Place::Exists, &mut Vec::new(), &mut Vec::new())?;
+    if pattern.has_exists() {
+        return Err(unsupported("EXISTS and NOT EXISTS inside EXISTS"));
+    }
+    if pattern.triple_patterns().is_empty() {
+        return Err(unsupported("EXISTS over a pattern without triple patterns"));
+    }
+    Ok(pattern)
 }
 
 /// A literal of a numeric datatype the grammar produces, `-3` being the
@@ -1486,6 +1597,47 @@ mod tests {
              MINUS { ?x ex:tier ?t } }",
         );
         assert_eq!(q.bindings.len(), 1);
+    }
+
+    #[test]
+    fn parse_exists_is_an_expression_of_its_pattern() {
+        let q = parse_ok(
+            "SELECT ?c WHERE { ?c ex:name ?n \
+             FILTER(!EXISTS { ?o ex:placedBy ?c FILTER(?n != \"Kim\") } || ?n = \"Lee\") }",
+        );
+        let Pattern::Filter(inner, filter) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        assert_eq!(**inner, bgp(&[("c", "name", "n")]));
+        let Expression::Or(left, _) = filter else {
+            panic!("{filter:?}")
+        };
+        let Expression::Not(exists) = left.as_ref() else {
+            panic!("{left:?}")
+        };
+        let Expression::Exists(pattern) = exists.as_ref() else {
+            panic!("{exists:?}")
+        };
+        assert!(
+            matches!(&**pattern, Pattern::Filter(p, _) if **p == bgp(&[("o", "placedBy", "c")]))
+        );
+        assert_eq!(filter.exists_patterns(), [pattern.as_ref()]);
+        // The variables of the pattern count as variables of the filter,
+        // and its triple patterns as none of the query.
+        assert_eq!(filter.variables(), ["o", "c", "n", "n"]);
+        assert_eq!(q.pattern.triple_patterns().len(), 1);
+        assert_eq!(q.pattern.left_joins(), 0);
+
+        // OPTIONAL and UNION inside EXISTS, and EXISTS in the FILTER of
+        // OPTIONAL.
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t \
+             FILTER EXISTS { { ?o ex:placedBy ?c } UNION { ?o ex:amount ?t OPTIONAL { ?o ex:x ?y } } } } }",
+        );
+        let Pattern::LeftJoin(_, _, Some(Expression::Exists(pattern))) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        assert!(matches!(&**pattern, Pattern::Union(..)));
     }
 
     #[test]
@@ -1940,10 +2092,6 @@ mod tests {
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(REGEX(?t, ?t)) }",
                 "REGEX with a pattern or flags that are not constants",
             ),
-            (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER EXISTS { ?c ex:name ?n } }",
-                "EXISTS",
-            ),
             ("SELECT * WHERE { ?c ?p ?o }", "variable predicates"),
             (
                 "CONSTRUCT { ?c ex:label ?n } WHERE { ?c ex:name ?n }",
@@ -2044,6 +2192,59 @@ mod tests {
             (
                 "SELECT * WHERE { MINUS { ?c ex:name ?n } }",
                 "empty graph patterns",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n } ORDER BY ASC(EXISTS { ?c ex:tier ?t })",
+                "EXISTS and NOT EXISTS in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n BIND(EXISTS { ?c ex:tier ?t } AS ?x) }",
+                "EXISTS and NOT EXISTS in BIND and SELECT expressions",
+            ),
+            (
+                "SELECT (NOT EXISTS { ?c ex:tier ?t } AS ?x) WHERE { ?c ex:name ?n }",
+                "EXISTS and NOT EXISTS in BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER EXISTS { ?c ex:tier ?t MINUS { ?c ex:city ?y } } }",
+                "MINUS inside EXISTS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER EXISTS { ?c ex:tier ?t BIND(?t AS ?u) } }",
+                "BIND inside EXISTS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER EXISTS { ?c ex:tier ?t VALUES ?t { \"VIP\" } } }",
+                "VALUES inside EXISTS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER EXISTS { { SELECT ?c WHERE { ?c ex:tier ?t } } } }",
+                "subqueries",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n \
+                 FILTER EXISTS { ?c ex:tier ?t FILTER NOT EXISTS { ?c ex:city ?y } } }",
+                "EXISTS and NOT EXISTS inside EXISTS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n MINUS { ?c ex:tier ?t FILTER EXISTS { ?c ex:city ?y } } }",
+                "EXISTS and NOT EXISTS inside MINUS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER(IF(EXISTS { ?c ex:tier ?t }, ?n, \"\") = ?n) }",
+                "EXISTS and NOT EXISTS inside IF",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER EXISTS { FILTER(?n = \"Kim\") } }",
+                "EXISTS over a pattern without triple patterns",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n BIND(?n AS ?m) FILTER EXISTS { ?d ex:name ?m } }",
+                "FILTER over ?m, which BIND or SELECT computes",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER(EXISTS { ?c ex:tier ?t } = true) }",
+                "expressions other than terms",
             ),
         ];
         for (query, feature) in cases {

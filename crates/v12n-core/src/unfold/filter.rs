@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `FILTER` expressions over the terms a branch binds.
 
-use super::{Branch, Env, Scope, Source};
+use super::{Branch, Env, Exists, Scope, Source};
 use oxrdf::Term;
 
 use crate::Error;
@@ -28,17 +28,20 @@ struct Leaf<'a> {
 impl<'a> Branch<'a> {
     /// The filter `expression` over the variables of `env`. Sources in
     /// the `certain` scopes are bound wherever the filter is evaluated;
-    /// any other source only where its `OPTIONAL` part matched.
+    /// any other source only where its `OPTIONAL` part matched. `exists`
+    /// holds the parts of each `EXISTS` in it (see [`Branch::exists`]).
     pub(super) fn filter(
         &self,
         expression: &'a Expression,
         env: &Env<'a>,
         certain: &[Scope],
+        exists: &[Exists<'a>],
     ) -> Result<Filter, Error> {
         Context {
             branch: self,
             env,
             certain,
+            exists,
         }
         .boolean(expression)
     }
@@ -50,6 +53,7 @@ impl<'a> Branch<'a> {
             branch: self,
             env: &self.env,
             certain: &[None],
+            exists: &[],
         };
         if !expression.is_term() {
             return Ok(OrderValue::Boolean(Box::new(context.boolean(expression)?)));
@@ -70,6 +74,7 @@ impl<'a> Branch<'a> {
             branch: self,
             env: &self.env,
             certain: &[None],
+            exists: &[],
         };
         Ok(context
             .operand(expression)?
@@ -92,6 +97,7 @@ struct Context<'c, 'a> {
     branch: &'c Branch<'a>,
     env: &'c Env<'a>,
     certain: &'c [Scope],
+    exists: &'c [Exists<'a>],
 }
 
 impl<'a> Context<'_, 'a> {
@@ -123,6 +129,16 @@ impl<'a> Context<'_, 'a> {
                 same_term: same_term(l, r),
             })?,
             Expression::Bound(variable) => self.bound(variable)?,
+            Expression::Exists(pattern) => {
+                let (_, parts) = self
+                    .exists
+                    .iter()
+                    .find(|(p, _)| std::ptr::eq(*p, pattern.as_ref()))
+                    .ok_or_else(|| {
+                        Error::UnsupportedFeature("EXISTS and NOT EXISTS outside FILTER".to_owned())
+                    })?;
+                Filter::Exists(parts.clone())
+            }
             Expression::Test(test, a) => {
                 self.unary(a, |leaf| Filter::Test(*test, leaf.value.clone()))?
             }
@@ -314,7 +330,16 @@ impl<'a> Context<'_, 'a> {
     /// which matched. Bound sources of one row are the same term.
     fn operand_of(&self, variable: &str) -> Result<Vec<Bound<'a>>, Error> {
         let Some((_, sources)) = self.env.iter().find(|(v, _)| *v == variable) else {
-            return Ok(Vec::new());
+            // Inside the pattern of an `EXISTS`, the value substituted for
+            // a variable of the current solution (SPARQL 1.1 §18.6).
+            return Ok(self
+                .branch
+                .outer
+                .iter()
+                .find(|(v, _)| *v == variable)
+                .map(|(_, sources)| (None, sources[0].term))
+                .into_iter()
+                .collect());
         };
         if let Some(source) = sources.iter().find(|s| self.certain.contains(&s.scope)) {
             return Ok(vec![(None, source.term)]);

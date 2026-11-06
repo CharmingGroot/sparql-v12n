@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# The people with an order.
+SELECT ?p ?n WHERE { ?p ex:name ?n FILTER EXISTS { ?o ex:buyer ?p } }
