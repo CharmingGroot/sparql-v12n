@@ -5,9 +5,9 @@ use super::{Branch, Env, Scope, Source};
 use oxrdf::{Literal, Term, vocab};
 
 use crate::Error;
-use crate::sparql::{CompareOp, DateTimeFunction, Expression};
+use crate::sparql::{CompareOp, DateTimeFunction, Expression, StrTest};
 use crate::sql::{Condition, Filter, FilterTerm, FilterValue, OrderValue, TermMatch, ValueCases};
-use crate::xpath_regex::{Untranslated, translate};
+use crate::xpath_regex::{Untranslated, translate, translate_replace};
 use crate::xsd::{self, Num, Value};
 
 use super::term::{Equality, TermExpr, TermValue, term_eq};
@@ -135,12 +135,6 @@ impl<'a> Context<'_, 'a> {
             Expression::Regex(text, pattern, flags) => {
                 // The pattern and the flags are simple literals (SPARQL 1.1
                 // §17.4.3.14); anything else is a type error.
-                let simple = |term: &Term| match term {
-                    Term::Literal(l) if l.datatype().as_str() == XSD_STRING => {
-                        Some(l.value().to_owned())
-                    }
-                    _ => None,
-                };
                 let flags = match flags {
                     Some(flags) => simple(flags),
                     None => Some(String::new()),
@@ -251,6 +245,91 @@ impl<'a> Context<'_, 'a> {
                         (guards, Leaf { value, term: None })
                     })
                     .collect())
+            }
+            Expression::EncodeForUri(a) => derived(a, FilterValue::EncodeForUri),
+            Expression::Replace(a, pattern, replacement, flags) => {
+                // The pattern, the replacement and the flags are simple
+                // literals (SPARQL 1.1 §17.4.3.15); anything else is a type
+                // error, and so are an invalid pattern, replacement or flags,
+                // and a pattern that matches the empty string (F&O 3.1
+                // §5.6.4).
+                let flags = match flags {
+                    Some(flags) => simple(flags),
+                    None => Some(String::new()),
+                };
+                let (Some(pattern), Some(replacement), Some(flags)) =
+                    (simple(pattern), simple(replacement), flags)
+                else {
+                    return Ok(Vec::new());
+                };
+                let translated = match translate_replace(&pattern, &flags, &replacement) {
+                    Ok(translated) => translated,
+                    Err(Untranslated::Invalid) => return Ok(Vec::new()),
+                    Err(Untranslated::Unsupported(reason)) => {
+                        return Err(Error::UnsupportedFeature(reason));
+                    }
+                };
+                Ok(self
+                    .operand(a)?
+                    .into_iter()
+                    .map(|(guards, leaf)| {
+                        let value = FilterValue::Replace {
+                            text: Box::new(leaf.value),
+                            pattern: translated.pattern.clone(),
+                            replacement: translated.replacement.clone(),
+                        };
+                        (guards, Leaf { value, term: None })
+                    })
+                    .collect())
+            }
+            // Without the second string in the first, the result is a
+            // simple literal, whatever the language tag of the first
+            // (SPARQL 1.1 §17.4.3.9, §17.4.3.10). Where the first can have
+            // one, the cases tell the two apart by CONTAINS, which is an
+            // error for arguments that are not compatible.
+            Expression::StrBefore(a, b) | Expression::StrAfter(a, b) => {
+                let right = self.operand(b)?;
+                let mut out = Vec::new();
+                for (left_guards, left) in self.operand(a)? {
+                    for (right_guards, right) in &right {
+                        let guards: Vec<Condition> =
+                            left_guards.iter().chain(right_guards).cloned().collect();
+                        let (text, search) = (left.value.clone(), right.value.clone());
+                        let value = match expression {
+                            Expression::StrBefore(..) => FilterValue::StrBefore(
+                                Box::new(text.clone()),
+                                Box::new(search.clone()),
+                            ),
+                            _ => FilterValue::StrAfter(
+                                Box::new(text.clone()),
+                                Box::new(search.clone()),
+                            ),
+                        };
+                        if !may_have_language(&text) {
+                            out.push((guards, Leaf { value, term: None }));
+                            continue;
+                        }
+                        let found = Filter::StrTest {
+                            test: StrTest::Contains,
+                            text,
+                            search,
+                        };
+                        let mut found_guards = guards.clone();
+                        found_guards.push(Condition::Filter(found.clone()));
+                        out.push((found_guards, Leaf { value, term: None }));
+                        let mut missing_guards = guards;
+                        missing_guards.push(Condition::Filter(Filter::Not(Box::new(found))));
+                        let empty = FilterValue::Constant(Literal::new_simple_literal("").into());
+                        out.push((
+                            missing_guards,
+                            Leaf {
+                                value: empty,
+                                term: None,
+                            },
+                        ));
+                    }
+                }
+                Ok(out)
             }
             Expression::Numeric(function, a) => Ok(self
                 .operand(a)?
@@ -467,6 +546,30 @@ fn substr_integer(term: &Term) -> Result<Option<i128>, Error> {
             literal.datatype().as_str()
         ))),
         _ => Ok(None),
+    }
+}
+
+/// The lexical form of a simple literal; `None` for any other term.
+fn simple(term: &Term) -> Option<String> {
+    match term {
+        Term::Literal(l) if l.datatype().as_str() == XSD_STRING => Some(l.value().to_owned()),
+        _ => None,
+    }
+}
+
+/// Whether `value` can be a literal with a language tag.
+fn may_have_language(value: &FilterValue) -> bool {
+    match value {
+        FilterValue::Term(term) => term.language.is_some(),
+        FilterValue::Constant(Term::Literal(literal)) => literal.language().is_some(),
+        FilterValue::Substr { text, .. }
+        | FilterValue::UCase(text)
+        | FilterValue::LCase(text)
+        | FilterValue::Replace { text, .. }
+        | FilterValue::StrBefore(text, _)
+        | FilterValue::StrAfter(text, _) => may_have_language(text),
+        FilterValue::Concat(args) => !args.is_empty() && args.iter().all(may_have_language),
+        _ => false,
     }
 }
 

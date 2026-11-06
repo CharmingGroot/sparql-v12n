@@ -395,6 +395,21 @@ pub enum FilterValue {
     LCase(Box<FilterValue>),
     /// `CONCAT` (SPARQL 1.1 §17.4.3.12).
     Concat(Vec<FilterValue>),
+    /// `STRBEFORE` (SPARQL 1.1 §17.4.3.9): the characters before the
+    /// first occurrence of the second string, `""` without one.
+    StrBefore(Box<FilterValue>, Box<FilterValue>),
+    /// `STRAFTER` (SPARQL 1.1 §17.4.3.10): the characters after the first
+    /// occurrence of the second string, `""` without one.
+    StrAfter(Box<FilterValue>, Box<FilterValue>),
+    /// `ENCODE_FOR_URI` (SPARQL 1.1 §17.4.3.11).
+    EncodeForUri(Box<FilterValue>),
+    /// `REPLACE` (SPARQL 1.1 §17.4.3.15), with the XPath pattern, flags
+    /// and replacement already written for PostgreSQL's `regexp_replace`.
+    Replace {
+        text: Box<FilterValue>,
+        pattern: String,
+        replacement: String,
+    },
 }
 
 impl FilterValue {
@@ -411,9 +426,11 @@ impl FilterValue {
             | Self::Substr { text: v, .. }
             | Self::UCase(v)
             | Self::LCase(v)
+            | Self::EncodeForUri(v)
+            | Self::Replace { text: v, .. }
             | Self::Numeric(_, v)
             | Self::DateTime(_, v) => v.terms(),
-            Self::Arith(_, a, b) => {
+            Self::Arith(_, a, b) | Self::StrBefore(a, b) | Self::StrAfter(a, b) => {
                 let mut terms = a.terms();
                 terms.extend(b.terms());
                 terms
@@ -434,9 +451,11 @@ impl FilterValue {
             | Self::Substr { text: v, .. }
             | Self::UCase(v)
             | Self::LCase(v)
+            | Self::EncodeForUri(v)
+            | Self::Replace { text: v, .. }
             | Self::Numeric(_, v)
             | Self::DateTime(_, v) => v.terms_mut(),
-            Self::Arith(_, a, b) => {
+            Self::Arith(_, a, b) | Self::StrBefore(a, b) | Self::StrAfter(a, b) => {
                 let mut terms = a.terms_mut();
                 terms.extend(b.terms_mut());
                 terms

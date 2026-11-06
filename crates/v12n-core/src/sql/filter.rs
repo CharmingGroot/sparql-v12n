@@ -377,7 +377,10 @@ impl<'a> Renderer<'a> {
                     kind => self.string_error(value, kind),
                 };
             }
-            FilterValue::Substr { text: a, .. } | FilterValue::UCase(a) | FilterValue::LCase(a) => {
+            FilterValue::Substr { text: a, .. }
+            | FilterValue::UCase(a)
+            | FilterValue::LCase(a)
+            | FilterValue::Replace { text: a, .. } => {
                 return match string_argument(&self.operand(a)) {
                     kind @ (Kind::String | Kind::Lang(_)) => Operand {
                         kind,
@@ -385,6 +388,38 @@ impl<'a> Renderer<'a> {
                         ..operand
                     },
                     kind => self.string_error(value, kind),
+                };
+            }
+            // A simple literal (SPARQL 1.1 §17.4.3.11).
+            FilterValue::EncodeForUri(a) => {
+                return match string_argument(&self.operand(a)) {
+                    Kind::String | Kind::Lang(_) => Operand {
+                        kind: Kind::String,
+                        text: Text::Computed(value),
+                        ..operand
+                    },
+                    kind => self.string_error(value, kind),
+                };
+            }
+            // The kind of the first argument; the cases of the value give
+            // the simple literal "" where the second is not in the first.
+            FilterValue::StrBefore(a, b) | FilterValue::StrAfter(a, b) => {
+                let (text, search) = (
+                    string_argument(&self.operand(a)),
+                    string_argument(&self.operand(b)),
+                );
+                for kind in [&text, &search] {
+                    if let Kind::Unsupported(_) = kind {
+                        return self.string_error(value, kind.clone());
+                    }
+                }
+                if !compatible(&text, &search) {
+                    return self.string_error(value, Kind::Error);
+                }
+                return Operand {
+                    kind: text,
+                    text: Text::Computed(value),
+                    ..operand
                 };
             }
             // A language tag where all arguments have the same one; a
@@ -1489,6 +1524,58 @@ impl<'a> Renderer<'a> {
                     self.argument_text(arg)?;
                 }
                 self.sql.push(')');
+            }
+            FilterValue::EncodeForUri(a) => {
+                let start = self.sql.len();
+                self.sql.push('(');
+                self.argument_text(a)?;
+                self.sql.push_str(self.dialect.code_point_collation());
+                self.sql.push(')');
+                let text = self.sql.split_off(start);
+                self.sql.push_str(&self.dialect.encode_for_uri(&text));
+            }
+            FilterValue::Replace {
+                text,
+                pattern,
+                replacement,
+            } => {
+                let start = self.sql.len();
+                self.argument_text(text)?;
+                self.sql.push_str(self.dialect.code_point_collation());
+                let text = self.sql.split_off(start);
+                let mut param = |value: &str| {
+                    self.cast_rendered(&SqlType::Text, |this| {
+                        this.expr(&super::SqlExpr::Param(value.into()))
+                    });
+                    self.sql.split_off(start)
+                };
+                let (pattern, replacement) = (param(pattern), param(replacement));
+                self.sql
+                    .push_str(&self.dialect.regex_replace(&text, &pattern, &replacement));
+            }
+            FilterValue::StrBefore(a, b) | FilterValue::StrAfter(a, b) => {
+                let collation = self.dialect.code_point_collation();
+                let start = self.sql.len();
+                self.argument_text(a)?;
+                self.sql.push_str(collation);
+                let text = self.sql.split_off(start);
+                self.argument_text(b)?;
+                self.sql.push_str(collation);
+                let search = self.sql.split_off(start);
+                let position = self.dialect.position(&text, &search);
+                let part = match value {
+                    FilterValue::StrBefore(..) => {
+                        self.dialect
+                            .substring(&text, "1", Some(&format!("{position} - 1")))
+                    }
+                    _ => self.dialect.substring(
+                        &text,
+                        &format!("{position} + {}", self.dialect.char_length(&search)),
+                        None,
+                    ),
+                };
+                self.sql
+                    .push_str(&format!("CASE WHEN {position} > 0 THEN {part} ELSE '' END"));
             }
             other => unreachable!("not a computed string: {other:?}"),
         }
@@ -3012,5 +3099,118 @@ pub(super) mod tests {
         assert_eq!(x("i4", "NOW()"), "NULL::bool");
         assert!(rejected("?s ex:ts ?x", "?x < NOW()").contains("implicit time zone"));
         assert!(rejected("?s ex:tz ?x", "sameTerm(?x, NOW())").contains("sameTerm of NOW"));
+    }
+
+    #[test]
+    fn strbefore_and_strafter_drop_the_language_tag_without_a_match() {
+        let position = "strpos((t0.\"txt\"::text) COLLATE \"C\", $1::text COLLATE \"C\")";
+        assert_eq!(
+            x("txt", "STRBEFORE(?x, \"b\") = \"a\""),
+            format!(
+                "((CASE WHEN {position} > 0 THEN substr((t0.\"txt\"::text) COLLATE \"C\", 1, \
+                 {position} - 1) ELSE '' END COLLATE \"C\") = $2::text)"
+            )
+        );
+        assert_eq!(
+            x("txt", "STRAFTER(?x, \"b\") = \"c\""),
+            format!(
+                "((CASE WHEN {position} > 0 THEN substr((t0.\"txt\"::text) COLLATE \"C\", \
+                 {position} + char_length($1::text COLLATE \"C\")) ELSE '' END COLLATE \"C\") = \
+                 $2::text)"
+            )
+        );
+        // SPARQL 1.1 §17.4.3.9: the tag of the first argument where the
+        // second is in it, and the simple literal "" where it is not.
+        let tagged = x("label", "STRAFTER(?x, \"b\") = \"\"");
+        assert!(
+            tagged.starts_with(
+                "CASE WHEN ((t0.\"txt\"::text) COLLATE \"C\" LIKE $1::text) THEN NULL::bool \
+                 WHEN NOT (((t0.\"txt\"::text) COLLATE \"C\" LIKE $2::text)) THEN ($3::text = \
+                 $4::text) END"
+            ),
+            "{tagged}"
+        );
+        let tagged = x("label", "STRBEFORE(?x, \"b\") = \"a\"@en");
+        assert!(
+            tagged
+                .starts_with("CASE WHEN ((t0.\"txt\"::text) COLLATE \"C\" LIKE $1::text) THEN (("),
+            "{tagged}"
+        );
+        assert!(tagged.ends_with(" THEN NULL::bool END"), "{tagged}");
+        assert_eq!(
+            x("label", "LANG(STRBEFORE(?x, \"b\")) = \"en\""),
+            "CASE WHEN ((t0.\"txt\"::text) COLLATE \"C\" LIKE $1::text) THEN ($2::text = $3::text) \
+             WHEN NOT (((t0.\"txt\"::text) COLLATE \"C\" LIKE $4::text)) THEN ($5::text = $6::text) END"
+        );
+        // Arguments that are not compatible strings are an error in every
+        // case.
+        assert_eq!(
+            x("label", "STRAFTER(?x, \"b\"@fr) = \"\""),
+            "CASE WHEN NULL::bool THEN NULL::bool WHEN NOT (NULL::bool) THEN ($1::text = $2::text) END"
+        );
+        assert_eq!(x("txt", "STRBEFORE(?x, \"b\"@en) = \"\""), "NULL::bool");
+        assert_eq!(x("i4", "STRAFTER(?x, \"1\") = \"\""), "NULL::bool");
+        assert_eq!(x("txt", "STRAFTER(?x, 1) = \"\""), "NULL::bool");
+        assert!(rejected("?s ex:ts ?x", "STRAFTER(?x, \"1\") = \"\"").contains("infinite"));
+    }
+
+    #[test]
+    fn encode_for_uri_is_a_simple_literal() {
+        assert_eq!(
+            x("txt", "ENCODE_FOR_URI(?x) = \"a%20b\""),
+            "((CASE WHEN ((t0.\"txt\"::text) COLLATE \"C\") ~ '^[-.0-9A-Z_a-z~]*$' THEN \
+             ((t0.\"txt\"::text) COLLATE \"C\") WHEN ((t0.\"txt\"::text) COLLATE \"C\") IS NOT \
+             NULL THEN (SELECT coalesce(string_agg(CASE WHEN c ~ '^[-.0-9A-Z_a-z~]$' THEN c ELSE \
+             regexp_replace(upper(encode(convert_to(c, 'UTF8'), 'hex')), '(..)', '%\\1', 'g') END, \
+             '' ORDER BY n), '') FROM generate_series(1, char_length(((t0.\"txt\"::text) COLLATE \
+             \"C\"))) AS n, substr(((t0.\"txt\"::text) COLLATE \"C\"), n, 1) AS c) END COLLATE \
+             \"C\") = $1::text)"
+        );
+        // SPARQL 1.1 §17.4.3.11: also of a language-tagged literal.
+        assert!(x("label", "ENCODE_FOR_URI(?x) = \"a\"").ends_with(" = $1::text)"));
+        assert_eq!(x("label", "ENCODE_FOR_URI(?x) = \"a\"@en"), "NULL::bool");
+        assert_eq!(x("link", "ENCODE_FOR_URI(?x) = \"a\""), "NULL::bool");
+    }
+
+    #[test]
+    fn replace_uses_the_translated_pattern_and_replacement() {
+        assert_eq!(
+            x("txt", "REPLACE(?x, \"a+\", \"[$0]\") = \"[a]\""),
+            "((regexp_replace((t0.\"txt\"::text) COLLATE \"C\", $1::text, $2::text, 'g') \
+             COLLATE \"C\") = $3::text)"
+        );
+        assert_eq!(
+            filter_params("REPLACE(?x, \"(b)\\\\.\", \"$1\\\\$\", \"i\") = \"x\""),
+            ["([Bb])\\u002E", "\\1$", "x"]
+        );
+        // The result keeps the language tag of the first argument.
+        assert!(x("label", "REPLACE(?x, \"a\", \"b\") = \"b\"@en").starts_with("((regexp_replace"));
+        assert_eq!(
+            x("label", "REPLACE(?x, \"a\", \"b\") = \"b\""),
+            "NULL::bool"
+        );
+        // Errors: a pattern that matches the empty string, an invalid
+        // pattern, replacement or flag, arguments other than simple
+        // literals.
+        for filter in [
+            "REPLACE(?x, \"a*\", \"b\") = \"b\"",
+            "REPLACE(?x, \"(\", \"b\") = \"b\"",
+            "REPLACE(?x, \"a\", \"$\") = \"b\"",
+            "REPLACE(?x, \"a\", \"b\", \"g\") = \"b\"",
+            "REPLACE(?x, \"a\", \"b\"@en) = \"b\"",
+            "REPLACE(?x, \"a\"@en, \"b\") = \"b\"",
+            "REPLACE(?x, \"a\", 1) = \"b\"",
+        ] {
+            assert_eq!(x("txt", filter), "NULL::bool", "{filter}");
+        }
+        assert_eq!(x("i4", "REPLACE(?x, \"1\", \"2\") = \"2\""), "NULL::bool");
+        assert!(
+            rejected("?s ex:txt ?x", "REPLACE(?x, \"a|b\", \"c\") = \"c\"")
+                .contains("alternatives")
+        );
+        assert!(rejected("?s ex:txt ?x", "REPLACE(?x, \"\\\\d\", \"c\") = \"c\"").contains("\\d"));
+        assert!(
+            rejected("?s ex:txt ?x", "REPLACE(?x, \"a\", \"b\", \"q\") = \"b\"").contains("q flag")
+        );
     }
 }

@@ -643,19 +643,37 @@ The following are rejected as unsupported:
 
 An invalid pattern or flag is an error, as in XPath.
 
-`STRLEN`, `SUBSTR`, `UCASE`, `LCASE`, `STRSTARTS`, `STRENDS`, `CONTAINS`
-and `CONCAT` follow SPARQL 1.1 §17.4.3:
+The functions on strings `STRLEN`, `SUBSTR`, `UCASE`, `LCASE`,
+`STRSTARTS`, `STRENDS`, `CONTAINS`, `STRBEFORE`, `STRAFTER`,
+`ENCODE_FOR_URI`, `CONCAT` and `REPLACE` follow SPARQL 1.1 §17.4.3:
 
 - Their arguments are string literals: simple literals, `xsd:string` and
   language-tagged literals (§17.4.3.1.1). Any other term, such as a
   number, an IRI or an unbound variable, makes the function an error.
-- `STRSTARTS`, `STRENDS` and `CONTAINS` need compatible arguments
-  (§17.4.3.1.2): both without a language tag, both with the same tag, or
-  a tag on the first only. `CONTAINS(?label, "pie")` works on `"Apple
+- `STRSTARTS`, `STRENDS`, `CONTAINS`, `STRBEFORE` and `STRAFTER` need
+  compatible arguments (§17.4.3.1.2): both without a language tag, both
+  with the same tag, or a tag on the first only. `CONTAINS(?label, "pie")` works on `"Apple
   pie"@en`, and `CONTAINS(?name, "pie"@en)` is an error on `"pie"`.
-- `SUBSTR`, `UCASE` and `LCASE` keep the language tag of their argument.
-  `CONCAT` keeps a language tag that all its arguments have, and gives a
-  simple literal otherwise (§17.4.3.12).
+- `SUBSTR`, `UCASE`, `LCASE` and `REPLACE` keep the language tag of
+  their first argument. `CONCAT` keeps a language tag that all its
+  arguments have, and gives a simple literal otherwise (§17.4.3.12).
+  `ENCODE_FOR_URI` gives a simple literal.
+- `STRBEFORE` and `STRAFTER` give the characters before and after the
+  first occurrence of the second string, with the language tag of the
+  first. Where the second string does not occur, they give the simple
+  literal `""` (§17.4.3.9, §17.4.3.10): `STRBEFORE("abc"@en, "z")` is
+  `""`, and `STRBEFORE("abc"@en, "")` is `""@en`.
+- `ENCODE_FOR_URI` writes every character other than `A-Z`, `a-z`,
+  `0-9`, `-`, `_`, `.` and `~` as `%XX` per UTF-8 byte, upper case
+  (F&O 3.1 §6.2): `"café"` gives `"caf%C3%A9"`.
+- `REPLACE(arg, pattern, replacement, flags)` replaces each match of the
+  pattern as `fn:replace` does (F&O 3.1 §5.6.4). The pattern, the
+  replacement and the flags are simple literal constants, and the
+  pattern is translated as for `REGEX` (above). In the replacement, `$N`
+  is the text of group `N` and `$0` the match, and `\$` and `\\` are `$`
+  and `\`. A reference to a group that does not exist is the empty string
+  up to `$9`. A pattern that matches the empty string, such as `a*`, and
+  a replacement with another `$` or `\` are errors.
 - Lengths and positions count characters, which are Unicode code points.
   `STRLEN` of `"e\u0301"` (`e` and a combining acute accent) is 2, and
   of an emoji 1. `SUBSTR(s, start, length)` takes the characters at the
@@ -675,13 +693,28 @@ database. `UCASE` and `LCASE` are `upper` and `lower` under the ICU
 collation `"und-x-icu"`, the root locale, which applies the mappings of
 Unicode. Under a libc locale, `upper` and `lower` map one character at a
 time (`"STRAßE"`), and under `"C"` they map only ASCII. A PostgreSQL
-server built without ICU rejects the statement. `STRSTARTS`, `STRENDS` and `CONTAINS`
-with a constant are `LIKE` with the constant as a parameter, its `%`,
-`_` and `\` escaped, so `STRSTARTS(?name, "Kim")` is
+server built without ICU rejects the statement. `STRSTARTS`, `STRENDS`
+and `CONTAINS` with a constant are `LIKE` with the constant as a
+parameter, its `%`, `_` and `\` escaped, so `STRSTARTS(?name, "Kim")` is
 `name COLLATE "C" LIKE 'Kim%'`. An index on the column under
 `COLLATE "C"`, or with the operator class `text_pattern_ops`, serves
 `STRSTARTS`. With a string computed from the row instead of a constant,
-they are `starts_with`, `right` and `strpos`.
+they are `starts_with`, `right` and `strpos`. `STRBEFORE` and `STRAFTER`
+use `strpos` and `substr`. Where the first argument has a language tag,
+the cases of the value tell the match from its absence with `CONTAINS`,
+so that `LANG` and `=` see the tag or the simple literal. `REPLACE` is
+`regexp_replace` with the flag `g`, and the translated pattern and
+replacement as parameters, so `$1` becomes `\1`.
+
+`REPLACE` also depends on which match is chosen where several start at
+one position. XPath takes the first alternative and lets each greedy
+quantifier take as much as the rest of the pattern allows, in turn.
+PostgreSQL takes the longest match of the whole pattern. `REPLACE`
+therefore accepts only patterns where the two choose the same match: no
+`|`, no reluctant quantifier, no quantifier on a group, and every
+repeated character set followed by characters it cannot match. `\s+`,
+`[^,]+,` and `a+$` are accepted, while `a|ab`, `^\s+|\s+$`, `(ab)+` and
+`x.*y` are rejected.
 
 `STRLEN` is a number, and can be the value of `BIND` and `SELECT`
 expressions (see below). The other functions give strings, which a
@@ -707,6 +740,9 @@ differently from engines that extend SPARQL:
   `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`, `IF`, `COALESCE`, the
   functions on strings or the functions of dateTimes of them) as operands,
   such as a comparison as an argument of `IF`, `COALESCE` or `IN`;
+- `REPLACE` with a pattern whose matches XPath and PostgreSQL can choose
+  differently (see above), with a reference to a group after the ninth,
+  or with a pattern, replacement or flags that are not constants;
 - a starting location or length of `SUBSTR` that is not a constant, or
   not an `xsd:integer`, such as `1.5`: SPARQL 1.1 makes it a type error,
   and engines that round it as `fn:substring` does answer;

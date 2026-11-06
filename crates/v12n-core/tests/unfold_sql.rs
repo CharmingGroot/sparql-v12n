@@ -76,6 +76,18 @@ impl Dialect for MarkerDialect {
         }
     }
 
+    fn position(&self, text: &str, search: &str) -> String {
+        format!("<<POSITION {text}, {search}>>")
+    }
+
+    fn regex_replace(&self, text: &str, pattern: &str, replacement: &str) -> String {
+        format!("<<REGEX_REPLACE {text}, {pattern}, {replacement}>>")
+    }
+
+    fn encode_for_uri(&self, text: &str) -> String {
+        format!("<<ENCODE_FOR_URI {text}>>")
+    }
+
     fn case_map(&self, text: &str, upper: bool) -> String {
         let case = if upper { "UPPER" } else { "LOWER" };
         format!("<<CASE_MAP_{case} {text}>>")
@@ -1027,6 +1039,19 @@ fn filter_string_functions() {
 fn bind_strlen() {
     insta::assert_snapshot!(explain_shop_with_types(
         "SELECT ?c ?l WHERE { ?c ex:name ?n BIND(STRLEN(?n) AS ?l) }"
+    ));
+}
+
+/// `STRBEFORE` and `STRAFTER` find the second string with `strpos`,
+/// `ENCODE_FOR_URI` encodes the characters outside the unreserved set,
+/// and `REPLACE` is `regexp_replace` with the translated pattern and
+/// replacement as parameters.
+#[test]
+fn filter_strbefore_strafter_encode_for_uri_and_replace() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c WHERE { ?c ex:name ?n ; ex:tier ?t \
+         FILTER(STRBEFORE(?n, \"m\") = \"Ki\" && STRAFTER(?n, ?t) != \"\" \
+         && ENCODE_FOR_URI(?n) = \"Kim\" && REPLACE(?t, \"(I)P\", \"$1-\", \"i\") = \"VI-\") }"
     ));
 }
 
