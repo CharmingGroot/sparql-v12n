@@ -615,6 +615,75 @@ async fn string_functions_follow_xpath() {
     );
 }
 
+/// `STRBEFORE`, `STRAFTER`, `ENCODE_FOR_URI` and `REPLACE` over the same
+/// strings: positions in code points, the simple literal `""` where the
+/// second string is missing, UTF-8 bytes in the encoding, and the matches
+/// and replacement strings of `fn:replace`.
+#[tokio::test]
+async fn string_functions_before_after_encode_and_replace_follow_xpath() {
+    let Some(url) = database_url() else { return };
+    let rows = |filter: &'static str| {
+        let url = url.clone();
+        async move {
+            let mut rows = filtered_rows(&url, STRINGS, "?row ex:s ?s ; ex:l ?l", filter).await;
+            rows.sort_by_key(|r| r.parse::<u32>().unwrap());
+            rows
+        }
+    };
+    let all = ["1", "2", "3", "4", "5", "6", "7"];
+    for (filter, expected) in [
+        ("STRBEFORE(?s, \"b\") = \"a\"", &["1"][..]),
+        ("STRBEFORE(?s, \"%\") = \"a\"", &["5"]),
+        ("STRAFTER(?s, \"b\") = \"c\"", &["1"]),
+        ("STRAFTER(?s, \"\u{1F600}\") = \"x\"", &["4"]),
+        ("STRBEFORE(?s, \"\u{301}\") = \"e\"", &["3"]),
+        ("STRAFTER(?s, \"_\") = \"c\\\\d\"", &["5"]),
+        ("STRBEFORE(?s, \"\") = \"\"", &all),
+        ("STRAFTER(?s, \"\") = ?s", &all),
+        ("STRBEFORE(?s, \"zz\") = \"\"", &all),
+        ("STRAFTER(?s, \"zz\") = \"\"", &all),
+        // SPARQL 1.1 §17.4.3.9 and §17.4.3.10: the tag of the first
+        // argument where the second is in it, a simple literal where not.
+        ("STRBEFORE(?l, \"c\") = \"ab\"@en", &["1"]),
+        ("LANG(STRBEFORE(?l, \"c\")) = \"en\"", &["1", "5"]),
+        ("LANG(STRBEFORE(?l, \"zz\")) = \"\"", &all),
+        ("STRBEFORE(?l, \"\") = \"\"@en", &all),
+        ("STRAFTER(?l, \"\") = ?l", &all),
+        ("STRAFTER(?l, \"b\"@en) = \"c\"@en", &["1"]),
+        ("STRAFTER(?l, \"zz\") = \"\"", &all),
+        ("!(STRAFTER(?l, \"c\"@fr) = \"\")", &[]),
+        ("!(STRAFTER(?s, \"c\"@en) = \"\")", &[]),
+        // UTF-8 bytes, upper case, of everything but the unreserved
+        // characters (F&O 3.1 §6.2).
+        ("ENCODE_FOR_URI(?s) = \"Stra%C3%9Fe\"", &["2"]),
+        ("ENCODE_FOR_URI(?s) = \"a%25b_c%5Cd\"", &["5"]),
+        ("ENCODE_FOR_URI(?s) = \"%F0%9F%98%80x\"", &["4"]),
+        ("ENCODE_FOR_URI(?s) = \"e%CC%81\"", &["3"]),
+        ("ENCODE_FOR_URI(?s) = \"\"", &["7"]),
+        ("ENCODE_FOR_URI(?l) = \"abc\"", &["1"]),
+        ("ENCODE_FOR_URI(?l) = \"abc\"@en", &[]),
+        // fn:replace (F&O 3.1 §5.6.4).
+        ("REPLACE(?s, \"b\", \"Z\") = \"aZc\"", &["1"]),
+        ("REPLACE(?s, \"[%_\\\\\\\\]\", \"-\") = \"a-b-c-d\"", &["5"]),
+        ("REPLACE(?s, \"(.)(.)\", \"$2$1\") = \"bac\"", &["1"]),
+        ("REPLACE(?s, \"ß\", \"ss\") = \"Strasse\"", &["2"]),
+        ("REPLACE(?s, \"\u{301}\", \"\") = \"e\"", &["3"]),
+        ("REPLACE(?s, \"σ\", \"s\", \"i\") = \"ΟΔΟs\"", &["6"]),
+        ("REPLACE(?s, \"A B\", \"Z\", \"ix\") = \"Zc\"", &["1"]),
+        ("REPLACE(?s, \"c\", \"$5\") = \"ab\"", &["1"]),
+        ("REPLACE(?s, \"c\", \"\\\\$\") = \"ab$\"", &["1"]),
+        ("REPLACE(?s, \"b+\", \"[$0]\") = \"a[b]c\"", &["1"]),
+        ("REPLACE(?l, \"b\", \"B\") = \"aBc\"@en", &["1"]),
+        ("REPLACE(?l, \"b\", \"B\") = \"aBc\"", &[]),
+        // Errors: a pattern that matches the empty string, and an invalid
+        // replacement.
+        ("!(REPLACE(?s, \"a*\", \"x\") = \"\")", &[]),
+        ("!(REPLACE(?s, \"a\", \"\\\\x\") = \"\")", &[]),
+    ] {
+        assert_eq!(rows(filter).await, expected, "{filter}");
+    }
+}
+
 /// `STRSTARTS` with a constant is a `LIKE` prefix under `COLLATE "C"`,
 /// which an index on the column under that collation serves, and which
 /// compares code points under a column's nondeterministic collation.
@@ -665,6 +734,15 @@ async fn string_tests_use_an_index_and_ignore_the_column_collation() {
     assert_eq!(rows.len(), 1000);
     let rows = filtered_rows(&url, mapping, "?row ex:ci ?c", "UCASE(?c) = ?c").await;
     assert_eq!(rows.len(), 1000);
+    for filter in [
+        "STRBEFORE(?c, \"b\") = \"a\"",
+        "STRAFTER(?c, \"a\") = \"bc\"",
+        "REPLACE(?c, \"b\", \"x\") = \"axc\"",
+        "ENCODE_FOR_URI(?c) = \"abc\"",
+    ] {
+        let rows = filtered_rows(&url, mapping, "?row ex:ci ?c", filter).await;
+        assert_eq!(rows.len(), 1000, "{filter}");
+    }
 
     let database = PostgresBackend::connect(&url, Limits::default())
         .await

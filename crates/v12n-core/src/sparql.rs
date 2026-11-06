@@ -1250,7 +1250,9 @@ fn string_function(
     let constant = |e: &SparqlExpression| match *operand(e)? {
         Expression::Constant(term) => Ok(term),
         _ => Err(unsupported(match function {
-            Function::Replace => "REPLACE with a pattern, replacement or flags that are not constants",
+            Function::Replace => {
+                "REPLACE with a pattern, replacement or flags that are not constants"
+            }
             _ => "SUBSTR with a starting location or length that is not a constant",
         })),
     };

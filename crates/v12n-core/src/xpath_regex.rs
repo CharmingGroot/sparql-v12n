@@ -872,7 +872,11 @@ mod tests {
         }
     }
 
-    fn replace(pattern: &str, flags: &str, replacement: &str) -> Result<(String, String), Untranslated> {
+    fn replace(
+        pattern: &str,
+        flags: &str,
+        replacement: &str,
+    ) -> Result<(String, String), Untranslated> {
         translate_replace(pattern, flags, replacement).map(|r| (r.pattern, r.replacement))
     }
 
@@ -910,10 +914,19 @@ mod tests {
     #[test]
     fn replace_rejects_patterns_that_match_the_empty_string() {
         // err:FORX0003, whether or not the pattern has other matches.
-        for pattern in ["", "a*", "a?", "(a|)", "^", "$", "a{0,2}", "(?:a*)b?", "x*|y"] {
-            assert_eq!(replace(pattern, "", "z"), Err(Untranslated::Invalid), "{pattern:?}");
+        for pattern in [
+            "", "a*", "a?", "(a|)", "^", "$", "a{0,2}", "(?:a*)b?", "x*|y",
+        ] {
+            assert_eq!(
+                replace(pattern, "", "z"),
+                Err(Untranslated::Invalid),
+                "{pattern:?}"
+            );
         }
-        assert_eq!(replace("a+", "", "z"), Ok(("a+".to_owned(), "z".to_owned())));
+        assert_eq!(
+            replace("a+", "", "z"),
+            Ok(("a+".to_owned(), "z".to_owned()))
+        );
         assert_eq!(replace("^a", "m", "z").map(|r| r.1), Ok("z".to_owned()));
     }
 
@@ -963,7 +976,10 @@ mod tests {
             );
         }
         // Not supported in REGEX either.
-        assert!(matches!(replace("\\d+", "", ""), Err(Untranslated::Unsupported(_))));
+        assert!(matches!(
+            replace("\\d+", "", ""),
+            Err(Untranslated::Unsupported(_))
+        ));
         assert_eq!(replace("(", "", ""), Err(Untranslated::Invalid));
         assert_eq!(replace("a", "g", ""), Err(Untranslated::Invalid));
     }

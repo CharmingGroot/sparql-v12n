@@ -1042,6 +1042,19 @@ fn bind_strlen() {
     ));
 }
 
+/// `STRBEFORE` and `STRAFTER` find the second string with `strpos`,
+/// `ENCODE_FOR_URI` encodes the characters outside the unreserved set,
+/// and `REPLACE` is `regexp_replace` with the translated pattern and
+/// replacement as parameters.
+#[test]
+fn filter_strbefore_strafter_encode_for_uri_and_replace() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c WHERE { ?c ex:name ?n ; ex:tier ?t \
+         FILTER(STRBEFORE(?n, \"m\") = \"Ki\" && STRAFTER(?n, ?t) != \"\" \
+         && ENCODE_FOR_URI(?n) = \"Kim\" && REPLACE(?t, \"(I)P\", \"$1-\", \"i\") = \"VI-\") }"
+    ));
+}
+
 /// `ABS`, `ROUND`, `CEIL` and `FLOOR` keep the class of their argument:
 /// an integer is its own ceiling, and a decimal rounds halves towards
 /// positive infinity as `floor(x + 0.5)`.

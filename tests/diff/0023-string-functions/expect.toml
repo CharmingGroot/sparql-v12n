@@ -3,6 +3,27 @@
 [query.bind-ucase]
 expect = "rejected"
 
+[query.bind-strafter]
+expect = "rejected"
+
+# REPLACE with alternatives: XPath takes the first alternative that
+# matches, PostgreSQL the longest match (F&O 3.1 §5.6.4).
+[query.replace-alternatives]
+expect = "rejected"
+
+# Ontop passes the replacement string to regexp_replace as it is, so "$2$1"
+# stays literal ("$2$1ple"); XPath makes $N a group ("paple").
+[query.replace-groups]
+expect = "mismatch"
+issue = 26
+
+# A pattern that matches the empty string is an error (err:FORX0003, F&O
+# 3.1 §5.6.4), so neither the comparison nor its negation holds. Ontop
+# replaces the empty matches ("-a-p-p-l-e-") and keeps every word.
+[query.replace-empty-match]
+expect = "mismatch"
+issue = 26
+
 # STRLEN in ORDER BY comes with the other expressions there (#108).
 [query.order-by-strlen]
 expect = "rejected"

@@ -296,10 +296,14 @@ impl<'a> Context<'_, 'a> {
                             left_guards.iter().chain(right_guards).cloned().collect();
                         let (text, search) = (left.value.clone(), right.value.clone());
                         let value = match expression {
-                            Expression::StrBefore(..) => {
-                                FilterValue::StrBefore(Box::new(text.clone()), Box::new(search.clone()))
-                            }
-                            _ => FilterValue::StrAfter(Box::new(text.clone()), Box::new(search.clone())),
+                            Expression::StrBefore(..) => FilterValue::StrBefore(
+                                Box::new(text.clone()),
+                                Box::new(search.clone()),
+                            ),
+                            _ => FilterValue::StrAfter(
+                                Box::new(text.clone()),
+                                Box::new(search.clone()),
+                            ),
                         };
                         if !may_have_language(&text) {
                             out.push((guards, Leaf { value, term: None }));
@@ -316,7 +320,13 @@ impl<'a> Context<'_, 'a> {
                         let mut missing_guards = guards;
                         missing_guards.push(Condition::Filter(Filter::Not(Box::new(found))));
                         let empty = FilterValue::Constant(Literal::new_simple_literal("").into());
-                        out.push((missing_guards, Leaf { value: empty, term: None }));
+                        out.push((
+                            missing_guards,
+                            Leaf {
+                                value: empty,
+                                term: None,
+                            },
+                        ));
                     }
                 }
                 Ok(out)

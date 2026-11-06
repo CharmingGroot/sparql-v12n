@@ -1369,11 +1369,8 @@ impl<'a> Renderer<'a> {
                     self.sql.split_off(start)
                 };
                 let (pattern, replacement) = (param(pattern), param(replacement));
-                self.sql.push_str(
-                    &self
-                        .dialect
-                        .regex_replace(&text, &pattern, &replacement),
-                );
+                self.sql
+                    .push_str(&self.dialect.regex_replace(&text, &pattern, &replacement));
             }
             FilterValue::StrBefore(a, b) | FilterValue::StrAfter(a, b) => {
                 let collation = self.dialect.code_point_collation();
@@ -2707,7 +2704,11 @@ pub(super) mod tests {
             "{tagged}"
         );
         let tagged = x("label", "STRBEFORE(?x, \"b\") = \"a\"@en");
-        assert!(tagged.starts_with("CASE WHEN ((t0.\"txt\"::text) COLLATE \"C\" LIKE $1::text) THEN (("), "{tagged}");
+        assert!(
+            tagged
+                .starts_with("CASE WHEN ((t0.\"txt\"::text) COLLATE \"C\" LIKE $1::text) THEN (("),
+            "{tagged}"
+        );
         assert!(tagged.ends_with(" THEN NULL::bool END"), "{tagged}");
         assert_eq!(
             x("label", "LANG(STRBEFORE(?x, \"b\")) = \"en\""),
@@ -2757,7 +2758,10 @@ pub(super) mod tests {
         );
         // The result keeps the language tag of the first argument.
         assert!(x("label", "REPLACE(?x, \"a\", \"b\") = \"b\"@en").starts_with("((regexp_replace"));
-        assert_eq!(x("label", "REPLACE(?x, \"a\", \"b\") = \"b\""), "NULL::bool");
+        assert_eq!(
+            x("label", "REPLACE(?x, \"a\", \"b\") = \"b\""),
+            "NULL::bool"
+        );
         // Errors: a pattern that matches the empty string, an invalid
         // pattern, replacement or flag, arguments other than simple
         // literals.
@@ -2773,8 +2777,13 @@ pub(super) mod tests {
             assert_eq!(x("txt", filter), "NULL::bool", "{filter}");
         }
         assert_eq!(x("i4", "REPLACE(?x, \"1\", \"2\") = \"2\""), "NULL::bool");
-        assert!(rejected("?s ex:txt ?x", "REPLACE(?x, \"a|b\", \"c\") = \"c\"").contains("alternatives"));
+        assert!(
+            rejected("?s ex:txt ?x", "REPLACE(?x, \"a|b\", \"c\") = \"c\"")
+                .contains("alternatives")
+        );
         assert!(rejected("?s ex:txt ?x", "REPLACE(?x, \"\\\\d\", \"c\") = \"c\"").contains("\\d"));
-        assert!(rejected("?s ex:txt ?x", "REPLACE(?x, \"a\", \"b\", \"q\") = \"b\"").contains("q flag"));
+        assert!(
+            rejected("?s ex:txt ?x", "REPLACE(?x, \"a\", \"b\", \"q\") = \"b\"").contains("q flag")
+        );
     }
 }
