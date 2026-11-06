@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# RAND has a new value in every call (SPARQL 1.1 §17.4.4.5).
+SELECT ?r WHERE { ?r ex:i ?i FILTER(RAND() < 2) }

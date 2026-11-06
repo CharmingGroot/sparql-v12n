@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# fn:abs of an integer is an integer: rows 1, 4 and 5.
+SELECT ?r WHERE { ?r ex:i ?i FILTER(ABS(?i) > 5) }

@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# fn:round(0.5) is 1, fn:round(1.25) is 1 and fn:round(-0.5) is 0: rows 3,
+# 4 and 5.
+SELECT ?r WHERE { ?r ex:d ?d FILTER(ROUND(?d) = 1 || ROUND(?d) = 0) }

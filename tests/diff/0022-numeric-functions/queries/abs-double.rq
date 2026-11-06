@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# fn:abs of a double: rows 1 and 2.
+SELECT ?r WHERE { ?r ex:f ?f FILTER(ABS(?f) = 2.5e0) }

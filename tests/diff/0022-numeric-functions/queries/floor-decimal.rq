@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# fn:floor(-1.75) is -2 and fn:floor(-2.5) is -3: row 6.
+SELECT ?r WHERE { ?r ex:d ?d FILTER(FLOOR(?d) = -2) }
