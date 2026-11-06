@@ -1,0 +1,17 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"SELECT ?c WHERE { ?c ex:name ?n ; ex:tier ?t \\\n         FILTER(STRSTARTS(?n, \\\"K_m%\\\") && STRENDS(?t, \\\"P\\\") && CONTAINS(LCASE(?n), ?t) \\\n         && STRLEN(SUBSTR(?n, 2, 3)) >= 2 && CONCAT(UCASE(?t), \\\"-\\\", ?n) != \\\"VIP-Kim\\\") }\")"
+---
+SELECT t0."id" AS "c"
+FROM "customers" t0
+JOIN "customers" t1 ON t1."id" = t0."id" AND ((((((t0."name"::text) COLLATE "C" LIKE $1::text) AND ((t1."tier"::text) COLLATE "C" LIKE $2::text)) AND (strpos((lower((t0."name"::text) COLLATE "und-x-icu") COLLATE "C") COLLATE "C", (t1."tier"::text) COLLATE "C") > 0)) AND char_length((substr((t0."name"::text), $3::int4, $4::int4) COLLATE "C"))::numeric >= $5::int8) AND NOT (((((upper((t1."tier"::text) COLLATE "und-x-icu") COLLATE "C") || $6::text || (t0."name"::text)) COLLATE "C") = $7::text)))
+WHERE t0."name" IS NOT NULL AND t1."tier" IS NOT NULL
+
+-- params
+$1 = "K\\_m\\%%"
+$2 = "%P"
+$3 = "2"
+$4 = "3"
+$5 = "2"
+$6 = "-"
+$7 = "VIP-Kim"

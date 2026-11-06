@@ -1,0 +1,9 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"SELECT ?c ?l WHERE { ?c ex:name ?n BIND(STRLEN(?n) AS ?l) }\")"
+---
+SELECT t0."id" AS "c", char_length((t0."name"::text))::numeric AS "l"
+FROM "customers" t0
+WHERE t0."id" IS NOT NULL AND t0."name" IS NOT NULL
+
+-- params

@@ -161,6 +161,20 @@ pub enum Expression {
     /// e2) || …` and false for an empty list. `NOT IN` is its negation
     /// (§17.4.1.10).
     In(Box<Expression>, Vec<Expression>),
+    /// `STRLEN` (SPARQL 1.1 §17.4.3.2): the number of characters.
+    StrLen(Box<Expression>),
+    /// `SUBSTR(source, start, length)` (SPARQL 1.1 §17.4.3.3), with the
+    /// starting location and the length constants.
+    Substr(Box<Expression>, Term, Option<Term>),
+    /// `UCASE` (SPARQL 1.1 §17.4.3.4).
+    UCase(Box<Expression>),
+    /// `LCASE` (SPARQL 1.1 §17.4.3.5).
+    LCase(Box<Expression>),
+    /// `STRSTARTS`, `STRENDS` and `CONTAINS` (SPARQL 1.1 §17.4.3.6 to
+    /// §17.4.3.8).
+    StrTest(StrTest, Box<Expression>, Box<Expression>),
+    /// `CONCAT` (SPARQL 1.1 §17.4.3.12).
+    Concat(Vec<Expression>),
 }
 
 impl Expression {
@@ -179,7 +193,8 @@ impl Expression {
             | Self::And(a, b)
             | Self::Compare(_, a, b)
             | Self::SameTerm(a, b)
-            | Self::Arith(_, a, b) => {
+            | Self::Arith(_, a, b)
+            | Self::StrTest(_, a, b) => {
                 a.collect_variables(out);
                 b.collect_variables(out);
             }
@@ -189,13 +204,19 @@ impl Expression {
             | Self::Lang(a)
             | Self::Datatype(a)
             | Self::Regex(a, _, _)
-            | Self::Negate(a) => a.collect_variables(out),
+            | Self::Negate(a)
+            | Self::StrLen(a)
+            | Self::Substr(a, _, _)
+            | Self::UCase(a)
+            | Self::LCase(a) => a.collect_variables(out),
             Self::If(c, a, b) => {
                 c.collect_variables(out);
                 a.collect_variables(out);
                 b.collect_variables(out);
             }
-            Self::Coalesce(args) => args.iter().for_each(|a| a.collect_variables(out)),
+            Self::Coalesce(args) | Self::Concat(args) => {
+                args.iter().for_each(|a| a.collect_variables(out))
+            }
             Self::In(a, list) => {
                 a.collect_variables(out);
                 list.iter().for_each(|b| b.collect_variables(out));
@@ -216,8 +237,22 @@ impl Expression {
                 | Self::Negate(_)
                 | Self::If(..)
                 | Self::Coalesce(_)
+                | Self::StrLen(_)
+                | Self::Substr(..)
+                | Self::UCase(_)
+                | Self::LCase(_)
+                | Self::Concat(_)
         )
     }
+}
+
+/// `STRSTARTS`, `STRENDS` and `CONTAINS`: whether the first string starts
+/// with, ends with or contains the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrTest {
+    Starts,
+    Ends,
+    Contains,
 }
 
 /// The arithmetic operators of SPARQL 1.1 §17.3.
@@ -650,7 +685,8 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
         Expression::Constant(_)
         | Expression::Variable(_)
         | Expression::Arith(..)
-        | Expression::Negate(_) => return Ok(expression),
+        | Expression::Negate(_)
+        | Expression::StrLen(_) => return Ok(expression),
         // The value of a computed variable is a number in SQL, so every
         // result must be one or an error.
         Expression::If(..) | Expression::Coalesce(_) if numeric_results(&expression) => {
@@ -668,6 +704,14 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
         Expression::Lang(_) => "LANG",
         Expression::Datatype(_) => "DATATYPE",
         Expression::Regex(..) => "REGEX",
+        Expression::StrTest(StrTest::Starts, ..) => "STRSTARTS",
+        Expression::StrTest(StrTest::Ends, ..) => "STRENDS",
+        Expression::StrTest(StrTest::Contains, ..) => "CONTAINS",
+        // A computed variable holds only numbers in SQL (#100).
+        Expression::Substr(..) => "SUBSTR",
+        Expression::UCase(_) => "UCASE",
+        Expression::LCase(_) => "LCASE",
+        Expression::Concat(_) => "CONCAT",
     };
     Err(unsupported(&format!(
         "{what} as the value of BIND and SELECT expressions"
@@ -679,7 +723,7 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
 /// error.
 fn numeric_results(expression: &Expression) -> bool {
     match expression {
-        Expression::Arith(..) | Expression::Negate(_) => true,
+        Expression::Arith(..) | Expression::Negate(_) | Expression::StrLen(_) => true,
         Expression::Constant(Term::Literal(literal)) => matches!(
             crate::xsd::value(literal.value(), literal.datatype().as_str()),
             crate::xsd::Value::Numeric(_)
@@ -1001,6 +1045,28 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
                 }
             }
         }
+        // Expressions in ORDER BY come with #108.
+        SparqlExpression::FunctionCall(
+            function @ (Function::StrLen
+            | Function::SubStr
+            | Function::UCase
+            | Function::LCase
+            | Function::Concat),
+            _,
+        ) if matches!(site, Site::OrderBy) => {
+            return Err(in_site(&format!("the {function} function")));
+        }
+        SparqlExpression::FunctionCall(
+            function @ (Function::StrLen
+            | Function::SubStr
+            | Function::UCase
+            | Function::LCase
+            | Function::StrStarts
+            | Function::StrEnds
+            | Function::Contains
+            | Function::Concat),
+            args,
+        ) => string_function(function, args, site)?,
         SparqlExpression::FunctionCall(function, args) => {
             let [arg] = args.as_slice() else {
                 return Err(match function {
@@ -1096,6 +1162,50 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
                 .into(),
             )),
         ),
+    })
+}
+
+/// A function on strings (SPARQL 1.1 §17.4.3), whose arguments are terms.
+/// The starting location and the length of `SUBSTR` must be constants.
+fn string_function(
+    function: &Function,
+    args: &[SparqlExpression],
+    site: Site,
+) -> Result<Expression, Error> {
+    let operand = |e: &SparqlExpression| operand(e, site);
+    let constant = |e: &SparqlExpression| match *operand(e)? {
+        Expression::Constant(term) => Ok(term),
+        _ => Err(unsupported(
+            "SUBSTR with a starting location or length that is not a constant",
+        )),
+    };
+    let arity = |n: &str| Error::QuerySyntax(format!("{function} takes {n}"));
+    Ok(match (function, args) {
+        (Function::StrLen, [a]) => Expression::StrLen(operand(a)?),
+        (Function::UCase, [a]) => Expression::UCase(operand(a)?),
+        (Function::LCase, [a]) => Expression::LCase(operand(a)?),
+        (Function::SubStr, [a, start]) => Expression::Substr(operand(a)?, constant(start)?, None),
+        (Function::SubStr, [a, start, length]) => {
+            Expression::Substr(operand(a)?, constant(start)?, Some(constant(length)?))
+        }
+        (Function::SubStr, _) => return Err(arity("two or three arguments")),
+        (Function::StrStarts | Function::StrEnds | Function::Contains, [a, b]) => {
+            let test = match function {
+                Function::StrStarts => StrTest::Starts,
+                Function::StrEnds => StrTest::Ends,
+                _ => StrTest::Contains,
+            };
+            Expression::StrTest(test, operand(a)?, operand(b)?)
+        }
+        (Function::StrStarts | Function::StrEnds | Function::Contains, _) => {
+            return Err(arity("two arguments"));
+        }
+        (Function::Concat, args) => Expression::Concat(
+            args.iter()
+                .map(|a| operand(a).map(|a| *a))
+                .collect::<Result<_, _>>()?,
+        ),
+        _ => return Err(arity("one argument")),
     })
 }
 
@@ -1272,7 +1382,7 @@ mod tests {
             ("ASK { ?c ex:name ?n } OFFSET 1", "LIMIT and OFFSET in ASK"),
             ("ASK FROM ex:g { ?c ex:name ?n }", "FROM"),
             ("ASK { ?c ?p ?o }", "variable predicates"),
-            ("ASK { ?c ex:name ?n FILTER(UCASE(?n) = \"A\") }", "UCASE"),
+            ("ASK { ?c ex:name ?n FILTER(MD5(?n) = \"A\") }", "MD5"),
         ] {
             let Error::UnsupportedFeature(message) = parse_err(query) else {
                 panic!("{query}")
@@ -1650,6 +1760,82 @@ mod tests {
     }
 
     #[test]
+    fn parse_string_functions() {
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n \
+             FILTER(STRLEN(SUBSTR(?n, -1, 3)) > 1 && STRSTARTS(UCASE(?n), LCASE(\"A\")) \
+             && CONTAINS(CONCAT(?n, \"-\", ?x), \"a-\") && !STRENDS(?n, \"z\")) }",
+        );
+        let Pattern::Filter(_, filter) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        assert_eq!(filter.variables(), ["n", "n", "n", "x", "n"]);
+        let Expression::And(left, ends) = filter else {
+            panic!("{filter:?}")
+        };
+        assert!(matches!(ends.as_ref(), Expression::Not(e)
+            if matches!(e.as_ref(), Expression::StrTest(StrTest::Ends, ..))));
+        let Expression::And(left, contains) = left.as_ref() else {
+            panic!("{left:?}")
+        };
+        let Expression::StrTest(StrTest::Contains, concat, _) = contains.as_ref() else {
+            panic!("{contains:?}")
+        };
+        assert!(matches!(concat.as_ref(), Expression::Concat(args) if args.len() == 3));
+        let Expression::And(length, starts) = left.as_ref() else {
+            panic!("{left:?}")
+        };
+        assert!(matches!(
+            starts.as_ref(),
+            Expression::StrTest(StrTest::Starts, a, b)
+                if matches!(a.as_ref(), Expression::UCase(_))
+                    && matches!(b.as_ref(), Expression::LCase(_))
+        ));
+        let Expression::Compare(CompareOp::Greater, length, _) = length.as_ref() else {
+            panic!("{length:?}")
+        };
+        let Expression::StrLen(substr) = length.as_ref() else {
+            panic!("{length:?}")
+        };
+        assert_eq!(
+            **substr,
+            Expression::Substr(
+                variable("n"),
+                Literal::new_typed_literal(
+                    "-1",
+                    NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer")
+                )
+                .into(),
+                Some(
+                    Literal::new_typed_literal(
+                        "3",
+                        NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer")
+                    )
+                    .into()
+                )
+            )
+        );
+        assert!(length.is_term() && !starts.is_term());
+
+        // STRLEN is a number, which BIND and SELECT compute; a test is a
+        // boolean, which ORDER BY takes.
+        let q = parse_ok("SELECT ?c (STRLEN(?n) AS ?l) WHERE { ?c ex:name ?n }");
+        assert!(matches!(q.bindings[0].expression, Expression::StrLen(_)));
+        let q = parse_ok("SELECT * WHERE { ?c ex:name ?n } ORDER BY DESC(CONTAINS(?n, \"a\"))");
+        assert!(matches!(
+            q.order_by[0].expression,
+            Expression::StrTest(StrTest::Contains, ..)
+        ));
+        assert!(
+            parse_ok("SELECT * WHERE { ?c ex:name ?n FILTER(CONCAT() = \"\") }")
+                .pattern
+                .triple_patterns()
+                .len()
+                == 1
+        );
+    }
+
+    #[test]
     fn parse_unsupported_features_are_rejected_by_name() {
         let cases = [
             (
@@ -1725,16 +1911,56 @@ mod tests {
                 "COALESCE in ORDER BY",
             ),
             (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(STRLEN(?t) > 2) }",
-                "the STRLEN function",
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(MD5(?t) = \"a\") }",
+                "the MD5 function",
             ),
             (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(STR(UCASE(?t)) = \"A\") }",
-                "the UCASE function",
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(STR(SHA1(?t)) = \"A\") }",
+                "the SHA1 function",
             ),
             (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(UCASE(?t)) }",
-                "the UCASE function",
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(SHA256(?t)) }",
+                "the SHA256 function",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(SUBSTR(?t, STRLEN(?t)) = \"a\") }",
+                "SUBSTR with a starting location or length that is not a constant",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(SUBSTR(?t, 1, ?t) = \"a\") }",
+                "SUBSTR with a starting location or length that is not a constant",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(CONTAINS(?t, ?t = \"a\")) }",
+                "expressions other than terms",
+            ),
+            (
+                "SELECT (UCASE(?n) AS ?u) WHERE { ?c ex:name ?n }",
+                "UCASE as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n BIND(CONCAT(?n, \"!\") AS ?u) }",
+                "CONCAT as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT (SUBSTR(?n, 2) AS ?u) WHERE { ?c ex:name ?n }",
+                "SUBSTR as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT (LCASE(?n) AS ?u) WHERE { ?c ex:name ?n }",
+                "LCASE as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT (STRSTARTS(?n, \"a\") AS ?u) WHERE { ?c ex:name ?n }",
+                "STRSTARTS as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n } ORDER BY STRLEN(?n)",
+                "the STRLEN function in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n } ORDER BY (CONCAT(?n, \"a\") = \"b\")",
+                "the CONCAT function in ORDER BY",
             ),
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER((?t > 1) = true) }",

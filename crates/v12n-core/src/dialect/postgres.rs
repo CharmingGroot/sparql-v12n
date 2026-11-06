@@ -3,6 +3,7 @@
 
 use super::{Dialect, SqlType};
 use crate::mapping::template::UCSCHAR;
+use crate::sparql::StrTest;
 
 /// PostgreSQL 13 or later.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -34,6 +35,40 @@ impl Dialect for PostgresDialect {
 
     fn regex_match(&self, text: &str, pattern: &str) -> String {
         format!("{text} ~ {pattern}")
+    }
+
+    /// `char_length` counts characters, which are code points in a UTF-8
+    /// database, as `substr` does.
+    fn char_length(&self, text: &str) -> String {
+        format!("char_length({text})")
+    }
+
+    fn substring(&self, text: &str, start: &str, length: Option<&str>) -> String {
+        match length {
+            Some(length) => format!("substr({text}, {start}, {length})"),
+            None => format!("substr({text}, {start})"),
+        }
+    }
+
+    /// The root locale of ICU applies Unicode's default case operations,
+    /// full mappings (`ß` to `SS`) and the final sigma included, while
+    /// `upper` and `lower` under a libc locale map one character at a time
+    /// and under `"C"` only ASCII. Needs a server built with ICU.
+    fn case_map(&self, text: &str, upper: bool) -> String {
+        let function = if upper { "upper" } else { "lower" };
+        format!("{function}({text} COLLATE \"und-x-icu\")")
+    }
+
+    fn like(&self, text: &str, pattern: &str) -> String {
+        format!("{text} LIKE {pattern}")
+    }
+
+    fn str_test(&self, test: StrTest, text: &str, search: &str) -> String {
+        match test {
+            StrTest::Starts => format!("starts_with({text}, {search})"),
+            StrTest::Ends => format!("right({text}, char_length({search})) = {search}"),
+            StrTest::Contains => format!("strpos({text}, {search}) > 0"),
+        }
     }
 
     fn is_finite(&self, expr: &str) -> String {

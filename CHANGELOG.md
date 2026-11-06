@@ -19,6 +19,14 @@ Design decisions are recorded in the `Decision:` Discussions.
   whose subject templates can produce the same IRI. Each warning is a
   `warning: ...` line on stderr and an entry of `warnings` in JSON, and
   the exit code stays 0.
+- `STRLEN`, `SUBSTR`, `UCASE`, `LCASE`, `STRSTARTS`, `STRENDS`, `CONTAINS`
+  and `CONCAT` in `FILTER`, and `STRLEN` in `BIND` and `SELECT (expr AS
+  ?v)`, with the argument compatibility and language tag rules of SPARQL
+  1.1 §17.4.3. Lengths and positions count code points, and `UCASE` and
+  `LCASE` use Unicode's full case mappings through the ICU root locale,
+  whatever the database locale. `STRSTARTS`, `STRENDS` and `CONTAINS` with
+  a constant are `LIKE` with escaped wildcards under `COLLATE "C"`, which
+  an index on the column under that collation can serve.
 - `IF`, `COALESCE`, `IN` and `NOT IN` in `FILTER`, with the error rules of
   SPARQL 1.1 §17.4.1, and `IF` and `COALESCE` over numbers in `BIND` and
   `SELECT (expr AS ?v)`. `IN` over constants keeps a comparison of the

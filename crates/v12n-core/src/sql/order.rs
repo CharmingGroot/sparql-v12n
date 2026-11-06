@@ -188,7 +188,7 @@ impl<'a> Renderer<'a> {
                     });
                     let datatype = match self.datatype(&sort.operand) {
                         Text::Constant(d) | Text::NaturalDatatype { datatype: d, .. } => d,
-                        Text::Term(_) | Text::Unknown => String::new(),
+                        Text::Term(_) | Text::Computed(_) | Text::Unknown => String::new(),
                     };
                     if others
                         .insert(datatype.clone(), other)
@@ -434,7 +434,9 @@ impl<'a> Renderer<'a> {
                         .cast_rendered(&SqlType::Text, |this| {
                             this.expr(&super::SqlExpr::Param(datatype.as_str().into()))
                         }),
-                    Text::Term(_) | Text::Unknown => self.typed_null(&SqlType::Text),
+                    Text::Term(_) | Text::Computed(_) | Text::Unknown => {
+                        self.typed_null(&SqlType::Text)
+                    }
                 }
                 close(self, &finite);
             }
