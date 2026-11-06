@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Order 11 has no ship city and shares no variable with the left side.
+SELECT ?p ?c WHERE { ?p ex:city ?c MINUS { ?o ex:buyer ?q OPTIONAL { ?o ex:shipCity ?c } } }

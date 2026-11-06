@@ -359,6 +359,31 @@ SPARQL 将数据与其所在组的解连接。v12n 将其与整个模式的解�
 - 能匹配同一个解的两行：相同的行，或仅在其中一行为 `UNDEF` 的位置不同的行；
 - 没有变量的 `VALUES`。
 
+## MINUS
+
+`A MINUS { B }` 保留 `A` 中未被 `B` 的任何解移除的解（SPARQL 1.1 §8.3，§18.5 Minus）。当 `B` 的一个解与 `A` 的一个解兼容，且二者至少共享一个双方都绑定的变量时，`B` 的该解移除 `A` 的该解。`B` 的变量不出现在解中。
+
+`B` 的每种 triples map 选择，以及 `B` 内 `UNION` 的每一侧，在 SQL 中都是一个 anti-join：对其表的 `LEFT JOIN`，其 `ON` 子句在它移除左侧行时成立，并在 `WHERE` 中对其一列使用 `IS NULL`。在 shop 示例中，`?o ex:placedBy ?c ; ex:amount ?a` 与 `MINUS { ?c ex:tier "VIP" }` 给出以下 SQL：
+
+```sql
+FROM "orders" t0
+JOIN "orders" t1 ON t1."id" = t0."id"
+LEFT JOIN "customers" t2 ON t2."tier" = $1 AND t2."id" = t0."customer_id"
+WHERE t2."id" IS NULL AND …
+```
+
+- 共享变量与连接中一样作为 RDF term 比较。字符串永远不等于由相同数字组成的整数，不同 SQL 类型的列也可以比较。
+- 只由 `OPTIONAL` 部分绑定的共享变量可能在一侧未绑定。此时它与任何值兼容，与 [`OPTIONAL`](#optional) 相同。只有双方都绑定时才算共享，因此除非某个共享变量在每一行中都被绑定，`ON` 子句还要求某个共享变量在双方都被绑定（`IS NOT NULL`）。
+- 与左侧没有共享变量、或永远不可能与左侧兼容的 `B` 的选择不移除任何解，也不添加 `LEFT JOIN`（§8.3.2）。
+- `B` 独立求值（§8.3.3）。其中的 `FILTER` 只看到 `B` 的变量，左侧的变量在其中未绑定。
+- `MINUS` 作用于组中写在它之前的部分。它之后的模式与剩余的行连接，组的 `FILTER` 作用于整个组。
+- 唯一的表是左侧的一个表、并通过 `NOT NULL` 唯一键连接的 `LEFT JOIN`，与 `OPTIONAL` 一样改为读取该行。
+
+以下情形作为不支持的功能拒绝：
+
+- `OPTIONAL`、`UNION` 或另一个 `MINUS` 内部的 `MINUS`；
+- `MINUS` 内部的 `BIND` 与 `VALUES`。
+
 ## ORDER BY、LIMIT 与 OFFSET
 
 解修饰符按代数定义的顺序应用（SPARQL 1.1 §18.2.5）。该顺序为 `ORDER BY`，然后是投影、`DISTINCT`、`OFFSET` 与 `LIMIT`。它们全部在 SQL 中应用。

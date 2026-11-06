@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# ASK over MINUS.
+ASK { ?p a ex:Person MINUS { ?p ex:code ?v } }

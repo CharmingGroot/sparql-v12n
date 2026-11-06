@@ -30,6 +30,12 @@ Design decisions are recorded in the `Decision:` Discussions.
   with their variables' columns and checked like triple pattern constants.
   The `VALUES` blocks of a query hold at most 1000 values; a larger query
   fails with `Error::TooManyValues`, HTTP 400.
+- `MINUS` (#114), as an anti-join on the shared variables compared as RDF
+  terms. A solution of the right side removes a left solution only when
+  the two are compatible and share a variable that both bind, so
+  variables that `OPTIONAL` leaves unbound on either side follow
+  SPARQL 1.1 §18.5. `MINUS` inside `OPTIONAL`, `UNION` or another `MINUS`,
+  and `BIND` or `VALUES` inside `MINUS`, are rejected.
 - Arithmetic on `xsd:double` values in `FILTER`, `BIND` and `SELECT`, with
   IEEE 754 results: infinities and signed zeros where PostgreSQL's
   `float8` operators raise errors, and NaN neither equal to nor ordered

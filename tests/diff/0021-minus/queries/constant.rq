@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A constant in the right side.
+SELECT ?p ?n WHERE { ?p ex:name ?n MINUS { ?p ex:city "Seoul" } }

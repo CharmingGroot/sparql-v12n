@@ -91,6 +91,8 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0019-values/values-in-optional`, `values-in-union` | `VALUES` inside `OPTIONAL` or `UNION`: inline data is joined with the whole pattern, which differs there from the join with its group (#113). |
 | `0019-values/values-unbound-variable`, `values-optional-variable` | `VALUES` over a variable that the rest of its group may leave unbound: solutions would take its value from the inline data (#113). |
 | `0019-values/values-overlapping-rows` | Two `VALUES` rows that one solution can match, which the join would repeat (#113). |
+| `0021-minus/minus-in-optional`, `minus-in-union`, `nested-minus` | `MINUS` inside `OPTIONAL`, `UNION` or another `MINUS`, whose anti-join would apply to a part of a branch that none of the cases tests (#114). |
+| `0021-minus/bind-in-minus`, `values-in-minus` | `BIND` and `VALUES` inside `MINUS`: both are computed for the whole pattern, not for the right side of `MINUS` (#114). |
 | `0020-functional-forms/bind-coalesce-variable`, `bind-in` | `COALESCE` whose result can be a term other than a number, and `IN` as the value of `BIND`: a computed variable holds only numbers (#100). |
 | `0020-functional-forms/order-by-if` | `IF` in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0008-order/distinct-over-hidden` | `ORDER BY` over a variable that `SELECT DISTINCT` does not project: one solution stands for several that the order puts at different places (Discussion #63). |
