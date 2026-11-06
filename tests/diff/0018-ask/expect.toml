@@ -1,0 +1,12 @@
+# SPARQL 1.1 §18.2.5 applies LIMIT and OFFSET before ASK tests for a
+# solution, so limit-zero and offset-duplicate-triple answer false. Ontop
+# answers from the pattern alone and gives true, so v12n rejects LIMIT and
+# OFFSET in ASK.
+[query.limit-zero]
+expect = "rejected"
+
+[query.offset-second-solution]
+expect = "rejected"
+
+[query.offset-duplicate-triple]
+expect = "rejected"

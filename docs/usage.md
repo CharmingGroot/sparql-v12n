@@ -25,6 +25,13 @@ line feed and carriage return, so a literal with one, such as U+0001, ends
 XML output with an error. `--format xml` and `--format tsv` apply to
 `v12n query` only. The other commands refuse them with exit code 1.
 
+An `ASK` query prints its answer in the boolean form of JSON
+(`{"head":{},"boolean":true}`) or XML (`<boolean>true</boolean>`), or as
+`true` or `false` in the table, and exits with 0 for both answers. The CSV
+and TSV formats define no boolean form (SPARQL 1.1 Query Results CSV and
+TSV §1), so `--format csv` and `--format tsv` with `ASK` exit with 1
+before the database is reached.
+
 The query can come from three places:
 
 - a file, such as `query.rq` in the example above;
@@ -268,6 +275,8 @@ of the most specific media range that matches it, so `*/*` does not
 override `text/csv;q=0`. When formats tie, the order of the table decides.
 A request without `Accept`, or with `*/*`, therefore gets JSON, and
 `text/*` gets CSV. A request that accepts none of these formats gets `406`.
+An `ASK` query is answered in JSON or XML only, so a request that accepts
+neither gets `406` for it.
 CSV and TSV responses carry `charset=utf-8`.
 
 Results in every format are streamed as rows arrive from PostgreSQL.

@@ -27,6 +27,12 @@ CSV, TSV, 표에서 바인딩(binding)되지 않은 변수는 빈 필드가 된�
 `--format xml`과 `--format tsv`는 `v12n query`에만 적용된다. 다른 명령은 이
 형식을 종료 코드 1로 거절한다.
 
+`ASK` 쿼리는 답을 JSON의 boolean 형식(`{"head":{},"boolean":true}`)이나 XML의
+boolean 형식(`<boolean>true</boolean>`)으로, 표에서는 `true`나 `false`로 출력하고,
+답과 무관하게 종료 코드 0으로 끝난다. CSV와 TSV 형식에는 boolean 형식이 정의되어
+있지 않으므로(SPARQL 1.1 Query Results CSV and TSV §1), `ASK`에 `--format csv`나
+`--format tsv`를 지정하면 데이터베이스에 연결하기 전에 종료 코드 1로 끝난다.
+
 쿼리는 다음 세 곳에서 읽는다.
 
 - 위 예의 `query.rq` 같은 파일
@@ -255,7 +261,9 @@ libpq와 다른 점은 다음과 같다.
 가장 구체적인 범위의 `q` 값을 따른다. 따라서 `*/*`는 `text/csv;q=0`을 덮어쓰지
 않는다. `q` 값이 같으면 표의 순서로 정한다. 따라서 `Accept`가 없거나 `*/*`인
 요청은 JSON을, `text/*`인 요청은 CSV를 받는다. 이 형식 중 어느 것도 받지 않는
-요청에는 `406`을 반환한다. CSV와 TSV 응답에는 `charset=utf-8`이 붙는다.
+요청에는 `406`을 반환한다. `ASK` 쿼리의 결과는 JSON과 XML로만 제공하므로, 둘
+중 어느 것도 받지 않는 요청에는 `406`을 반환한다. CSV와 TSV 응답에는
+`charset=utf-8`이 붙는다.
 
 모든 형식의 결과는 PostgreSQL에서 행이 도착하는 대로 스트리밍된다.
 

@@ -22,8 +22,9 @@ use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use v12n_core::backend::{Backend, BackendError, Connector, ErrorKind, SolutionStream};
 use v12n_core::mapping::Mapping;
-use v12n_core::results::{ResultsFormat, ResultsWriter};
+use v12n_core::results::{ResultsFormat, ResultsWriter, write_boolean};
 use v12n_core::solution::Solution;
+use v12n_core::sparql::QueryForm;
 use v12n_core::sql::SqlPlan;
 use v12n_core::{Catalog, Planner};
 
@@ -242,14 +243,16 @@ async fn answer<C: Connector + 'static>(
     url_query: Option<String>,
     body: Body,
 ) -> Result<Response, Failure> {
-    let format = protocol::negotiate(headers).ok_or_else(|| {
-        let offered: Vec<&str> = ResultsFormat::ALL.iter().map(|f| f.media_type()).collect();
+    let not_acceptable = |offered: &[ResultsFormat], what: &str| {
+        let offered: Vec<&str> = offered.iter().map(|f| f.media_type()).collect();
         Failure::new(
             StatusCode::NOT_ACCEPTABLE,
             "not_acceptable",
-            format!("results are available as {}", offered.join(", ")),
+            format!("{what} are available as {}", offered.join(", ")),
         )
-    })?;
+    };
+    let format = protocol::negotiate(headers, &ResultsFormat::ALL)
+        .ok_or_else(|| not_acceptable(&ResultsFormat::ALL, "results"))?;
     let query = protocol::read_query(
         method,
         headers,
@@ -259,6 +262,13 @@ async fn answer<C: Connector + 'static>(
     )
     .await?;
     let plan = plan(&app.planner, &query)?;
+    let ask = plan.form == QueryForm::Ask;
+    let format = if ask {
+        protocol::negotiate(headers, &ResultsFormat::BOOLEAN)
+            .ok_or_else(|| not_acceptable(&ResultsFormat::BOOLEAN, "ASK results"))?
+    } else {
+        format
+    };
 
     // Refusing at once instead of queueing keeps a burst from holding
     // client connections open with no bound.
@@ -299,6 +309,32 @@ async fn answer<C: Connector + 'static>(
         HeaderValue::from_static(format.content_type()),
     );
     response_headers.insert(header::VARY, HeaderValue::from_static("accept"));
+    if ask {
+        let value = first.is_some();
+        // The plan returns at most one row, so the next read ends the
+        // result and the session can go back to the pool.
+        if value {
+            solutions
+                .try_next()
+                .await
+                .map_err(|e| database_failure(&e))?;
+        }
+        drop(solutions);
+        lease.release();
+        let mut body = Vec::new();
+        write_boolean(format, &mut body, value).map_err(|e| {
+            Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+        })?;
+        tracing::info!(
+            query_id,
+            status = 200,
+            boolean = value,
+            sql_ms,
+            total_ms = started.elapsed().as_millis() as u64,
+            "answered"
+        );
+        return Ok((response_headers, body).into_response());
+    }
     if solutions.is_truncated() {
         response_headers.insert(
             HeaderName::from_static(TRUNCATED_HEADER),

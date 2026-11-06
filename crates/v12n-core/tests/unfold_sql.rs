@@ -201,6 +201,25 @@ fn multiple_triples_maps_union() {
     ));
 }
 
+/// One row answers `ASK` (SPARQL 1.1 §16.3), so the branches are combined
+/// with `UNION ALL` and no duplicates are removed.
+#[test]
+fn ask_reads_one_row_without_removing_duplicates() {
+    insta::assert_snapshot!(explain(
+        MULTI,
+        &format!("{PREFIXES}ASK {{ ?c a ex:Customer ; ex:name ?name }}")
+    ));
+}
+
+/// The order never changes which solutions exist, so `ORDER BY` adds no
+/// sort.
+#[test]
+fn ask_over_a_join_ignores_order_by() {
+    insta::assert_snapshot!(shop(
+        r#"ASK { ?o ex:placedBy ?c . ?c ex:tier "VIP" } ORDER BY ?o"#
+    ));
+}
+
 #[test]
 fn referencing_object_map_joins_parent() {
     insta::assert_snapshot!(explain(

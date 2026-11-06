@@ -16,7 +16,8 @@ use crate::mapping::{
     TermMapValue, TermType, TriplesMap,
 };
 use crate::sparql::{
-    ArithOp, Expression, InlineData, Pattern, PatternTerm, RDF_TYPE, SelectQuery, TriplePattern,
+    ArithOp, Expression, InlineData, Pattern, PatternTerm, QueryForm, RDF_TYPE, SelectQuery,
+    TriplePattern,
 };
 use crate::sql::{
     Condition, LeftJoin, OrderKey, ProjectedTerm, ResultTerm, ResultValue, SqlBranch, SqlExpr,
@@ -1605,6 +1606,7 @@ fn plan(
                 .collect(),
             branches: Vec::new(),
             distinct: query.distinct,
+            form: query.form,
             base_iri: base_iri.cloned(),
             order: order_keys(query),
             offset: query.offset,
@@ -1612,7 +1614,7 @@ fn plan(
         });
     }
 
-    let hidden = if query.distinct {
+    let hidden = if query.distinct || query.form == QueryForm::Ask {
         Vec::new()
     } else {
         hidden_variables(query)
@@ -1884,6 +1886,7 @@ fn plan(
         split_columns: Vec::new(),
         branches: sql_branches,
         distinct: query.distinct,
+        form: query.form,
         base_iri: base_iri.cloned(),
         order: order_keys(query),
         offset: query.offset,

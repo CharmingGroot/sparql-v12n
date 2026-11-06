@@ -18,6 +18,8 @@
 
 在 CSV、TSV 和表格中，未绑定变量为空字段。JSON 和 XML 则在解中省略该变量。除表格外，所有格式都随行到达而输出。XML 1.0 无法容纳制表符、换行符和回车符以外的控制字符，因此含有此类字符（例如 U+0001）的字面量会使 XML 输出以错误结束。`--format xml` 和 `--format tsv` 仅适用于 `v12n query`，其他命令以退出码 1 拒绝它们。
 
+`ASK` 查询以 JSON 的布尔形式（`{"head":{},"boolean":true}`）或 XML 的布尔形式（`<boolean>true</boolean>`）输出答案，在表格中输出 `true` 或 `false`，无论答案如何都以退出码 0 结束。CSV 和 TSV 格式没有定义布尔形式（SPARQL 1.1 Query Results CSV and TSV §1），因此对 `ASK` 使用 `--format csv` 或 `--format tsv` 时，会在连接数据库之前以退出码 1 结束。
+
 查询可以来自三处：
 
 - 文件，例如上例中的 `query.rq`；
@@ -183,7 +185,7 @@ TLS 连接失败属于数据库错误（退出码 3，kind 为 `database`）。�
 | SPARQL 1.1 Query Results CSV | `text/csv` |
 | SPARQL 1.1 Query Results TSV | `text/tab-separated-values` |
 
-`q` 值最高的格式胜出。每种格式采用与其匹配的最具体媒体范围的 `q` 值，因此 `*/*` 不会覆盖 `text/csv;q=0`。`q` 值相同时，按表中顺序决定。因此，不带 `Accept` 或带 `*/*` 的请求得到 JSON，`text/*` 得到 CSV。不接受上述任何格式的请求返回 `406`。CSV 和 TSV 响应带有 `charset=utf-8`。
+`q` 值最高的格式胜出。每种格式采用与其匹配的最具体媒体范围的 `q` 值，因此 `*/*` 不会覆盖 `text/csv;q=0`。`q` 值相同时，按表中顺序决定。因此，不带 `Accept` 或带 `*/*` 的请求得到 JSON，`text/*` 得到 CSV。不接受上述任何格式的请求返回 `406`。`ASK` 查询的结果只以 JSON 和 XML 提供，因此两者都不接受的请求对其返回 `406`。CSV 和 TSV 响应带有 `charset=utf-8`。
 
 所有格式的结果都随行从 PostgreSQL 到达而以流式发送。
 

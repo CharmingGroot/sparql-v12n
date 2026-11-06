@@ -101,6 +101,8 @@ Formats: json is SPARQL 1.1 Query Results JSON, xml the SPARQL Query
 Results XML Format, csv and tsv SPARQL 1.1 Query Results CSV and TSV. CSV
 holds lexical forms only, TSV holds terms in SPARQL syntax, and both write
 an unbound variable as an empty field. All four are written as rows arrive.
+An ASK query prints true or false in json, xml or table and exits with 0
+either way; csv and tsv have no form for it and exit with 1.
 The session is read-only; still, connect as a user that can only read.
 
 When more rows exist than --row-limit, the first --row-limit solutions are
@@ -254,10 +256,10 @@ pub(crate) enum Command {
 #[derive(clap::Args)]
 #[group(required = true, multiple = false)]
 pub(crate) struct QueryArg {
-    /// SPARQL SELECT query file, or `-` for stdin
+    /// SPARQL SELECT or ASK query file, or `-` for stdin
     #[arg(value_name = "QUERY")]
     pub(crate) file: Option<PathBuf>,
-    /// SPARQL SELECT query text, instead of a QUERY file
+    /// SPARQL SELECT or ASK query text, instead of a QUERY file
     #[arg(long = "query", value_name = "SPARQL")]
     pub(crate) text: Option<String>,
 }

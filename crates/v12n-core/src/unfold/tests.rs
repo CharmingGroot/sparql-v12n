@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::dialect::PostgresDialect;
-use crate::sparql;
+use crate::sparql::{self, QueryForm};
 use crate::sql::{Filter, Param, RenderOptions, TableKeys, TermMatch, TermSql, TermSqlValue};
 
 const SHOP: &str = include_str!("../../../../examples/shop/mapping.ttl");
@@ -51,6 +51,21 @@ fn unfold_shared_variable_emits_column_join() {
     assert_eq!(branch.from.len(), 3);
     assert!(branch.conditions.contains(&same(1, "customer_id", 0, "id")));
     assert!(branch.conditions.contains(&same(2, "id", 1, "id")));
+}
+
+#[test]
+fn unfold_ask_selects_no_column_and_keeps_duplicates() {
+    let body = "{ ?o ex:placedBy ?c ; ex:amount ?a }";
+    let select = unfold_query(SHOP, &format!("SELECT ?o WHERE {body}")).unwrap();
+    assert!(!select.hidden_columns.is_empty());
+    assert!(select.has_duplicates(None));
+
+    let ask = unfold_query(SHOP, &format!("ASK {body}")).unwrap();
+    assert_eq!(ask.form, QueryForm::Ask);
+    assert!(ask.columns.is_empty() && ask.hidden_columns.is_empty());
+    assert!(ask.projection.is_empty());
+    assert_eq!(ask.limit, Some(1));
+    assert!(!ask.has_duplicates(None));
 }
 
 #[test]

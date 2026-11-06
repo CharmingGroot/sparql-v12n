@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use v12n_core::backend::{Connector, SolutionStream};
 use v12n_core::mapping::BaseIri;
-use v12n_core::results::ResultsWriter;
+use v12n_core::results::{ResultsFormat, ResultsWriter, write_boolean};
 use v12n_core::solution::Solution;
+use v12n_core::sparql::QueryForm;
 use v12n_core::{Engine, Limits};
 
 use crate::args::QueryArg;
@@ -27,6 +28,17 @@ pub(crate) fn query(
     output: Output,
 ) -> Result<(), Failure> {
     let (planner, plan) = load_plan(mapping_path, query_arg, base_iri)?;
+    let ask = plan.form == QueryForm::Ask;
+    if let Some(format) = output.format.results()
+        && ask
+        && !ResultsFormat::BOOLEAN.contains(&format)
+    {
+        return Err(Failure::new(
+            EXIT_INPUT,
+            "input",
+            "csv and tsv have no form for ASK results; use --format json, xml or table",
+        ));
+    }
     let connector = connector.ok_or_else(|| {
         Failure::new(
             EXIT_INPUT,
@@ -47,6 +59,9 @@ pub(crate) fn query(
         // Waiting for the first row before printing anything means an error
         // in planning or early execution is still reported in `format`.
         let first = solutions.try_next().await.map_err(before_output)?;
+        if ask {
+            return print_boolean(output.format.results(), first.is_some());
+        }
         match output.format.results() {
             Some(format) => {
                 let stdout = BufWriter::new(io::stdout().lock());
@@ -61,6 +76,20 @@ pub(crate) fn query(
         }
         Ok(())
     })
+}
+
+/// Prints the answer of an `ASK` query, as a bare `true` or `false` line
+/// in the table format.
+fn print_boolean(format: Option<ResultsFormat>, value: bool) -> Result<(), Failure> {
+    let mut out = BufWriter::new(io::stdout().lock());
+    let result = match format {
+        Some(format) => write_boolean(format, &mut out, value),
+        None => writeln!(out, "{value}"),
+    };
+    match result.and_then(|()| out.flush()) {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(output_failure(e)),
+        _ => Ok(()),
+    }
 }
 
 /// Streams the solutions into `writer` as they arrive.
