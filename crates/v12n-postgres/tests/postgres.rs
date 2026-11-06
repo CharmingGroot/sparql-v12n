@@ -2106,6 +2106,131 @@ async fn minus_shares_a_variable_only_where_both_sides_bind_it() {
     );
 }
 
+/// EXISTS tests its pattern with the variables of the current solution
+/// replaced by their values (SPARQL 1.1 §8.1, §18.6), also inside the
+/// FILTER of the pattern and of OPTIONAL, and combined with `||` and `!`.
+#[tokio::test]
+async fn exists_tests_the_pattern_with_the_current_solution_substituted() {
+    let Some(url) = database_url() else { return };
+    let rows = |query: &str| {
+        let url = url.clone();
+        let query = format!("PREFIX ex: <http://example.org/>\n{query}");
+        async move {
+            run(&url, Limits::default(), &plan(SHOP, &query))
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .0
+        }
+    };
+    let names =
+        |names: &[&str]| -> Vec<String> { names.iter().map(|n| format!("?n=\"{n}\"")).collect() };
+    assert_eq!(
+        rows(
+            "SELECT ?n WHERE { ?c ex:name ?n \
+             FILTER EXISTS { ?o ex:placedBy ?c ; ex:amount ?a FILTER(?a > 100000) } }"
+        )
+        .await,
+        names(&["Kim"])
+    );
+    assert_eq!(
+        rows(
+            "SELECT ?n WHERE { ?c ex:name ?n \
+             FILTER NOT EXISTS { ?o ex:placedBy ?c ; ex:amount ?a FILTER(?a > 50000) } }"
+        )
+        .await,
+        names(&["Lee"])
+    );
+    // Unlike MINUS (§8.3.2), NOT EXISTS of a pattern with solutions and no
+    // variable in common removes every solution.
+    assert_eq!(
+        rows("SELECT ?n WHERE { ?c ex:name ?n FILTER NOT EXISTS { ?o ex:amount ?a } }").await,
+        names(&[])
+    );
+    assert_eq!(
+        rows("SELECT ?n WHERE { ?c ex:name ?n FILTER EXISTS { ?o ex:amount ?a } }").await,
+        names(&["Kim", "Lee", "Park"])
+    );
+    // Unlike MINUS (§8.3.3), the FILTER inside sees ?n: Park is removed by
+    // Kim, of the same tier and an earlier name.
+    assert_eq!(
+        rows(
+            "SELECT ?n WHERE { ?c ex:name ?n ; ex:tier ?t \
+             FILTER NOT EXISTS { ?d ex:name ?m ; ex:tier ?t FILTER(?m < ?n) } }"
+        )
+        .await,
+        names(&["Kim", "Lee"])
+    );
+    assert_eq!(
+        rows(
+            "SELECT ?n WHERE { ?c ex:name ?n ; ex:tier ?t \
+             FILTER(?t = \"REGULAR\" || !EXISTS { ?o ex:placedBy ?c ; ex:amount 15000 }) }"
+        )
+        .await,
+        names(&["Lee", "Park"])
+    );
+    // A constant that binds to NULL matches nothing in the subquery and
+    // keeps the solutions.
+    assert_eq!(
+        rows(
+            "SELECT ?n WHERE { ?c ex:name ?n \
+             FILTER NOT EXISTS { ?o ex:placedBy ?c ; ex:amount 99999999999 } }"
+        )
+        .await,
+        names(&["Kim", "Lee", "Park"])
+    );
+    // Terms, not values: a text column against an integer column.
+    assert_eq!(
+        rows("SELECT ?n WHERE { ?c ex:name ?n FILTER EXISTS { ?o ex:amount ?n } }").await,
+        names(&[])
+    );
+    // In the FILTER of OPTIONAL, the subquery reads both sides.
+    let order = |n: &str, id: &str| format!("?n=\"{n}\" ?o=<http://example.org/order/{id}>");
+    assert_eq!(
+        rows(
+            "SELECT ?n ?o WHERE { ?c ex:name ?n \
+             OPTIONAL { ?o ex:placedBy ?c FILTER EXISTS { ?o ex:amount ?a FILTER(?a < 50000) } } }"
+        )
+        .await,
+        [
+            order("Kim", "1004"),
+            order("Lee", "1002"),
+            "?n=\"Park\"".to_owned()
+        ]
+    );
+    assert_eq!(
+        rows("ASK { ?c ex:tier \"VIP\" FILTER NOT EXISTS { ?o ex:placedBy ?c } }").await,
+        Vec::<String>::new()
+    );
+}
+
+/// The subquery of a FILTER over two tables reads a third one, which only
+/// `WHERE` can, since the tables have no keys to merge them.
+#[tokio::test]
+async fn exists_reads_every_table_of_its_scope() {
+    let Some(url) = database_url() else { return };
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#Person> rr:logicalTable [ rr:sqlQuery """
+            SELECT * FROM (VALUES (1, 'a'), (2, 'b')) p(id, name)""" ] ;
+          rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+        <#Visit> rr:logicalTable [ rr:sqlQuery """
+            SELECT * FROM (VALUES (10, 1, 5), (11, 2, 7), (12, 2, 5)) v(id, person, n)""" ] ;
+          rr:subjectMap [ rr:template "http://example.org/visit/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:by ;
+            rr:objectMap [ rr:template "http://example.org/person/{person}" ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:n ; rr:objectMap [ rr:column "n" ] ] .
+    "#;
+    let query = "PREFIX ex: <http://example.org/>\n\
+        SELECT ?v WHERE { ?p ex:name ?m . ?v ex:by ?p ; ex:n ?k \
+        FILTER(STR(?v) != ?m && NOT EXISTS { ?w ex:n ?k FILTER(?w != ?v) }) }";
+    let (rows, _) = run(&url, Limits::default(), &plan(mapping, query))
+        .await
+        .unwrap();
+    assert_eq!(rows, ["?v=<http://example.org/visit/11>"]);
+}
+
 #[tokio::test]
 async fn constants_round_trip_through_the_result_formatting() {
     let Some(url) = database_url() else { return };

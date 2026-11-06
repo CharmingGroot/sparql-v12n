@@ -284,6 +284,7 @@ impl<'a> Renderer<'a> {
             }
             Filter::Ebv(value) => self.ebv(value)?,
             Filter::NoError(value) => self.no_error(value)?,
+            Filter::Exists(parts) => self.exists(parts)?,
         }
         Ok(())
     }

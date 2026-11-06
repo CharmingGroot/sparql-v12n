@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# EXISTS of a pattern with solutions and no variable in common keeps them.
+SELECT ?p ?n WHERE { ?p ex:name ?n FILTER EXISTS { ?o ex:amount ?a } }

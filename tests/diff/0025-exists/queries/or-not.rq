@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# EXISTS combined with || and !.
+SELECT ?p ?c WHERE { ?p ex:city ?c FILTER(?c = "Busan" || !EXISTS { ?o ex:buyer ?p }) }

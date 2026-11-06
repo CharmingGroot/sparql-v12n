@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A pattern over the row of the current solution.
+SELECT ?p WHERE { ?p a ex:Person FILTER NOT EXISTS { ?p ex:code ?v } }

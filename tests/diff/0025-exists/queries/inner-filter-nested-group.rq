@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# The FILTER of a group inside the pattern sees ?b as well.
+SELECT ?p ?b WHERE { ?p ex:bonus ?b FILTER EXISTS { ?o ex:buyer ?q { ?o ex:amount ?a FILTER(?a = ?b) } } }

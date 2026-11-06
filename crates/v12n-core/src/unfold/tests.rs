@@ -529,6 +529,179 @@ fn unfold_minus_filter_sees_only_the_right_side() {
 }
 
 #[test]
+fn unfold_exists_is_a_part_that_adds_no_rows() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c ex:name ?n FILTER EXISTS { ?o ex:placedBy ?c } }",
+    )
+    .unwrap();
+    let [branch] = plan.branches.as_slice() else {
+        panic!("expected one branch");
+    };
+    let [part] = branch.left_joins.as_slice() else {
+        panic!("expected one part: {branch:?}");
+    };
+    assert!(part.exists);
+    assert_eq!((part.tables.clone(), part.parent), (1..2, None));
+    // The variable of the current solution is compared as a term.
+    assert!(part.conditions.contains(&same(1, "customer_id", 0, "id")));
+    assert!(
+        branch
+            .conditions
+            .contains(&Condition::Filter(Filter::Exists(vec![0])))
+    );
+    // The variables of the pattern are not in the solutions.
+    assert_eq!(plan.hidden_columns, ["n"]);
+}
+
+/// Unlike MINUS (SPARQL 1.1 §8.3.2), NOT EXISTS over a pattern that shares
+/// no variable still tests the pattern.
+#[test]
+fn unfold_not_exists_without_a_shared_variable_tests_the_pattern() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c ex:name ?n FILTER NOT EXISTS { ?o ex:amount ?a } }",
+    )
+    .unwrap();
+    let branch = &plan.branches[0];
+    let [part] = branch.left_joins.as_slice() else {
+        panic!("expected one part: {branch:?}");
+    };
+    assert!(part.exists);
+    let reads_left = part
+        .conditions
+        .iter()
+        .any(|c| crate::sql::condition_tables(c).contains(&0));
+    assert!(!reads_left, "{part:?}");
+    assert!(
+        branch
+            .conditions
+            .contains(&Condition::Filter(Filter::Not(Box::new(Filter::Exists(
+                vec![0]
+            )))))
+    );
+}
+
+/// SPARQL 1.1 §18.6: unlike MINUS (§8.3.3), a FILTER inside EXISTS sees
+/// the value of a variable of the current solution, also in a group of the
+/// pattern that does not bind it.
+#[test]
+fn unfold_exists_filter_sees_the_current_solution() {
+    for query in [
+        "SELECT ?c WHERE { ?c ex:name ?n FILTER EXISTS { ?d ex:tier ?t FILTER(?t = ?n) } }",
+        "SELECT ?c WHERE { ?c ex:name ?n \
+         FILTER EXISTS { ?d ex:tier ?t { ?d ex:name ?m FILTER(?m = ?n) } } }",
+    ] {
+        let plan = unfold_query(SHOP, query).unwrap();
+        let part = &plan.branches[0].left_joins[0];
+        let filter = part
+            .conditions
+            .iter()
+            .find_map(|c| match c {
+                Condition::Filter(f) => Some(f),
+                _ => None,
+            })
+            .expect("the FILTER of the pattern");
+        // Without the value, the comparison would be an error.
+        assert!(
+            matches!(filter, Filter::Compare { .. }),
+            "{query}: {filter:?}"
+        );
+    }
+}
+
+/// A part whose terms can never be those of the current solution has no
+/// row, and an EXISTS without parts is false; a UNION gives one part per
+/// side, in the same branch.
+#[test]
+fn unfold_exists_has_one_part_per_choice_that_can_match() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c ex:name ?n FILTER EXISTS { ?c ex:amount ?a } }",
+    )
+    .unwrap();
+    let branch = &plan.branches[0];
+    assert!(branch.left_joins.is_empty());
+    assert!(
+        branch
+            .conditions
+            .contains(&Condition::Filter(Filter::Exists(Vec::new())))
+    );
+
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c ex:name ?n \
+         FILTER EXISTS { { ?c ex:tier \"VIP\" } UNION { ?o ex:placedBy ?c } } }",
+    )
+    .unwrap();
+    let [branch] = plan.branches.as_slice() else {
+        panic!("expected one branch");
+    };
+    assert_eq!(branch.left_joins.len(), 2);
+    assert!(
+        branch
+            .conditions
+            .contains(&Condition::Filter(Filter::Exists(vec![0, 1])))
+    );
+}
+
+/// In the FILTER of OPTIONAL, the parts are nested in the OPTIONAL part.
+#[test]
+fn unfold_exists_in_optional_is_nested_in_the_part() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c ?o WHERE { ?c ex:name ?n \
+         OPTIONAL { ?o ex:placedBy ?c FILTER EXISTS { ?o ex:amount ?a } } }",
+    )
+    .unwrap();
+    let [optional, exists] = plan.branches[0].left_joins.as_slice() else {
+        panic!("expected two parts");
+    };
+    assert!(!optional.exists && exists.exists);
+    assert_eq!(exists.parent, Some(0));
+    assert!(optional.tables.start < exists.tables.start);
+    assert_eq!(optional.tables.end, exists.tables.end);
+    assert!(
+        optional
+            .conditions
+            .contains(&Condition::Filter(Filter::Exists(vec![1])))
+    );
+}
+
+/// Where substitution (SPARQL 1.1 §18.6) and a join with the current
+/// solution can differ, EXISTS is rejected.
+#[test]
+fn unfold_exists_rejects_variables_that_may_be_unbound() {
+    for (query, feature) in [
+        (
+            "SELECT ?c WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t } \
+             FILTER EXISTS { ?d ex:tier ?t } }",
+            "EXISTS over ?t, which the solutions it filters may leave unbound",
+        ),
+        (
+            "SELECT ?c WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t } \
+             FILTER NOT EXISTS { ?d ex:name ?m FILTER(?m = ?t) } }",
+            "EXISTS over ?t, which the solutions it filters may leave unbound",
+        ),
+        (
+            "SELECT ?c WHERE { ?c ex:tier ?t \
+             FILTER EXISTS { ?o ex:placedBy ?d OPTIONAL { ?d ex:tier ?t } } }",
+            "EXISTS over ?t, which its pattern binds only inside OPTIONAL",
+        ),
+        (
+            "SELECT ?c WHERE { ?c ex:tier ?t FILTER EXISTS { { } UNION { ?d ex:tier ?t } } }",
+            "EXISTS over a pattern without triple patterns",
+        ),
+    ] {
+        let err = unfold_query(SHOP, query).unwrap_err();
+        assert!(
+            matches!(&err, Error::UnsupportedFeature(f) if f.contains(feature)),
+            "{query}\n=> {err}"
+        );
+    }
+}
+
+#[test]
 fn unfold_values_rows_are_alternatives_of_the_branch() {
     let customer = |id: &str| format!("<http://example.org/customer/{id}>");
     let order = "<http://example.org/order/1>";
