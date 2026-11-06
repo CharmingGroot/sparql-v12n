@@ -1,0 +1,33 @@
+# Functions on strings whose value is a string as the value of BIND: a
+# computed variable holds only numbers (#100).
+[query.bind-ucase]
+expect = "rejected"
+
+# STRLEN in ORDER BY comes with the other expressions there (#108).
+[query.order-by-strlen]
+expect = "rejected"
+
+# A starting location that is not an xsd:integer: a type error by the
+# signature of SUBSTR (SPARQL 1.1 §17.4.3.3), which engines that round it
+# as fn:substring does answer.
+[query.substr-decimal]
+expect = "rejected"
+
+# Ontop maps case with UPPER and LOWER under the database collation, which
+# maps one character at a time: "Straße" to "STRAßE" and "ΟΔΟΣ" to "οδοσ".
+# XPath uses the full case mappings of Unicode (F&O 3.1 §5.4.7, §5.4.8):
+# "STRASSE" and "οδος".
+[query.ucase-sharp-s]
+expect = "mismatch"
+issue = 26
+
+[query.lcase-final-sigma]
+expect = "mismatch"
+issue = 26
+
+# Ontop refuses LANG of a function result ("A variable or a value is
+# expected in Lang").
+[query.lcase-lang-language]
+expect = "ontop-error"
+issue = 26
+solutions = 8

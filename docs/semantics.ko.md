@@ -557,6 +557,47 @@ decimal의 `ROUND`는 `floor(x + 0.5)`다. double에서 `float8`의 `abs`, `ceil
 
 잘못된 패턴이나 플래그는 XPath와 마찬가지로 오류다.
 
+`STRLEN`, `SUBSTR`, `UCASE`, `LCASE`, `STRSTARTS`, `STRENDS`, `CONTAINS`,
+`CONCAT`은 SPARQL 1.1 §17.4.3을 따른다.
+
+- 인자는 문자열 리터럴, 곧 단순 리터럴, `xsd:string`, 언어 태그가 있는
+  리터럴이다(§17.4.3.1.1). 숫자, IRI, 바인딩되지 않은 변수 같은 다른 term이면
+  함수는 오류다.
+- `STRSTARTS`, `STRENDS`, `CONTAINS`의 인자는 호환되어야 한다(§17.4.3.1.2).
+  두 인자 모두 언어 태그가 없거나, 같은 태그가 있거나, 첫 인자에만 태그가
+  있어야 한다. `CONTAINS(?label, "pie")`는 `"Apple pie"@en`에 적용되고,
+  `CONTAINS(?name, "pie"@en)`은 `"pie"`에 대해 오류다.
+- `SUBSTR`, `UCASE`, `LCASE`는 인자의 언어 태그를 유지한다. `CONCAT`은 모든
+  인자에 같은 언어 태그가 있으면 그 태그를 유지하고, 그렇지 않으면 단순
+  리터럴을 반환한다(§17.4.3.12).
+- 길이와 위치는 문자, 곧 Unicode 코드 포인트 단위로 센다. `"e\u0301"`(`e`와
+  결합 악센트)의 `STRLEN`은 2이고, 이모지 하나의 `STRLEN`은 1이다.
+  `SUBSTR(s, start, length)`는 XPath의 `fn:substring`과 같이 1부터 센 위치
+  `p` 가운데 `start <= p < start + length`인 문자를 반환한다.
+  `SUBSTR("abc", 0, 2)`는 `"a"`이고, 길이가 음수이면 `""`이다. 시작 위치와
+  길이는 `xsd:integer` 상수다.
+- `UCASE`와 `LCASE`는 언어별 조정이 없는 Unicode의 전체 대소문자 변환을
+  적용한다(XPath F&O 3.1 §5.4.7, §5.4.8). `UCASE("Straße")`는 `"STRASSE"`이고,
+  `LCASE("ΟΔΟΣ")`는 마지막 시그마를 반영한 `"οδος"`이다.
+
+SQL에서 계산한 문자열은 모두 `COLLATE "C"`를 적용한다. 따라서 계산한
+문자열의 비교, 검색, 연결은 컬럼의 collation과 관계없이 코드 포인트를
+비교한다. `STRLEN`은 `char_length`이고 `SUBSTR`은 `substr`이다. 두 함수는
+문자를 세며, UTF-8 데이터베이스에서 문자는 코드 포인트다. `UCASE`와
+`LCASE`는 ICU collation `"und-x-icu"`(root 로캘)에서의 `upper`와 `lower`이며,
+이 collation은 Unicode의 변환을 적용한다. libc 로캘에서 `upper`와 `lower`는
+문자 하나씩 변환하고(`"STRAßE"`), `"C"`에서는 ASCII만 변환한다. ICU 없이
+빌드한 PostgreSQL 서버는 해당 SQL 문을 거부한다. 상수를 찾는 `STRSTARTS`,
+`STRENDS`, `CONTAINS`는 `%`, `_`, `\`를 escape한 상수를 파라미터로 넘기는
+`LIKE`다. 예를 들어 `STRSTARTS(?name, "Kim")`은
+`name COLLATE "C" LIKE 'Kim%'`이다. `COLLATE "C"`를 적용한 컬럼 인덱스나
+연산자 클래스 `text_pattern_ops`를 쓴 인덱스를 `STRSTARTS`에 사용할 수 있다.
+상수 대신 행에서 계산한 문자열을 찾으면 `starts_with`, `right`, `strpos`를
+쓴다.
+
+`STRLEN`은 숫자이므로 `BIND`와 `SELECT` 식의 값이 될 수 있다(아래 참고). 그 밖의
+함수는 문자열을 반환하며, 계산된 변수는 현재 문자열을 담지 않는다.
+
 다음은 SPARQL을 확장한 엔진과 다른 결과를 반환하는 대신 미지원으로 거부한다.
 
 - 위 표에 없는 데이터타입에서 같은 데이터타입의 두 리터럴을 정렬하거나
@@ -572,21 +613,27 @@ decimal의 `ROUND`는 `floor(x + 0.5)`다. double에서 `float8`의 `abs`, `ceil
   - 1년부터 9999년 범위를 벗어나거나 마이크로초보다 정밀한 dateTime 상수
 - `RAND`를 포함한 그 밖의 함수, `EXISTS`, 그리고 term(변수, 상수, 산술,
   이들에 대한 `STR`, `LANG`, `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`,
-  `IF`, `COALESCE`)이 아닌 식을 피연산자로 쓰는 것.
+  `IF`, `COALESCE`, 문자열 함수)이 아닌 식을 피연산자로 쓰는 것.
   `IF`, `COALESCE`, `IN`의 인자로 쓰는 비교가 그 예다
-- 인코딩이 UTF-8이 아닌 데이터베이스에서의 문자열 정렬과 `REGEX`
+- 상수가 아니거나 `1.5`처럼 `xsd:integer`가 아닌 `SUBSTR`의 시작 위치와
+  길이. SPARQL 1.1에서는 타입 오류이고, `fn:substring`처럼 반올림하는 엔진은
+  값을 반환한다
+- `date`나 `timestamp` 컬럼에 대한 문자열 함수. 이 컬럼의 무한대 값은 plain
+  literal이다
+- 인코딩이 UTF-8이 아닌 데이터베이스에서의 문자열 정렬, `REGEX`, 문자열 함수
 
 ## BIND와 SELECT 식
 
 `BIND(expr AS ?v)`와 `SELECT (expr AS ?v)`는 각 해에서 식의 값을 `?v`에
 바인딩한다(SPARQL 1.1 §18.5, Extend). 식은 변수, 상수,
-[`FILTER`](#filter)와 같은 산술과 숫자 함수, 또는 결과가 산술이나 숫자
-상수인 `IF`와 `COALESCE`다.
+[`FILTER`](#filter)와 같은 산술과 숫자 함수, `STRLEN`, 또는 결과가 산술이나
+숫자 상수인 `IF`와 `COALESCE`다.
 
 - 변수는 그 변수의 term을, 상수는 상수 자신을 값으로 한다.
 - 산술은 XPath의 타입 승격에 따른 데이터타입의 숫자를 정규 표기로 쓴다
   ([리터럴](#리터럴) 참고). 정수 컬럼에 대해 `?qty * 2`는 `xsd:integer`이고
-  `?qty / 4`는 `xsd:decimal`이다. XPath가 구현에 맡긴 decimal 나눗셈의
+  `?qty / 4`는 `xsd:decimal`이다. `STRLEN(?name)`은 `xsd:integer`다. XPath가
+  구현에 맡긴 decimal 나눗셈의
   정밀도는 PostgreSQL `numeric` 나눗셈의 정밀도를 따른다.
   `?qty * 1.5e0`은 `1.5E0`, `-0.0E0`, `INF`, `NaN` 같은 `xsd:double`이다.
   `SELECT DISTINCT`는 서로 다른 term인 `-0.0E0`과 `0.0E0`을 구분한다.
@@ -606,9 +653,10 @@ SPARQL은 `BIND`를 그것이 쓰인 그룹의 해에 대해 평가한다. v12n�
 
 다음은 미지원으로 거부한다.
 
-- 변수, 상수, 산술, 숫자 함수, 그리고 산술과 숫자 상수에 대한 `IF`와
-  `COALESCE`가 아닌 식. `STR`, 비교, `IN`, 결과가 임의의 term일 수 있는
-  `COALESCE(?x, 0)`이 그 예다. SQL에서 계산된 변수는 숫자만 담는다
+- 변수, 상수, 산술, 숫자 함수, `STRLEN`, 그리고 산술과 숫자 상수에 대한
+  `IF`와 `COALESCE`가 아닌 식. `STR`, 비교, `IN`, `UCASE`를 비롯한 문자열
+  함수, 결과가 임의의 term일 수 있는 `COALESCE(?x, 0)`이 그 예다. SQL에서
+  계산된 변수는 숫자만 담는다
 - `OPTIONAL`이나 `UNION` 안의 `BIND`
 - 그룹이 바인딩하지 않을 수 있고 패턴의 뒷부분이 바인딩하는 변수에 대한 `BIND`
 - `BIND`나 `SELECT`가 계산한 변수를 트리플 패턴, `FILTER`, `ORDER BY`, 다른
@@ -764,4 +812,5 @@ SPARQL이 순서를 정하지 않은 경우에는 엔진이 정한 고정 순서
 - `real` 컬럼에 대한 정렬 기준
 - 인코딩이 UTF-8이 아닌 데이터베이스의 문자열에 대한 정렬 기준
 - `FILTER`와 마찬가지로 그 밖의 함수, 산술, `ABS`, `ROUND`, `CEIL`,
-  `FLOOR`, `IF`, `COALESCE`, SQL이 계산할 수 없는 문자열 형태
+  `FLOOR`, `IF`, `COALESCE`, `STRSTARTS`, `STRENDS`, `CONTAINS`를 제외한
+  문자열 함수, SQL이 계산할 수 없는 문자열 형태

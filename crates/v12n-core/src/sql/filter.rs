@@ -12,7 +12,7 @@ use crate::Error;
 use crate::dialect::{Dialect, SqlType};
 use crate::mapping::TermType;
 use crate::solution::canonical_double;
-use crate::sparql::{ArithOp, CompareOp, NumericFunction, TermTest};
+use crate::sparql::{ArithOp, CompareOp, NumericFunction, StrTest, TermTest};
 use crate::xsd::{self, Num, Number, Value, XSD};
 
 mod double;
@@ -77,6 +77,9 @@ pub(super) enum Text<'v> {
         column: (usize, &'v str),
         datatype: String,
     },
+    /// The string of a function on strings (SPARQL 1.1 §17.4.3), computed
+    /// in SQL.
+    Computed(&'v FilterValue),
     /// Not known without the column types.
     Unknown,
 }
@@ -98,12 +101,58 @@ pub(super) struct Operand<'v> {
     pub(super) infinite: bool,
 }
 
-/// Whether the value is computed by arithmetic or a numeric function.
+/// Whether the value is a number computed in SQL, by arithmetic, a
+/// numeric function or `STRLEN`.
 fn is_arith(value: &FilterValue) -> bool {
     matches!(
         value,
-        FilterValue::Arith(..) | FilterValue::Negate(_) | FilterValue::Numeric(..)
+        FilterValue::Arith(..)
+            | FilterValue::Negate(_)
+            | FilterValue::Numeric(..)
+            | FilterValue::StrLen(_)
     )
+}
+
+/// What a string function sees in an argument, which must be a string
+/// literal (SPARQL 1.1 §17.4.3.1.1): `String` or `Lang`, an error for any
+/// other term, or the reason the argument is not supported.
+fn string_argument(operand: &Operand<'_>) -> Kind {
+    match &operand.kind {
+        Kind::Unsupported(reason) => Kind::Unsupported(reason.clone()),
+        _ if operand.infinite => Kind::Unsupported(
+            "functions on strings of a date or timestamp column: its infinite values are plain \
+             literals"
+                .to_owned(),
+        ),
+        // Without column types, as if the column held strings.
+        Kind::String | Kind::Unknown => Kind::String,
+        Kind::Lang(tag) => Kind::Lang(tag.clone()),
+        _ => Kind::Error,
+    }
+}
+
+/// Whether two string arguments are compatible (SPARQL 1.1 §17.4.3.1.2):
+/// both without a language tag, both with the same one, or the first with
+/// one and the second without.
+fn compatible(text: &Kind, search: &Kind) -> bool {
+    match (text, search) {
+        (Kind::String | Kind::Lang(_), Kind::String) => true,
+        (Kind::Lang(a), Kind::Lang(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// `text` as a `LIKE` pattern that matches only itself, `\` being
+/// PostgreSQL's default escape character.
+fn like_escaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The value of `numeric` columns that is not an `xsd:decimal`: `NaN` and
@@ -197,6 +246,7 @@ impl<'a> Renderer<'a> {
                 }
             }
             Filter::Regex { text, pattern } => self.regex(text, pattern)?,
+            Filter::StrTest { test, text, search } => self.str_test(*test, text, search)?,
             Filter::Test(test, value) => {
                 let operand = self.operand(value);
                 if let Kind::Unsupported(reason) = &operand.kind {
@@ -284,6 +334,47 @@ impl<'a> Renderer<'a> {
             FilterValue::Negate(a) | FilterValue::Numeric(_, a) => {
                 return self.arith(value, None, &[self.operand(a)]);
             }
+            FilterValue::StrLen(a) => {
+                return match string_argument(&self.operand(a)) {
+                    Kind::String | Kind::Lang(_) => Operand {
+                        kind: Kind::Numeric(Num::Integer),
+                        ..operand
+                    },
+                    kind => self.string_error(value, kind),
+                };
+            }
+            FilterValue::Substr { text: a, .. } | FilterValue::UCase(a) | FilterValue::LCase(a) => {
+                return match string_argument(&self.operand(a)) {
+                    kind @ (Kind::String | Kind::Lang(_)) => Operand {
+                        kind,
+                        text: Text::Computed(value),
+                        ..operand
+                    },
+                    kind => self.string_error(value, kind),
+                };
+            }
+            // A language tag where all arguments have the same one; a
+            // simple literal otherwise (SPARQL 1.1 §17.4.3.12).
+            FilterValue::Concat(args) => {
+                let mut kinds = Vec::with_capacity(args.len());
+                for arg in args {
+                    match string_argument(&self.operand(arg)) {
+                        kind @ (Kind::String | Kind::Lang(_)) => kinds.push(kind),
+                        kind => return self.string_error(value, kind),
+                    }
+                }
+                operand.kind = match kinds.split_first() {
+                    Some((first @ Kind::Lang(_), rest)) if rest.iter().all(|k| k == first) => {
+                        first.clone()
+                    }
+                    _ => Kind::String,
+                };
+                operand.text = if args.is_empty() {
+                    Text::Constant(String::new())
+                } else {
+                    Text::Computed(value)
+                };
+            }
             FilterValue::Term(term) => {
                 operand.term_type = Some(term.term_type);
                 operand.text = Text::Term(&term.term);
@@ -337,6 +428,23 @@ impl<'a> Renderer<'a> {
             }
         }
         operand
+    }
+
+    /// A function on strings whose argument is `kind`, which is not a
+    /// string literal.
+    fn string_error<'v>(&self, value: &'v FilterValue, kind: Kind) -> Operand<'v> {
+        Operand {
+            value,
+            kind: match kind {
+                Kind::Unsupported(reason) => Kind::Unsupported(reason),
+                _ => Kind::Error,
+            },
+            term_type: None,
+            text: Text::Unknown,
+            column: None,
+            constant: None,
+            infinite: false,
+        }
     }
 
     /// `STR`, `LANG` or `DATATYPE` (SPARQL 1.1 §17.4.2) of `inner`.
@@ -474,6 +582,21 @@ impl<'a> Renderer<'a> {
                     self.sql.push_str(" + 0.5");
                 }
                 self.sql.push(')');
+            }
+            // Characters are code points in a UTF-8 database.
+            FilterValue::StrLen(a) => {
+                let operand = self.operand(a);
+                if !matches!(string_argument(&operand), Kind::String | Kind::Lang(_)) {
+                    self.typed_null(&SqlType::Numeric);
+                    return Ok(());
+                }
+                self.utf8_strings()?;
+                let start = self.sql.len();
+                self.text(&operand)?;
+                let text = self.sql.split_off(start);
+                let length = self.dialect.char_length(&text);
+                self.sql
+                    .push_str(&self.dialect.cast(&length, &SqlType::Numeric));
             }
             _ => {
                 let operand = self.operand(value);
@@ -1137,8 +1260,131 @@ impl<'a> Renderer<'a> {
                 });
                 self.sql.push_str(" END");
             }
+            Text::Computed(value) => self.computed_text(value)?,
             Text::Unknown => self.typed_null(&SqlType::Text),
         }
+        Ok(())
+    }
+
+    /// The string of a function on strings, under the code point
+    /// collation, so that comparing, searching and concatenating it do not
+    /// depend on the collations of the columns it is computed from.
+    fn computed_text(&mut self, value: &FilterValue) -> Result<(), Error> {
+        self.utf8_strings()?;
+        self.sql.push('(');
+        match value {
+            FilterValue::Substr {
+                text,
+                start,
+                length,
+            } => {
+                let at = self.sql.len();
+                self.argument_text(text)?;
+                let text = self.sql.split_off(at);
+                let mut int4 = |n: i32| {
+                    self.cast_rendered(&SqlType::Integer, |this| {
+                        this.expr(&super::SqlExpr::Param(n.to_string().into()))
+                    });
+                    self.sql.split_off(at)
+                };
+                let start = int4(*start);
+                let length = length.map(&mut int4);
+                self.sql
+                    .push_str(&self.dialect.substring(&text, &start, length.as_deref()));
+            }
+            FilterValue::UCase(a) | FilterValue::LCase(a) => {
+                let start = self.sql.len();
+                self.argument_text(a)?;
+                let text = self.sql.split_off(start);
+                let upper = matches!(value, FilterValue::UCase(_));
+                self.sql.push_str(&self.dialect.case_map(&text, upper));
+            }
+            FilterValue::Concat(args) => {
+                self.sql.push('(');
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        self.sql.push_str(" || ");
+                    }
+                    self.argument_text(arg)?;
+                }
+                self.sql.push(')');
+            }
+            other => unreachable!("not a computed string: {other:?}"),
+        }
+        self.sql.push_str(self.dialect.code_point_collation());
+        self.sql.push(')');
+        Ok(())
+    }
+
+    /// The lexical form of a string argument.
+    fn argument_text(&mut self, value: &FilterValue) -> Result<(), Error> {
+        let operand = self.operand(value);
+        self.text(&operand)
+    }
+
+    /// Functions on strings count, compare and map characters, which
+    /// PostgreSQL does as code points only in a UTF-8 database.
+    fn utf8_strings(&self) -> Result<(), Error> {
+        if self.options.non_utf8 {
+            return Err(unsupported(
+                "functions on strings in a database whose encoding is not UTF-8, where \
+                 PostgreSQL's characters are not Unicode code points",
+            ));
+        }
+        Ok(())
+    }
+
+    /// `STRSTARTS`, `STRENDS` or `CONTAINS` (SPARQL 1.1 §17.4.3.6 to
+    /// §17.4.3.8): an error unless the arguments are compatible strings.
+    /// A constant to search for is a `LIKE` pattern, which an index on the
+    /// column under the code point collation can serve for `STRSTARTS`.
+    fn str_test(
+        &mut self,
+        test: StrTest,
+        text: &FilterValue,
+        search: &FilterValue,
+    ) -> Result<(), Error> {
+        let (l, r) = (self.operand(text), self.operand(search));
+        let (a, b) = (string_argument(&l), string_argument(&r));
+        for kind in [&a, &b] {
+            if let Kind::Unsupported(reason) = kind {
+                return Err(unsupported(reason));
+            }
+        }
+        if !compatible(&a, &b) {
+            self.typed_null(&SqlType::Boolean);
+            return Ok(());
+        }
+        self.utf8_strings()?;
+        let collation = self.dialect.code_point_collation();
+        self.sql.push('(');
+        let start = self.sql.len();
+        self.text(&l)?;
+        self.sql.push_str(collation);
+        let text = self.sql.split_off(start);
+        if let Text::Constant(constant) = &r.text {
+            if constant.contains('\0') {
+                return Err(unsupported("strings with a NUL character in FILTER"));
+            }
+            let escaped = like_escaped(constant);
+            let pattern = match test {
+                StrTest::Starts => format!("{escaped}%"),
+                StrTest::Ends => format!("%{escaped}"),
+                StrTest::Contains => format!("%{escaped}%"),
+            };
+            self.cast_rendered(&SqlType::Text, |this| {
+                this.expr(&super::SqlExpr::Param(pattern.into()))
+            });
+            let pattern = self.sql.split_off(start);
+            self.sql.push_str(&self.dialect.like(&text, &pattern));
+        } else {
+            self.text(&r)?;
+            self.sql.push_str(collation);
+            let search = self.sql.split_off(start);
+            self.sql
+                .push_str(&self.dialect.str_test(test, &text, &search));
+        }
+        self.sql.push(')');
         Ok(())
     }
 
@@ -1426,7 +1672,7 @@ pub(super) mod tests {
     }
 
     /// The SQL of `FILTER(filter)` over `?s ex:<p> ?x` (and `?s ex:<q> ?y`).
-    fn render(patterns: &str, filter: &str) -> Result<String, Error> {
+    pub(super) fn render(patterns: &str, filter: &str) -> Result<String, Error> {
         render_with(
             &format!("SELECT ?s WHERE {{ {patterns} FILTER({filter}) }}"),
             false,
@@ -2096,5 +2342,248 @@ pub(super) mod tests {
             params("SELECT ?s WHERE { ?s ex:i4 ?x FILTER(?x < FLOOR(-1.5e0)) }")[0],
             "-2.0E0"
         );
+    }
+
+    /// The parameters of `FILTER(filter)` over `?s ex:txt ?x`.
+    fn filter_params(filter: &str) -> Vec<String> {
+        params(&format!(
+            "SELECT ?s WHERE {{ ?s ex:txt ?x FILTER({filter}) }}"
+        ))
+    }
+
+    #[test]
+    fn strlen_counts_the_characters_of_string_literals() {
+        let length = "char_length((t0.\"txt\"::text))::numeric";
+        assert_eq!(x("txt", "STRLEN(?x) > 3"), format!("{length} > $1::int8"));
+        assert_eq!(x("label", "STRLEN(?x) > 3"), format!("{length} > $1::int8"));
+        // Computed in numeric, so that a quotient is a decimal.
+        assert_eq!(
+            x("txt", "STRLEN(?x) / 2 > 3"),
+            format!("({length} / NULLIF($1::numeric, 0)) > $2::numeric")
+        );
+        assert_eq!(x("txt", "STRLEN(?x)"), format!("({length} <> 0)"));
+        // Anything but a string literal is a type error (SPARQL 1.1
+        // §17.4.3.1.1), also a number's lexical form.
+        assert_eq!(x("i4", "STRLEN(?x) > 3"), "NULL::bool");
+        assert_eq!(x("link", "STRLEN(?x) > 3"), "NULL::bool");
+        assert_eq!(x("i4", "STRLEN(STRLEN(?x)) > 3"), "NULL::bool");
+        assert_eq!(
+            x("link", "STRLEN(STR(?x)) = 3"),
+            "char_length(($1 || t0.\"i4\"::text))::numeric = $2::int8"
+        );
+        assert_eq!(
+            x("txt", "COALESCE(STRLEN(?nothing), 0) = 0"),
+            "$1::int8 = $2::int8"
+        );
+    }
+
+    #[test]
+    fn substr_takes_the_positions_of_fn_substring() {
+        assert_eq!(
+            x("txt", "SUBSTR(?x, 2) = \"bc\""),
+            "((substr((t0.\"txt\"::text), $1::int4) COLLATE \"C\") = $2::text)"
+        );
+        assert_eq!(
+            x("label", "SUBSTR(?x, 2, 1) = \"b\"@en"),
+            "((substr((t0.\"txt\"::text), $1::int4, $2::int4) COLLATE \"C\") = $3::text)"
+        );
+        // The positions p with start <= p < start + length, from 1.
+        for (args, expected) in [
+            ("2", ["2", ""]),
+            ("0, 3", ["1", "2"]),
+            ("-5, 7", ["1", "1"]),
+            ("5, -3", ["5", "0"]),
+            ("2, 0", ["2", "0"]),
+            ("99999999999999999999999", ["2147483647", ""]),
+            ("1, 99999999999999999999999", ["1", "2147483646"]),
+            (
+                "-99999999999999999999999, 99999999999999999999999",
+                ["1", "0"],
+            ),
+            (
+                "-99999999999999999999999, 100000000000000000000002",
+                ["1", "2"],
+            ),
+            (
+                "170141183460469231731687303715884105727, 170141183460469231731687303715884105727",
+                ["2147483647", "0"],
+            ),
+            (
+                "-170141183460469231731687303715884105727, 170141183460469231731687303715884105727",
+                ["1", "0"],
+            ),
+            ("3000000000, 1", ["2147483647", "0"]),
+            ("\"7\"^^xsd:integer, 2", ["7", "2"]),
+        ] {
+            let mut expected: Vec<String> = expected
+                .iter()
+                .filter(|p| !p.is_empty())
+                .map(|p| (*p).to_owned())
+                .collect();
+            expected.push("x".to_owned());
+            assert_eq!(
+                filter_params(&format!("SUBSTR(?x, {args}) = \"x\"")),
+                expected,
+                "{args}"
+            );
+        }
+        // The arguments are xsd:integer, anything else a type error.
+        assert_eq!(x("txt", "SUBSTR(?x, \"1\") = \"a\""), "NULL::bool");
+        assert_eq!(
+            x("txt", "SUBSTR(?x, 1, <http://example.org/a>) = \"a\""),
+            "NULL::bool"
+        );
+        assert_eq!(
+            x("txt", "SUBSTR(?x, \"one\"^^xsd:integer) = \"a\""),
+            "NULL::bool"
+        );
+        assert_eq!(x("i4", "SUBSTR(?x, 1) = \"1\""), "NULL::bool");
+        assert!(rejected("?s ex:txt ?x", "SUBSTR(?x, 1.5) = \"a\"").contains("xsd:integer"));
+        assert!(rejected("?s ex:txt ?x", "SUBSTR(?x, 1, 2e0) = \"a\"").contains("round"));
+        assert!(rejected("?s ex:txt ?x", "SUBSTR(?x, \"1\"^^xsd:int) = \"a\"").contains("#int>"));
+        assert!(
+            rejected(
+                "?s ex:txt ?x",
+                "SUBSTR(?x, 1701411834604692317316873037158841057270)"
+            )
+            .contains("128-bit")
+        );
+    }
+
+    #[test]
+    fn case_mappings_do_not_depend_on_the_database_locale() {
+        assert_eq!(
+            x("txt", "UCASE(?x) = \"AB\""),
+            "((upper((t0.\"txt\"::text) COLLATE \"und-x-icu\") COLLATE \"C\") = $1::text)"
+        );
+        assert_eq!(
+            x("txt", "LCASE(?x) < \"b\""),
+            "(lower((t0.\"txt\"::text) COLLATE \"und-x-icu\") COLLATE \"C\") COLLATE \"C\" < \
+             $1::text"
+        );
+        // The result keeps the language tag (SPARQL 1.1 §17.4.3.4).
+        assert_eq!(
+            x("label", "UCASE(?x) = \"AB\"@en"),
+            "((upper((t0.\"txt\"::text) COLLATE \"und-x-icu\") COLLATE \"C\") = $1::text)"
+        );
+        assert_eq!(x("label", "UCASE(?x) = \"AB\""), "NULL::bool");
+        assert_eq!(
+            x("label", "LANG(LCASE(?x)) = \"en\""),
+            "($1::text = $2::text)"
+        );
+        assert_eq!(
+            x(
+                "label",
+                "DATATYPE(LCASE(?x)) = <http://www.w3.org/1999/02/22-rdf-syntax-ns#langString>"
+            ),
+            "($1::text = $2::text)"
+        );
+        assert_eq!(x("txt", "isLiteral(UCASE(?x))"), "true");
+        assert_eq!(x("i4", "isLiteral(UCASE(?x))"), "NULL::bool");
+        assert_eq!(x("i4", "UCASE(?x) = \"1\""), "NULL::bool");
+        assert_eq!(x("link", "LCASE(?x) = \"a\""), "NULL::bool");
+        // Under negation, a type error stays an error.
+        assert_eq!(x("i4", "!(UCASE(?x) = \"1\")"), "NOT (NULL::bool)");
+        assert!(rejected("?s ex:label ?x", "!(UCASE(?x) = \"A\"@en)").contains("under negation"));
+        assert_eq!(
+            x("txt", "UCASE(?x)"),
+            "((upper((t0.\"txt\"::text) COLLATE \"und-x-icu\") COLLATE \"C\") <> '')"
+        );
+    }
+
+    #[test]
+    fn string_tests_need_compatible_arguments() {
+        let like = "((t0.\"txt\"::text) COLLATE \"C\" LIKE $1::text)";
+        assert_eq!(x("txt", "STRSTARTS(?x, \"a\")"), like);
+        assert_eq!(x("label", "STRSTARTS(?x, \"a\")"), like);
+        assert_eq!(x("label", "STRSTARTS(?x, \"a\"@EN)"), like);
+        assert_eq!(x("label", "STRSTARTS(?x, \"a\"^^xsd:string)"), like);
+        // SPARQL 1.1 §17.4.3.1.2: a language tag on the second argument
+        // only with the same one on the first.
+        assert_eq!(x("label", "STRSTARTS(?x, \"a\"@fr)"), "NULL::bool");
+        assert_eq!(x("txt", "STRENDS(?x, \"a\"@en)"), "NULL::bool");
+        assert_eq!(x("label", "CONTAINS(\"abc\", ?x)"), "NULL::bool");
+        assert_eq!(x("i4", "CONTAINS(?x, \"1\")"), "NULL::bool");
+        assert_eq!(x("txt", "CONTAINS(?x, 1)"), "NULL::bool");
+        assert_eq!(x("link", "STRSTARTS(?x, \"http\")"), "NULL::bool");
+        assert_eq!(x("txt", "!CONTAINS(?x, 1)"), "NOT (NULL::bool)");
+        assert_eq!(
+            x("link", "STRSTARTS(STR(?x), \"http\")"),
+            "(($1 || t0.\"i4\"::text) COLLATE \"C\" LIKE $2::text)"
+        );
+        // The wildcards and the escape character of a constant stand for
+        // themselves.
+        for (filter, pattern) in [
+            ("STRSTARTS(?x, \"a%_\\\\b\")", "a\\%\\_\\\\b%"),
+            ("STRENDS(?x, \"%\")", "%\\%"),
+            ("CONTAINS(?x, \"_\")", "%\\_%"),
+            ("CONTAINS(?x, \"\")", "%%"),
+            ("STRSTARTS(?x, \"\u{e9}\u{1F600}\")", "\u{e9}\u{1F600}%"),
+        ] {
+            assert_eq!(filter_params(filter), [pattern], "{filter}");
+        }
+        // A computed string to search for.
+        assert_eq!(
+            x("txt", "STRSTARTS(?x, ?x)"),
+            "(starts_with((t0.\"txt\"::text) COLLATE \"C\", (t0.\"txt\"::text) COLLATE \"C\"))"
+        );
+        assert_eq!(
+            x("txt", "STRENDS(?x, ?x)"),
+            "(right((t0.\"txt\"::text) COLLATE \"C\", char_length((t0.\"txt\"::text) COLLATE \
+             \"C\")) = (t0.\"txt\"::text) COLLATE \"C\")"
+        );
+        assert_eq!(
+            x("txt", "CONTAINS(UCASE(?x), STR(?x))"),
+            "(strpos((upper((t0.\"txt\"::text) COLLATE \"und-x-icu\") COLLATE \"C\") COLLATE \
+             \"C\", (t0.\"txt\"::text) COLLATE \"C\") > 0)"
+        );
+        assert!(rejected("?s ex:txt ?x", "CONTAINS(?x, \"a\\u0000\")").contains("NUL character"));
+    }
+
+    #[test]
+    fn concat_keeps_a_language_tag_that_all_arguments_have() {
+        assert_eq!(
+            x("txt", "CONCAT(?x, \"-\", ?x) = \"a-a\""),
+            "((((t0.\"txt\"::text) || $1::text || (t0.\"txt\"::text)) COLLATE \"C\") = \
+             $2::text)"
+        );
+        // SPARQL 1.1 §17.4.3.12.
+        assert_eq!(
+            x("label", "CONCAT(?x, \"a\"@en) = \"a\"@en"),
+            "((((t0.\"txt\"::text) || $1::text) COLLATE \"C\") = $2::text)"
+        );
+        assert_eq!(x("label", "CONCAT(?x, \"a\") = \"a\"@en"), "NULL::bool");
+        assert_eq!(x("label", "CONCAT(?x, \"a\"@fr) = \"a\"@en"), "NULL::bool");
+        assert_eq!(
+            x("label", "LANG(CONCAT(?x, \"a\")) = \"\""),
+            "($1::text = $2::text)"
+        );
+        assert_eq!(x("txt", "CONCAT() = \"\""), "($1::text = $2::text)");
+        assert_eq!(x("txt", "CONCAT(?x, 1) = \"a1\""), "NULL::bool");
+        assert_eq!(x("txt", "CONCAT(?x, ?nothing) = \"a\""), "NULL::bool");
+    }
+
+    #[test]
+    fn functions_on_strings_that_sql_cannot_answer_exactly_are_rejected() {
+        for filter in [
+            "STRLEN(?x) > 1",
+            "UCASE(?x) = \"A\"",
+            "STRSTARTS(?x, \"a\")",
+            "CONCAT(?x, \"a\") = \"aa\"",
+        ] {
+            assert!(
+                matches!(
+                    render_with(&format!("SELECT ?s WHERE {{ ?s ex:txt ?x FILTER({filter}) }}"), true),
+                    Err(Error::UnsupportedFeature(reason)) if reason.contains("UTF-8")
+                ),
+                "{filter}"
+            );
+            // Infinite timestamps are plain literals.
+            assert!(
+                rejected("?s ex:ts ?x", filter).contains("infinite"),
+                "{filter}"
+            );
+        }
+        assert!(rejected("?s ex:bpc ?x", "UCASE(?x) = \"A\"").contains("bpchar"));
     }
 }

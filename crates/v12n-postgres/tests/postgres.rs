@@ -492,6 +492,223 @@ async fn functional_forms_follow_sparql_errors() {
     );
 }
 
+/// Strings for the functions on strings (#103), over one text column as a
+/// simple literal (`ex:s`), with the tags `en` (`ex:l`) and `fr` (`ex:f`),
+/// and an integer column (`ex:n`).
+const STRINGS: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+<#Strings> rr:logicalTable [ rr:sqlQuery """SELECT * FROM (VALUES
+    (1, 'abc'), (2, 'Straße'), (3, U&'e\\0301'), (4, U&'\\+01F600x'),
+    (5, 'a%b_c\\d'), (6, 'ΟΔΟΣ'), (7, '')) AS v(id, s)""" ] ;
+  rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:s ; rr:objectMap [ rr:column "s" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:l ; rr:objectMap [ rr:column "s" ; rr:language "en" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:f ; rr:objectMap [ rr:column "s" ; rr:language "fr" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:n ; rr:objectMap [ rr:column "id" ] ] .
+"#;
+
+/// The functions on strings (SPARQL 1.1 §17.4.3) count and cut code
+/// points, combining characters and characters outside the BMP included,
+/// map case as XPath does whatever the database locale, take `%`, `_` and
+/// `\` in a constant as themselves, and are errors for arguments that are
+/// not compatible strings, also under negation.
+#[tokio::test]
+async fn string_functions_follow_xpath() {
+    let Some(url) = database_url() else { return };
+    let rows = |filter: &'static str| {
+        let url = url.clone();
+        async move {
+            let mut rows = filtered_rows(
+                &url,
+                STRINGS,
+                "?row ex:s ?s ; ex:l ?l ; ex:f ?f ; ex:n ?n",
+                filter,
+            )
+            .await;
+            rows.sort_by_key(|r| r.parse::<u32>().unwrap());
+            rows
+        }
+    };
+    let all = ["1", "2", "3", "4", "5", "6", "7"];
+    let none = Vec::<String>::new();
+    for (filter, expected) in [
+        // U+0301 is a character of its own, and U+1F600 one character.
+        ("STRLEN(?s) = 2", &["3", "4"][..]),
+        ("STRLEN(?s) = 0", &["7"]),
+        ("STRLEN(?l) = 6", &["2"]),
+        ("STRLEN(?s) / 2 = 1.5", &["1"]),
+        ("SUBSTR(?s, 1, 1) = \"e\"", &["3"]),
+        ("SUBSTR(?s, 2) = \"\u{301}\"", &["3"]),
+        ("SUBSTR(?s, 2, 1) = \"x\"", &["4"]),
+        ("SUBSTR(?s, 1, 1) = \"\u{1F600}\"", &["4"]),
+        ("SUBSTR(?s, 0, 2) = \"a\"", &["1", "5"]),
+        ("SUBSTR(?s, -1) = ?s", &all),
+        ("SUBSTR(?s, 3, -1) = \"\"", &all),
+        ("SUBSTR(?l, 2, 2) = \"bc\"@en", &["1"]),
+        ("SUBSTR(?l, 2, 2) = \"bc\"", &[]),
+        // Full case mappings (ß to SS) and the final sigma.
+        ("UCASE(?s) = \"STRASSE\"", &["2"]),
+        ("LCASE(?s) = \"οδος\"", &["6"]),
+        ("UCASE(?s) = \"ABC\"", &["1"]),
+        ("UCASE(?s) = \"E\u{301}\"", &["3"]),
+        ("UCASE(?l) = \"ABC\"@en", &["1"]),
+        ("LANG(LCASE(?f)) = \"fr\"", &all),
+        // A constant's wildcards and escape character are its own.
+        ("STRSTARTS(?s, \"a%\")", &["5"]),
+        ("STRSTARTS(?s, \"a_\")", &[]),
+        ("CONTAINS(?s, \"b_c\")", &["5"]),
+        ("CONTAINS(?s, \"%\")", &["5"]),
+        ("CONTAINS(?s, \"\\\\\")", &["5"]),
+        ("STRENDS(?s, \"c\\\\d\")", &["5"]),
+        ("STRENDS(?s, \"x\")", &["4"]),
+        ("STRSTARTS(?s, \"\u{1F600}\")", &["4"]),
+        ("STRSTARTS(?s, \"e\")", &["3"]),
+        ("STRENDS(?s, \"\u{301}\")", &["3"]),
+        ("CONTAINS(?s, \"\")", &all),
+        ("STRSTARTS(UCASE(?s), \"STRA\")", &["2"]),
+        // Computed strings to search for.
+        ("STRSTARTS(?s, SUBSTR(?s, 1, 2))", &all),
+        ("STRENDS(?s, SUBSTR(?s, 3))", &all),
+        ("CONTAINS(?s, LCASE(?s))", &["1", "3", "4", "5", "7"]),
+        ("CONTAINS(CONCAT(\"x\", ?s, \"y\"), ?s)", &all),
+        // SPARQL 1.1 §17.4.3.1.2.
+        ("CONTAINS(?l, \"b\")", &["1", "5"]),
+        ("CONTAINS(?l, \"b\"@en)", &["1", "5"]),
+        ("CONTAINS(?l, \"b\"^^xsd:string)", &["1", "5"]),
+        ("CONTAINS(?l, \"b\"@fr)", &[]),
+        ("!CONTAINS(?l, \"b\"@fr)", &[]),
+        ("CONTAINS(?s, \"b\"@en)", &[]),
+        ("!STRSTARTS(?s, ?l)", &[]),
+        ("STRSTARTS(?l, ?s)", &all),
+        // SPARQL 1.1 §17.4.3.12.
+        ("CONCAT(?s, \"!\", ?l) = \"abc!abc\"", &["1"]),
+        ("CONCAT(?l, ?l) = \"abcabc\"@en", &["1"]),
+        ("CONCAT(?l, ?f) = \"abcabc\"", &["1"]),
+        ("LANG(CONCAT(?l, ?f)) = \"\"", &all),
+        ("CONCAT() = \"\"", &all),
+        // An integer is not a string literal.
+        ("STRLEN(?n) > 0", &[]),
+        ("!(STRLEN(?n) > 0)", &[]),
+        ("!(UCASE(?n) = \"1\")", &[]),
+        ("COALESCE(UCASE(?n), \"none\") = \"none\"", &all),
+        ("CONTAINS(STR(?n), \"1\")", &["1"]),
+    ] {
+        assert_eq!(rows(filter).await, expected, "{filter}");
+    }
+    assert_eq!(rows("STRLEN(?s) > 100").await, none);
+
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?row (STRLEN(?s) AS ?length) WHERE { ?row ex:s ?s ; ex:n ?n FILTER(?n < 5) }";
+    let (rows, _) = run(&url, Limits::default(), &plan(STRINGS, query))
+        .await
+        .unwrap();
+    let length = |row: u32, n: u32| {
+        format!(
+            "?row=<http://example.org/row/{row}> \
+             ?length=\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+        )
+    };
+    assert_eq!(
+        rows,
+        [length(1, 3), length(2, 6), length(3, 2), length(4, 2)]
+    );
+}
+
+/// `STRSTARTS` with a constant is a `LIKE` prefix under `COLLATE "C"`,
+/// which an index on the column under that collation serves, and which
+/// compares code points under a column's nondeterministic collation.
+#[tokio::test]
+async fn string_tests_use_an_index_and_ignore_the_column_collation() {
+    let Some(url) = database_url() else { return };
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS v12n_str103 CASCADE;
+             CREATE SCHEMA v12n_str103;
+             CREATE COLLATION v12n_str103.ci
+               (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+             CREATE TABLE v12n_str103.words (
+               id int PRIMARY KEY,
+               w text NOT NULL,
+               p text NOT NULL,
+               ci text COLLATE v12n_str103.ci NOT NULL);
+             INSERT INTO v12n_str103.words
+               SELECT n, 'w' || n, 'p' || n, CASE WHEN n % 2 = 0 THEN 'abc' ELSE 'ABC' END
+               FROM generate_series(1, 2000) AS n;
+             CREATE INDEX words_w_c ON v12n_str103.words (w COLLATE \"C\");
+             CREATE INDEX words_p_pattern ON v12n_str103.words (p text_pattern_ops);
+             ANALYZE v12n_str103.words;",
+        )
+        .await
+        .unwrap();
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#W> rr:logicalTable [ rr:tableName "v12n_str103.words" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:w ; rr:objectMap [ rr:column "w" ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "p" ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:ci ; rr:objectMap [ rr:column "ci" ] ] .
+    "#;
+    let mut rows = filtered_rows(&url, mapping, "?row ex:w ?w", "STRSTARTS(?w, \"w199\")").await;
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            "199", "1990", "1991", "1992", "1993", "1994", "1995", "1996", "1997", "1998", "1999"
+        ]
+    );
+    // Code points, not the collation that finds "abc" and "ABC" equal.
+    let rows = filtered_rows(&url, mapping, "?row ex:ci ?c", "CONTAINS(?c, \"ab\")").await;
+    assert_eq!(rows.len(), 1000);
+    let rows = filtered_rows(&url, mapping, "?row ex:ci ?c", "UCASE(?c) = ?c").await;
+    assert_eq!(rows.len(), 1000);
+
+    let database = PostgresBackend::connect(&url, Limits::default())
+        .await
+        .unwrap();
+    client
+        .batch_execute("SET enable_seqscan = off")
+        .await
+        .unwrap();
+    for (variable, filter, index) in [
+        ("w", "STRSTARTS(?v, \"w199\")", "words_w_c"),
+        ("p", "STRSTARTS(?v, \"p199\")", "words_p_pattern"),
+    ] {
+        let query = format!(
+            "PREFIX ex: <http://example.org/> SELECT ?row WHERE {{ ?row ex:{variable} ?v FILTER({filter}) }}"
+        );
+        let plan = plan(mapping, &query);
+        let snapshot = database
+            .load_catalog(&CatalogRequest::for_plan(&plan))
+            .await
+            .unwrap();
+        let ready = CatalogPlan::new(&plan, Arc::new(snapshot)).unwrap();
+        let rendered = plan
+            .to_sql_with(&PostgresDialect, &ready.render_options())
+            .unwrap();
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = rendered
+            .params
+            .iter()
+            .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let explain: Vec<String> = client
+            .query(&format!("EXPLAIN {}", rendered.sql), &params)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert!(
+            explain.iter().any(|line| line.contains(index)),
+            "{filter}: {explain:?}"
+        );
+    }
+    drop_schema(&url, "v12n_str103").await;
+}
+
 /// `ABS`, `ROUND`, `CEIL` and `FLOOR` (#104) over integers and decimals:
 /// the result has the class of the argument, `ROUND` takes halves towards
 /// positive infinity (XPath F&O 3.1 §4.4.4), and a `numeric` NaN and a
