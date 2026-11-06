@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# A row that the template cannot produce matches nothing.
+SELECT ?p ?n WHERE {
+  ?p ex:name ?n
+  VALUES ?p { <http://example.org/person/1> <http://example.org/person/3> <http://example.org/order/10> }
+}

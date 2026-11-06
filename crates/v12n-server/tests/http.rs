@@ -131,6 +131,24 @@ async fn too_many_branches_is_400_and_names_the_patterns() {
     );
 }
 
+#[tokio::test]
+async fn too_many_values_is_400() {
+    let values: Vec<String> = (0..=v12n_core::sparql::MAX_VALUES)
+        .map(|i| i.to_string())
+        .collect();
+    let query = format!(
+        "SELECT * WHERE {{ ?o <http://example.org/amount> ?a VALUES ?a {{ {} }} }}",
+        values.join(" ")
+    );
+    let response = send(&offline(), post_direct(&query)).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = text(response).await;
+    assert!(
+        body.contains("VALUES holds 1001 values, more than the limit of 1000"),
+        "{body}"
+    );
+}
+
 fn get_as(query: &str, accept: &str) -> Request<Body> {
     Request::get(format!("/sparql?query={}", encode(query)))
         .header(header::ACCEPT, accept)

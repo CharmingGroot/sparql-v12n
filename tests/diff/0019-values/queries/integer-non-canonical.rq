@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Forms PostgreSQL would read as 3, or reject as out of range.
+SELECT ?o WHERE { ?o ex:amount ?a } VALUES ?a { 03 +3 99999999999 }

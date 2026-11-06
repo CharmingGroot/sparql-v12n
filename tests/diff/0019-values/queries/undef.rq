@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+
+# UNDEF is compatible with every value.
+SELECT ?o ?b ?a WHERE {
+  ?o ex:buyer ?b ; ex:amount ?a
+  VALUES (?b ?a) { (<http://example.org/person/1> UNDEF) (<http://example.org/person/2> 3) (<http://example.org/person/3> 5) }
+}

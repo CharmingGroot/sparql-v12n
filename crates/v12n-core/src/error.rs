@@ -43,6 +43,14 @@ pub enum Error {
         /// `patterns`.
         omitted: usize,
     },
+    /// The `VALUES` blocks of the query hold more values than the limit,
+    /// [`MAX_VALUES`](crate::sparql::MAX_VALUES).
+    #[error("VALUES holds {values} values, more than the limit of {limit}")]
+    TooManyValues {
+        limit: usize,
+        /// Rows times variables of every block, `UNDEF` included.
+        values: usize,
+    },
     /// A result row cannot be turned into an RDF term, such as a relative
     /// IRI without a base IRI (an R2RML data error).
     #[error("invalid term: {0}")]

@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Only the integer 3 is a term the integer column produces.
+SELECT ?o WHERE { ?o ex:amount ?a } VALUES ?a { 3 "3" 3.0 }

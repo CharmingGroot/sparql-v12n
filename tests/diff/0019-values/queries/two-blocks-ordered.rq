@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?o ?a WHERE {
+  VALUES ?b { <http://example.org/person/1> <http://example.org/person/2> }
+  ?o ex:buyer ?b ; ex:amount ?a
+}
+ORDER BY ?o
+VALUES ?a { 3 5 }

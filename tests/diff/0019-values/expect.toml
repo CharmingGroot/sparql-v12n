@@ -1,0 +1,23 @@
+# VALUES that the join with the whole pattern would answer differently
+# from the join with its group, or that would repeat solutions (#113).
+[query.values-in-optional]
+expect = "rejected"
+
+[query.values-in-union]
+expect = "rejected"
+
+[query.values-unbound-variable]
+expect = "rejected"
+
+[query.values-optional-variable]
+expect = "rejected"
+
+[query.values-overlapping-rows]
+expect = "rejected"
+
+# Ontop keeps the numeric scale, so 12.5 does not match a stored 12.50;
+# v12n writes and matches the XSD 1.1 canonical form, as decided in
+# Discussion #35.
+[query.decimal]
+expect = "mismatch"
+issue = 25

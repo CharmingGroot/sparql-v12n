@@ -217,13 +217,14 @@ answer. Each supported feature is compared with
 | `UNION` | Bag union of its sides, inside `OPTIONAL` too; term maps of different shapes for one variable | Removing duplicates across a column of natural datatype and another literal shape of the same variable |
 | `FILTER` | `=`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `\|\|`, `!`, `BOUND`, `sameTerm`, `isIRI`, `isBlank`, `isLiteral`, `STR`, `LANG`, `DATATYPE`, `REGEX`, `+`, `-`, `*`, `/` on integers, decimals and doubles (IEEE 754 results for doubles), with SPARQL's error semantics | Other functions, `IN`, `EXISTS`; comparisons SPARQL 1.1 leaves to extensions (ordering `xsd:date`, `!=` on language-tagged literals, dateTimes with and without a time zone); comparisons and arithmetic over `real` columns; `REGEX` with `\d`, `\w`, `\p{..}` and back-references |
 | `ORDER BY`, `LIMIT`, `OFFSET` | SPARQL 1.1 order, a fixed order where it leaves one open | `ORDER BY` over a variable that `SELECT DISTINCT` does not project |
+| `VALUES` | Inside a group and after the query, `UNDEF`; constants match RDF terms as in triple patterns; at most 1000 values per query | `VALUES` inside `OPTIONAL` or `UNION`; over a variable that the rest of its group may leave unbound; two rows that one solution can match |
 | Literals | RDF 1.1 term equality: language tags in lower case, `xsd:string` is the simple literal, XSD 1.1 canonical lexical forms | `xsd:float` and derived integer types compared by value in `FILTER` |
-| Other forms | No RDFS inference: `rdf:type` matches the classes the mapping states | `ASK`, `CONSTRUCT`, `DESCRIBE`, `MINUS`, `VALUES`, `SERVICE` |
+| Other forms | No RDFS inference: `rdf:type` matches the classes the mapping states | `ASK`, `CONSTRUCT`, `DESCRIBE`, `MINUS`, `SERVICE` |
 
 [docs/semantics.md](docs/semantics.md) gives the rules behind the table:
 [constants](docs/semantics.md#constants-in-a-query), [joins](docs/semantics.md#variables-shared-across-columns), [duplicates](docs/semantics.md#duplicate-triples),
 [`OPTIONAL`](docs/semantics.md#optional), [`UNION`](docs/semantics.md#union), [`FILTER`](docs/semantics.md#filter),
-[`BIND` and `SELECT` expressions](docs/semantics.md#bind-and-select-expressions),
+[`BIND` and `SELECT` expressions](docs/semantics.md#bind-and-select-expressions), [`VALUES`](docs/semantics.md#values),
 [ordering](docs/semantics.md#order-by-limit-and-offset) and [literals](docs/semantics.md#literals). `tests/diff/README.md` lists
 the known differences from Ontop and why each rejected test query is
 rejected.
@@ -307,7 +308,7 @@ flowchart LR
 | Milestone | On main | Remaining |
 |---|---|---|
 | [R1 Value expressions](https://github.com/CharmingGroot/sparql-v12n/milestone/1) | Arithmetic in `FILTER`, `BIND` and `SELECT` expressions | Conditional, RDF term, string, numeric, date and time and hash functions, casts, and the new expressions in `ORDER BY` |
-| [R2 Operators and query forms](https://github.com/CharmingGroot/sparql-v12n/milestone/3) | SPARQL XML, CSV and TSV results | `VALUES`, `MINUS`, `EXISTS`, subqueries, `ASK`, `CONSTRUCT`, `DESCRIBE` |
+| [R2 Operators and query forms](https://github.com/CharmingGroot/sparql-v12n/milestone/3) | SPARQL XML, CSV and TSV results, `VALUES` | `MINUS`, `EXISTS`, subqueries, `ASK`, `CONSTRUCT`, `DESCRIBE` |
 | [R3 Aggregates](https://github.com/CharmingGroot/sparql-v12n/milestone/4) | | `GROUP BY`, `HAVING` and the aggregate functions |
 | [M Catalog metadata](https://github.com/CharmingGroot/sparql-v12n/milestone/2) | | Engine and backend ports, catalog metadata loaded once and refreshed, optimizations from NOT NULL and foreign key constraints |
 | [O1 RDFS ontologies](https://github.com/CharmingGroot/sparql-v12n/milestone/5) | | RDFS entailment |

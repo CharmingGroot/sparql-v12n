@@ -421,6 +421,39 @@ fn optional_in_each_union_branch() {
     ));
 }
 
+/// Each row compares its constants with the columns of its variables, an
+/// `UNDEF` compares nothing, and a row the template cannot produce is
+/// left out.
+#[test]
+fn values_join_the_pattern_as_a_disjunction_of_rows() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?o ?a WHERE { ?o ex:placedBy ?c ; ex:amount ?a \
+         VALUES (?c ?a) { (<http://example.org/customer/7> UNDEF) \
+         (<http://example.org/customer/8> 30000) (<http://example.org/order/1> 5) } }"
+    ));
+}
+
+/// One row left is a condition on every row of the branch, as a triple
+/// pattern constant is.
+#[test]
+fn values_after_the_query_with_one_matching_row() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?n WHERE { ?c ex:name ?n } \
+         VALUES ?c { <http://example.org/customer/7> <http://example.org/order/1> }"
+    ));
+}
+
+#[test]
+fn values_in_each_union_branch() {
+    insta::assert_snapshot!(explain(
+        MULTI,
+        &format!(
+            "{PREFIXES}SELECT ?c WHERE {{ ?c a ex:Customer ; ex:name ?name }} \
+             VALUES ?name {{ \"Kim\" \"Lee\" }}"
+        )
+    ));
+}
+
 /// The SQL with the shop's keys and the column types a database reports.
 fn explain_shop_with_types(body: &str) -> String {
     let mapping = Mapping::from_turtle(SHOP).unwrap();
@@ -661,6 +694,15 @@ fn explain_merged(query: &str) -> String {
 fn self_join_star_reads_the_table_once() {
     insta::assert_snapshot!(explain_merged(
         r#"SELECT ?asset ?hostname WHERE { ?asset ex:criticality "High" ; ex:hostname ?hostname }"#
+    ));
+}
+
+/// The rows of `VALUES` compare the columns of the merged scan.
+#[test]
+fn self_join_star_with_values() {
+    insta::assert_snapshot!(explain_merged(
+        r#"SELECT ?asset ?hostname WHERE { ?asset ex:criticality ?c ; ex:hostname ?hostname }
+           VALUES ?c { "High" "Low" }"#
     ));
 }
 

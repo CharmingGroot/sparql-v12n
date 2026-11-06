@@ -212,13 +212,14 @@ v12n explain examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq
 | `UNION` | 양쪽의 bag 합집합(`OPTIONAL` 안에서도 지원). 한 변수에 형태가 다른 term map을 쓸 수 있다 | 같은 변수에서 자연 데이터타입 컬럼과 다른 리터럴 형태 사이의 중복 제거 |
 | `FILTER` | `=`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `\|\|`, `!`, `BOUND`, `sameTerm`, `isIRI`, `isBlank`, `isLiteral`, `STR`, `LANG`, `DATATYPE`, `REGEX`, 정수·decimal·double의 `+`, `-`, `*`, `/`(double은 IEEE 754 결과). SPARQL의 오류 의미론을 따른다 | 그 밖의 함수, `IN`, `EXISTS`. SPARQL 1.1이 확장에 맡긴 비교(`xsd:date`의 순서 비교, 언어 태그가 있는 리터럴에 대한 `!=`, 시간대가 있는 dateTime과 없는 dateTime의 비교). `real` 컬럼에 대한 비교와 산술. `\d`, `\w`, `\p{..}`, 역참조를 쓰는 `REGEX` |
 | `ORDER BY`, `LIMIT`, `OFFSET` | SPARQL 1.1의 순서. SPARQL이 정하지 않은 부분은 고정된 순서를 쓴다 | `SELECT DISTINCT`가 투영하지 않는 변수에 대한 `ORDER BY` |
+| `VALUES` | 그룹 안과 쿼리 뒤, `UNDEF`. 상수는 트리플 패턴과 같이 RDF term으로 일치한다. 쿼리 하나에 값 1000개까지 | `OPTIONAL`이나 `UNION` 안의 `VALUES`. 그룹의 나머지 부분이 바인딩하지 않을 수 있는 변수에 대한 `VALUES`. 한 해와 일치할 수 있는 두 행 |
 | 리터럴(literal) | RDF 1.1 term 동등성. 언어 태그는 소문자로, `xsd:string`은 simple literal로 다루고, 값은 XSD 1.1 정규 표기(canonical form)로 쓴다 | `FILTER`에서 `xsd:float`와 파생 정수 타입을 값으로 비교하는 것 |
-| 그 밖의 형식 | RDFS 추론 없음. `rdf:type`은 매핑에 명시된 클래스와만 일치한다 | `ASK`, `CONSTRUCT`, `DESCRIBE`, `MINUS`, `VALUES`, `SERVICE` |
+| 그 밖의 형식 | RDFS 추론 없음. `rdf:type`은 매핑에 명시된 클래스와만 일치한다 | `ASK`, `CONSTRUCT`, `DESCRIBE`, `MINUS`, `SERVICE` |
 
 표의 각 항목에 대한 규칙은 [docs/semantics.ko.md](docs/semantics.ko.md)에 있다.
 [상수](docs/semantics.ko.md#쿼리-안의-상수), [조인](docs/semantics.ko.md#여러-컬럼이-공유하는-변수), [중복](docs/semantics.ko.md#중복-트리플), [`OPTIONAL`](docs/semantics.ko.md#optional),
 [`UNION`](docs/semantics.ko.md#union), [`FILTER`](docs/semantics.ko.md#filter),
-[`BIND`와 `SELECT` 식](docs/semantics.ko.md#bind와-select-식), [정렬](docs/semantics.ko.md#order-by-limit-offset), [리터럴](docs/semantics.ko.md#리터럴)을
+[`BIND`와 `SELECT` 식](docs/semantics.ko.md#bind와-select-식), [`VALUES`](docs/semantics.ko.md#values), [정렬](docs/semantics.ko.md#order-by-limit-offset), [리터럴](docs/semantics.ko.md#리터럴)을
 참고한다. `tests/diff/README.md`에는 Ontop과의 알려진 차이와, 거부되는 테스트
 쿼리마다 거부되는 이유가 정리되어 있다.
 
@@ -295,7 +296,7 @@ flowchart LR
 | 마일스톤 | main에 반영된 것 | 남은 작업 |
 |---|---|---|
 | [R1 값 식](https://github.com/CharmingGroot/sparql-v12n/milestone/1) | `FILTER`의 산술, `BIND`와 `SELECT` 식 | 조건 함수, RDF term 함수, 문자열·수치·날짜와 시간·해시 함수, 형 변환, `ORDER BY`의 새 식 |
-| [R2 연산자와 쿼리 형식](https://github.com/CharmingGroot/sparql-v12n/milestone/3) | SPARQL XML, CSV, TSV 결과 | `VALUES`, `MINUS`, `EXISTS`, 하위 쿼리, `ASK`, `CONSTRUCT`, `DESCRIBE` |
+| [R2 연산자와 쿼리 형식](https://github.com/CharmingGroot/sparql-v12n/milestone/3) | SPARQL XML, CSV, TSV 결과, `VALUES` | `MINUS`, `EXISTS`, 하위 쿼리, `ASK`, `CONSTRUCT`, `DESCRIBE` |
 | [R3 집계](https://github.com/CharmingGroot/sparql-v12n/milestone/4) | | `GROUP BY`, `HAVING`, 집계 함수 |
 | [M 카탈로그 메타데이터](https://github.com/CharmingGroot/sparql-v12n/milestone/2) | | 엔진과 백엔드 포트, 한 번 읽고 갱신하는 카탈로그 메타데이터, NOT NULL과 외래 키 제약을 이용한 최적화 |
 | [O1 RDFS 온톨로지](https://github.com/CharmingGroot/sparql-v12n/milestone/5) | | RDFS entailment |

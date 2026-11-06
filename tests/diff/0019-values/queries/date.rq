@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT ?p WHERE { ?p ex:born ?d } VALUES ?d { "1990-01-02"^^xsd:date "2000-12-31"^^xsd:date }

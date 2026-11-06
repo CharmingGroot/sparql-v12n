@@ -958,6 +958,106 @@ async fn unrepresentable_constant_drops_only_its_branch() {
     assert!(subjects(&url, mapping, "v", "99999999999").await.is_empty());
 }
 
+/// `VALUES` (#113): each constant is compared with the columns of its
+/// variable's term, so PostgreSQL types its parameter as the column and
+/// the round trip of Discussion #21 applies. A constant no value can
+/// match drops its row, never the others.
+#[tokio::test]
+async fn values_keep_the_solutions_a_row_matches() {
+    let Some(url) = database_url() else { return };
+    let rows = |query: String| {
+        let url = url.clone();
+        async move {
+            let query = format!("PREFIX ex: <http://example.org/>\n{query}");
+            run(&url, Limits::default(), &plan(SHOP, &query))
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .0
+        }
+    };
+    let customer = |id: &str| format!("<http://example.org/customer/{id}>");
+    let order = |id: &str| format!("?o=<http://example.org/order/{id}>");
+    let ids = ["7", "9", "007", "+8", "99999999999", "seven"].map(customer);
+    assert_eq!(
+        rows(format!(
+            "SELECT ?n WHERE {{ ?c ex:name ?n }} VALUES ?c {{ {} <http://example.org/order/1> }}",
+            ids.join(" ")
+        ))
+        .await,
+        ["?n=\"Kim\"", "?n=\"Park\""]
+    );
+    // UNDEF is compatible with every value.
+    assert_eq!(
+        rows(format!(
+            "SELECT ?o WHERE {{ ?o ex:placedBy ?c ; ex:amount ?a \
+             VALUES (?c ?a) {{ ({} UNDEF) ({} 30000) ({} 1) }} }}",
+            customer("7"),
+            customer("8"),
+            customer("9")
+        ))
+        .await,
+        [order("1001"), order("1002"), order("1004")]
+    );
+    // Terms, not values: no string or decimal is the integer 120000.
+    assert!(
+        rows(
+            "SELECT ?o WHERE { ?o ex:amount ?a VALUES ?a { \"120000\" 120000.0 0120000 } }"
+                .to_owned()
+        )
+        .await
+        .is_empty()
+    );
+    // One row that no value can match empties the result.
+    assert!(
+        rows("SELECT ?o WHERE { ?o ex:amount ?a VALUES ?a { 99999999999 } }".to_owned())
+            .await
+            .is_empty()
+    );
+
+    let plan = plan(
+        SHOP,
+        &format!(
+            "SELECT ?n WHERE {{ ?c <http://example.org/name> ?n }} VALUES ?c {{ {} {} }}",
+            customer("7"),
+            customer("9")
+        ),
+    );
+    let sql = plan.to_sql().unwrap().sql;
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    let statement = client.prepare(&sql).await.unwrap();
+    assert_eq!(statement.params(), [Type::INT4, Type::INT4], "{sql}");
+}
+
+/// A `VALUES` row whose constant one triples map cannot produce still
+/// matches the solutions of another.
+#[tokio::test]
+async fn values_rows_match_in_the_branches_that_can_produce_them() {
+    let Some(url) = database_url() else { return };
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#Text> rr:logicalTable [ rr:sqlQuery "SELECT 1 AS id, 'abc'::text AS v" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column "v" ] ] .
+        <#Int> rr:logicalTable [ rr:sqlQuery "SELECT 2 AS id, 5::int4 AS v" ] ;
+          rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column "v" ] ] .
+    "#;
+    let query = "SELECT ?row WHERE { ?row <http://example.org/v> ?v } \
+                 VALUES ?v { \"abc\" 5 \"5\" 99999999999 }";
+    let (rows, _) = run(&url, Limits::default(), &plan(mapping, query))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            "?row=<http://example.org/row/1>",
+            "?row=<http://example.org/row/2>"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn constants_round_trip_through_the_result_formatting() {
     let Some(url) = database_url() else { return };

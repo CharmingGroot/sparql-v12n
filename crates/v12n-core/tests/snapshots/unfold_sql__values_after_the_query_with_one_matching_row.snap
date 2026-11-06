@@ -1,0 +1,13 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "shop(\"SELECT ?n WHERE { ?c ex:name ?n } \\\n         VALUES ?c { <http://example.org/customer/7> <http://example.org/order/1> }\")"
+---
+SELECT q."n"
+FROM (
+SELECT DISTINCT t0."id" AS "c", t0."name" AS "n"
+FROM "customers" t0
+WHERE t0."id" = $1 AND t0."name" IS NOT NULL
+) q
+
+-- params
+$1 = "7"
