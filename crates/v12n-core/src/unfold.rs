@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Unfolding: triple patterns to SQL fragments, shared variables to joins,
-//! `OPTIONAL` to left joins.
+//! `OPTIONAL` to left joins, `MINUS` to anti-joins.
 
 mod filter;
 mod term;
@@ -531,7 +531,7 @@ enum Attempt<'a> {
     Matched(Fork<'a>, usize),
 }
 
-/// An `OPTIONAL` part of a branch.
+/// An `OPTIONAL` part of a branch, or the right side of a `MINUS`.
 #[derive(Debug, Clone)]
 struct Group {
     /// The number of its LeftJoin in the pattern (see [`Branch::walk`]),
@@ -731,6 +731,16 @@ impl<'a> Branch<'a> {
                 check_count(out.len())?;
                 Ok(out)
             }
+            Pattern::Minus(left, right) => {
+                let lefts = self.walk(left, scope, node, sides, chosen, context)?;
+                let node = node + left.left_joins();
+                let mut out = Vec::with_capacity(lefts.len());
+                for (branch, l) in lefts {
+                    let branch = branch.minus(&l, right, scope, node, context)?;
+                    out.push((branch, l));
+                }
+                Ok(out)
+            }
             // Filter(expr, P) keeps the solutions of P where expr holds, so
             // it sees the variables of P only (SPARQL 1.1 §18.2.2.6).
             Pattern::Filter(inner, expression) => {
@@ -862,6 +872,181 @@ impl<'a> Branch<'a> {
         }
         check_count(out.len())?;
         Ok(out)
+    }
+
+    /// Minus(left, right) (SPARQL 1.1 §18.5): the solutions of the left
+    /// side for which every solution of `right` is incompatible or shares
+    /// no variable bound in both. Each choice of arm and triples maps for
+    /// `right`, and each branch it gives, is an anti-join: a `LEFT JOIN` of
+    /// its tables whose `ON` clause holds where a solution of it removes
+    /// the left side's, with `IS NULL` on one of its columns in `scope`.
+    /// The variables of `right` stay out of the left side's solutions.
+    ///
+    /// The right side is evaluated on its own (SPARQL 1.1 §8.3.3), so a
+    /// `FILTER` in it sees only its own variables. A choice that can never
+    /// be compatible with the left side, or that shares no variable with
+    /// it, removes nothing and adds no table (§8.3.2).
+    fn minus(
+        self,
+        left: &Env<'a>,
+        right: &'a Pattern,
+        scope: Scope,
+        node: usize,
+        context: &Context<'a>,
+    ) -> Result<Self, Error> {
+        let arms = right.arms(MAX_BRANCHES).ok_or_else(too_many)?;
+        let mut branch = self;
+        let mut parts = 0;
+        for arm in &arms {
+            let patterns = right.required_triple_patterns(arm);
+            for chosen in choices(&patterns, context.mapping, context.index)? {
+                // Each outcome that removes something is added to the
+                // branch built so far, as the Diff branch of `optional` is.
+                let removing: Vec<usize> = branch
+                    .clone()
+                    .exclude(left, right, scope, node, arm, &chosen, context)?
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, outcome)| outcome.is_some().then_some(k))
+                    .collect();
+                for k in removing {
+                    let Some(Some(next)) = branch
+                        .exclude(left, right, scope, node, arm, &chosen, context)?
+                        .into_iter()
+                        .nth(k)
+                    else {
+                        unreachable!("a choice matches the same way on any branch");
+                    };
+                    branch = next;
+                    parts += 1;
+                    check_count(parts)?;
+                }
+            }
+        }
+        Ok(branch)
+    }
+
+    /// The right side of a Minus with these choices, as a new `OPTIONAL`
+    /// part of the branch that removes the solutions it matches: one
+    /// outcome per branch the side gives, `None` for one that can remove
+    /// nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn exclude(
+        self,
+        left: &Env<'a>,
+        right: &'a Pattern,
+        scope: Scope,
+        node: usize,
+        arm: &[bool],
+        chosen: &[Candidate<'a>],
+        context: &Context<'a>,
+    ) -> Result<Vec<Option<Self>>, Error> {
+        let mut branch = self;
+        let group = branch.groups.len();
+        let start = branch.from.len();
+        branch.groups.push(Group {
+            node,
+            parent: scope,
+            tables: start..start,
+            conditions: Vec::new(),
+        });
+        let mut sides = arm.iter().copied();
+        let mut chosen = chosen.iter().copied();
+        let forks = branch.walk(
+            right,
+            Some(group),
+            node + 1,
+            &mut sides,
+            &mut chosen,
+            context,
+        )?;
+        let mut out = Vec::with_capacity(forks.len());
+        for (mut part, inner) in forks {
+            part.groups[group].tables.end = part.from.len();
+            // Without a triple pattern, the side's solutions bind nothing.
+            if part.groups[group].tables.is_empty() {
+                out.push(None);
+                continue;
+            }
+            let inner = settle(inner, Some(group));
+            let Some(shared) = part.shared(left, &inner, scope, Some(group))? else {
+                out.push(None);
+                continue;
+            };
+            if part
+                .join(left.clone(), inner, scope, Some(group), Some(group))?
+                .is_none()
+            {
+                out.push(None);
+                continue;
+            }
+            part.groups[group].conditions.extend(shared);
+            let (table, name) = part.witness(Some(group))?;
+            part.conditions_mut(scope)
+                .push(Condition::IsNull(column(table, name)));
+            out.push(Some(part));
+        }
+        Ok(out)
+    }
+
+    /// The conditions under which some variable of both `left` and `right`
+    /// is bound on both sides, evaluated in `left_scope` and `right_scope`:
+    /// Minus keeps a solution that shares no bound variable with any
+    /// solution of the right side (SPARQL 1.1 §18.5, dom(μ) ∩ dom(μ') = ∅).
+    /// Empty when one variable is bound in every row of both, `None` when
+    /// the two sides have no variable in common.
+    fn shared(
+        &self,
+        left: &Env<'a>,
+        right: &Env<'a>,
+        left_scope: Scope,
+        right_scope: Scope,
+    ) -> Result<Option<Vec<Condition>>, Error> {
+        let mut alternatives: Vec<Vec<Condition>> = Vec::new();
+        for (variable, sources) in right {
+            let Some((_, existing)) = left.iter().find(|(v, _)| v == variable) else {
+                continue;
+            };
+            match (
+                self.bound_in(existing, left_scope)?,
+                self.bound_in(sources, right_scope)?,
+            ) {
+                (None, None) => return Ok(Some(Vec::new())),
+                (None, Some(one)) | (Some(one), None) => {
+                    alternatives.extend(one.into_iter().map(|c| vec![c]));
+                }
+                (Some(l), Some(r)) => {
+                    for a in &l {
+                        for b in &r {
+                            alternatives.push(vec![a.clone(), b.clone()]);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(match alternatives.len() {
+            0 => None,
+            1 => alternatives.pop(),
+            _ => Some(vec![Condition::Or(alternatives)]),
+        })
+    }
+
+    /// `None` when `sources` are bound wherever `scope` has rows, or else
+    /// the conditions of which one holds where they are bound.
+    fn bound_in(
+        &self,
+        sources: &[Source<'a>],
+        scope: Scope,
+    ) -> Result<Option<Vec<Condition>>, Error> {
+        let sources = bound_sources(sources, scope);
+        if sources.iter().any(|s| s.scope == scope) {
+            return Ok(None);
+        }
+        sources
+            .into_iter()
+            .map(|s| self.bound(s))
+            .collect::<Result<_, _>>()
+            .map(Some)
     }
 
     /// The right side of a LeftJoin with these choices, as a new `OPTIONAL`
@@ -1209,7 +1394,9 @@ fn skip(pattern: &Pattern, sides: &mut Sides<'_>, chosen: &mut Chosen<'_, '_>) {
             skip(left, sides, chosen);
             skip(right, sides, chosen);
         }
-        Pattern::LeftJoin(inner, _, _) | Pattern::Filter(inner, _) => skip(inner, sides, chosen),
+        Pattern::LeftJoin(inner, _, _) | Pattern::Minus(inner, _) | Pattern::Filter(inner, _) => {
+            skip(inner, sides, chosen)
+        }
         Pattern::Union(left, right) => {
             if sides.next().expect("one side per Union of the arm") {
                 skip(right, sides, chosen);
@@ -1315,7 +1502,7 @@ fn shape<'a>(term: &TermExpr<'a>) -> Shape<'a> {
 /// occurrence.
 fn hidden_variables(query: &SelectQuery) -> Vec<&str> {
     let mut out: Vec<&str> = Vec::new();
-    for pattern in query.pattern.triple_patterns() {
+    for pattern in query.pattern.solution_triple_patterns() {
         for term in [&pattern.subject, &pattern.object] {
             if let PatternTerm::Variable(name) = term
                 && !query.variables.contains(name)
@@ -1798,7 +1985,7 @@ fn plan(
         next += width;
     }
     let mut distinct_order = Vec::new();
-    for pattern in query.pattern.triple_patterns() {
+    for pattern in query.pattern.solution_triple_patterns() {
         for term in [&pattern.subject, &pattern.object] {
             if let PatternTerm::Variable(name) = term
                 && let Some(slots) = entries.remove(name.as_str())

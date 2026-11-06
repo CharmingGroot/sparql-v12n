@@ -173,10 +173,11 @@ v12n explain examples/shop/mapping.ttl examples/shop/queries/vip-orders.rq
 | `FILTER` | `=`、`!=`、`<`、`<=`、`>`、`>=`、`&&`、`\|\|`、`!`、`BOUND`、`sameTerm`、`IF`、`COALESCE`、`IN`、`NOT IN`、`isIRI`、`isBlank`、`isLiteral`、`STR`、`LANG`、`DATATYPE`、`REGEX`、整数、decimal 与 double 的 `ABS`、`ROUND`、`CEIL`、`FLOOR`、`+`、`-`、`*`、`/`（double 采用 IEEE 754 结果），`xsd:dateTime` 值的 `YEAR`、`MONTH`、`DAY`、`HOURS`、`MINUTES`、`SECONDS`、`TIMEZONE`、`TZ`，`NOW`，遵循 SPARQL 的错误语义 | `RAND` 与其他函数、作用于 `xsd:date` 与 `xsd:time` 值的 `xsd:dateTime` 函数、`EXISTS`；SPARQL 1.1 留给扩展处理的比较（`xsd:date` 的排序、带语言标签字面量上的 `!=`、带时区与不带时区的 dateTime 之间的比较）；`real` 列上的比较与算术；含 `\d`、`\w`、`\p{..}` 与反向引用的 `REGEX` |
 | `ORDER BY`、`LIMIT`、`OFFSET` | SPARQL 1.1 的顺序，在其未规定之处采用固定顺序 | 对 `SELECT DISTINCT` 未投影的变量使用 `ORDER BY` |
 | `VALUES` | 组内与查询之后、`UNDEF`；常量与三元组模式中一样按 RDF term 匹配；每个查询最多 1000 个值 | `OPTIONAL` 或 `UNION` 内部的 `VALUES`；对组其余部分可能未绑定的变量使用 `VALUES`；能匹配同一个解的两行 |
+| `MINUS` | 对共享变量的 anti-join，按 RDF term 比较；任一侧由 `OPTIONAL` 留下未绑定的变量；右侧的 `UNION` 与 `OPTIONAL` | `OPTIONAL`、`UNION` 或另一个 `MINUS` 内部的 `MINUS`；`MINUS` 内部的 `BIND` 与 `VALUES` |
 | 字面量 | RDF 1.1 的 term 相等：语言标签为小写，`xsd:string` 即简单字面量，XSD 1.1 规范词法形式 | 在 `FILTER` 中按值比较 `xsd:float` 与派生整数类型 |
-| 其他形式 | 不进行 RDFS 推理：`rdf:type` 匹配映射中声明的类 | `CONSTRUCT`、`DESCRIBE`、`MINUS`、`SERVICE` |
+| 其他形式 | 不进行 RDFS 推理：`rdf:type` 匹配映射中声明的类 | `CONSTRUCT`、`DESCRIBE`、`SERVICE` |
 
-表中各项背后的规则见 [docs/semantics.zh-CN.md](docs/semantics.zh-CN.md)：[常量](docs/semantics.zh-CN.md#查询中的常量)、[连接](docs/semantics.zh-CN.md#跨列共享的变量)、[去重](docs/semantics.zh-CN.md#重复的三元组)、[`OPTIONAL`](docs/semantics.zh-CN.md#optional)、[`UNION`](docs/semantics.zh-CN.md#union)、[`FILTER`](docs/semantics.zh-CN.md#filter)、[`BIND` 与 `SELECT` 表达式](docs/semantics.zh-CN.md#bind-与-select-表达式)、[`VALUES`](docs/semantics.zh-CN.md#values)、[排序](docs/semantics.zh-CN.md#order-bylimit-与-offset) 与[字面量](docs/semantics.zh-CN.md#字面量)。`tests/diff/README.md` 列出了与 Ontop 的已知差异，以及每个被拒绝的测试查询被拒绝的原因。
+表中各项背后的规则见 [docs/semantics.zh-CN.md](docs/semantics.zh-CN.md)：[常量](docs/semantics.zh-CN.md#查询中的常量)、[连接](docs/semantics.zh-CN.md#跨列共享的变量)、[去重](docs/semantics.zh-CN.md#重复的三元组)、[`OPTIONAL`](docs/semantics.zh-CN.md#optional)、[`UNION`](docs/semantics.zh-CN.md#union)、[`FILTER`](docs/semantics.zh-CN.md#filter)、[`BIND` 与 `SELECT` 表达式](docs/semantics.zh-CN.md#bind-与-select-表达式)、[`VALUES`](docs/semantics.zh-CN.md#values)、[`MINUS`](docs/semantics.zh-CN.md#minus)、[排序](docs/semantics.zh-CN.md#order-bylimit-与-offset) 与[字面量](docs/semantics.zh-CN.md#字面量)。`tests/diff/README.md` 列出了与 Ontop 的已知差异，以及每个被拒绝的测试查询被拒绝的原因。
 
 ## 使用说明
 
@@ -226,7 +227,7 @@ flowchart LR
 | 里程碑 | main 上已有 | 剩余工作 |
 |---|---|---|
 | [R1 值表达式](https://github.com/CharmingGroot/sparql-v12n/milestone/1) | `FILTER` 中的算术、`BIND` 与 `SELECT` 表达式 | 条件函数、RDF 项函数、字符串、数值、日期时间与哈希函数、类型转换，以及 `ORDER BY` 中的新表达式 |
-| [R2 运算符与查询形式](https://github.com/CharmingGroot/sparql-v12n/milestone/3) | SPARQL XML、CSV、TSV 结果、`ASK`、`VALUES` | `MINUS`、`EXISTS`、子查询、`CONSTRUCT`、`DESCRIBE` |
+| [R2 运算符与查询形式](https://github.com/CharmingGroot/sparql-v12n/milestone/3) | SPARQL XML、CSV、TSV 结果、`ASK`、`VALUES`、`MINUS` | `EXISTS`、子查询、`CONSTRUCT`、`DESCRIBE` |
 | [R3 聚合](https://github.com/CharmingGroot/sparql-v12n/milestone/4) | | `GROUP BY`、`HAVING` 与聚合函数 |
 | [M 目录元数据](https://github.com/CharmingGroot/sparql-v12n/milestone/2) | | 引擎与后端端口、一次加载并可刷新的目录元数据、利用 NOT NULL 与外键约束的优化 |
 | [O1 RDFS 本体](https://github.com/CharmingGroot/sparql-v12n/milestone/5) | | RDFS 蕴涵 |

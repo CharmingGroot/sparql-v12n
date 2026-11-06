@@ -118,6 +118,12 @@ pub enum Pattern {
     /// `Union(left, right)` from `{ A } UNION { B }`: the solutions of both
     /// sides as a bag (SPARQL 1.1 §18.5).
     Union(Box<Pattern>, Box<Pattern>),
+    /// `Minus(left, right)` from `A MINUS { B }` (SPARQL 1.1 §18.5): the
+    /// solutions of the left side that no solution of the right side is
+    /// compatible with while sharing a variable with it. The right side is
+    /// evaluated on its own (§8.3.3), so its `FILTER`s see only its
+    /// variables, and its variables are not in the solutions.
+    Minus(Box<Pattern>, Box<Pattern>),
 }
 
 /// A `FILTER` expression in the supported subset (SPARQL 1.1 §17).
@@ -340,20 +346,28 @@ impl Pattern {
         out
     }
 
-    fn collect_triple_patterns<'p>(&'p self, out: &mut Vec<&'p TriplePattern>, optional: bool) {
+    /// The triple patterns whose variables a solution can bind: all but
+    /// those on the right side of a `Minus`, in the order they are written.
+    pub fn solution_triple_patterns(&self) -> Vec<&TriplePattern> {
+        let mut out = Vec::new();
+        self.collect_triple_patterns(&mut out, false);
+        out
+    }
+
+    fn collect_triple_patterns<'p>(&'p self, out: &mut Vec<&'p TriplePattern>, minus: bool) {
         match self {
             Self::Bgp(patterns) => out.extend(patterns),
-            Self::Join(left, right) | Self::Union(left, right) => {
-                left.collect_triple_patterns(out, optional);
-                right.collect_triple_patterns(out, optional);
+            Self::Join(left, right) | Self::Union(left, right) | Self::LeftJoin(left, right, _) => {
+                left.collect_triple_patterns(out, minus);
+                right.collect_triple_patterns(out, minus);
             }
-            Self::LeftJoin(left, right, _) => {
-                left.collect_triple_patterns(out, optional);
-                if optional {
-                    right.collect_triple_patterns(out, optional);
+            Self::Minus(left, right) => {
+                left.collect_triple_patterns(out, minus);
+                if minus {
+                    right.collect_triple_patterns(out, minus);
                 }
             }
-            Self::Filter(inner, _) => inner.collect_triple_patterns(out, optional),
+            Self::Filter(inner, _) => inner.collect_triple_patterns(out, minus),
         }
     }
 
@@ -380,7 +394,9 @@ impl Pattern {
                 }
                 out
             }
-            Self::LeftJoin(left, _, _) | Self::Filter(left, _) => left.arms(limit)?,
+            Self::LeftJoin(left, _, _) | Self::Minus(left, _) | Self::Filter(left, _) => {
+                left.arms(limit)?
+            }
             Self::Union(left, right) => {
                 let side = |side: bool, arms: Vec<Vec<bool>>| {
                     arms.into_iter().map(move |arm| {
@@ -419,7 +435,7 @@ impl Pattern {
                 left.collect_required(out, sides);
                 right.collect_required(out, sides);
             }
-            Self::LeftJoin(inner, _, _) | Self::Filter(inner, _) => {
+            Self::LeftJoin(inner, _, _) | Self::Minus(inner, _) | Self::Filter(inner, _) => {
                 inner.collect_required(out, sides);
             }
             Self::Union(left, right) => {
@@ -443,7 +459,9 @@ impl Pattern {
                 out.extend(right.certain_variables());
                 out
             }
-            Self::LeftJoin(inner, _, _) | Self::Filter(inner, _) => inner.certain_variables(),
+            Self::LeftJoin(inner, _, _) | Self::Minus(inner, _) | Self::Filter(inner, _) => {
+                inner.certain_variables()
+            }
             Self::Union(left, right) => {
                 let right = right.certain_variables();
                 left.certain_variables()
@@ -459,7 +477,7 @@ impl Pattern {
     fn filter_variables(&self) -> Vec<&str> {
         match self {
             Self::Bgp(_) => Vec::new(),
-            Self::Join(left, right) | Self::Union(left, right) => {
+            Self::Join(left, right) | Self::Union(left, right) | Self::Minus(left, right) => {
                 let mut out = left.filter_variables();
                 out.extend(right.filter_variables());
                 out
@@ -478,14 +496,17 @@ impl Pattern {
         }
     }
 
-    /// Number of `LeftJoin` nodes in the pattern.
+    /// Number of `LeftJoin` and `Minus` nodes in the pattern. The right
+    /// side of each is a `LEFT JOIN` when unfolded.
     pub fn left_joins(&self) -> usize {
         match self {
             Self::Bgp(_) => 0,
             Self::Join(left, right) | Self::Union(left, right) => {
                 left.left_joins() + right.left_joins()
             }
-            Self::LeftJoin(left, right, _) => left.left_joins() + 1 + right.left_joins(),
+            Self::LeftJoin(left, right, _) | Self::Minus(left, right) => {
+                left.left_joins() + 1 + right.left_joins()
+            }
             Self::Filter(inner, _) => inner.left_joins(),
         }
     }
@@ -594,7 +615,7 @@ pub fn parse(query: &str) -> Result<SelectQuery, Error> {
     let mut extends = Vec::new();
     let mut values = Vec::new();
     let pattern = group(&inner, Place::Required, &mut extends, &mut values)?;
-    if pattern.triple_patterns().is_empty() {
+    if pattern.solution_triple_patterns().is_empty() {
         return Err(unsupported("empty graph patterns"));
     }
     let bindings = check_extends(&pattern, extends, &order_by)?;
@@ -637,12 +658,16 @@ fn check_extends(
         .iter()
         .map(|e| e.binding.variable.as_str())
         .collect();
-    let occurrences = |p: &Pattern, v: &str| {
-        p.triple_patterns()
+    let count = |patterns: Vec<&TriplePattern>, v: &str| {
+        patterns
             .iter()
             .filter(|t| t.variables().any(|u| u == v))
             .count()
     };
+    // The right side of a MINUS binds no variable of the solutions, but it
+    // reads the value of a variable it shares with them.
+    let binding = |p: &Pattern, v: &str| count(p.solution_triple_patterns(), v);
+    let occurrences = |p: &Pattern, v: &str| count(p.triple_patterns(), v);
     let filters = pattern.filter_variables();
     for extend in &extends {
         let variable = extend.binding.variable.as_str();
@@ -655,9 +680,7 @@ fn check_extends(
             }
             // Joined with the rest of the pattern, a solution of the group
             // that leaves the variable unbound can get a value for it.
-            if !certain.contains(&used)
-                && occurrences(pattern, used) > occurrences(&extend.group, used)
-            {
+            if !certain.contains(&used) && binding(pattern, used) > binding(&extend.group, used) {
                 return Err(unsupported(&format!(
                     "BIND over ?{used}, which its group may leave unbound and a later part of \
                      the pattern binds"
@@ -689,10 +712,23 @@ fn check_extends(
 /// Where a group is written, for the `BIND`s it may hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Place {
-    /// Outside `OPTIONAL` and `UNION`.
+    /// Outside `OPTIONAL`, `UNION` and the right side of `MINUS`.
     Required,
     Optional,
     Union,
+    Minus,
+}
+
+impl Place {
+    /// The keyword of the group a non-required place is inside.
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::Required => "the WHERE clause",
+            Self::Optional => "OPTIONAL",
+            Self::Union => "UNION",
+            Self::Minus => "MINUS",
+        }
+    }
 }
 
 /// The expression of a `BIND` or `SELECT (expr AS ?v)`: a variable, a
@@ -854,10 +890,8 @@ fn group(
             variable,
             expression,
         } if !has_group(inner) => {
-            match place {
-                Place::Required => {}
-                Place::Optional => return Err(unsupported("BIND inside OPTIONAL")),
-                Place::Union => return Err(unsupported("BIND inside UNION")),
+            if place != Place::Required {
+                return Err(unsupported(&format!("BIND inside {}", place.keyword())));
             }
             let inner = nested(inner, place)?;
             extends.push(Extend {
@@ -871,6 +905,16 @@ fn group(
         }
         // Not joined with patterns that bind its variables.
         GraphPattern::Values { .. } => values_join(&[pattern], place, extends, values),
+        // Unfolding evaluates Minus where it is written. Inside OPTIONAL,
+        // UNION and another MINUS it is rejected, as untested shapes.
+        GraphPattern::Minus { left, right } => {
+            if place != Place::Required {
+                return Err(unsupported(&format!("MINUS inside {}", place.keyword())));
+            }
+            let left = nested(left, place)?;
+            let right = nested(right, Place::Minus)?;
+            Ok(Pattern::Minus(Box::new(left), Box::new(right)))
+        }
         other => Err(unsupported(describe(other))),
     }
 }
@@ -912,10 +956,8 @@ fn values_join(
     extends: &mut Vec<Extend>,
     values: &mut Vec<InlineData>,
 ) -> Result<Pattern, Error> {
-    match place {
-        Place::Required => {}
-        Place::Optional => return Err(unsupported("VALUES inside OPTIONAL")),
-        Place::Union => return Err(unsupported("VALUES inside UNION")),
+    if place != Place::Required {
+        return Err(unsupported(&format!("VALUES inside {}", place.keyword())));
     }
     let mut joined = Pattern::Bgp(Vec::new());
     let mut data = Vec::new();
@@ -1479,6 +1521,51 @@ mod tests {
         assert_eq!(q.pattern.left_joins(), 2);
         assert_eq!(q.pattern.required_triple_patterns(&[]).len(), 1);
         assert_eq!(q.pattern.triple_patterns().len(), 3);
+    }
+
+    fn minus(left: Pattern, right: Pattern) -> Pattern {
+        Pattern::Minus(Box::new(left), Box::new(right))
+    }
+
+    #[test]
+    fn parse_minus_applies_to_the_group_before_it() {
+        let q = parse_ok("SELECT * WHERE { ?c ex:name ?n MINUS { ?c ex:tier ?t } }");
+        assert_eq!(q.variables, ["c", "n"]);
+        let expected = minus(bgp(&[("c", "name", "n")]), bgp(&[("c", "tier", "t")]));
+        assert_eq!(q.pattern, expected);
+        assert_eq!(q.pattern.left_joins(), 1);
+        assert_eq!(q.pattern.required_triple_patterns(&[]).len(), 1);
+        assert_eq!(q.pattern.triple_patterns().len(), 2);
+        assert_eq!(q.pattern.solution_triple_patterns().len(), 1);
+
+        // A pattern after MINUS joins its result, and a FILTER of the
+        // group applies to the whole group.
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n MINUS { ?c ex:tier ?t } ?o ex:placedBy ?c \
+             FILTER(?n != \"Kim\") }",
+        );
+        let Pattern::Filter(inner, _) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        assert_eq!(
+            **inner,
+            Pattern::Join(Box::new(expected), Box::new(bgp(&[("o", "placedBy", "c")])))
+        );
+        // The FILTER of the right side stays inside it.
+        let q =
+            parse_ok("SELECT * WHERE { ?c ex:name ?n MINUS { ?c ex:tier ?t FILTER(?t = ?n) } }");
+        let Pattern::Minus(_, right) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        assert!(matches!(&**right, Pattern::Filter(..)));
+
+        // The right side binds no variable of the solutions, so a BIND
+        // over ?t reads the value of the OPTIONAL part.
+        let q = parse_ok(
+            "SELECT ?u WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t } BIND(?t AS ?u) \
+             MINUS { ?x ex:tier ?t } }",
+        );
+        assert_eq!(q.bindings.len(), 1);
     }
 
     #[test]
@@ -2115,6 +2202,34 @@ mod tests {
             (
                 "SELECT * WHERE { ?c ex:name ?n VALUES () { () } }",
                 "VALUES without variables",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t MINUS { ?c ex:city ?y } } }",
+                "MINUS inside OPTIONAL",
+            ),
+            (
+                "SELECT * WHERE { { ?c ex:name ?n MINUS { ?c ex:tier ?t } } UNION { ?c ex:city ?n } }",
+                "MINUS inside UNION",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n MINUS { ?c ex:tier ?t MINUS { ?c ex:city ?y } } }",
+                "MINUS inside MINUS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n MINUS { ?c ex:tier ?t BIND(?t AS ?u) } }",
+                "BIND inside MINUS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n MINUS { ?c ex:tier ?t VALUES ?t { \"VIP\" } } }",
+                "VALUES inside MINUS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n BIND(?n AS ?m) MINUS { ?d ex:name ?m } }",
+                "a triple pattern over ?m, which BIND computes",
+            ),
+            (
+                "SELECT * WHERE { MINUS { ?c ex:name ?n } }",
+                "empty graph patterns",
             ),
         ];
         for (query, feature) in cases {

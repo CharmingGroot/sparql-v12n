@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# The right side matches names from both triples maps.
+SELECT ?p ?c WHERE { ?p ex:city ?c MINUS { ?p ex:name "P. Park" } }

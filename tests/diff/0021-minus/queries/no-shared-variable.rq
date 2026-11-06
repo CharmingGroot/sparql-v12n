@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# SPARQL 1.1 §8.3.2: no variable in common, so nothing is removed.
+SELECT ?p ?n WHERE { ?p ex:name ?n MINUS { ?o ex:amount ?a } }

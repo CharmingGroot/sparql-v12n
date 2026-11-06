@@ -3,7 +3,9 @@
 use super::*;
 use crate::dialect::PostgresDialect;
 use crate::sparql::{self, QueryForm};
-use crate::sql::{Filter, Param, RenderOptions, TableKeys, TermMatch, TermSql, TermSqlValue};
+use crate::sql::{
+    Filter, Param, RenderOptions, TableKeys, TermDatatype, TermMatch, TermSql, TermSqlValue,
+};
 
 const SHOP: &str = include_str!("../../../../examples/shop/mapping.ttl");
 
@@ -395,6 +397,135 @@ fn eq_param(table: usize, name: &str, value: &str, datatype: Option<&str>) -> Co
             datatype: datatype.map(str::to_owned),
         }),
     )
+}
+
+#[test]
+fn unfold_minus_is_a_left_join_that_keeps_the_rows_it_does_not_extend() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?o WHERE { ?o ex:placedBy ?c MINUS { ?c ex:tier ?t } }",
+    )
+    .unwrap();
+    let [branch] = plan.branches.as_slice() else {
+        panic!("expected one branch");
+    };
+    let [part] = branch.left_joins.as_slice() else {
+        panic!("expected one part: {branch:?}");
+    };
+    assert_eq!(part.tables, 1..2);
+    // The shared variable is compared as a term, as in a join.
+    assert!(part.conditions.contains(&same(1, "id", 0, "customer_id")));
+    assert!(
+        branch
+            .conditions
+            .contains(&Condition::IsNull(column(1, "id")))
+    );
+    // The variables of the right side are not in the solutions.
+    assert_eq!(plan.hidden_columns, ["c"]);
+}
+
+/// SPARQL 1.1 §8.3.2: a right side that shares no variable with the left
+/// side, has no solution that binds one, or can never be compatible with
+/// it removes nothing.
+#[test]
+fn unfold_minus_without_a_shared_variable_removes_nothing() {
+    let left = unfold_query(SHOP, "SELECT ?c WHERE { ?c ex:name ?n }").unwrap();
+    for right in [
+        "{ ?o ex:amount ?a }",
+        "{ }",
+        "{ FILTER(true) }",
+        "{ ?c ex:amount ?a }",
+    ] {
+        let plan = unfold_query(
+            SHOP,
+            &format!("SELECT ?c WHERE {{ ?c ex:name ?n MINUS {right} }}"),
+        )
+        .unwrap();
+        assert_eq!(plan, left, "{right}");
+    }
+}
+
+/// A variable that one side may leave unbound is shared only where it is
+/// bound, and compatible with any value where it is not (SPARQL 1.1
+/// §18.3).
+#[test]
+fn unfold_minus_shares_a_variable_only_where_both_sides_bind_it() {
+    let tier = |table| SqlExpr::Column {
+        table,
+        name: "tier".into(),
+    };
+    // Unbound on the left: the tier of the OPTIONAL part.
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t } MINUS { ?x ex:tier ?t } }",
+    )
+    .unwrap();
+    let part = &plan.branches[0].left_joins[1];
+    let same_tier = |r, l| {
+        let side = |table| TermSql {
+            value: TermSqlValue::Column {
+                table,
+                name: "tier".into(),
+            },
+            datatype: Some(TermDatatype::Natural),
+            base_iri: None,
+        };
+        Condition::SameTerm(side(r), side(l))
+    };
+    assert!(part.conditions.contains(&Condition::Or(vec![
+        vec![Condition::IsNull(tier(1))],
+        vec![same_tier(2, 1)],
+    ])));
+    assert!(part.conditions.contains(&Condition::IsNotNull(tier(1))));
+
+    // Unbound on the right: the tier of the OPTIONAL part inside MINUS.
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c ex:tier ?t MINUS { ?x ex:name ?n OPTIONAL { ?x ex:tier ?t } } }",
+    )
+    .unwrap();
+    let [part, nested] = plan.branches[0].left_joins.as_slice() else {
+        panic!("expected two parts");
+    };
+    assert_eq!(nested.parent, Some(0));
+    assert!(part.conditions.contains(&Condition::IsNotNull(tier(2))));
+
+    // Unbound on both sides: both must be bound.
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t } \
+         MINUS { ?x ex:name ?m OPTIONAL { ?x ex:tier ?t } } }",
+    )
+    .unwrap();
+    let part = &plan.branches[0].left_joins[1];
+    assert!(part.conditions.contains(&Condition::IsNotNull(tier(1))));
+    assert!(part.conditions.contains(&Condition::IsNotNull(tier(3))));
+
+    // A variable bound on both sides in every row needs no condition.
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t } MINUS { ?c ex:tier ?t } }",
+    )
+    .unwrap();
+    let part = &plan.branches[0].left_joins[1];
+    assert!(!part.conditions.contains(&Condition::IsNotNull(tier(1))));
+}
+
+/// SPARQL 1.1 §8.3.3: the right side is evaluated on its own, so its
+/// FILTER does not see `?n`, which is an error there.
+#[test]
+fn unfold_minus_filter_sees_only_the_right_side() {
+    let plan = unfold_query(
+        SHOP,
+        "SELECT ?c WHERE { ?c ex:name ?n MINUS { ?c ex:tier ?t FILTER(?t = ?n) } }",
+    )
+    .unwrap();
+    let part = &plan.branches[0].left_joins[0];
+    assert!(
+        part.conditions
+            .contains(&Condition::Filter(Filter::Constant(None))),
+        "{part:?}"
+    );
 }
 
 #[test]

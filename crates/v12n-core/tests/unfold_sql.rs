@@ -1278,3 +1278,49 @@ fn foreign_key_keeps_a_parent_whose_other_columns_are_read() {
         "SELECT ?a ?b ?h WHERE { ?a ex:connectsTo ?b . ?b ex:hostname ?h }"
     ));
 }
+
+/// MINUS is a `LEFT JOIN` of the right side on the shared variables,
+/// compared as terms, that keeps the rows it does not extend.
+#[test]
+fn minus_is_an_anti_join_on_the_shared_variables() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?o WHERE { ?o ex:placedBy ?c ; ex:amount ?a MINUS { ?c ex:tier \"VIP\" } }"
+    ));
+}
+
+/// A variable the left side may leave unbound removes a solution only
+/// where it is bound, and is compatible with any value where it is not.
+#[test]
+fn minus_over_an_optional_variable_needs_it_bound_to_share_it() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?c ?t WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t } \
+         MINUS { ?x ex:tier ?t } }"
+    ));
+}
+
+/// SPARQL 1.1 §8.3.3: the FILTER of the right side does not see `?n`, so
+/// it is an error, and nothing is removed.
+#[test]
+fn minus_filter_sees_only_the_right_side() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?c WHERE { ?c ex:name ?n MINUS { ?c ex:tier ?t FILTER(?t = ?n) } }"
+    ));
+}
+
+/// Each side of a UNION on the right is an anti-join of its own, and a
+/// pattern after MINUS joins the rows that are left.
+#[test]
+fn minus_with_a_union_has_one_anti_join_per_side() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?c ?t WHERE { ?c ex:name ?n \
+         MINUS { { ?c ex:tier \"VIP\" } UNION { ?o ex:placedBy ?c } } ?c ex:tier ?t }"
+    ));
+}
+
+/// The right side pinned to the row of the left side reads that row.
+#[test]
+fn self_join_minus_reads_the_left_row() {
+    insta::assert_snapshot!(explain_merged(
+        "SELECT ?asset WHERE { ?asset a ex:Asset . MINUS { ?asset ex:criticality ?c } }"
+    ));
+}

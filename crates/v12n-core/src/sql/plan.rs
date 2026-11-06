@@ -144,7 +144,10 @@ pub enum ValueKind {
 /// where there are some (SPARQL 1.1 §18.5, LeftJoin).
 ///
 /// Every column of its tables is `NULL` in a row it does not extend, and
-/// a variable bound only by it is then unbound.
+/// a variable bound only by it is then unbound. The right side of a
+/// `MINUS` is a part as well, with a condition of the branch that one of
+/// its columns `IS NULL`, so only the rows it does not extend are kept
+/// (SPARQL 1.1 §18.5, Minus).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeftJoin {
     /// The tables of the part, those nested in it included: aliases
