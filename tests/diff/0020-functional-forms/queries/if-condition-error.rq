@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# Where ?o is unbound, the condition is an error and so is IF, also under
+# negation (SPARQL 1.1 §17.4.1.2).
+SELECT ?r WHERE { ?r ex:a ?a OPTIONAL { ?r ex:opt ?o } FILTER(!(IF(?o > 0, ?a, 0) = 0)) }

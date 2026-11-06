@@ -1,0 +1,15 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"SELECT ?c ?t WHERE { ?c ex:tier ?t } ORDER BY DESC(?t IN (\\\"VIP\\\", \\\"Gold\\\")) ?c\")"
+---
+SELECT t0."id" AS "c", t0."tier" AS "t", CASE WHEN ((coalesce((t0."tier" = $1), false) OR coalesce((t0."tier" = $2), false))) IS NULL THEN 0 ELSE 4 END AS "o1_rank", ((coalesce((t0."tier" = $3), false) OR coalesce((t0."tier" = $4), false))) AS "o1_boolean", ($5 || t0."id"::text) COLLATE "C" AS "o2_text"
+FROM "customers" t0
+WHERE t0."id" IS NOT NULL AND t0."tier" IS NOT NULL
+ORDER BY "o1_rank" DESC, "o1_boolean" DESC, "o2_text"
+
+-- params
+$1 = "VIP"
+$2 = "Gold"
+$3 = "VIP"
+$4 = "Gold"
+$5 = "http://example.org/customer/"

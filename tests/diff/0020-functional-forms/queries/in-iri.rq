@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?r WHERE { ?r ex:a ?a FILTER(?r IN (<http://example.org/item/1>, <http://example.org/item/3>)) }
