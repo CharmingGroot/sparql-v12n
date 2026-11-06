@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?r WHERE { ?r ex:a ?a OPTIONAL { ?r ex:opt ?o } FILTER(?o NOT IN (10)) }

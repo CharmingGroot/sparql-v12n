@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?r WHERE { ?r ex:name ?n FILTER(?n IN ("one", "three", "five")) }

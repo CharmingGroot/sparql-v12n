@@ -1,0 +1,20 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"SELECT ?c WHERE { ?c ex:tier ?t OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a } \\\n         FILTER(IF(BOUND(?a), ?a, 0) < 500 && COALESCE(1000 / ?a, ?a, 0) > 1) }\")"
+---
+SELECT t0."id" AS "c"
+FROM "customers" t0
+LEFT JOIN ("orders" t1
+JOIN "orders" t2 ON t2."id" = t1."id") ON t1."customer_id" = t0."id" AND t2."amount" IS NOT NULL
+WHERE (CASE WHEN (t2."amount" IS NOT NULL) AND t2."amount" IS NOT NULL THEN t2."amount" < $1::int8 WHEN NOT ((t2."amount" IS NOT NULL)) THEN $2::int8 < $3::int8 END AND CASE WHEN t2."amount" IS NOT NULL AND (($4::numeric / NULLIF(t2."amount"::numeric, 0)) IS NOT NULL) THEN ($5::numeric / NULLIF(t2."amount"::numeric, 0)) > $6::numeric WHEN t2."amount" IS NOT NULL THEN t2."amount" > $7::int8 WHEN true THEN $8::int8 > $9::int8 END) AND t0."id" IS NOT NULL AND t0."tier" IS NOT NULL
+
+-- params
+$1 = "500"
+$2 = "0"
+$3 = "500"
+$4 = "1000"
+$5 = "1000"
+$6 = "1"
+$7 = "1"
+$8 = "0"
+$9 = "1"

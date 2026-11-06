@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# 7 = "x" is an error, which a true comparison overrules.
+SELECT ?r WHERE { ?r ex:a ?a FILTER(?a IN ("x", 7)) }

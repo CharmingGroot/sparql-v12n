@@ -211,6 +211,25 @@ impl<'a> Renderer<'a> {
                 self.sql.push_str(if holds { "true" } else { "false" });
             }
             Filter::Ebv(value) => self.ebv(value)?,
+            Filter::NoError(value) => self.no_error(value)?,
+        }
+        Ok(())
+    }
+
+    /// Whether `value` is not an error. Only arithmetic is an error that
+    /// depends on the row, such as a division by zero, and its SQL is
+    /// `NULL` exactly there.
+    fn no_error(&mut self, value: &FilterValue) -> Result<(), Error> {
+        let operand = self.operand(value);
+        match operand.kind {
+            Kind::Unsupported(reason) => return Err(unsupported(&reason)),
+            Kind::Error => self.sql.push_str("false"),
+            Kind::Numeric(class) if is_arith(value) => {
+                self.sql.push('(');
+                self.class_value(value, class)?;
+                self.sql.push_str(" IS NOT NULL)");
+            }
+            _ => self.sql.push_str("true"),
         }
         Ok(())
     }
@@ -1823,5 +1842,108 @@ pub(super) mod tests {
             render_with("SELECT ?s WHERE { ?s ex:txt ?x FILTER(REGEX(?x, \"a\")) }", true),
             Err(Error::UnsupportedFeature(reason)) if reason.contains("UTF-8")
         ));
+    }
+
+    #[test]
+    fn in_is_a_disjunction_of_equalities_on_the_column() {
+        // Each comparison keeps the column as it is, so that an index on
+        // the column can be used.
+        assert_eq!(
+            x("i4", "?x IN (1, 2, 3)"),
+            "((t0.\"i4\" = $1::int8 OR t0.\"i4\" = $2::int8) OR t0.\"i4\" = $3::int8)"
+        );
+        assert_eq!(
+            x(
+                "link",
+                "?x IN (<http://example.org/r/1>, <http://example.org/r/2>)"
+            ),
+            "((t0.\"i4\" = $1) OR (t0.\"i4\" = $2))"
+        );
+        assert_eq!(
+            x("i4", "?x NOT IN (1, 2)"),
+            "NOT ((t0.\"i4\" = $1::int8 OR t0.\"i4\" = $2::int8))"
+        );
+        // An empty list (SPARQL 1.1 §17.4.1.9, §17.4.1.10).
+        assert_eq!(x("i4", "?x IN ()"), "false");
+        assert_eq!(x("i4", "?x NOT IN ()"), "NOT (false)");
+        // A string compared with a number is an error, which only a true
+        // comparison overrules, so "b" NOT IN ("a", 1) is an error.
+        assert_eq!(
+            x("txt", "?x IN (\"a\", 1)"),
+            "((t0.\"txt\" = $1) OR NULL::bool)"
+        );
+        assert_eq!(
+            x("txt", "?x NOT IN (\"a\", 1)"),
+            "NOT ((coalesce((t0.\"txt\" = $1), false) OR NULL::bool))"
+        );
+        assert_eq!(x("i4", "?nothing IN (1)"), "NULL::bool");
+        assert!(rejected("?s ex:label ?x", "?x NOT IN (\"a\"@en)").contains("under negation"));
+    }
+
+    #[test]
+    fn if_takes_the_branch_its_condition_chooses() {
+        // Where the condition is an error, neither branch is taken
+        // (SPARQL 1.1 §17.4.1.2).
+        assert_eq!(
+            x("i4", "IF(?x > 2, ?x, 0) > 1"),
+            "CASE WHEN t0.\"i4\" > $1::int8 THEN t0.\"i4\" > $2::int8 \
+             WHEN NOT (t0.\"i4\" > $3::int8) THEN $4::int8 > $5::int8 END"
+        );
+        assert_eq!(
+            x("i4", "IF(?x, \"\", \"b\")"),
+            "CASE WHEN t0.\"i4\" <> 0 THEN false WHEN NOT (t0.\"i4\" <> 0) THEN true END"
+        );
+        // A condition known without the rows takes one branch, and the
+        // other is not evaluated.
+        assert_eq!(x("i4", "IF(BOUND(?x), ?x, 0) > 1"), "t0.\"i4\" > $1::int8");
+        assert_eq!(
+            x("txt", "IF(!BOUND(?x), ?x + 1, 2) = 2"),
+            "$1::int8 = $2::int8"
+        );
+        assert_eq!(x("i4", "IF(?nothing, 1, 0) = 1"), "NULL::bool");
+    }
+
+    #[test]
+    fn coalesce_takes_the_first_argument_that_is_not_an_error() {
+        // A division by zero is an error, which COALESCE skips (SPARQL 1.1
+        // §17.4.1.3).
+        let skipped = "CASE WHEN ((t0.\"i4\"::numeric / NULLIF($1::numeric, 0)) IS NOT NULL) \
+                       THEN (t0.\"i4\"::numeric / NULLIF($2::numeric, 0)) = $3::numeric \
+                       WHEN true THEN $4::int8 = $5::int8 END";
+        assert_eq!(x("i4", "COALESCE(?x / 0, 5) = 5"), skipped);
+        assert_eq!(
+            x("i4", "!(COALESCE(?x / 0, 5) = 5)"),
+            format!("NOT ({skipped})")
+        );
+        // An unbound variable is an error; a bound one never is.
+        assert_eq!(
+            x("i4", "COALESCE(?nothing, ?x) = 5"),
+            "t0.\"i4\" = $1::int8"
+        );
+        // Arithmetic over a string, and LANG of an IRI, are errors in
+        // every row.
+        assert_eq!(
+            x("txt", "COALESCE(?x + 1, 7) = 7"),
+            "CASE WHEN false THEN NULL::bool WHEN true THEN $1::int8 = $2::int8 END"
+        );
+        assert!(
+            x("link", "COALESCE(LANG(?x), \"none\") = \"none\"")
+                .starts_with("CASE WHEN false THEN NULL::bool WHEN true THEN ")
+        );
+        assert_eq!(
+            x("txt", "COALESCE(STR(?x), 1) = \"a\""),
+            "CASE WHEN true THEN ((t0.\"txt\"::text) = $1::text) WHEN true THEN NULL::bool END"
+        );
+        assert_eq!(x("i4", "COALESCE() = 1"), "NULL::bool");
+        // A double is not an error unless an operand is one.
+        let sql = x("f8", "COALESCE(?x * 2, 0) > 1");
+        assert!(sql.starts_with("CASE WHEN (CASE WHEN "), "{sql}");
+        assert!(
+            sql.ends_with(
+                "ELSE t0.\"f8\" * $2::float8 END AS x) AS d) WHEN true THEN $4::int8 > $5::int8 END"
+            ),
+            "{sql}"
+        );
+        assert!(rejected("?s ex:f4 ?x", "COALESCE(?x + 1, 0) > 0").contains("float4"));
     }
 }

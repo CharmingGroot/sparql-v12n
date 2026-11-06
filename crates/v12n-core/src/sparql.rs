@@ -112,6 +112,17 @@ pub enum Expression {
     /// Unary minus of an expression that is not a numeric literal
     /// (op:numeric-unary-minus).
     Negate(Box<Expression>),
+    /// `IF(cond, a, b)` (SPARQL 1.1 §17.4.1.2): `a` where the effective
+    /// boolean value of `cond` is true, `b` where it is false, and an
+    /// error where it is an error.
+    If(Box<Expression>, Box<Expression>, Box<Expression>),
+    /// `COALESCE` (SPARQL 1.1 §17.4.1.3): the first argument that is not
+    /// an error.
+    Coalesce(Vec<Expression>),
+    /// `lhs IN (…)` (SPARQL 1.1 §17.4.1.9), which is `(lhs = e1) || (lhs =
+    /// e2) || …` and false for an empty list. `NOT IN` is its negation
+    /// (§17.4.1.10).
+    In(Box<Expression>, Vec<Expression>),
 }
 
 impl Expression {
@@ -141,6 +152,16 @@ impl Expression {
             | Self::Datatype(a)
             | Self::Regex(a, _, _)
             | Self::Negate(a) => a.collect_variables(out),
+            Self::If(c, a, b) => {
+                c.collect_variables(out);
+                a.collect_variables(out);
+                b.collect_variables(out);
+            }
+            Self::Coalesce(args) => args.iter().for_each(|a| a.collect_variables(out)),
+            Self::In(a, list) => {
+                a.collect_variables(out);
+                list.iter().for_each(|b| b.collect_variables(out));
+            }
         }
     }
 
@@ -155,6 +176,8 @@ impl Expression {
                 | Self::Datatype(_)
                 | Self::Arith(..)
                 | Self::Negate(_)
+                | Self::If(..)
+                | Self::Coalesce(_)
         )
     }
 }
@@ -554,14 +577,30 @@ enum Place {
 }
 
 /// The expression of a `BIND` or `SELECT (expr AS ?v)`: a variable, a
-/// constant or arithmetic.
+/// constant, arithmetic, or `IF` and `COALESCE` whose results are numbers.
 fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> {
+    if let SparqlExpression::Not(inner) = expression
+        && matches!(**inner, SparqlExpression::In(..))
+    {
+        return Err(unsupported(
+            "IN and NOT IN as the value of BIND and SELECT expressions",
+        ));
+    }
     let expression = expression_in(expression, Site::Bind)?;
     let what = match &expression {
         Expression::Constant(_)
         | Expression::Variable(_)
         | Expression::Arith(..)
         | Expression::Negate(_) => return Ok(expression),
+        // The value of a computed variable is a number in SQL, so every
+        // result must be one or an error.
+        Expression::If(..) | Expression::Coalesce(_) if numeric_results(&expression) => {
+            return Ok(expression);
+        }
+        Expression::If(..) | Expression::Coalesce(_) => {
+            "IF and COALESCE with a result other than arithmetic or a numeric constant"
+        }
+        Expression::In(..) => "IN and NOT IN",
         Expression::Or(..) | Expression::And(..) | Expression::Not(_) => "logical operators",
         Expression::Compare(..) | Expression::SameTerm(..) => "comparisons",
         Expression::Bound(_) => "BOUND",
@@ -574,6 +613,22 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
     Err(unsupported(&format!(
         "{what} as the value of BIND and SELECT expressions"
     )))
+}
+
+/// Whether every result of `IF` and `COALESCE` in `expression` is
+/// arithmetic or a numeric constant, so that its value is a number or an
+/// error.
+fn numeric_results(expression: &Expression) -> bool {
+    match expression {
+        Expression::Arith(..) | Expression::Negate(_) => true,
+        Expression::Constant(Term::Literal(literal)) => matches!(
+            crate::xsd::value(literal.value(), literal.datatype().as_str()),
+            crate::xsd::Value::Numeric(_)
+        ),
+        Expression::If(_, a, b) => numeric_results(a) && numeric_results(b),
+        Expression::Coalesce(args) => args.iter().all(numeric_results),
+        _ => false,
+    }
 }
 
 /// An order comparator: a term, compared as SPARQL 1.1 §15.1 orders them,
@@ -780,7 +835,29 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
                 other => return Err(in_site(&format!("the {other} function"))),
             }
         }
-        SparqlExpression::In(..) => return Err(in_site("IN and NOT IN")),
+        // Expressions in ORDER BY come with #108.
+        SparqlExpression::If(..) | SparqlExpression::Coalesce(_)
+            if matches!(site, Site::OrderBy) =>
+        {
+            return Err(in_site(match expression {
+                SparqlExpression::If(..) => "IF",
+                _ => "COALESCE",
+            }));
+        }
+        SparqlExpression::If(condition, a, b) => {
+            Expression::If(boxed(condition)?, operand(a)?, operand(b)?)
+        }
+        SparqlExpression::Coalesce(args) => Expression::Coalesce(
+            args.iter()
+                .map(|a| operand(a).map(|a| *a))
+                .collect::<Result<_, _>>()?,
+        ),
+        SparqlExpression::In(a, list) => Expression::In(
+            operand(a)?,
+            list.iter()
+                .map(|b| operand(b).map(|b| *b))
+                .collect::<Result<_, _>>()?,
+        ),
         SparqlExpression::Exists(_) => return Err(unsupported("EXISTS and NOT EXISTS")),
         SparqlExpression::UnaryMinus(inner) | SparqlExpression::UnaryPlus(inner)
             if numeric_literal(inner).is_some() =>
@@ -829,8 +906,6 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
                 .into(),
             )),
         ),
-        SparqlExpression::If(..) => return Err(in_site("IF")),
-        SparqlExpression::Coalesce(_) => return Err(in_site("COALESCE")),
     })
 }
 
@@ -868,9 +943,10 @@ fn compare(
     ))
 }
 
-/// An argument that must be an RDF term: a variable, a constant, or `STR`,
-/// `LANG` or `DATATYPE` of one. Other expressions as arguments, such as a
-/// comparison compared with `true`, are not supported.
+/// An argument that must be an RDF term: a variable, a constant, or an
+/// expression whose value is a term, such as `STR`, arithmetic or `IF`.
+/// Other expressions as arguments, such as a comparison compared with
+/// `true`, are not supported.
 fn operand(expression: &SparqlExpression, site: Site) -> Result<Box<Expression>, Error> {
     let operand = expression_in(expression, site)?;
     if operand.is_term() {
@@ -1316,6 +1392,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_functional_forms() {
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:tier ?t ; ex:name ?n \
+             FILTER(?t NOT IN (1, ?n) && COALESCE(?x, IF(?t > 1, ?t, ?n)) = 2) }",
+        );
+        let Pattern::Filter(_, Expression::And(not_in, coalesce)) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        assert_eq!(
+            **not_in,
+            Expression::Not(Box::new(Expression::In(
+                variable("t"),
+                vec![*integer(1), *variable("n")]
+            )))
+        );
+        assert_eq!(coalesce.variables(), ["x", "t", "t", "n"]);
+        let Expression::Compare(CompareOp::Equal, coalesce, _) = coalesce.as_ref() else {
+            panic!("{coalesce:?}")
+        };
+        assert!(coalesce.is_term());
+        assert!(!not_in.is_term());
+
+        // IF and COALESCE whose results are numbers or errors.
+        let q = parse_ok(
+            "SELECT ?o (COALESCE(?a / ?b, 0) AS ?q) (IF(?a > 1, ?a * 2, 1.5) AS ?d) \
+             WHERE { ?o ex:amount ?a ; ex:b ?b }",
+        );
+        assert_eq!(q.bindings.len(), 2);
+        // IN is a boolean, as ORDER BY takes it.
+        let q = parse_ok("SELECT * WHERE { ?c ex:name ?n } ORDER BY (?n IN (\"a\", \"b\"))");
+        assert!(matches!(q.order_by[0].expression, Expression::In(..)));
+    }
+
+    #[test]
     fn parse_unsupported_features_are_rejected_by_name() {
         let cases = [
             (
@@ -1355,12 +1465,40 @@ mod tests {
                 "comparisons as the value",
             ),
             (
-                "SELECT (IF(BOUND(?n), 1, 0) AS ?x) WHERE { ?c ex:name ?n }",
-                "IF in BIND and SELECT expressions",
+                "SELECT (IF(BOUND(?n), ?n, 0) AS ?x) WHERE { ?c ex:name ?n }",
+                "IF and COALESCE with a result other than arithmetic or a numeric constant",
             ),
             (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(?t IN (1, 2)) }",
-                "IN",
+                "SELECT (COALESCE(?a * 2, \"none\") AS ?x) WHERE { ?o ex:amount ?a }",
+                "IF and COALESCE with a result other than arithmetic or a numeric constant",
+            ),
+            (
+                "SELECT (?a IN (1, 2) AS ?x) WHERE { ?o ex:amount ?a }",
+                "IN and NOT IN as the value of BIND",
+            ),
+            (
+                "SELECT * WHERE { ?o ex:amount ?a BIND(?a NOT IN (1) AS ?x) }",
+                "IN and NOT IN as the value of BIND",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(?t IN (?t > 1)) }",
+                "expressions other than terms",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(IF(?t, ?t > 1, false)) }",
+                "expressions other than terms",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(COALESCE(?t > 1, false)) }",
+                "expressions other than terms",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n } ORDER BY IF(BOUND(?n), ?n, \"\")",
+                "IF in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n } ORDER BY COALESCE(?n, \"\")",
+                "COALESCE in ORDER BY",
             ),
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(STRLEN(?t) > 2) }",

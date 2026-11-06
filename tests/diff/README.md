@@ -85,6 +85,8 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0011-time/time-filter-equal` | `=` on `xsd:time`: no row of the operator mapping (SPARQL 1.1 §17.3), so a type error, which engines that extend SPARQL compare as values (Discussion #57). |
 | `0013-bind/bind-in-optional` | `BIND` inside `OPTIONAL`: the variable is computed only where the part matches, which the first step of `BIND` leaves out (#100). |
 | `0013-bind/filter-over-bind` | `FILTER` over a variable that `BIND` computes, which the first step of `BIND` leaves out (#100). |
+| `0020-functional-forms/bind-coalesce-variable`, `bind-in` | `COALESCE` whose result can be a term other than a number, and `IN` as the value of `BIND`: a computed variable holds only numbers (#100). |
+| `0020-functional-forms/order-by-if` | `IF` in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0008-order/distinct-over-hidden` | `ORDER BY` over a variable that `SELECT DISTINCT` does not project: one solution stands for several that the order puts at different places (Discussion #63). |
 | `w3c/R2RMLTC0012e/type-ious` | A self-join on blank nodes from a template over a `float8` column: no SQL computes the canonical `xsd:double` form (Discussion #35). Removing self-joins on keys (#28, V6) would make the comparison unnecessary. |
 

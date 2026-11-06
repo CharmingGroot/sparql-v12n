@@ -325,6 +325,9 @@ pub enum Filter {
     Test(TermTest, FilterValue),
     /// The effective boolean value of a term (SPARQL 1.1 §17.2.2).
     Ebv(FilterValue),
+    /// Whether the value is not an error, never an error itself: for
+    /// `COALESCE` (SPARQL 1.1 §17.4.1.3).
+    NoError(FilterValue),
     /// `REGEX` (SPARQL 1.1 §17.4.3.14) with the XPath pattern and flags
     /// already written as a PostgreSQL pattern with the same matches.
     Regex {
@@ -456,7 +459,9 @@ impl Filter {
                     conditions.iter().for_each(|c| f(Part::Condition(c)));
                 }
             }
-            Self::Test(_, v) | Self::Ebv(v) | Self::Regex { text: v, .. } => value(v, f),
+            Self::Test(_, v) | Self::Ebv(v) | Self::NoError(v) | Self::Regex { text: v, .. } => {
+                value(v, f)
+            }
         }
     }
 
@@ -497,7 +502,9 @@ impl Filter {
                     conditions.iter_mut().for_each(|c| f(PartMut::Condition(c)));
                 }
             }
-            Self::Test(_, v) | Self::Ebv(v) | Self::Regex { text: v, .. } => value(v, f),
+            Self::Test(_, v) | Self::Ebv(v) | Self::NoError(v) | Self::Regex { text: v, .. } => {
+                value(v, f)
+            }
         }
     }
 
