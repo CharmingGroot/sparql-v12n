@@ -3,7 +3,7 @@
 
 use super::{Dialect, SqlType};
 use crate::mapping::template::UCSCHAR;
-use crate::sparql::StrTest;
+use crate::sparql::{HashFunction, StrTest};
 
 /// PostgreSQL 13 or later.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,6 +60,20 @@ impl Dialect for PostgresDialect {
 
     fn encode_for_uri(&self, text: &str) -> String {
         percent_encoded(text, "[-.0-9A-Z_a-z~]")
+    }
+
+    /// `convert_to` gives the bytes of the UTF-8 encoding whatever the
+    /// encoding of the database. `md5` writes lower-case hexadecimal
+    /// digits itself; the SHA-2 functions (11 or later) give the digest as
+    /// `bytea`.
+    fn hash(&self, function: HashFunction, text: &str) -> String {
+        let bytes = format!("convert_to({text}, 'UTF8')");
+        match function {
+            HashFunction::Md5 => format!("md5({bytes})"),
+            HashFunction::Sha256 => format!("encode(sha256({bytes}), 'hex')"),
+            HashFunction::Sha384 => format!("encode(sha384({bytes}), 'hex')"),
+            HashFunction::Sha512 => format!("encode(sha512({bytes}), 'hex')"),
+        }
     }
 
     /// The root locale of ICU applies Unicode's default case operations,

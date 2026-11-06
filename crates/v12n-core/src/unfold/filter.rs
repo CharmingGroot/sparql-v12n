@@ -247,6 +247,14 @@ impl<'a> Context<'_, 'a> {
                     .collect())
             }
             Expression::EncodeForUri(a) => derived(a, FilterValue::EncodeForUri),
+            Expression::Hash(function, a) => Ok(self
+                .operand(a)?
+                .into_iter()
+                .map(|(guards, leaf)| {
+                    let value = FilterValue::Hash(*function, Box::new(leaf.value));
+                    (guards, Leaf { value, term: None })
+                })
+                .collect()),
             Expression::Replace(a, pattern, replacement, flags) => {
                 // The pattern, the replacement and the flags are simple
                 // literals (SPARQL 1.1 §17.4.3.15); anything else is a type

@@ -101,6 +101,9 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0023-string-functions/replace-alternatives` | `REPLACE` with alternatives: XPath takes the first alternative that matches, PostgreSQL the longest match (F&O 3.1 §5.6.4). |
 | `0023-string-functions/order-by-strlen` | `STRLEN` in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0023-string-functions/substr-decimal` | A starting location of `SUBSTR` that is not an `xsd:integer`: a type error by the signature of `SUBSTR` (SPARQL 1.1 §17.4.3.3), which engines that round it as `fn:substring` does answer. |
+| `0026-hash-functions/sha1` | `SHA1`: PostgreSQL computes SHA-1 only with the `pgcrypto` extension, which v12n does not require. |
+| `0026-hash-functions/bind-md5` | A hash function as the value of `BIND`: a computed variable holds only numbers (#100). |
+| `0026-hash-functions/order-by-sha256` | A hash function in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0008-order/distinct-over-hidden` | `ORDER BY` over a variable that `SELECT DISTINCT` does not project: one solution stands for several that the order puts at different places (Discussion #63). |
 | `w3c/R2RMLTC0012e/type-ious` | A self-join on blank nodes from a template over a `float8` column: no SQL computes the canonical `xsd:double` form (Discussion #35). Removing self-joins on keys (#28, V6) would make the comparison unnecessary. |
 

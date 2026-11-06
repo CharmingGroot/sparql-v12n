@@ -10,6 +10,11 @@ Design decisions are recorded in the `Decision:` Discussions.
 
 ### Added
 
+- `MD5`, `SHA256`, `SHA384` and `SHA512` in `FILTER`: the digest of the
+  UTF-8 encoding of a simple literal or `xsd:string` as a simple literal
+  of lower-case hexadecimal digits (SPARQL 1.1 §17.4.6), with
+  PostgreSQL's built-in functions. `SHA1` is rejected as unsupported,
+  since PostgreSQL computes it only with the `pgcrypto` extension.
 - `ABS`, `ROUND`, `CEIL` and `FLOOR` in `FILTER`, `BIND` and
   `SELECT (expr AS ?v)`, with a result of the argument's datatype.
   `ROUND` rounds halves towards positive infinity, as `fn:round` does,

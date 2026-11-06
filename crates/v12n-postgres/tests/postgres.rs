@@ -684,6 +684,119 @@ async fn string_functions_before_after_encode_and_replace_follow_xpath() {
     }
 }
 
+/// `MD5`, `SHA256`, `SHA384` and `SHA512` (SPARQL 1.1 §17.4.6) digest the
+/// UTF-8 encoding of a simple literal or `xsd:string` as lower-case
+/// hexadecimal digits, and are errors for any other term, also under
+/// negation. The digests were computed outside PostgreSQL, with Python's
+/// `hashlib`.
+#[tokio::test]
+async fn hash_functions_digest_the_utf8_encoding() {
+    let Some(url) = database_url() else { return };
+    let rows = |filter: &'static str| {
+        let url = url.clone();
+        async move {
+            let mut rows =
+                filtered_rows(&url, STRINGS, "?row ex:s ?s ; ex:l ?l ; ex:n ?n", filter).await;
+            rows.sort_by_key(|r| r.parse::<u32>().unwrap());
+            rows
+        }
+    };
+    let all = ["1", "2", "3", "4", "5", "6", "7"];
+    for (filter, expected) in [
+        ("MD5(?s) = \"900150983cd24fb0d6963f7d28e17f72\"", &["1"][..]),
+        ("MD5(?s) = \"a763ca073cfda1fce8a14f2f0cc84591\"", &["2"]),
+        ("MD5(?s) = \"5526861fbb1e71a1bda6ac364310a807\"", &["3"]),
+        ("MD5(?s) = \"387521b62098c4bb1c77dc464d1b265c\"", &["4"]),
+        ("MD5(?s) = \"6f4f43958155fa1d80e648d8111f947a\"", &["5"]),
+        ("MD5(?s) = \"232cc02634156573ed087d3940bdcdf0\"", &["6"]),
+        ("MD5(?s) = \"d41d8cd98f00b204e9800998ecf8427e\"", &["7"]),
+        (
+            "SHA256(?s) = \"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\"",
+            &["1"],
+        ),
+        (
+            "SHA256(?s) = \"58a3778c18c41726cd53c2a4c77dcbed8512f962d7e616717abee95ca41d0029\"",
+            &["2"],
+        ),
+        (
+            "SHA256(?s) = \"10f5e9cdd01d869815a52f43599f9c372ffa4b41cda11b5180da85dc0928333c\"",
+            &["4"],
+        ),
+        (
+            "SHA256(?s) = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"",
+            &["7"],
+        ),
+        (
+            "SHA384(?s) = \"cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed\
+             8086072ba1e7cc2358baeca134c825a7\"",
+            &["1"],
+        ),
+        (
+            "SHA384(?s) = \"2cdfc954d7a8196d23976d00454d78a0cb675238261fc52251e7863ee76a3290\
+             85429b2f7e57894ce50e42c02941cc2d\"",
+            &["3"],
+        ),
+        (
+            "SHA384(?s) = \"66a0a6f557ab8ab217091348ce3e32b06f0cdac092f5b7867b09a6cc16bae37f\
+             6e1eb13fd418527c97701612996e78ae\"",
+            &["6"],
+        ),
+        (
+            "SHA512(?s) = \"ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f\"",
+            &["1"],
+        ),
+        (
+            "SHA512(?s) = \"61c30f852a3593f4b104f4d473098900c982958b16b185d4163b5dd1e49ed52a\
+             96c95ec2a9dc1681700e2557fe7fed15997691f9fce3657697c065652f519066\"",
+            &["5"],
+        ),
+        (
+            "SHA512(?s) = \"cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
+             47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e\"",
+            &["7"],
+        ),
+        // Lower case only, and a simple literal.
+        ("MD5(?s) = \"900150983CD24FB0D6963F7D28E17F72\"", &[]),
+        (
+            "MD5(?s) = \"900150983cd24fb0d6963f7d28e17f72\"^^xsd:string",
+            &["1"],
+        ),
+        ("MD5(?s) = \"900150983cd24fb0d6963f7d28e17f72\"@en", &[]),
+        (
+            "DATATYPE(SHA256(?s)) = xsd:string && LANG(MD5(?s)) = \"\"",
+            &all,
+        ),
+        ("STRLEN(MD5(?s)) = 32 && STRLEN(SHA512(?s)) = 128", &all),
+        ("STRLEN(SHA256(?s)) = 64 && STRLEN(SHA384(?s)) = 96", &all),
+        ("MD5(?s)", &all),
+        ("STRSTARTS(SHA256(?s), \"ba78\")", &["1"]),
+        (
+            "MD5(UCASE(?s)) = \"902fbdd2b1df0c4f70b4a5d23525e932\"",
+            &["1"],
+        ),
+        (
+            "MD5(STR(?l)) = \"900150983cd24fb0d6963f7d28e17f72\"",
+            &["1"],
+        ),
+        (
+            "MD5(STR(?n)) = \"c4ca4238a0b923820dcc509a6f75849b\"",
+            &["1"],
+        ),
+        // Type errors: a language-tagged literal, a number, an IRI and an
+        // unbound variable.
+        ("MD5(?l) = \"900150983cd24fb0d6963f7d28e17f72\"", &[]),
+        ("!(MD5(?l) = \"\")", &[]),
+        ("!(SHA256(UCASE(?l)) = \"\")", &[]),
+        ("!(SHA384(?n) = \"\")", &[]),
+        ("!(SHA512(?row) = \"\")", &[]),
+        ("!(MD5(?unbound) = \"\")", &[]),
+        ("!(MD5(\"abc\"@en) = \"\")", &[]),
+    ] {
+        assert_eq!(rows(filter).await, expected, "{filter}");
+    }
+}
+
 /// `STRSTARTS` with a constant is a `LIKE` prefix under `COLLATE "C"`,
 /// which an index on the column under that collation serves, and which
 /// compares code points under a column's nondeterministic collation.
@@ -739,6 +852,7 @@ async fn string_tests_use_an_index_and_ignore_the_column_collation() {
         "STRAFTER(?c, \"a\") = \"bc\"",
         "REPLACE(?c, \"b\", \"x\") = \"axc\"",
         "ENCODE_FOR_URI(?c) = \"abc\"",
+        "MD5(?c) = \"900150983cd24fb0d6963f7d28e17f72\"",
     ] {
         let rows = filtered_rows(&url, mapping, "?row ex:ci ?c", filter).await;
         assert_eq!(rows.len(), 1000, "{filter}");

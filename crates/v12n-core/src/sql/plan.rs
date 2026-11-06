@@ -8,7 +8,9 @@ use oxrdf::Term;
 
 use crate::dialect::{Dialect, SqlType};
 use crate::mapping::{BaseIri, LogicalTable, TemplatePart, TermType};
-use crate::sparql::{ArithOp, CompareOp, NumericFunction, QueryForm, StrTest, TermTest};
+use crate::sparql::{
+    ArithOp, CompareOp, HashFunction, NumericFunction, QueryForm, StrTest, TermTest,
+};
 
 pub(super) const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -402,6 +404,9 @@ pub enum FilterValue {
         pattern: String,
         replacement: String,
     },
+    /// `MD5`, `SHA256`, `SHA384` or `SHA512` (SPARQL 1.1 §17.4.6) of a
+    /// simple literal or `xsd:string`.
+    Hash(HashFunction, Box<FilterValue>),
 }
 
 impl FilterValue {
@@ -420,6 +425,7 @@ impl FilterValue {
             | Self::LCase(v)
             | Self::EncodeForUri(v)
             | Self::Replace { text: v, .. }
+            | Self::Hash(_, v)
             | Self::Numeric(_, v) => v.terms(),
             Self::Arith(_, a, b) | Self::StrBefore(a, b) | Self::StrAfter(a, b) => {
                 let mut terms = a.terms();
@@ -444,6 +450,7 @@ impl FilterValue {
             | Self::LCase(v)
             | Self::EncodeForUri(v)
             | Self::Replace { text: v, .. }
+            | Self::Hash(_, v)
             | Self::Numeric(_, v) => v.terms_mut(),
             Self::Arith(_, a, b) | Self::StrBefore(a, b) | Self::StrAfter(a, b) => {
                 let mut terms = a.terms_mut();
