@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# People and staff share subject IRIs; person 3 has a city.
+SELECT ?p ?n WHERE { ?p ex:name ?n MINUS { ?p ex:city ?c } }

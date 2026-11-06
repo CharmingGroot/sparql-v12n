@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Each side of the UNION removes the solutions it matches.
+SELECT ?p ?n WHERE { ?p ex:name ?n MINUS { { ?p ex:city "Seoul" } UNION { ?o ex:buyer ?p ; ex:amount 1 } } }

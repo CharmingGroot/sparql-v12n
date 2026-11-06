@@ -1,0 +1,16 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "shop(\"SELECT ?c ?t WHERE { ?c ex:name ?n \\\n         MINUS { { ?c ex:tier \\\"VIP\\\" } UNION { ?o ex:placedBy ?c } } ?c ex:tier ?t }\")"
+---
+SELECT q."c", q."t"
+FROM (
+SELECT DISTINCT t0."id" AS "c", t0."name" AS "n", t3."tier" AS "t"
+FROM "customers" t0
+LEFT JOIN "customers" t1 ON t1."tier" = $1 AND t1."id" = t0."id"
+LEFT JOIN "orders" t2 ON t2."customer_id" = t0."id" AND t2."id" IS NOT NULL
+JOIN "customers" t3 ON t3."id" = t0."id"
+WHERE t1."id" IS NULL AND t2."id" IS NULL AND t0."name" IS NOT NULL AND t3."tier" IS NOT NULL
+) q
+
+-- params
+$1 = "VIP"

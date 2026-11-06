@@ -1,0 +1,16 @@
+# MINUS inside OPTIONAL, UNION or another MINUS, and BIND or VALUES on
+# its right side (#114).
+[query.minus-in-optional]
+expect = "rejected"
+
+[query.minus-in-union]
+expect = "rejected"
+
+[query.nested-minus]
+expect = "rejected"
+
+[query.bind-in-minus]
+expect = "rejected"
+
+[query.values-in-minus]
+expect = "rejected"
