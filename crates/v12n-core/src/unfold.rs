@@ -1696,8 +1696,11 @@ enum Computed<'q> {
 /// double; otherwise a division gives a decimal (op:numeric-divide), and
 /// a variable may be a double column. A result of `IF` or `COALESCE` is
 /// one of their arguments, so a double constant there does not make the
-/// whole result a double.
+/// whole result a double. `STRLEN` is an integer (SPARQL 1.1 §17.4.3.2).
 fn value_kinds(expression: &Expression) -> Vec<ValueKind> {
+    if let Expression::StrLen(_) = expression {
+        return vec![ValueKind::Integer];
+    }
     if has_double_constant(expression) {
         return vec![ValueKind::Double];
     }
@@ -1730,6 +1733,7 @@ fn exact_kinds(expression: &Expression) -> Vec<ValueKind> {
         Expression::DateTime(DateTimeFunction::Seconds, _) => return vec![ValueKind::Decimal],
         Expression::DateTime(..) => return vec![ValueKind::Integer],
         Expression::Negate(inner) | Expression::Numeric(_, inner) => return exact_kinds(inner),
+        Expression::StrLen(_) => return vec![ValueKind::Integer],
         Expression::If(_, a, b) => vec![a, b],
         Expression::Coalesce(args) => args.iter().collect(),
         _ => return vec![ValueKind::Integer, ValueKind::Decimal],

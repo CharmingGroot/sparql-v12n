@@ -97,6 +97,9 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0020-functional-forms/order-by-if` | `IF` in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0022-numeric-functions/rand` | `RAND`: its value differs per row and per run, so no other engine can confirm the results. |
 | `0022-numeric-functions/order-by-abs` | `ABS` in `ORDER BY`, which comes with the other expressions there (#108). |
+| `0023-string-functions/bind-ucase` | A function on strings whose value is a string as the value of `BIND`: a computed variable holds only numbers (#100). |
+| `0023-string-functions/order-by-strlen` | `STRLEN` in `ORDER BY`, which comes with the other expressions there (#108). |
+| `0023-string-functions/substr-decimal` | A starting location of `SUBSTR` that is not an `xsd:integer`: a type error by the signature of `SUBSTR` (SPARQL 1.1 §17.4.3.3), which engines that round it as `fn:substring` does answer. |
 | `0024-date-time-functions/date-year` | `YEAR` of an `xsd:date`: SPARQL 1.1 §17.4.5 defines the function only for `xsd:dateTime`, and engines that extend it differ. |
 | `0024-date-time-functions/order-by-year` | `YEAR` in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0024-date-time-functions/select-tz`, `select-now` | `TZ` and `NOW` as the value of `SELECT`: a computed variable holds only numbers (#100). |
@@ -121,6 +124,8 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0017-double-arithmetic/filter-effective-boolean-value` (Ontop error) | #99 | Ontop writes the NaN test of a double's effective boolean value as an unquoted `NaN`, which PostgreSQL reads as a column name. |
 | `0002-constants/uuid-uppercase` | #26 | Ontop matches a `uuid` constant by value; the terms differ in case. |
 | `0006-filter/string-order-code-points`, `0008-order/string-accent`, `0008-order/string-hangul` | #26 | Ontop orders strings by the database collation; SPARQL orders them by code point. |
+| `0023-string-functions/ucase-sharp-s`, `lcase-final-sigma` | #26 | Ontop maps case with `UPPER` and `LOWER` under the database collation, one character at a time (`"STRAßE"`, `"οδοσ"`); XPath uses Unicode's full case mappings (`"STRASSE"`, `"οδος"`, F&O 3.1 §5.4.7, §5.4.8). |
+| `0023-string-functions/lcase-lang-language` (Ontop error) | #26 | Ontop refuses `LANG` of a function result. |
 | `0002-constants/date-non-canonical`, `date-invalid` (Ontop error) | #26 | Ontop refuses ill-typed `xsd:date` constants, which match nothing. |
 | `w3c/R2RMLTC0009c/name`, `R2RMLTC0009d/name`, `R2RMLTC0009d/numsport`, `R2RMLTC0019a/name` (Ontop error) | #26 | Ontop does not start with a computed `rr:sqlQuery` column, and does not resolve relative IRIs from columns. |
 

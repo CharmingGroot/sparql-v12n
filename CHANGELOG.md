@@ -22,6 +22,14 @@ Design decisions are recorded in the `Decision:` Discussions.
   `SELECT (expr AS ?v)`, with a result of the argument's datatype.
   `ROUND` rounds halves towards positive infinity, as `fn:round` does,
   for decimals and doubles. `RAND` is rejected as unsupported.
+- `STRLEN`, `SUBSTR`, `UCASE`, `LCASE`, `STRSTARTS`, `STRENDS`, `CONTAINS`
+  and `CONCAT` in `FILTER`, and `STRLEN` in `BIND` and `SELECT (expr AS
+  ?v)`, with the argument compatibility and language tag rules of SPARQL
+  1.1 §17.4.3. Lengths and positions count code points, and `UCASE` and
+  `LCASE` use Unicode's full case mappings through the ICU root locale,
+  whatever the database locale. `STRSTARTS`, `STRENDS` and `CONTAINS` with
+  a constant are `LIKE` with escaped wildcards under `COLLATE "C"`, which
+  an index on the column under that collation can serve.
 - `ASK` queries. The SQL reads at most one row and removes no duplicates.
   The answer is the JSON or XML boolean result from the endpoint and from
   `v12n query`, which prints `true` or `false` in the table format and

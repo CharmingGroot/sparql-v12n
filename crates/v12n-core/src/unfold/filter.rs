@@ -8,7 +8,7 @@ use crate::Error;
 use crate::sparql::{CompareOp, DateTimeFunction, Expression};
 use crate::sql::{Condition, Filter, FilterTerm, FilterValue, OrderValue, TermMatch, ValueCases};
 use crate::xpath_regex::{Untranslated, translate};
-use crate::xsd;
+use crate::xsd::{self, Num, Value};
 
 use super::term::{Equality, TermExpr, TermValue, term_eq};
 
@@ -123,6 +123,11 @@ impl<'a> Context<'_, 'a> {
                 right: r.value.clone(),
                 same_term: same_term(l, r),
             })?,
+            Expression::StrTest(test, a, b) => self.binary(a, b, |l, r| Filter::StrTest {
+                test: *test,
+                text: l.value.clone(),
+                search: r.value.clone(),
+            })?,
             Expression::Bound(variable) => self.bound(variable)?,
             Expression::Test(test, a) => {
                 self.unary(a, |leaf| Filter::Test(*test, leaf.value.clone()))?
@@ -202,6 +207,51 @@ impl<'a> Context<'_, 'a> {
             Expression::Lang(a) => derived(a, FilterValue::Lang),
             Expression::Datatype(a) => derived(a, FilterValue::Datatype),
             Expression::Negate(a) => derived(a, FilterValue::Negate),
+            Expression::StrLen(a) => derived(a, FilterValue::StrLen),
+            Expression::UCase(a) => derived(a, FilterValue::UCase),
+            Expression::LCase(a) => derived(a, FilterValue::LCase),
+            Expression::Substr(a, start, length) => {
+                let Some((start, length)) = substr_range(start, length.as_ref())? else {
+                    return Ok(Vec::new());
+                };
+                Ok(self
+                    .operand(a)?
+                    .into_iter()
+                    .map(|(guards, leaf)| {
+                        let value = FilterValue::Substr {
+                            text: Box::new(leaf.value),
+                            start,
+                            length,
+                        };
+                        (guards, Leaf { value, term: None })
+                    })
+                    .collect())
+            }
+            // One case per combination of the ways the arguments are bound.
+            Expression::Concat(args) => {
+                let mut out = vec![(Vec::new(), Vec::new())];
+                for arg in args {
+                    let cases = self.operand(arg)?;
+                    let mut next = Vec::with_capacity(out.len() * cases.len());
+                    for (guards, values) in &out {
+                        for (arg_guards, leaf) in &cases {
+                            let mut guards: Vec<Condition> = guards.clone();
+                            guards.extend(arg_guards.iter().cloned());
+                            let mut values: Vec<FilterValue> = values.clone();
+                            values.push(leaf.value.clone());
+                            next.push((guards, values));
+                        }
+                    }
+                    out = next;
+                }
+                Ok(out
+                    .into_iter()
+                    .map(|(guards, values)| {
+                        let value = FilterValue::Concat(values);
+                        (guards, Leaf { value, term: None })
+                    })
+                    .collect())
+            }
             Expression::Numeric(function, a) => Ok(self
                 .operand(a)?
                 .into_iter()
@@ -354,6 +404,69 @@ impl<'a> Context<'_, 'a> {
             }
         }
         Ok(out)
+    }
+}
+
+/// The positions that `SUBSTR(source, start, length)` takes, as the start
+/// and the length of PostgreSQL's `substr`: fn:substring takes the
+/// characters at the positions `p` with `start <= p < start + length`,
+/// counted from 1 (SPARQL 1.1 §17.4.3.3), so a start below 1 shortens the
+/// result and a negative length gives the empty string. `None` for a type
+/// error: an argument that is not an `xsd:integer`.
+fn substr_range(start: &Term, length: Option<&Term>) -> Result<Option<(i32, Option<i32>)>, Error> {
+    // No string has more characters than an int4 counts, so larger
+    // positions all give the same result.
+    const LIMIT: i128 = i32::MAX as i128;
+    let Some(start) = substr_integer(start)? else {
+        return Ok(None);
+    };
+    let length = match length.map(substr_integer).transpose()? {
+        Some(None) => return Ok(None),
+        Some(Some(length)) => Some(length),
+        None => None,
+    };
+    let first = start.clamp(1, LIMIT);
+    let count = length.map(|length| {
+        // Past the end of every string where the sum overflows upwards,
+        // before its start where it overflows downwards.
+        let end =
+            start
+                .checked_add(length)
+                .unwrap_or(if length > 0 { i128::MAX } else { i128::MIN });
+        end.saturating_sub(first).clamp(0, LIMIT - first)
+    });
+    let int4 = |n: i128| i32::try_from(n).expect("clamped to the int4 range");
+    Ok(Some((int4(first), count.map(int4))))
+}
+
+/// An `xsd:integer` argument of `SUBSTR`; `None` for a type error.
+fn substr_integer(term: &Term) -> Result<Option<i128>, Error> {
+    let Term::Literal(literal) = term else {
+        return Ok(None);
+    };
+    match xsd::value(literal.value(), literal.datatype().as_str()) {
+        Value::Numeric(n) if n.class == Num::Integer => n
+            .decimal
+            .expect("integers have a decimal form")
+            .parse::<i128>()
+            .map(Some)
+            .map_err(|_| {
+                Error::UnsupportedFeature(
+                    "SUBSTR with a starting location or length beyond the range of a 128-bit \
+                     integer"
+                        .to_owned(),
+                )
+            }),
+        Value::Numeric(_) => Err(Error::UnsupportedFeature(
+            "SUBSTR with a starting location or length that is not an xsd:integer: SPARQL 1.1 \
+             makes it a type error, while engines that round it as fn:substring does differ"
+                .to_owned(),
+        )),
+        Value::Unsupported(_) => Err(Error::UnsupportedFeature(format!(
+            "SUBSTR with a starting location or length of datatype <{}>",
+            literal.datatype().as_str()
+        ))),
+        _ => Ok(None),
     }
 }
 

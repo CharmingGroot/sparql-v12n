@@ -643,6 +643,50 @@ The following are rejected as unsupported:
 
 An invalid pattern or flag is an error, as in XPath.
 
+`STRLEN`, `SUBSTR`, `UCASE`, `LCASE`, `STRSTARTS`, `STRENDS`, `CONTAINS`
+and `CONCAT` follow SPARQL 1.1 §17.4.3:
+
+- Their arguments are string literals: simple literals, `xsd:string` and
+  language-tagged literals (§17.4.3.1.1). Any other term, such as a
+  number, an IRI or an unbound variable, makes the function an error.
+- `STRSTARTS`, `STRENDS` and `CONTAINS` need compatible arguments
+  (§17.4.3.1.2): both without a language tag, both with the same tag, or
+  a tag on the first only. `CONTAINS(?label, "pie")` works on `"Apple
+  pie"@en`, and `CONTAINS(?name, "pie"@en)` is an error on `"pie"`.
+- `SUBSTR`, `UCASE` and `LCASE` keep the language tag of their argument.
+  `CONCAT` keeps a language tag that all its arguments have, and gives a
+  simple literal otherwise (§17.4.3.12).
+- Lengths and positions count characters, which are Unicode code points.
+  `STRLEN` of `"e\u0301"` (`e` and a combining acute accent) is 2, and
+  of an emoji 1. `SUBSTR(s, start, length)` takes the characters at the
+  positions `p` with `start <= p < start + length`, counted from 1, as
+  XPath's `fn:substring` does. `SUBSTR("abc", 0, 2)` is `"a"`, and a
+  negative length gives `""`. The starting location and the length are
+  `xsd:integer` constants.
+- `UCASE` and `LCASE` apply the full case mappings of Unicode without
+  language tailoring (XPath F&O 3.1 §5.4.7, §5.4.8): `UCASE("Straße")` is
+  `"STRASSE"`, and `LCASE("ΟΔΟΣ")` is `"οδος"`, with the final sigma.
+
+In SQL, every computed string is under `COLLATE "C"`, so comparing,
+searching and concatenating it compare code points whatever the
+collation of the column. `STRLEN` is `char_length` and `SUBSTR` is
+`substr`. Both count characters, which are code points in a UTF-8
+database. `UCASE` and `LCASE` are `upper` and `lower` under the ICU
+collation `"und-x-icu"`, the root locale, which applies the mappings of
+Unicode. Under a libc locale, `upper` and `lower` map one character at a
+time (`"STRAßE"`), and under `"C"` they map only ASCII. A PostgreSQL
+server built without ICU rejects the statement. `STRSTARTS`, `STRENDS` and `CONTAINS`
+with a constant are `LIKE` with the constant as a parameter, its `%`,
+`_` and `\` escaped, so `STRSTARTS(?name, "Kim")` is
+`name COLLATE "C" LIKE 'Kim%'`. An index on the column under
+`COLLATE "C"`, or with the operator class `text_pattern_ops`, serves
+`STRSTARTS`. With a string computed from the row instead of a constant,
+they are `starts_with`, `right` and `strpos`.
+
+`STRLEN` is a number, and can be the value of `BIND` and `SELECT`
+expressions (see below). The other functions give strings, which a
+computed variable does not hold yet.
+
 The following are rejected as unsupported, rather than answered
 differently from engines that extend SPARQL:
 
@@ -660,26 +704,33 @@ differently from engines that extend SPARQL:
     microsecond;
 - other functions, `RAND` among them, `EXISTS`, and expressions other
   than terms (variables, constants, arithmetic, `NOW`, and `STR`, `LANG`,
-  `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`, the functions of
-  dateTimes, `IF` or `COALESCE` of them) as operands, such as a comparison
-  as an argument of `IF`, `COALESCE` or `IN`;
+  `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`, `IF`, `COALESCE`, the
+  functions on strings or the functions of dateTimes of them) as operands,
+  such as a comparison as an argument of `IF`, `COALESCE` or `IN`;
+- a starting location or length of `SUBSTR` that is not a constant, or
+  not an `xsd:integer`, such as `1.5`: SPARQL 1.1 makes it a type error,
+  and engines that round it as `fn:substring` does answer;
+- functions on strings of a `date` or `timestamp` column, whose infinite
+  values are plain literals;
 - the functions of dateTimes over `xsd:date` and `xsd:time` values, and
   `sameTerm` of `NOW`;
-- string ordering and `REGEX` in a database whose encoding is not UTF-8.
+- string ordering, `REGEX` and the functions on strings in a database
+  whose encoding is not UTF-8.
 
 ## BIND and SELECT expressions
 
 `BIND(expr AS ?v)` and `SELECT (expr AS ?v)` give `?v` the value of the
 expression in each solution (SPARQL 1.1 §18.5, Extend). The expression is
 a variable, a constant, arithmetic and the numeric functions as in
-[`FILTER`](#filter), or `IF` and `COALESCE` whose results are arithmetic
-or numeric constants:
+[`FILTER`](#filter), `STRLEN`, or `IF` and `COALESCE` whose results are
+arithmetic or numeric constants:
 
 - A variable gives its term, and a constant gives itself.
 - Arithmetic gives a number whose datatype follows XPath's type
   promotion, written in canonical form (see [Literals](#literals)). Over
   an integer column, `?qty * 2` is an `xsd:integer` and `?qty / 4` is an
-  `xsd:decimal`. The precision of a decimal division, which XPath leaves
+  `xsd:decimal`. `STRLEN(?name)` is an `xsd:integer`. The precision of a
+  decimal division, which XPath leaves
   to the implementation, is that of PostgreSQL's `numeric` division.
   `?qty * 1.5e0` is an `xsd:double`, such as `1.5E0`, `-0.0E0`, `INF` or
   `NaN`. `SELECT DISTINCT` keeps `-0.0E0` and `0.0E0` apart, which are
@@ -706,9 +757,10 @@ of the variables of the expression that the group may leave unbound.
 The following are rejected as unsupported:
 
 - expressions other than variables, constants, arithmetic, numeric
-  functions, `YEAR` to `SECONDS`, and `IF` and `COALESCE` over arithmetic
-  and numeric constants. `STR`, comparisons, `IN`, `TZ`, `TIMEZONE`,
-  `NOW`, and `COALESCE(?x, 0)`, whose result can be any term, are
+  functions, `STRLEN`, `YEAR` to `SECONDS`, and `IF` and `COALESCE` over
+  arithmetic and numeric constants. `STR`, comparisons, `IN`, `UCASE` and
+  the other functions on strings, `TZ`, `TIMEZONE`, `NOW`, and
+  `COALESCE(?x, 0)`, whose result can be any term, are
   examples. A computed variable holds only numbers in SQL;
 - `BIND` inside `OPTIONAL` or `UNION`;
 - `BIND` over a variable that its group may leave unbound and a later
@@ -879,5 +931,6 @@ The following are rejected as unsupported:
 - comparators over `real` columns;
 - comparators over strings in a database whose encoding is not UTF-8;
 - as in `FILTER`, other functions, arithmetic, `ABS`, `ROUND`, `CEIL`,
-  `FLOOR`, the functions of dateTimes, `NOW`, `IF`, `COALESCE` and string
-  forms that SQL cannot compute.
+  `FLOOR`, `IF`, `COALESCE`, the functions on strings other than
+  `STRSTARTS`, `STRENDS` and `CONTAINS`, the functions of dateTimes, `NOW`,
+  and string forms that SQL cannot compute.
