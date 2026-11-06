@@ -3,7 +3,7 @@
 use super::*;
 use crate::dialect::PostgresDialect;
 use crate::sparql::{self, QueryForm};
-use crate::sql::{Filter, RenderOptions, TableKeys, TermMatch, TermSql, TermSqlValue};
+use crate::sql::{Filter, Param, RenderOptions, TableKeys, TermMatch, TermSql, TermSqlValue};
 
 const SHOP: &str = include_str!("../../../../examples/shop/mapping.ttl");
 
@@ -382,6 +382,76 @@ fn unfold_literal_constants_are_parameters_not_sql_text() {
     let rendered = plan.to_sql().unwrap();
     assert!(!rendered.sql.contains("DROP"));
     assert_eq!(rendered.params, ["x'; DROP TABLE customers; --"]);
+}
+
+fn eq_param(table: usize, name: &str, value: &str, datatype: Option<&str>) -> Condition {
+    Condition::Eq(
+        SqlExpr::Column {
+            table,
+            name: name.into(),
+        },
+        SqlExpr::Param(Param {
+            value: value.into(),
+            datatype: datatype.map(str::to_owned),
+        }),
+    )
+}
+
+#[test]
+fn unfold_values_rows_are_alternatives_of_the_branch() {
+    let customer = |id: &str| format!("<http://example.org/customer/{id}>");
+    let order = "<http://example.org/order/1>";
+    let plan = unfold_query(
+        SHOP,
+        &format!(
+            "SELECT ?c WHERE {{ ?c ex:name ?n }} VALUES (?c ?n) {{ ({} \"Kim\") ({} UNDEF) \
+             ({order} UNDEF) }}",
+            customer("7"),
+            customer("8")
+        ),
+    )
+    .unwrap();
+    let [branch] = plan.branches.as_slice() else {
+        panic!("expected one branch");
+    };
+    // The constant's datatype is checked against the column's natural one.
+    assert!(branch.conditions.contains(&Condition::Or(vec![
+        vec![
+            eq_param(0, "id", "7", None),
+            eq_param(0, "name", "Kim", Some(XSD_STRING))
+        ],
+        vec![eq_param(0, "id", "8", None)],
+    ])));
+
+    // One row left holds in every row of the branch.
+    let plan = unfold_query(
+        SHOP,
+        &format!(
+            "SELECT ?n WHERE {{ ?c ex:name ?n }} VALUES ?c {{ {} {order} }}",
+            customer("7")
+        ),
+    )
+    .unwrap();
+    let conditions = &plan.branches[0].conditions;
+    assert!(conditions.contains(&eq_param(0, "id", "7", None)));
+    assert!(!conditions.iter().any(|c| matches!(c, Condition::Or(_))));
+
+    // No row left: no branch.
+    let plan = unfold_query(
+        SHOP,
+        &format!("SELECT ?n WHERE {{ ?c ex:name ?n }} VALUES ?c {{ {order} }}"),
+    )
+    .unwrap();
+    assert!(plan.branches.is_empty());
+
+    // A row of UNDEF only is compatible with every solution.
+    let all = unfold_query(SHOP, "SELECT ?n WHERE { ?c ex:name ?n }").unwrap();
+    let undef = unfold_query(
+        SHOP,
+        "SELECT ?n WHERE { ?c ex:name ?n VALUES (?c ?n) { (UNDEF UNDEF) } }",
+    )
+    .unwrap();
+    assert_eq!(undef, all);
 }
 
 #[test]

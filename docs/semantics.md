@@ -646,6 +646,58 @@ The following are rejected as unsupported:
 - a variable that `BIND` or `SELECT` computes, used in a triple pattern,
   in `FILTER`, in `ORDER BY` or in another expression.
 
+## VALUES
+
+`VALUES` supplies inline data, inside a group or after the query (SPARQL
+1.1 §10.2), and joins it with the pattern (§18.5, Join). A row is
+compatible with a solution when each of its terms is the term that the
+solution binds its variable to, and `UNDEF` is compatible with every term
+(§18.3).
+
+The constants of `VALUES` are matched as RDF terms, like the
+[constants of triple patterns](#constants-in-a-query). Each row is one
+alternative of a disjunction in the SQL, and each of its constants is
+compared with the columns of its variable, as a triple pattern constant
+is. In the shop example, `?o ex:placedBy ?c ; ex:amount ?a` with
+`VALUES (?c ?a) { (<…/customer/7> UNDEF) (<…/customer/8> 30000) }`
+gives this condition:
+
+```sql
+(t0."customer_id" = $1 OR (t0."customer_id" = $2 AND t1."amount" = $3))
+```
+
+PostgreSQL types each parameter as the column it is compared with, so the
+round-trip check applies and the column's indexes are used. A SQL `VALUES`
+list types its parameters as `text` before the join compares them with a
+column.
+
+A row whose constant the term map cannot produce, such as an order IRI
+for a customer template, is left out of the branch. A branch that no row
+can match is left out of the query. A constant that no value of the
+column can match fails its row only.
+
+SPARQL joins the data with the solutions of the group it is written in.
+v12n joins it with the solutions of the whole pattern. Both give the same
+solutions when the block is outside `OPTIONAL` and `UNION` and every
+variable of the data is bound in every solution of the rest of its group.
+Each solution is then kept once or dropped, which is the result of the
+join when no two rows can match one solution.
+
+The `VALUES` blocks of a query hold at most 1000 values together, rows
+times variables, `UNDEF` included. A query with more fails with an error
+that names the limit (`v12n query` exits with 1, the HTTP endpoint answers
+400).
+
+The following are rejected as unsupported:
+
+- `VALUES` inside `OPTIONAL` or `UNION`;
+- `VALUES` over a variable that the rest of its group may leave unbound,
+  such as one that no triple pattern binds or that only an `OPTIONAL`
+  part binds;
+- two rows that one solution can match: equal rows, or rows that differ
+  only where one of them is `UNDEF`;
+- `VALUES` without variables.
+
 ## ORDER BY, LIMIT and OFFSET
 
 The solution modifiers apply in the order that the algebra defines

@@ -298,6 +298,23 @@ fn explain_too_many_branches_lists_the_patterns_in_details() {
 }
 
 #[test]
+fn explain_too_many_values_names_the_limit_in_details() {
+    let values: Vec<String> = (0..=1000).map(|i| i.to_string()).collect();
+    let query = format!(
+        "SELECT * WHERE {{ ?o <http://example.org/amount> ?a VALUES ?a {{ {} }} }}",
+        values.join(" ")
+    );
+    let output = v12n(&["explain", SHOP, "-"], &query);
+    assert_eq!(output.status.code(), Some(1));
+    let error = stdout_json(&output);
+    assert_eq!(error["error"]["kind"], json!("unsupported"));
+    assert_eq!(
+        error["error"]["details"],
+        json!({ "limit": 1000, "values": 1001 })
+    );
+}
+
+#[test]
 fn explain_plan_that_cannot_be_rendered_exits_one() {
     let case = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/diff/0006-filter");
     let output = v12n(

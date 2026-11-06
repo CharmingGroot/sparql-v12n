@@ -79,6 +79,10 @@ pub(crate) fn load_plan(
                     .collect::<Vec<_>>(),
                 "omitted": omitted,
             })),
+            v12n_core::Error::TooManyValues { limit, values } => Some(json!({
+                "limit": limit,
+                "values": values,
+            })),
             _ => None,
         };
         Failure {

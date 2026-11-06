@@ -103,7 +103,7 @@ CLI는 사람이 직접 실행하는 경우뿐 아니라 셸 도구가 호출하
 
 | `kind` | 종료 코드 | `details` |
 |---|---|---|
-| `input`, `query`, `unsupported`, `output`, `runtime` | 1 | 파일을 읽을 수 없을 때 `{"path": ...}`. 너무 많은 SQL branch로 unfold되는 쿼리에는 `{"limit": ..., "patterns": [{"pattern": ..., "triples_maps": ...}], "omitted": ...}` |
+| `input`, `query`, `unsupported`, `output`, `runtime` | 1 | 파일을 읽을 수 없을 때 `{"path": ...}`. 너무 많은 SQL branch로 unfold되는 쿼리에는 `{"limit": ..., "patterns": [{"pattern": ..., "triples_maps": ...}], "omitted": ...}`. `VALUES` 블록의 값이 너무 많은 쿼리에는 `{"limit": ..., "values": ...}` |
 | `mapping` | 2 | |
 | `database`, `data` | 3 | |
 | `timeout` | 4 | `{"timeout_ms": ..., "rows": ...}` |
@@ -273,7 +273,7 @@ libpq와 다른 점은 다음과 같다.
 | 상태 | 조건 |
 |---|---|
 | `200` | 결과. 행 제한이 적용되어 결과가 잘리면 응답에 `V12N-Truncated: <row limit>`가 포함되고, 응답은 정확히 그 수만큼의 해를 담는다. 같은 경우 `v12n query`는 5로 종료한다 |
-| `400` | 쿼리 문법 오류, `query`가 없거나 두 번 이상 지정된 경우, 데이터셋 파라미터, 너무 많은 SQL branch로 unfold되는 쿼리. branch가 너무 많으면 본문에 후보 triples map이 둘 이상인 트리플 패턴과 그 수를 명시한다 |
+| `400` | 쿼리 문법 오류, `query`가 없거나 두 번 이상 지정된 경우, 데이터셋 파라미터, 너무 많은 SQL branch로 unfold되는 쿼리, `VALUES` 블록의 값이 1000개를 넘는 쿼리. branch가 너무 많으면 본문에 후보 triples map이 둘 이상인 트리플 패턴과 그 수를 명시한다 |
 | `406` / `413` / `414` / `415` | `406`: 제공하지 않는 형식. `413`: `POST`에서 `max_query_bytes`를 넘는 쿼리. `414`: `GET`에서 `max_query_bytes`를 넘는 쿼리. `415`: 그 밖의 content type |
 | `501` | 아직 지원하지 않는 SPARQL 기능 |
 | `503` | 첫 행 이전에 발생한 statement timeout(이 경우 `v12n query`는 4로 종료한다), 또는 `max_concurrent_requests` 도달(응답에 `Retry-After`가 포함된다), 또는 카탈로그가 바뀌어 쿼리 계획을 다시 세우는 동안 카탈로그가 또 바뀐 경우(마이그레이션 중 등) |

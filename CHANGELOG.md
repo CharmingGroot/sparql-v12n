@@ -25,6 +25,11 @@ Design decisions are recorded in the `Decision:` Discussions.
   column that an index can serve.
 - `BIND` and `SELECT (expr AS ?v)` over variables, constants and arithmetic
   on integers and decimals. An error leaves the variable unbound.
+- `VALUES` inside a group and after the query, with `UNDEF` (#113). Each
+  row becomes an alternative of a disjunction whose constants are compared
+  with their variables' columns and checked like triple pattern constants.
+  The `VALUES` blocks of a query hold at most 1000 values; a larger query
+  fails with `Error::TooManyValues`, HTTP 400.
 - Arithmetic on `xsd:double` values in `FILTER`, `BIND` and `SELECT`, with
   IEEE 754 results: infinities and signed zeros where PostgreSQL's
   `float8` operators raise errors, and NaN neither equal to nor ordered

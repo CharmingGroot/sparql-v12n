@@ -16,7 +16,8 @@ use crate::mapping::{
     TermMapValue, TermType, TriplesMap,
 };
 use crate::sparql::{
-    ArithOp, Expression, Pattern, PatternTerm, QueryForm, RDF_TYPE, SelectQuery, TriplePattern,
+    ArithOp, Expression, InlineData, Pattern, PatternTerm, QueryForm, RDF_TYPE, SelectQuery,
+    TriplePattern,
 };
 use crate::sql::{
     Condition, LeftJoin, OrderKey, ProjectedTerm, ResultTerm, ResultValue, SqlBranch, SqlExpr,
@@ -91,7 +92,14 @@ fn unfold_branches(
             return Err(too_many());
         }
         for chosen in choices {
-            branches.extend(Branch::build(&query.pattern, a, arm, &chosen, &context)?);
+            branches.extend(Branch::build(
+                &query.pattern,
+                &query.values,
+                a,
+                arm,
+                &chosen,
+                &context,
+            )?);
             if branches.len() > MAX_BRANCHES {
                 return Err(too_many());
             }
@@ -557,10 +565,11 @@ struct Branch<'a> {
 }
 
 impl<'a> Branch<'a> {
-    /// The branches the pattern gives with these choices; none when they
-    /// can never produce a row.
+    /// The branches the pattern gives with these choices, joined with
+    /// `values`; none when they can never produce a row.
     fn build(
         pattern: &'a Pattern,
+        values: &'a [InlineData],
         arm_index: usize,
         arm: &[bool],
         chosen: &[Candidate<'a>],
@@ -577,14 +586,68 @@ impl<'a> Branch<'a> {
         let mut chosen = chosen.iter().copied();
         let mut sides = arm.iter().copied();
         let forks = branch.walk(pattern, None, 1, &mut sides, &mut chosen, context)?;
-        Ok(forks
-            .into_iter()
-            .map(|(mut branch, env)| {
-                branch.env = env;
+        let mut out = Vec::with_capacity(forks.len());
+        for (mut branch, env) in forks {
+            branch.env = env;
+            if branch.join_values(values)? {
                 branch.add_not_null();
-                branch
-            })
-            .collect())
+                out.push(branch);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Joins the branch with each `VALUES` block (see [`InlineData`]): a
+    /// row is compatible with a solution where each of its terms is the
+    /// term the pattern binds its variable to (SPARQL 1.1 §18.3), and an
+    /// `UNDEF` is compatible with every term. The rows go into one
+    /// disjunction, where each constant is compared with the columns of
+    /// its variable's term as a triple pattern constant is, so that the
+    /// database types its parameter as that column. `false` when no row
+    /// can match.
+    fn join_values(&mut self, values: &'a [InlineData]) -> Result<bool, Error> {
+        'blocks: for data in values {
+            let mut terms = Vec::with_capacity(data.variables.len());
+            for variable in &data.variables {
+                let term = self
+                    .env
+                    .iter()
+                    .find(|(v, _)| *v == variable.as_str())
+                    .and_then(|(_, sources)| sources.iter().find(|s| s.scope.is_none()))
+                    .ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "VALUES over ?{variable}, which the pattern may leave unbound"
+                        ))
+                    })?
+                    .term;
+                terms.push(term);
+            }
+            let mut rows = Vec::new();
+            'rows: for row in &data.rows {
+                let mut conditions = Vec::new();
+                for (term, value) in terms.iter().zip(row) {
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    match term_eq(term, &TermExpr::constant(value)) {
+                        Equality::Never => continue 'rows,
+                        Equality::When(c) => conditions.extend(c),
+                    }
+                }
+                // A row that every solution matches is the only one any
+                // solution matches.
+                if conditions.is_empty() {
+                    continue 'blocks;
+                }
+                rows.push(conditions);
+            }
+            match rows.len() {
+                0 => return Ok(false),
+                1 => self.conditions.extend(rows.pop().unwrap_or_default()),
+                _ => self.conditions.push(Condition::Or(rows)),
+            }
+        }
+        Ok(true)
     }
 
     /// Adds the tables and conditions of `pattern` to `scope`, taking the

@@ -88,6 +88,9 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0013-bind/bind-in-optional` | `BIND` inside `OPTIONAL`: the variable is computed only where the part matches, which the first step of `BIND` leaves out (#100). |
 | `0013-bind/filter-over-bind` | `FILTER` over a variable that `BIND` computes, which the first step of `BIND` leaves out (#100). |
 | `0018-ask/limit-zero`, `offset-second-solution`, `offset-duplicate-triple` | `LIMIT` and `OFFSET` in `ASK`: SPARQL 1.1 §18.2.5 slices the solutions before `ASK` tests for one, so `LIMIT 0` answers false; Ontop answers from the pattern alone. |
+| `0019-values/values-in-optional`, `values-in-union` | `VALUES` inside `OPTIONAL` or `UNION`: inline data is joined with the whole pattern, which differs there from the join with its group (#113). |
+| `0019-values/values-unbound-variable`, `values-optional-variable` | `VALUES` over a variable that the rest of its group may leave unbound: solutions would take its value from the inline data (#113). |
+| `0019-values/values-overlapping-rows` | Two `VALUES` rows that one solution can match, which the join would repeat (#113). |
 | `0020-functional-forms/bind-coalesce-variable`, `bind-in` | `COALESCE` whose result can be a term other than a number, and `IN` as the value of `BIND`: a computed variable holds only numbers (#100). |
 | `0020-functional-forms/order-by-if` | `IF` in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0008-order/distinct-over-hidden` | `ORDER BY` over a variable that `SELECT DISTINCT` does not project: one solution stands for several that the order puts at different places (Discussion #63). |
@@ -97,7 +100,7 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 
 | Queries | Issue | Difference |
 |---|---|---|
-| `0002-constants/prices`, `price-constant`, `price-integral-constant`, `0013-bind/select-divide`, `select-decimal` | #25 | Ontop keeps the scale of `numeric` values (`12.50`), also of computed ones (`3.5000000000000000`); v12n writes XSD 1.1 canonical forms (`12.5`), as decided in Discussion #35. |
+| `0002-constants/prices`, `price-constant`, `price-integral-constant`, `0013-bind/select-divide`, `select-decimal`, `0019-values/decimal` | #25 | Ontop keeps the scale of `numeric` values (`12.50`), also of computed ones (`3.5000000000000000`); v12n writes XSD 1.1 canonical forms (`12.5`), as decided in Discussion #35. |
 | `w3c/R2RMLTC0005a/owes`, `R2RMLTC0005b/amount`, `R2RMLTC0005b/type-ious`, `R2RMLTC0012a/amount`, `R2RMLTC0012e/amount`, `0009-literals/double-canonical`, `0017-double-arithmetic/select-double-product`, `select-integer-promoted` | #25 | Ontop writes an `xsd:double` as PostgreSQL's text output (`30`, `Infinity`), also a computed one, and matches constants against it; v12n writes and matches the canonical form (`3.0E1`, `INF`). |
 | `0017-double-arithmetic/filter-nan-not-ordered` | #99 | Ontop compares computed doubles in PostgreSQL, which orders NaN above every number; XPath orders NaN with nothing, so `!(?n * 2 > 0)` holds for a NaN. |
 | `0011-time/time-results`, `time-constant-midnight`, `time-constant-24`, `time-join`, `time-distinct`, `time-key-subject`, `time-order` | #37 | Ontop writes a `time` of `24:00:00` as is and treats it as another term than `00:00:00`; v12n writes the canonical form `00:00:00` for both and treats them as one term, as decided in Discussion #91. |

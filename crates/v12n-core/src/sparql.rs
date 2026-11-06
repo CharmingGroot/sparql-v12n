@@ -5,13 +5,18 @@ use std::fmt;
 
 use oxrdf::{Literal, NamedNode, Term};
 use spargebra::algebra::{Expression as SparqlExpression, Function, GraphPattern, OrderExpression};
-use spargebra::term::{NamedNodePattern, TermPattern};
+use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, Variable};
 use spargebra::{Query, SparqlParser};
 
 use crate::Error;
 
 /// IRI of `rdf:type`, whose constant objects are looked up as classes.
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+/// Most values, `UNDEF` included, that the `VALUES` blocks of one query
+/// may hold together. Each value becomes a few SQL parameters in every
+/// branch that reads its variable.
+pub const MAX_VALUES: usize = 1000;
 
 /// A `SELECT` or `ASK` query in the supported subset: a graph pattern
 /// with the solution modifiers in the order SPARQL 1.1 §18.2.5 applies
@@ -27,6 +32,9 @@ pub struct SelectQuery {
     /// The variables that `BIND` and `SELECT (expr AS ?v)` compute, in
     /// the order they are written.
     pub bindings: Vec<Binding>,
+    /// The `VALUES` blocks, in the order they are written, each joined
+    /// with the whole pattern (see [`InlineData`]).
+    pub values: Vec<InlineData>,
     /// The order comparators of `ORDER BY`, in order; empty without one.
     pub order_by: Vec<OrderCondition>,
     /// Solutions skipped from the start (`OFFSET`), 0 without one.
@@ -59,6 +67,25 @@ pub struct Binding {
     pub variable: String,
     /// A variable, a constant, or arithmetic.
     pub expression: Expression,
+}
+
+/// The inline data of a `VALUES` block (SPARQL 1.1 §10.2), inside a group
+/// or after the query, and `Join(P, data)` with the rest of its group.
+///
+/// It is joined with the solutions of the whole pattern rather than of
+/// its group. The parser accepts it only where both give the same
+/// solutions and the join can only drop solutions: outside `OPTIONAL`
+/// and `UNION`, every variable is bound in every solution of the rest of
+/// its group, and no two rows can be compatible with one solution. A
+/// solution is then kept once when a row is compatible with it (SPARQL
+/// 1.1 §18.3), an `UNDEF` being compatible with every value, and dropped
+/// otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineData {
+    /// Variable names without `?`.
+    pub variables: Vec<String>,
+    /// One term per variable in each row, `None` for `UNDEF`.
+    pub rows: Vec<Vec<Option<Term>>>,
 }
 
 /// One order comparator of `ORDER BY` (SPARQL 1.1 §15.1).
@@ -505,7 +532,8 @@ pub fn parse(query: &str) -> Result<SelectQuery, Error> {
         other => (Vec::new(), other),
     };
     let mut extends = Vec::new();
-    let pattern = group(&inner, Place::Required, &mut extends)?;
+    let mut values = Vec::new();
+    let pattern = group(&inner, Place::Required, &mut extends, &mut values)?;
     if pattern.triple_patterns().is_empty() {
         return Err(unsupported("empty graph patterns"));
     }
@@ -524,6 +552,7 @@ pub fn parse(query: &str) -> Result<SelectQuery, Error> {
         distinct,
         pattern,
         bindings,
+        values,
         order_by,
         offset,
         limit,
@@ -678,7 +707,18 @@ fn group(
     pattern: &GraphPattern,
     place: Place,
     extends: &mut Vec<Extend>,
+    values: &mut Vec<InlineData>,
 ) -> Result<Pattern, Error> {
+    if let GraphPattern::Join { .. } = pattern {
+        let mut operands = Vec::new();
+        join_operands(pattern, &mut operands);
+        if operands
+            .iter()
+            .any(|p| matches!(p, GraphPattern::Values { .. }))
+        {
+            return values_join(&operands, place, extends, values);
+        }
+    }
     // A group inside `OPTIONAL` or `UNION` stays there.
     let mut nested = |p: &GraphPattern, inside: Place| {
         let inside = if place == Place::Required {
@@ -686,7 +726,7 @@ fn group(
         } else {
             place
         };
-        group(p, inside, extends)
+        group(p, inside, extends, values)
     };
     match pattern {
         GraphPattern::Bgp { patterns } => {
@@ -703,23 +743,7 @@ fn group(
             }
             Ok(Pattern::Bgp(out))
         }
-        // A join of basic graph patterns is the basic graph pattern of all
-        // their triples: blank node labels cannot be shared across them
-        // (SPARQL 1.1 §4.1.4), so nothing is captured by merging.
-        GraphPattern::Join { left, right } => {
-            Ok(match (nested(left, place)?, nested(right, place)?) {
-                (Pattern::Bgp(mut left), Pattern::Bgp(right)) => {
-                    left.extend(right);
-                    Pattern::Bgp(left)
-                }
-                // Join(Z, P) = P for the empty pattern Z, whose one solution
-                // binds nothing.
-                (Pattern::Bgp(empty), other) | (other, Pattern::Bgp(empty)) if empty.is_empty() => {
-                    other
-                }
-                (left, right) => Pattern::Join(Box::new(left), Box::new(right)),
-            })
-        }
+        GraphPattern::Join { left, right } => Ok(join(nested(left, place)?, nested(right, place)?)),
         GraphPattern::Union { left, right } => Ok(Pattern::Union(
             Box::new(nested(left, Place::Union)?),
             Box::new(nested(right, Place::Union)?),
@@ -778,7 +802,143 @@ fn group(
             });
             Ok(inner)
         }
+        // Not joined with patterns that bind its variables.
+        GraphPattern::Values { .. } => values_join(&[pattern], place, extends, values),
         other => Err(unsupported(describe(other))),
+    }
+}
+
+/// A join of basic graph patterns is the basic graph pattern of all their
+/// triples: blank node labels cannot be shared across them (SPARQL 1.1
+/// §4.1.4), so nothing is captured by merging.
+fn join(left: Pattern, right: Pattern) -> Pattern {
+    match (left, right) {
+        (Pattern::Bgp(mut left), Pattern::Bgp(right)) => {
+            left.extend(right);
+            Pattern::Bgp(left)
+        }
+        // Join(Z, P) = P for the empty pattern Z, whose one solution
+        // binds nothing.
+        (Pattern::Bgp(empty), other) | (other, Pattern::Bgp(empty)) if empty.is_empty() => other,
+        (left, right) => Pattern::Join(Box::new(left), Box::new(right)),
+    }
+}
+
+/// The operands of nested joins, in the order they are written. Join is
+/// associative and commutative (SPARQL 1.1 §18.5), so the solutions do
+/// not depend on how they are nested.
+fn join_operands<'p>(pattern: &'p GraphPattern, out: &mut Vec<&'p GraphPattern>) {
+    match pattern {
+        GraphPattern::Join { left, right } => {
+            join_operands(left, out);
+            join_operands(right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// The join of `operands`, of which the `VALUES` blocks go to `values`
+/// (see [`InlineData`]) and the others make the pattern returned.
+fn values_join(
+    operands: &[&GraphPattern],
+    place: Place,
+    extends: &mut Vec<Extend>,
+    values: &mut Vec<InlineData>,
+) -> Result<Pattern, Error> {
+    match place {
+        Place::Required => {}
+        Place::Optional => return Err(unsupported("VALUES inside OPTIONAL")),
+        Place::Union => return Err(unsupported("VALUES inside UNION")),
+    }
+    let mut joined = Pattern::Bgp(Vec::new());
+    let mut data = Vec::new();
+    for operand in operands {
+        match operand {
+            GraphPattern::Values {
+                variables,
+                bindings,
+            } => data.push(inline_data(variables, bindings)?),
+            other => joined = join(joined, group(other, place, extends, values)?),
+        }
+    }
+    let certain = joined.certain_variables();
+    for variable in data.iter().flat_map(|d| &d.variables) {
+        if !certain.contains(&variable.as_str()) {
+            return Err(unsupported(&format!(
+                "VALUES over ?{variable}, which the rest of its group may leave unbound"
+            )));
+        }
+    }
+    values.extend(data);
+    let total = values
+        .iter()
+        .map(|d| d.rows.len().saturating_mul(d.variables.len()))
+        .fold(0, usize::saturating_add);
+    if total > MAX_VALUES {
+        return Err(Error::TooManyValues {
+            limit: MAX_VALUES,
+            values: total,
+        });
+    }
+    Ok(joined)
+}
+
+/// A `VALUES` block, or an error for one whose rows the parser does not
+/// accept (see [`InlineData`]).
+fn inline_data(
+    variables: &[Variable],
+    bindings: &[Vec<Option<GroundTerm>>],
+) -> Result<InlineData, Error> {
+    if variables.is_empty() {
+        return Err(unsupported("VALUES without variables"));
+    }
+    let values = bindings.len().saturating_mul(variables.len());
+    if values > MAX_VALUES {
+        return Err(Error::TooManyValues {
+            limit: MAX_VALUES,
+            values,
+        });
+    }
+    let rows: Vec<Vec<Option<Term>>> = bindings
+        .iter()
+        .map(|row| row.iter().map(|t| t.clone().map(Term::from)).collect())
+        .collect();
+    // Two rows are compatible with one solution exactly when every
+    // variable bound in both is the same term in both; the join would
+    // then repeat the solution.
+    for (i, row) in rows.iter().enumerate() {
+        for other in &rows[..i] {
+            let differ = row
+                .iter()
+                .zip(other)
+                .any(|pair| matches!(pair, (Some(a), Some(b)) if !same_term(a, b)));
+            if !differ {
+                return Err(unsupported(
+                    "VALUES with two rows that can match one solution: equal rows, or rows \
+                     that differ only where one of them is UNDEF",
+                ));
+            }
+        }
+    }
+    Ok(InlineData {
+        variables: variables.iter().map(|v| v.as_str().to_owned()).collect(),
+        rows,
+    })
+}
+
+/// RDF term equality, with language tags compared in lower case (RDF 1.1
+/// Concepts §3.3).
+fn same_term(a: &Term, b: &Term) -> bool {
+    match (a, b) {
+        (Term::Literal(a), Term::Literal(b)) => {
+            a.value() == b.value()
+                && a.datatype() == b.datatype()
+                && match (a.language(), b.language()) {
+                    (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+                    (x, y) => x == y,
+                }
+        }
+        _ => a == b,
     }
 }
 
@@ -1615,6 +1775,52 @@ mod tests {
                 "GROUP BY",
             ),
             ("SELECT * WHERE { }", "empty graph patterns"),
+            (
+                "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t VALUES ?t { \"VIP\" } } }",
+                "VALUES inside OPTIONAL",
+            ),
+            (
+                "SELECT * WHERE { { ?c ex:name ?n VALUES ?n { \"Kim\" } } UNION { ?c ex:tier ?n } }",
+                "VALUES inside UNION",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n VALUES ?x { 1 } }",
+                "VALUES over ?x, which the rest of its group may leave unbound",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t } VALUES ?t { \"VIP\" } }",
+                "VALUES over ?t",
+            ),
+            (
+                "SELECT * WHERE { { ?c ex:name ?n } UNION { ?c ex:tier ?t } VALUES ?t { \"VIP\" } }",
+                "VALUES over ?t",
+            ),
+            (
+                "SELECT * WHERE { VALUES ?n { \"Kim\" } OPTIONAL { ?c ex:name ?n } }",
+                "VALUES over ?n",
+            ),
+            // The FILTER of the inner group would see ?x bound by VALUES.
+            (
+                "SELECT * WHERE { { ?c ex:name ?n VALUES ?x { 1 } FILTER(BOUND(?x)) } ?c ex:amount ?x }",
+                "VALUES over ?x",
+            ),
+            ("SELECT * WHERE { VALUES ?x { 1 } }", "VALUES over ?x"),
+            (
+                "SELECT * WHERE { ?c ex:name ?n VALUES ?n { \"Kim\" \"Kim\" } }",
+                "VALUES with two rows that can match one solution",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n VALUES (?c ?n) { (ex:a UNDEF) (ex:a \"Kim\") } }",
+                "VALUES with two rows that can match one solution",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n VALUES ?n { \"Kim\"@EN \"Kim\"@en } }",
+                "VALUES with two rows that can match one solution",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n VALUES () { () } }",
+                "VALUES without variables",
+            ),
         ];
         for (query, feature) in cases {
             let err = parse_err(query);
@@ -1665,6 +1871,100 @@ mod tests {
         assert_eq!((q.offset, q.limit), (3, None));
         let q = parse_ok("SELECT * WHERE { ?c ex:name ?n } LIMIT 0");
         assert_eq!(q.limit, Some(0));
+    }
+
+    fn literal(value: &str) -> Option<Term> {
+        Some(Literal::new_simple_literal(value).into())
+    }
+
+    #[test]
+    fn parse_values_in_a_group_and_after_the_query() {
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n VALUES ?n { \"Kim\" \"Lee\" } ?c ex:tier ?t }",
+        );
+        // The triple patterns around the block are one basic graph pattern.
+        assert_eq!(q.pattern, bgp(&[("c", "name", "n"), ("c", "tier", "t")]));
+        assert_eq!(
+            q.values,
+            [InlineData {
+                variables: vec!["n".to_owned()],
+                rows: vec![vec![literal("Kim")], vec![literal("Lee")]],
+            }]
+        );
+
+        let q = parse_ok(
+            "SELECT ?c WHERE { ?c ex:name ?n } VALUES (?c ?n) { (ex:a UNDEF) (ex:b \"Lee\") }",
+        );
+        assert_eq!(q.pattern, bgp(&[("c", "name", "n")]));
+        let iri = |name: &str| {
+            Some(NamedNode::new_unchecked(format!("http://example.org/{name}")).into())
+        };
+        assert_eq!(
+            q.values,
+            [InlineData {
+                variables: vec!["c".to_owned(), "n".to_owned()],
+                rows: vec![vec![iri("a"), None], vec![iri("b"), literal("Lee")]],
+            }]
+        );
+
+        // Before an OPTIONAL, in a nested group, and one block per VALUES.
+        let q = parse_ok(
+            "SELECT * WHERE { VALUES ?n { \"Kim\" } ?c ex:name ?n OPTIONAL { ?c ex:tier ?t } \
+             { ?c ex:amount ?a VALUES ?a { 1 } } }",
+        );
+        assert_eq!(
+            q.pattern,
+            Pattern::Join(
+                Box::new(left_join(
+                    bgp(&[("c", "name", "n")]),
+                    bgp(&[("c", "tier", "t")])
+                )),
+                Box::new(bgp(&[("c", "amount", "a")]))
+            )
+        );
+        assert_eq!(q.values.len(), 2);
+        assert_eq!(q.values[1].rows, [vec![Some(Literal::from(1).into())]]);
+
+        // A group's FILTER wraps the join with the block.
+        let q = parse_ok("SELECT * WHERE { ?c ex:name ?n FILTER(?n) VALUES ?n { \"Kim\" } }");
+        assert!(matches!(q.pattern, Pattern::Filter(..)));
+        assert_eq!(q.values.len(), 1);
+    }
+
+    #[test]
+    fn parse_values_over_the_limit_is_a_limit_error() {
+        let block = |variable: &str, n: usize| {
+            let values: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+            format!("VALUES ?{variable} {{ {} }}", values.join(" "))
+        };
+        let q = parse_ok(&format!(
+            "SELECT * WHERE {{ ?c ex:amount ?a {} }}",
+            block("a", MAX_VALUES)
+        ));
+        assert_eq!(q.values[0].rows.len(), MAX_VALUES);
+        assert_eq!(
+            parse_err(&format!(
+                "SELECT * WHERE {{ ?c ex:amount ?a {} }}",
+                block("a", MAX_VALUES + 1)
+            )),
+            Error::TooManyValues {
+                limit: MAX_VALUES,
+                values: MAX_VALUES + 1,
+            }
+        );
+        // The blocks of one query count together.
+        let half = MAX_VALUES / 2 + 1;
+        assert_eq!(
+            parse_err(&format!(
+                "SELECT * WHERE {{ ?c ex:amount ?a ; ex:id ?i {} }} {}",
+                block("a", half),
+                block("i", half)
+            )),
+            Error::TooManyValues {
+                limit: MAX_VALUES,
+                values: 2 * half,
+            }
+        );
     }
 
     #[test]

@@ -334,6 +334,31 @@ SPARQL 在 `BIND` 所在组的解上对其求值。v12n 在连接之后，在整
 - 对其所在组可能未绑定、而模式后续部分会绑定的变量使用 `BIND`；
 - 在三元组模式、`FILTER`、`ORDER BY` 或其他表达式中使用由 `BIND` 或 `SELECT` 计算的变量。
 
+## VALUES
+
+`VALUES` 在组内或查询之后提供内联数据（SPARQL 1.1 §10.2），并与模式连接（§18.5，Join）。当一行的每个 term 都是解绑定到其变量的 term 时，该行与该解兼容；`UNDEF` 与任何 term 兼容（§18.3）。
+
+`VALUES` 中的常量与[三元组模式中的常量](#查询中的常量)一样作为 RDF term 匹配。每一行是 SQL 中析取的一个分支，行中的每个常量按三元组模式常量的方式与其变量的列比较。在 shop 示例中，`?o ex:placedBy ?c ; ex:amount ?a` 与 `VALUES (?c ?a) { (<…/customer/7> UNDEF) (<…/customer/8> 30000) }` 给出以下条件：
+
+```sql
+(t0."customer_id" = $1 OR (t0."customer_id" = $2 AND t1."amount" = $3))
+```
+
+PostgreSQL 将每个参数的类型推断为与其比较的列的类型，因此 round trip 检查适用，并会使用该列的索引。SQL `VALUES` 列表会在连接将参数与列比较之前把参数类型定为 `text`。
+
+若某行的常量无法由 term map 产生（例如 customer 模板对应的 order IRI），该行不进入该分支。没有任何行能够匹配的分支不进入查询。无法匹配该列任何值的常量只使其所在行失败。
+
+SPARQL 将数据与其所在组的解连接。v12n 将其与整个模式的解连接。当该块位于 `OPTIONAL` 与 `UNION` 之外，且数据的每个变量在组其余部分的每个解中都被绑定时，两者给出相同的解。此时每个解要么保留一次，要么被丢弃，这与没有两行能匹配同一个解时的连接结果相同。
+
+一个查询的所有 `VALUES` 块合计最多包含 1000 个值，即行数乘以变量数，包括 `UNDEF`。超过时查询失败，错误中写明该限制（`v12n query` 以 1 退出，HTTP 端点返回 400）。
+
+以下情形作为不支持的功能拒绝：
+
+- `OPTIONAL` 或 `UNION` 内部的 `VALUES`；
+- 对组其余部分可能未绑定的变量使用 `VALUES`，例如没有三元组模式绑定的变量，或只有 `OPTIONAL` 部分绑定的变量；
+- 能匹配同一个解的两行：相同的行，或仅在其中一行为 `UNDEF` 的位置不同的行；
+- 没有变量的 `VALUES`。
+
 ## ORDER BY、LIMIT 与 OFFSET
 
 解修饰符按代数定义的顺序应用（SPARQL 1.1 §18.2.5）。该顺序为 `ORDER BY`，然后是投影、`DISTINCT`、`OFFSET` 与 `LIMIT`。它们全部在 SQL 中应用。

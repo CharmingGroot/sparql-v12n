@@ -370,7 +370,7 @@ fn plan(planner: &Planner, query: &str) -> Result<SqlPlan, Failure> {
         let (status, kind) = match e {
             v12n_core::Error::QuerySyntax(_) => (StatusCode::BAD_REQUEST, "query"),
             // A limit on the request, not a missing feature.
-            v12n_core::Error::TooManyBranches { .. } => {
+            v12n_core::Error::TooManyBranches { .. } | v12n_core::Error::TooManyValues { .. } => {
                 (StatusCode::BAD_REQUEST, "query_too_complex")
             }
             v12n_core::Error::UnsupportedFeature(_) => (StatusCode::NOT_IMPLEMENTED, "unsupported"),
