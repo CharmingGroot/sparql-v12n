@@ -720,6 +720,22 @@ repeated character set followed by characters it cannot match. `\s+`,
 expressions (see below). The other functions give strings, which a
 computed variable does not hold yet.
 
+The hash functions `MD5`, `SHA256`, `SHA384` and `SHA512` follow SPARQL
+1.1 §17.4.6. Their argument is a simple literal or an `xsd:string`, and
+any other term, a language-tagged literal included, makes the function
+an error. The value is a simple literal with the digest of the UTF-8
+encoding of the argument in lower-case hexadecimal digits:
+`MD5("abc")` is `"900150983cd24fb0d6963f7d28e17f72"`. In SQL, the
+argument is converted to its UTF-8 bytes with `convert_to(text,
+'UTF8')`. `MD5` is `md5` of the bytes, and `SHA256`, `SHA384` and
+`SHA512` are `encode(sha256(...), 'hex')` and the like, under
+`COLLATE "C"` as the other computed strings. As for the functions on
+strings, the database must use the UTF-8 encoding. The digests are
+strings, so the hash functions are rejected in `BIND`, `SELECT` and
+`ORDER BY` as the functions on strings are. `SHA1` is rejected as
+unsupported: PostgreSQL computes SHA-1 only with the `pgcrypto`
+extension, which v12n does not require.
+
 The following are rejected as unsupported, rather than answered
 differently from engines that extend SPARQL:
 
@@ -735,23 +751,24 @@ differently from engines that extend SPARQL:
   - `xsd:float` and the derived integer types;
   - dateTime constants outside the years 1 to 9999, or finer than a
     microsecond;
-- other functions, `RAND` among them, and expressions other than terms
-  (variables, constants, arithmetic, `NOW`, and `STR`, `LANG`,
+- other functions, `RAND` and `SHA1` among them, and expressions other
+  than terms (variables, constants, arithmetic, `NOW`, and `STR`, `LANG`,
   `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`, `IF`, `COALESCE`, the
-  functions on strings or the functions of dateTimes of them) as operands,
-  such as a comparison as an argument of `IF`, `COALESCE` or `IN`;
+  functions on strings, the hash functions or the functions of dateTimes
+  of them) as operands, such as a comparison as an argument of `IF`,
+  `COALESCE` or `IN`;
 - `REPLACE` with a pattern whose matches XPath and PostgreSQL can choose
   differently (see above), with a reference to a group after the ninth,
   or with a pattern, replacement or flags that are not constants;
 - a starting location or length of `SUBSTR` that is not a constant, or
   not an `xsd:integer`, such as `1.5`: SPARQL 1.1 makes it a type error,
   and engines that round it as `fn:substring` does answer;
-- functions on strings of a `date` or `timestamp` column, whose infinite
-  values are plain literals;
+- functions on strings and hash functions of a `date` or `timestamp`
+  column, whose infinite values are plain literals;
 - the functions of dateTimes over `xsd:date` and `xsd:time` values, and
   `sameTerm` of `NOW`;
-- string ordering, `REGEX` and the functions on strings in a database
-  whose encoding is not UTF-8.
+- string ordering, `REGEX`, the functions on strings and the hash
+  functions in a database whose encoding is not UTF-8.
 
 ## BIND and SELECT expressions
 
@@ -795,8 +812,8 @@ The following are rejected as unsupported:
 - expressions other than variables, constants, arithmetic, numeric
   functions, `STRLEN`, `YEAR` to `SECONDS`, and `IF` and `COALESCE` over
   arithmetic and numeric constants. `STR`, comparisons, `IN`, `UCASE` and
-  the other functions on strings, `TZ`, `TIMEZONE`, `NOW`, and
-  `COALESCE(?x, 0)`, whose result can be any term, are
+  the other functions on strings, the hash functions, `TZ`, `TIMEZONE`,
+  `NOW`, and `COALESCE(?x, 0)`, whose result can be any term, are
   examples. A computed variable holds only numbers in SQL;
 - `BIND` inside `OPTIONAL` or `UNION`;
 - `BIND` over a variable that its group may leave unbound and a later
@@ -1014,5 +1031,5 @@ The following are rejected as unsupported:
 - comparators over strings in a database whose encoding is not UTF-8;
 - as in `FILTER`, other functions, arithmetic, `ABS`, `ROUND`, `CEIL`,
   `FLOOR`, `IF`, `COALESCE`, the functions on strings other than
-  `STRSTARTS`, `STRENDS` and `CONTAINS`, the functions of dateTimes, `NOW`,
-  and string forms that SQL cannot compute.
+  `STRSTARTS`, `STRENDS` and `CONTAINS`, the hash functions, the functions
+  of dateTimes, `NOW`, and string forms that SQL cannot compute.

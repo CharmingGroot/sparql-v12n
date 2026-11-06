@@ -198,6 +198,9 @@ pub enum Expression {
     /// `REPLACE(arg, pattern, replacement, flags)` (SPARQL 1.1 §17.4.3.15),
     /// with the pattern, the replacement and the flags constants.
     Replace(Box<Expression>, Term, Term, Option<Term>),
+    /// `MD5`, `SHA256`, `SHA384` or `SHA512` (SPARQL 1.1 §17.4.6) of a
+    /// simple literal or `xsd:string`.
+    Hash(HashFunction, Box<Expression>),
     /// `EXISTS { P }` (SPARQL 1.1 §8.1, §17.4.1.4): whether `P` has a
     /// solution once the variables of the current solution are replaced
     /// by their values (substitution, §18.6). Never an error, and it binds
@@ -241,6 +244,7 @@ impl Expression {
             | Self::LCase(a)
             | Self::EncodeForUri(a)
             | Self::Replace(a, ..)
+            | Self::Hash(_, a)
             | Self::Numeric(_, a)
             | Self::DateTime(_, a) => a.collect_variables(out),
             Self::If(c, a, b) => {
@@ -307,6 +311,7 @@ impl Expression {
                 | Self::StrAfter(..)
                 | Self::EncodeForUri(_)
                 | Self::Replace(..)
+                | Self::Hash(..)
         )
     }
 }
@@ -386,6 +391,18 @@ impl DateTimeFunction {
     pub fn is_numeric(self) -> bool {
         !matches!(self, Self::Timezone | Self::Tz)
     }
+}
+
+/// The hash functions of SPARQL 1.1 §17.4.6 that the engine computes,
+/// `SHA1` aside. The value is the digest of the UTF-8 encoding of the
+/// argument's lexical form, as a simple literal of lower-case hexadecimal
+/// digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashFunction {
+    Md5,
+    Sha256,
+    Sha384,
+    Sha512,
 }
 
 /// The relational operators of SPARQL 1.1 §17.3, `!=` aside.
@@ -900,6 +917,10 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
         Expression::DateTime(DateTimeFunction::Timezone, _) => "TIMEZONE",
         Expression::DateTime(..) => "TZ",
         Expression::Now => "NOW",
+        Expression::Hash(HashFunction::Md5, _) => "MD5",
+        Expression::Hash(HashFunction::Sha256, _) => "SHA256",
+        Expression::Hash(HashFunction::Sha384, _) => "SHA384",
+        Expression::Hash(HashFunction::Sha512, _) => "SHA512",
     };
     Err(unsupported(&format!(
         "{what} as the value of BIND and SELECT expressions"
@@ -1287,10 +1308,21 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
             | Function::StrBefore
             | Function::StrAfter
             | Function::EncodeForUri
-            | Function::Replace),
+            | Function::Replace
+            | Function::Md5
+            | Function::Sha256
+            | Function::Sha384
+            | Function::Sha512),
             _,
         ) if matches!(site, Site::OrderBy) => {
             return Err(in_site(&format!("the {function} function")));
+        }
+        // PostgreSQL computes SHA-1 only with the pgcrypto extension, which
+        // the engine does not require.
+        SparqlExpression::FunctionCall(Function::Sha1, _) => {
+            return Err(unsupported(
+                "SHA1, which PostgreSQL computes only with the pgcrypto extension",
+            ));
         }
         SparqlExpression::FunctionCall(
             function @ (Function::StrLen
@@ -1307,6 +1339,21 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
             | Function::Replace),
             args,
         ) => string_function(function, args, site)?,
+        SparqlExpression::FunctionCall(
+            function @ (Function::Md5 | Function::Sha256 | Function::Sha384 | Function::Sha512),
+            args,
+        ) => {
+            let [arg] = args.as_slice() else {
+                return Err(Error::QuerySyntax(format!("{function} takes one argument")));
+            };
+            let hash = match function {
+                Function::Md5 => HashFunction::Md5,
+                Function::Sha256 => HashFunction::Sha256,
+                Function::Sha384 => HashFunction::Sha384,
+                _ => HashFunction::Sha512,
+            };
+            Expression::Hash(hash, operand(arg)?)
+        }
         SparqlExpression::FunctionCall(function, args) => {
             let [arg] = args.as_slice() else {
                 return Err(match function {
@@ -1690,7 +1737,7 @@ mod tests {
             ("ASK { ?c ex:name ?n } OFFSET 1", "LIMIT and OFFSET in ASK"),
             ("ASK FROM ex:g { ?c ex:name ?n }", "FROM"),
             ("ASK { ?c ?p ?o }", "variable predicates"),
-            ("ASK { ?c ex:name ?n FILTER(MD5(?n) = \"A\") }", "MD5"),
+            ("ASK { ?c ex:name ?n FILTER(SHA1(?n) = \"A\") }", "SHA1"),
         ] {
             let Error::UnsupportedFeature(message) = parse_err(query) else {
                 panic!("{query}")
@@ -2271,6 +2318,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_hash_functions() {
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n \
+             FILTER(MD5(?n) = SHA256(?x) && STRSTARTS(SHA384(UCASE(?n)), SHA512(\"a\"))) }",
+        );
+        let Pattern::Filter(_, filter) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        assert_eq!(filter.variables(), ["n", "x", "n"]);
+        let Expression::And(compare, starts) = filter else {
+            panic!("{filter:?}")
+        };
+        let Expression::Compare(CompareOp::Equal, md5, sha256) = compare.as_ref() else {
+            panic!("{compare:?}")
+        };
+        assert_eq!(**md5, Expression::Hash(HashFunction::Md5, variable("n")));
+        assert_eq!(
+            **sha256,
+            Expression::Hash(HashFunction::Sha256, variable("x"))
+        );
+        let Expression::StrTest(StrTest::Starts, sha384, sha512) = starts.as_ref() else {
+            panic!("{starts:?}")
+        };
+        assert_eq!(
+            **sha384,
+            Expression::Hash(
+                HashFunction::Sha384,
+                Box::new(Expression::UCase(variable("n")))
+            )
+        );
+        assert_eq!(
+            **sha512,
+            Expression::Hash(
+                HashFunction::Sha512,
+                Box::new(Expression::Constant(
+                    Literal::new_simple_literal("a").into()
+                ))
+            )
+        );
+        assert!(md5.is_term() && sha512.is_term());
+        assert!(matches!(
+            parse_err("SELECT * WHERE { ?c ex:name ?n FILTER(MD5(?n, ?n) = \"a\") }"),
+            Error::QuerySyntax(_)
+        ));
+    }
+
+    #[test]
     fn parse_numeric_functions() {
         let q = parse_ok(
             "SELECT * WHERE { ?o ex:amount ?a FILTER(ROUND(?a / 2) = ABS(-?a) && CEIL(FLOOR(?a))) }",
@@ -2519,16 +2613,32 @@ mod tests {
                 "expressions other than terms",
             ),
             (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(MD5(?t) = \"a\") }",
-                "the MD5 function",
-            ),
-            (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(STR(SHA1(?t)) = \"A\") }",
-                "the SHA1 function",
+                "SHA1, which PostgreSQL computes only with the pgcrypto extension",
             ),
             (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(SHA256(?t)) }",
-                "the SHA256 function",
+                "SELECT (SHA1(?t) AS ?h) WHERE { ?c ex:tier ?t }",
+                "SHA1, which PostgreSQL computes only with the pgcrypto extension",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t } ORDER BY SHA1(?t)",
+                "SHA1, which PostgreSQL computes only with the pgcrypto extension",
+            ),
+            (
+                "SELECT (MD5(?t) AS ?h) WHERE { ?c ex:tier ?t }",
+                "MD5 as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t BIND(SHA512(?t) AS ?h) }",
+                "SHA512 as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t } ORDER BY SHA256(?t)",
+                "the SHA256 function in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t } ORDER BY (SHA384(?t) = \"a\")",
+                "the SHA384 function in ORDER BY",
             ),
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(SUBSTR(?t, STRLEN(?t)) = \"a\") }",

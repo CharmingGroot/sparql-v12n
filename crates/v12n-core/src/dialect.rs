@@ -3,7 +3,7 @@
 
 mod postgres;
 
-use crate::sparql::StrTest;
+use crate::sparql::{HashFunction, StrTest};
 
 pub use postgres::PostgresDialect;
 
@@ -67,6 +67,10 @@ pub trait Dialect {
     /// `.` and `~` as `%XX` per UTF-8 byte, upper case (XPath F&O 3.1
     /// §6.2, fn:encode-for-uri).
     fn encode_for_uri(&self, text: &str) -> String;
+
+    /// The digest by `function` of the UTF-8 encoding of `text`, as
+    /// lower-case hexadecimal digits (SPARQL 1.1 §17.4.6).
+    fn hash(&self, function: HashFunction, text: &str) -> String;
 
     /// `text` with every character mapped to its upper case (`upper`) or
     /// its lower case by the full case mappings of Unicode without

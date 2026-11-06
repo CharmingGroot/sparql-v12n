@@ -1,0 +1,14 @@
+# PostgreSQL computes SHA-1 only with the pgcrypto extension, which v12n
+# does not require.
+[query.sha1]
+expect = "rejected"
+
+# A hash function as the value of BIND: a computed variable holds only
+# numbers (#100).
+[query.bind-md5]
+expect = "rejected"
+
+# A hash function in ORDER BY comes with the other expressions there
+# (#108).
+[query.order-by-sha256]
+expect = "rejected"

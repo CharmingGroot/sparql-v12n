@@ -107,6 +107,9 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0024-date-time-functions/order-by-year` | `YEAR` in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0024-date-time-functions/select-tz`, `select-now` | `TZ` and `NOW` as the value of `SELECT`: a computed variable holds only numbers (#100). |
 | `0024-date-time-functions/now-timestamp` | `NOW`, which has a time zone, against a `timestamp`, which has none: their order depends on an implicit time zone (Discussion #57). |
+| `0026-hash-functions/sha1` | `SHA1`: PostgreSQL computes SHA-1 only with the `pgcrypto` extension, which v12n does not require. |
+| `0026-hash-functions/bind-md5` | A hash function as the value of `BIND`: a computed variable holds only numbers (#100). |
+| `0026-hash-functions/order-by-sha256` | A hash function in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0008-order/distinct-over-hidden` | `ORDER BY` over a variable that `SELECT DISTINCT` does not project: one solution stands for several that the order puts at different places (Discussion #63). |
 | `w3c/R2RMLTC0012e/type-ious` | A self-join on blank nodes from a template over a `float8` column: no SQL computes the canonical `xsd:double` form (Discussion #35). Removing self-joins on keys (#28, V6) would make the comparison unnecessary. |
 

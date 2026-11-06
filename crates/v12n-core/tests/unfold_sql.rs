@@ -9,7 +9,7 @@ use v12n_core::catalog::{
 };
 use v12n_core::dialect::{Dialect, PostgresDialect, SqlType};
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
-use v12n_core::sparql::StrTest;
+use v12n_core::sparql::{HashFunction, StrTest};
 use v12n_core::sql::{
     ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, RenderedSql, SqlPlan, TableKeys,
     TermNormal,
@@ -41,6 +41,11 @@ const POSTGRES_SYNTAX: &[&str] = &[
     "starts_with",
     "strpos",
     "right(",
+    "convert_to",
+    "md5(",
+    "sha256(",
+    "sha384(",
+    "sha512(",
 ];
 
 /// Writes each construct of [`Dialect`] as a marker, such as
@@ -86,6 +91,10 @@ impl Dialect for MarkerDialect {
 
     fn encode_for_uri(&self, text: &str) -> String {
         format!("<<ENCODE_FOR_URI {text}>>")
+    }
+
+    fn hash(&self, function: HashFunction, text: &str) -> String {
+        format!("<<HASH_{function:?} {text}>>")
     }
 
     fn case_map(&self, text: &str, upper: bool) -> String {
@@ -1052,6 +1061,18 @@ fn filter_strbefore_strafter_encode_for_uri_and_replace() {
         "SELECT ?c WHERE { ?c ex:name ?n ; ex:tier ?t \
          FILTER(STRBEFORE(?n, \"m\") = \"Ki\" && STRAFTER(?n, ?t) != \"\" \
          && ENCODE_FOR_URI(?n) = \"Kim\" && REPLACE(?t, \"(I)P\", \"$1-\", \"i\") = \"VI-\") }"
+    ));
+}
+
+/// `MD5`, `SHA256`, `SHA384` and `SHA512` digest the UTF-8 encoding of
+/// the lexical form, as lower-case hexadecimal digits under the code
+/// point collation.
+#[test]
+fn filter_hash_functions() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c WHERE { ?c ex:name ?n ; ex:tier ?t \
+         FILTER(MD5(?n) = \"f55fbaaca148300ac11f7752528cae3d\" \
+         && STRSTARTS(SHA256(?t), \"986e\") && SHA384(?n) != SHA512(?t)) }"
     ));
 }
 

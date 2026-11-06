@@ -402,6 +402,19 @@ impl<'a> Renderer<'a> {
                     kind => self.string_error(value, kind),
                 };
             }
+            // A simple literal, of a simple literal or an `xsd:string`
+            // only: a language-tagged literal is a type error (SPARQL 1.1
+            // §17.4.6).
+            FilterValue::Hash(_, a) => {
+                return match string_argument(&self.operand(a)) {
+                    Kind::String => Operand {
+                        kind: Kind::String,
+                        text: Text::Computed(value),
+                        ..operand
+                    },
+                    kind => self.string_error(value, kind),
+                };
+            }
             // The kind of the first argument; the cases of the value give
             // the simple literal "" where the second is not in the first.
             FilterValue::StrBefore(a, b) | FilterValue::StrAfter(a, b) => {
@@ -1534,6 +1547,12 @@ impl<'a> Renderer<'a> {
                 self.sql.push(')');
                 let text = self.sql.split_off(start);
                 self.sql.push_str(&self.dialect.encode_for_uri(&text));
+            }
+            FilterValue::Hash(function, a) => {
+                let start = self.sql.len();
+                self.argument_text(a)?;
+                let text = self.sql.split_off(start);
+                self.sql.push_str(&self.dialect.hash(*function, &text));
             }
             FilterValue::Replace {
                 text,
@@ -3171,6 +3190,56 @@ pub(super) mod tests {
         assert!(x("label", "ENCODE_FOR_URI(?x) = \"a\"").ends_with(" = $1::text)"));
         assert_eq!(x("label", "ENCODE_FOR_URI(?x) = \"a\"@en"), "NULL::bool");
         assert_eq!(x("link", "ENCODE_FOR_URI(?x) = \"a\""), "NULL::bool");
+    }
+
+    #[test]
+    fn hash_functions_digest_the_utf8_encoding_of_simple_literals() {
+        let bytes = "convert_to((t0.\"txt\"::text), 'UTF8')";
+        assert_eq!(
+            x("txt", "MD5(?x) = \"0cc175b9c0f1b6a831c399e269772661\""),
+            format!("((md5({bytes}) COLLATE \"C\") = $1::text)")
+        );
+        for (function, sql) in [
+            ("SHA256", "sha256"),
+            ("SHA384", "sha384"),
+            ("SHA512", "sha512"),
+        ] {
+            assert_eq!(
+                x("txt", &format!("{function}(?x) = \"a\"")),
+                format!("((encode({sql}({bytes}), 'hex') COLLATE \"C\") = $1::text)"),
+                "{function}"
+            );
+        }
+        // The value is a simple literal, also of an xsd:string.
+        assert_eq!(
+            x("txt", "STRSTARTS(MD5(STR(?x)), \"0c\")"),
+            format!("((md5({bytes}) COLLATE \"C\") COLLATE \"C\" LIKE $1::text)")
+        );
+        assert_eq!(
+            x("txt", "MD5(\"a\"^^xsd:string) = ?x"),
+            "((md5(convert_to($1::text, 'UTF8')) COLLATE \"C\") = (t0.\"txt\"::text))"
+        );
+        assert_eq!(x("txt", "LANG(SHA256(?x)) = \"\""), "($1::text = $2::text)");
+        assert_eq!(x("txt", "MD5(?x) = \"a\"@en"), "NULL::bool");
+        assert_eq!(
+            x("txt", "SHA512(UCASE(?x)) = \"a\""),
+            "((encode(sha512(convert_to((upper((t0.\"txt\"::text) COLLATE \"und-x-icu\") COLLATE \
+             \"C\"), 'UTF8')), 'hex') COLLATE \"C\") = $1::text)"
+        );
+        // SPARQL 1.1 §17.4.6: a type error for anything but a simple
+        // literal or an xsd:string, a language-tagged literal included.
+        assert_eq!(x("label", "MD5(?x) = \"a\""), "NULL::bool");
+        assert_eq!(x("label", "SHA256(UCASE(?x)) = \"a\""), "NULL::bool");
+        assert_eq!(x("txt", "MD5(\"a\"@en) = \"a\""), "NULL::bool");
+        assert_eq!(x("i4", "SHA384(?x) = \"a\""), "NULL::bool");
+        assert_eq!(x("txt", "SHA512(1) = \"a\""), "NULL::bool");
+        assert_eq!(x("link", "MD5(?x) = \"a\""), "NULL::bool");
+        assert_eq!(x("txt", "MD5(?nothing) = \"a\""), "NULL::bool");
+        assert!(rejected("?s ex:ts ?x", "MD5(?x) = \"a\"").contains("infinite"));
+        assert!(matches!(
+            render_with("SELECT ?s WHERE { ?s ex:txt ?x FILTER(MD5(?x) = \"a\") }", true),
+            Err(Error::UnsupportedFeature(reason)) if reason.contains("UTF-8")
+        ));
     }
 
     #[test]
