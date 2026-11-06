@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Order 11 has no ship city, so it is compatible with every city of person 1.
+SELECT ?p ?c WHERE { ?p ex:city ?c MINUS { ?o ex:buyer ?p OPTIONAL { ?o ex:shipCity ?c } } }

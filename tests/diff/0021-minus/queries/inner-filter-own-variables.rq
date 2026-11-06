@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A FILTER over the variables of the right side.
+SELECT ?p ?n WHERE { ?p ex:name ?n MINUS { ?p ex:bonus ?m FILTER(?m > 1) } }

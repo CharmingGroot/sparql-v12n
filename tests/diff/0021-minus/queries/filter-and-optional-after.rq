@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A FILTER of the group and an OPTIONAL after MINUS.
+SELECT ?p ?n ?c WHERE { ?p ex:name ?n MINUS { ?p ex:code "5" } OPTIONAL { ?p ex:city ?c } FILTER(?n != "Kim") }

@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# SPARQL 1.1 §8.3.3: ?n is not in scope inside MINUS, so the FILTER is
+# an error for every solution of the right side and nothing is removed.
+SELECT ?p ?n WHERE { ?p ex:score ?n MINUS { ?p ex:bonus ?m FILTER(?n = ?m) } }

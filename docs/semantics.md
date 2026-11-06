@@ -777,6 +777,50 @@ The following are rejected as unsupported:
   only where one of them is `UNDEF`;
 - `VALUES` without variables.
 
+## MINUS
+
+`A MINUS { B }` keeps the solutions of `A` that no solution of `B`
+removes (SPARQL 1.1 §8.3, §18.5 Minus). A solution of `B` removes a
+solution of `A` when the two are compatible and share at least one
+variable that both bind. The variables of `B` are not in the solutions.
+
+Each choice of triples maps for `B`, and each side of a `UNION` in it, is
+an anti-join in SQL: a `LEFT JOIN` of its tables whose `ON` clause holds
+where it removes the left row, and `IS NULL` on one of its columns in
+`WHERE`. In the shop example, `?o ex:placedBy ?c ; ex:amount ?a` with
+`MINUS { ?c ex:tier "VIP" }` gives the following.
+
+```sql
+FROM "orders" t0
+JOIN "orders" t1 ON t1."id" = t0."id"
+LEFT JOIN "customers" t2 ON t2."tier" = $1 AND t2."id" = t0."customer_id"
+WHERE t2."id" IS NULL AND …
+```
+
+- Shared variables are compared as RDF terms, as in joins. A string is
+  never the integer of the same digits, and columns of different SQL
+  types can be compared.
+- A shared variable may be unbound on one side, when only an `OPTIONAL`
+  part binds it. It is then compatible with any value, as in
+  [`OPTIONAL`](#optional). It counts as shared only where both sides bind
+  it, so the `ON` clause also requires one shared variable to be bound on
+  both sides (`IS NOT NULL`) unless one is bound in every row.
+- A choice of `B` that shares no variable with the left side, or that can
+  never be compatible with it, removes nothing and adds no `LEFT JOIN`
+  (§8.3.2).
+- `B` is evaluated on its own (§8.3.3). A `FILTER` inside it sees only
+  the variables of `B`, and a variable of the left side is unbound there.
+- `MINUS` applies to the part of the group written before it. Patterns
+  after it are joined with the rows that are left, and the `FILTER`s of
+  the group apply to the whole group.
+- A `LEFT JOIN` whose only table is a table of the left side, joined on a
+  `NOT NULL` unique key, reads that row instead, as for `OPTIONAL`.
+
+The following are rejected as unsupported:
+
+- `MINUS` inside `OPTIONAL`, inside `UNION`, and inside another `MINUS`;
+- `BIND` and `VALUES` inside `MINUS`.
+
 ## ORDER BY, LIMIT and OFFSET
 
 The solution modifiers apply in the order that the algebra defines

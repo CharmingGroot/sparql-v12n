@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# The string "3" is not the integer 3, so no code is removed.
+SELECT ?p ?v WHERE { ?p ex:code ?v MINUS { ?o ex:amount ?v } }

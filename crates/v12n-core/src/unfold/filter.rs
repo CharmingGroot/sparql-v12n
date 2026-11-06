@@ -80,7 +80,7 @@ impl<'a> Branch<'a> {
     }
 
     /// A condition that holds exactly when `source` is bound.
-    fn bound(&self, source: Source<'a>) -> Result<Condition, Error> {
+    pub(super) fn bound(&self, source: Source<'a>) -> Result<Condition, Error> {
         let (table, name) = match source.term.columns().first() {
             Some(&column) => column,
             None => self.witness(source.scope)?,
