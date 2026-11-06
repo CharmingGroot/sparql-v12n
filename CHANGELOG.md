@@ -15,6 +15,14 @@ Design decisions are recorded in the `Decision:` Discussions.
   of lower-case hexadecimal digits (SPARQL 1.1 §17.4.6), with
   PostgreSQL's built-in functions. `SHA1` is rejected as unsupported,
   since PostgreSQL computes it only with the `pgcrypto` extension.
+- `YEAR`, `MONTH`, `DAY`, `HOURS`, `MINUTES`, `SECONDS`, `TIMEZONE`, `TZ`
+  and `NOW` in `FILTER`, and `YEAR` to `SECONDS` also in `BIND` and
+  `SELECT (expr AS ?v)`. They read `xsd:dateTime` values from `timestamp`
+  and `timestamptz` columns, constants and `NOW`, and agree with the
+  lexical forms the engine writes: a `timestamptz` gives its components
+  in UTC and the time zone `Z`, and a `timestamp` has no time zone.
+  `NOW` is one value per query, sent as a parameter. The functions are
+  rejected over `xsd:date` and `xsd:time` values and in `ORDER BY`.
 - `ABS`, `ROUND`, `CEIL` and `FLOOR` in `FILTER`, `BIND` and
   `SELECT (expr AS ?v)`, with a result of the argument's datatype.
   `ROUND` rounds halves towards positive infinity, as `fn:round` does,

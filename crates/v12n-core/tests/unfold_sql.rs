@@ -1097,6 +1097,89 @@ fn bind_numeric_functions_over_numbers() {
     ));
 }
 
+/// A `timestamp` column `ts` and a `timestamptz` column `tz`.
+const EVENTS: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#E> rr:logicalTable [ rr:tableName "events" ] ;
+  rr:subjectMap [ rr:template "http://example.org/event/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:ts ; rr:objectMap [ rr:column "ts" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:tz ; rr:objectMap [ rr:column "tz" ] ] .
+"#;
+
+fn explain_events(body: &str) -> String {
+    let mapping = Mapping::from_turtle(EVENTS).unwrap();
+    let index = MappingIndex::new(&mapping);
+    let query = sparql::parse(&format!(
+        "{PREFIXES}PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n{body}"
+    ))
+    .unwrap();
+    let plan = unfold::unfold(&query, &mapping, &index).unwrap();
+    let types: ColumnTypes = [
+        ("id", typed_column("int4", "integer", Some(Lexical::Text))),
+        ("ts", typed_column("timestamp", "dateTime", None)),
+        ("tz", typed_column("timestamptz", "dateTime", None)),
+    ]
+    .into_iter()
+    .map(|(column, ty)| {
+        (
+            (LogicalTable::TableName("events".into()), column.into()),
+            ty,
+        )
+    })
+    .collect();
+    let rendered = to_sql(
+        &plan,
+        &RenderOptions {
+            column_types: Some(&types),
+            ..RenderOptions::default()
+        },
+    );
+    let mut out = rendered.sql;
+    out.push_str("\n\n-- params\n");
+    for (i, p) in rendered.params.iter().enumerate() {
+        out.push_str(&format!("${} = {p:?}\n", i + 1));
+    }
+    out
+}
+
+/// The components of a `timestamptz` are read in UTC, as the engine
+/// writes its values with `Z`; a `timestamp` has no time zone. Infinite
+/// values are plain literals, so every function of them is an error.
+#[test]
+fn filter_date_time_functions_read_timestamptz_in_utc() {
+    insta::assert_snapshot!(explain_events(
+        "SELECT ?e WHERE { ?e ex:ts ?u ; ex:tz ?z \
+         FILTER(YEAR(?z) = 2024 && MONTH(?u) = 12 && DAY(?z) < DAY(?u) && HOURS(?z) >= 23 \
+         && MINUTES(?u) = 59 && SECONDS(?z) > 1.5 && TZ(?z) = \"Z\" && TZ(?u) = \"\" \
+         && STR(TIMEZONE(?z)) = \"PT0S\") }"
+    ));
+}
+
+/// A constant argument is computed before the query is sent, in its own
+/// time zone (XPath F&O 3.1 §9.5).
+#[test]
+fn filter_date_time_functions_of_constants_are_computed() {
+    insta::assert_snapshot!(explain_events(
+        "SELECT ?e WHERE { ?e ex:tz ?z \
+         FILTER(HOURS(?z) = HOURS(\"2024-01-01T02:30:00-05:00\"^^xsd:dateTime) \
+         && SECONDS(\"2024-01-01T02:30:07.250\"^^xsd:dateTime) < SECONDS(?z) \
+         && TZ(\"2024-01-01T02:30:00-05:00\"^^xsd:dateTime) = \"-05:00\" \
+         && STR(TIMEZONE(\"2024-01-01T02:30:00+05:30\"^^xsd:dateTime)) = \"PT5H30M\") }"
+    ));
+}
+
+/// The integer components are integers and `SECONDS` is a decimal, one
+/// result column each.
+#[test]
+fn bind_date_time_functions_over_timestamps() {
+    insta::assert_snapshot!(explain_events(
+        "SELECT ?e (YEAR(?z) AS ?y) (SECONDS(?u) AS ?s) (HOURS(?u) + 1 AS ?h) \
+         WHERE { ?e ex:ts ?u ; ex:tz ?z BIND(MONTH(?z) AS ?m) }"
+    ));
+}
+
 /// A table with one column of each type whose SQL the snapshot queries
 /// above do not reach.
 const TYPED: &str = r#"

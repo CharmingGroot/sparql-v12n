@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?e WHERE { ?e ex:tz ?z FILTER(STR(TIMEZONE(?z)) = "PT0S") }

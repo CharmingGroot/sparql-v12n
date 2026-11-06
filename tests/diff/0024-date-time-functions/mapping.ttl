@@ -1,0 +1,10 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#Event> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "events" ] ;
+  rr:subjectMap [ rr:template "http://example.org/event/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:ts ; rr:objectMap [ rr:column "ts" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:tz ; rr:objectMap [ rr:column "tz" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:day ; rr:objectMap [ rr:column "day" ] ] .

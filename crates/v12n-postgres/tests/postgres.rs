@@ -993,6 +993,186 @@ async fn numeric_functions_keep_the_class_of_their_argument() {
     );
 }
 
+/// `url` with the session time zone `zone`, which must not change any
+/// result: the engine writes and reads `timestamptz` values in UTC.
+fn with_time_zone(url: &str, zone: &str) -> String {
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{separator}options=-c%20TimeZone%3D{zone}")
+    } else {
+        format!("{url} options='-c TimeZone={zone}'")
+    }
+}
+
+/// `YEAR`, `MONTH`, `DAY`, `HOURS`, `MINUTES`, `SECONDS`, `TZ` and
+/// `TIMEZONE` (#105) over `timestamp` and `timestamptz` columns, in a
+/// session whose time zone is not UTC. A `timestamptz` gives the
+/// components of the UTC form the engine writes, also across a year
+/// boundary; a `timestamp` has no time zone; infinite values and strings
+/// are errors, also under negation.
+#[tokio::test]
+async fn date_time_functions_follow_the_written_lexical_forms() {
+    let Some(url) = database_url() else { return };
+    let url = with_time_zone(&url, "Asia/Kolkata");
+    let mapping = sql_query_mapping(
+        "SELECT * FROM (VALUES \
+           (1, TIMESTAMP '2024-12-31 23:59:58.25', \
+               TIMESTAMPTZ '2025-01-01 03:00:00+05:00', 'x'::text), \
+           (2, TIMESTAMP '2024-02-29 00:00:00', \
+               TIMESTAMPTZ '2024-02-29 00:30:00-08:00', 'y'::text), \
+           (3, 'infinity', '-infinity', 'z'::text), \
+           (4, TIMESTAMP '0001-06-01 00:00:00 BC', \
+               TIMESTAMPTZ '2024-06-15 12:00:00+00', 'w'::text), \
+           (5, TIMESTAMP '1999-12-31 12:00:07.000001', \
+               TIMESTAMPTZ '1999-12-31 19:00:00-05:00', 'v'::text)) \
+           v(id, ts, tz, s)",
+        &["ts", "tz", "s"],
+    );
+    let rows = |filter: &'static str| {
+        let (url, mapping) = (url.clone(), mapping.clone());
+        async move { filtered_rows(&url, &mapping, "?row ex:ts ?u ; ex:tz ?z ; ex:s ?s", filter).await }
+    };
+    let none = Vec::<String>::new();
+    let finite = ["1", "2", "4", "5"];
+    // 2025-01-01T03:00:00+05:00 is 2024-12-31T22:00:00Z, which the
+    // session writes as 2025-01-01 03:30:00+05:30.
+    assert_eq!(rows("YEAR(?z) = 2024").await, ["1", "2", "4"]);
+    assert_eq!(rows("YEAR(?z) = 2000").await, ["5"]);
+    assert_eq!(rows("HOURS(?z) = 22 && MINUTES(?z) = 0").await, ["1"]);
+    assert_eq!(
+        rows("MONTH(?z) = 2 && DAY(?z) = 29 && HOURS(?z) = 8 && MINUTES(?z) = 30").await,
+        ["2"]
+    );
+    assert_eq!(rows("YEAR(?u) = 2024 && MONTH(?u) = 12").await, ["1"]);
+    // The year before 1 is written 0000.
+    assert_eq!(rows("YEAR(?u) = 0").await, ["4"]);
+    assert_eq!(rows("SECONDS(?u) = 58.25").await, ["1"]);
+    assert_eq!(rows("SECONDS(?u) > 7").await, ["1", "5"]);
+    assert_eq!(rows("SECONDS(?u) = 7.000001").await, ["5"]);
+    assert_eq!(rows("SECONDS(?u) < 1e0").await, ["2", "4"]);
+    assert_eq!(rows("TZ(?z) = \"Z\"").await, finite);
+    assert_eq!(rows("TZ(?u) = \"\"").await, finite);
+    assert_eq!(rows("!(TZ(?u) = \"Z\")").await, finite);
+    assert_eq!(rows("STR(TIMEZONE(?z)) = \"PT0S\"").await, finite);
+    assert_eq!(
+        rows("DATATYPE(TIMEZONE(?z)) = xsd:dayTimeDuration").await,
+        finite
+    );
+    // A timestamp has no time zone, and an infinite value is a plain
+    // literal: errors, which COALESCE skips.
+    assert_eq!(
+        rows("COALESCE(STR(TIMEZONE(?u)), \"none\") = \"none\"").await,
+        ["1", "2", "3", "4", "5"]
+    );
+    assert_eq!(rows("COALESCE(YEAR(?u), -1) = -1").await, ["3"]);
+    assert_eq!(rows("!(YEAR(?u) = 2024)").await, ["4", "5"]);
+    assert_eq!(rows("!isLiteral(HOURS(?z))").await, none);
+    assert_eq!(rows("isLiteral(TZ(?z))").await, finite);
+    assert_eq!(
+        rows("YEAR(?s) = 1 || !(TZ(?s) = \"\") || !(SECONDS(?s) > 0)").await,
+        none
+    );
+    // A constant is read in its own time zone.
+    assert_eq!(
+        rows("HOURS(?z) = HOURS(\"2024-12-31T22:59:00-05:00\"^^xsd:dateTime)").await,
+        ["1"]
+    );
+    assert_eq!(
+        rows("TZ(\"2024-01-01T00:00:00-05:00\"^^xsd:dateTime) = \"-05:00\" && YEAR(?z) = 2000")
+            .await,
+        ["5"]
+    );
+    // NOW is a timestamptz; -infinity is a plain literal.
+    assert_eq!(rows("?z < NOW()").await, finite);
+    assert_eq!(rows("YEAR(?z) < YEAR(NOW())").await, finite);
+    assert_eq!(rows("TZ(NOW()) = \"Z\" && YEAR(?u) = 0").await, ["4"]);
+
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?row ?z (YEAR(?z) AS ?y) (MONTH(?z) AS ?m) (DAY(?z) AS ?d) (HOURS(?z) AS ?h)
+          (MINUTES(?z) AS ?n) (SECONDS(?u) AS ?sec) (YEAR(?s) AS ?error)
+        WHERE { ?row ex:ts ?u ; ex:tz ?z ; ex:s ?s }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    let xsd = |lexical: &str, datatype: &str| {
+        format!("\"{lexical}\"^^<http://www.w3.org/2001/XMLSchema#{datatype}>")
+    };
+    let row = |id: u8, z: &str, parts: [&str; 5], seconds: &str| {
+        let [y, m, d, h, n] = parts.map(|p| xsd(p, "integer"));
+        format!(
+            "?row=<http://example.org/row/{id}> ?z={} ?y={y} ?m={m} ?d={d} ?h={h} ?n={n} ?sec={}",
+            xsd(z, "dateTime"),
+            xsd(seconds, "decimal")
+        )
+    };
+    assert_eq!(
+        rows,
+        [
+            row(
+                1,
+                "2024-12-31T22:00:00Z",
+                ["2024", "12", "31", "22", "0"],
+                "58.25"
+            ),
+            row(
+                2,
+                "2024-02-29T08:30:00Z",
+                ["2024", "2", "29", "8", "30"],
+                "0"
+            ),
+            "?row=<http://example.org/row/3> ?z=\"-infinity\"".to_owned(),
+            row(
+                4,
+                "2024-06-15T12:00:00Z",
+                ["2024", "6", "15", "12", "0"],
+                "0"
+            ),
+            row(
+                5,
+                "2000-01-01T00:00:00Z",
+                ["2000", "1", "1", "0", "0"],
+                "7.000001"
+            ),
+        ]
+    );
+
+    // Functions of dates are rejected; TZ, TIMEZONE and NOW are not
+    // numbers, which a computed variable holds.
+    for query in [
+        "SELECT ?row WHERE { ?row ex:d ?d FILTER(YEAR(?d) = 2024) }",
+        "SELECT ?row (TZ(?z) AS ?t) WHERE { ?row ex:tz ?z }",
+        "SELECT ?row WHERE { ?row ex:ts ?u FILTER(?u < NOW()) }",
+    ] {
+        let mapping = sql_query_mapping(
+            "SELECT 1 AS id, DATE '2024-01-01' AS d, TIMESTAMP '2024-01-01 00:00:00' AS ts, \
+             TIMESTAMPTZ '2024-01-01 00:00:00Z' AS tz",
+            &["d", "ts", "tz"],
+        );
+        let query = format!("PREFIX ex: <http://example.org/> {query}");
+        let result = match sparql::parse(&query) {
+            Err(e) => Err(Error::Core(e)),
+            Ok(parsed) => {
+                let parsed_mapping = Mapping::from_turtle(&mapping).unwrap();
+                match unfold::unfold(
+                    &parsed,
+                    &parsed_mapping,
+                    &MappingIndex::new(&parsed_mapping),
+                ) {
+                    Err(e) => Err(Error::Core(e)),
+                    Ok(plan) => run(&url, Limits::default(), &plan).await,
+                }
+            }
+        };
+        assert!(
+            matches!(
+                &result,
+                Err(Error::Core(v12n_core::Error::UnsupportedFeature(_)))
+            ),
+            "{query}: {result:?}"
+        );
+    }
+}
+
 /// fn:round (XPath F&O 3.1 §4.4.4) from Rust's `round`, which rounds
 /// halves away from zero: halves towards positive infinity, and `-0` for
 /// values from -0.5 to -0.

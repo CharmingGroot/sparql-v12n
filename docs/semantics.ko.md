@@ -527,6 +527,40 @@ decimal의 `ROUND`는 `floor(x + 0.5)`다. double에서 `float8`의 `abs`, `ceil
 
 `RAND`는 미지원으로 거부한다. `RAND`의 값은 행마다, 실행마다 다르다.
 
+`YEAR`, `MONTH`, `DAY`, `HOURS`, `MINUTES`, `SECONDS`, `TIMEZONE`,
+`TZ`(SPARQL 1.1 §17.4.5)는 `timestamp`나 `timestamptz` 컬럼, 상수, `NOW`에서
+나온 `xsd:dateTime`을 인자로 받고, 값 자신의 시간대에서 본 구성 요소를
+돌려준다(XPath F&O 3.1 §9.5). `YEAR`부터 `MINUTES`까지는 `xsd:integer`이고,
+`SECONDS`는 `58.25`처럼 소수 부분을 포함한 `xsd:decimal`이다. `TIMEZONE`은
+`-PT5H30M` 같은 `xsd:dayTimeDuration`이고 시간대가 없는 값에서는 오류다.
+`TZ`는 `-05:30`이나 `Z`처럼 표기된 시간대이고, 시간대가 없는 값에서는
+`""`이다. `xsd:dateTime`이 아닌 인자는 오류이고, 일반 리터럴인 무한대
+`timestamp`와 `timestamptz` 값도 오류다.
+
+함수의 결과는 엔진이 쓰는 lexical form과 일치한다. `timestamp`에는 시간대가
+없으므로 `TZ`는 `""`이고 `TIMEZONE`은 오류다. `timestamptz`는 UTC로 `Z`를
+붙여 쓰므로, 세션 시간대와 관계없이 구성 요소는 UTC 기준이고 `TZ`는 `Z`,
+`TIMEZONE`은 `PT0S`다. `timestamptz` 컬럼에 저장한
+`2025-01-01T03:00:00+05:00`은 `2024-12-31T22:00:00Z`로 쓰고, 그 `YEAR`는
+`2024`다. SQL에서 구성 요소는 컬럼에 대한 `extract`이고, `timestamptz`는
+`AT TIME ZONE 'UTC'`로 읽으며, 컬럼이 무한대인 행에서는 `NULL`이다.
+PostgreSQL은 1년 앞의 해를 -1년으로 세고 엔진은 그 해를 `0000`으로 쓰므로,
+`YEAR`는 1년 앞의 해에 1을 더한다. 상수는 쿼리를 보내기 전에 계산한다.
+`HOURS("2024-12-31T22:59:00-05:00"^^xsd:dateTime)`은 `22`, 같은 상수의
+`TZ`는 `-05:00`이고, `24:00:00`은 다음 날의 첫 시각이다.
+
+`NOW`(SPARQL 1.1 §17.4.5.1)는 쿼리 전체에서 하나인 UTC `xsd:dateTime`이다.
+마이크로초 단위로 쿼리를 렌더링할 때 정하고, `timestamptz` 파라미터 하나로
+보낸다. 쿼리 안의 모든 `NOW`가 같은 값이므로 `?t < NOW()`는 모든 행을 같은
+시각과 비교한다. `NOW`의 `TZ`는 `Z`다.
+
+`date`, `time` 컬럼이나 상수에서 나온 `xsd:date`, `xsd:time` 값에 대한
+`YEAR` 등의 함수는 미지원으로 거부한다. SPARQL 1.1은 이 함수들을
+`xsd:dateTime`에 대해서만 정의하고, 함수를 확장하는 엔진마다 결과가 다르다.
+`TIMEZONE`의 결과와 `xsd:dayTimeDuration` 상수의 비교는 연산자 매핑에 없는
+다른 데이터타입과 마찬가지로 거부한다. `STR(TIMEZONE(?t)) = "PT0S"`는
+lexical form을 비교한다.
+
 컬럼에 대한 `STR`과 `DATATYPE`은 조인과 마찬가지로 SQL에서 그 컬럼의 문자열
 표기나 자연 데이터타입을 알 수 있을 때 동작한다. `date`와 `timestamp`의
 무한대 값은 일반 리터럴이므로 그 `DATATYPE`은 `xsd:string`이다.
@@ -654,9 +688,10 @@ SQL에서 계산한 문자열은 모두 `COLLATE "C"`를 적용한다. 따라서
   - `xsd:float`와 파생 정수 타입
   - 1년부터 9999년 범위를 벗어나거나 마이크로초보다 정밀한 dateTime 상수
 - `RAND`, `SHA1`을 포함한 그 밖의 함수, `EXISTS`, 그리고 term(변수, 상수,
-  산술, 이들에 대한 `STR`, `LANG`, `DATATYPE`, `ABS`, `ROUND`, `CEIL`,
-  `FLOOR`, `IF`, `COALESCE`, 문자열 함수, 해시 함수)이 아닌 식을 피연산자로
-  쓰는 것. `IF`, `COALESCE`, `IN`의 인자로 쓰는 비교가 그 예다
+  산술, `NOW`, 이들에 대한 `STR`, `LANG`, `DATATYPE`, `ABS`, `ROUND`, `CEIL`,
+  `FLOOR`, `IF`, `COALESCE`, 문자열 함수, 해시 함수, dateTime 함수)이 아닌
+  식을 피연산자로 쓰는 것. `IF`, `COALESCE`, `IN`의 인자로 쓰는 비교가 그
+  예다
 - XPath와 PostgreSQL이 다른 일치를 선택할 수 있는 패턴(위 참고), 아홉
   번째 이후 그룹에 대한 참조, 상수가 아닌 패턴, 치환 문자열, 플래그를 쓰는
   `REPLACE`
@@ -665,6 +700,7 @@ SQL에서 계산한 문자열은 모두 `COLLATE "C"`를 적용한다. 따라서
   값을 반환한다
 - `date`나 `timestamp` 컬럼에 대한 문자열 함수와 해시 함수. 이 컬럼의 무한대
   값은 plain literal이다
+- `xsd:date`, `xsd:time` 값에 대한 dateTime 함수, `NOW`에 대한 `sameTerm`
 - 인코딩이 UTF-8이 아닌 데이터베이스에서의 문자열 정렬, `REGEX`, 문자열 함수,
   해시 함수
 
@@ -686,6 +722,9 @@ SQL에서 계산한 문자열은 모두 `COLLATE "C"`를 적용한다. 따라서
 - `ABS`, `ROUND`, `CEIL`, `FLOOR`는 인자의 데이터타입인 숫자를 값으로
   한다. `numeric` 컬럼에 대한 `ROUND(?price)`는 `3` 같은 `xsd:decimal`이고,
   정수 컬럼에 대한 `ROUND(?qty)`는 `?qty`다.
+- `YEAR`, `MONTH`, `DAY`, `HOURS`, `MINUTES`는 `xsd:integer`를, `SECONDS`는
+  `58.25`나 `0` 같은 `xsd:decimal`을 값으로 한다. 무한대 timestamp에서는
+  `?v`를 바인딩하지 않는다.
 - `IF`와 `COALESCE`는 선택한 인자의 숫자를 값으로 한다.
   `COALESCE(?qty / ?n, 0)`은 `?n`이 0이거나 바인딩되지 않은 해에서 `0`이다.
   `IF(?n > 0, ?qty / ?n, 0)`은 `?n`이 바인딩되지 않은 해에서 조건이 오류이므로
@@ -699,10 +738,11 @@ SPARQL은 `BIND`를 그것이 쓰인 그룹의 해에 대해 평가한다. v12n�
 
 다음은 미지원으로 거부한다.
 
-- 변수, 상수, 산술, 숫자 함수, `STRLEN`, 그리고 산술과 숫자 상수에 대한
-  `IF`와 `COALESCE`가 아닌 식. `STR`, 비교, `IN`, `UCASE`를 비롯한 문자열
-  함수, 해시 함수, 결과가 임의의 term일 수 있는 `COALESCE(?x, 0)`이 그
-  예다. SQL에서 계산된 변수는 숫자만 담는다
+- 변수, 상수, 산술, 숫자 함수, `STRLEN`, `YEAR`부터 `SECONDS`까지의 함수,
+  그리고 산술과 숫자 상수에 대한 `IF`와 `COALESCE`가 아닌 식. `STR`, 비교,
+  `IN`, `UCASE`를 비롯한 문자열 함수, 해시 함수, `TZ`, `TIMEZONE`, `NOW`,
+  결과가 임의의 term일 수 있는 `COALESCE(?x, 0)`이 그 예다. SQL에서 계산된
+  변수는 숫자만 담는다
 - `OPTIONAL`이나 `UNION` 안의 `BIND`
 - 그룹이 바인딩하지 않을 수 있고 패턴의 뒷부분이 바인딩하는 변수에 대한 `BIND`
 - `BIND`나 `SELECT`가 계산한 변수를 트리플 패턴, `FILTER`, `ORDER BY`, 다른
@@ -859,4 +899,5 @@ SPARQL이 순서를 정하지 않은 경우에는 엔진이 정한 고정 순서
 - 인코딩이 UTF-8이 아닌 데이터베이스의 문자열에 대한 정렬 기준
 - `FILTER`와 마찬가지로 그 밖의 함수, 산술, `ABS`, `ROUND`, `CEIL`,
   `FLOOR`, `IF`, `COALESCE`, `STRSTARTS`, `STRENDS`, `CONTAINS`를 제외한
-  문자열 함수, 해시 함수, SQL이 계산할 수 없는 문자열 형태
+  문자열 함수, 해시 함수, dateTime 함수, `NOW`, SQL이 계산할 수 없는 문자열
+  형태

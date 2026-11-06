@@ -1,0 +1,18 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_events(\"SELECT ?e WHERE { ?e ex:tz ?z \\\n         FILTER(HOURS(?z) = HOURS(\\\"2024-01-01T02:30:00-05:00\\\"^^xsd:dateTime) \\\n         && SECONDS(\\\"2024-01-01T02:30:07.250\\\"^^xsd:dateTime) < SECONDS(?z) \\\n         && TZ(\\\"2024-01-01T02:30:00-05:00\\\"^^xsd:dateTime) = \\\"-05:00\\\" \\\n         && STR(TIMEZONE(\\\"2024-01-01T02:30:00+05:30\\\"^^xsd:dateTime)) = \\\"PT5H30M\\\") }\")"
+---
+SELECT q."e"
+FROM (
+SELECT DISTINCT t0."id" AS "e", t0."tz" AS "z"
+FROM "events" t0
+WHERE (((CASE WHEN isfinite(t0."tz") THEN extract(hour FROM (t0."tz" AT TIME ZONE 'UTC'))::numeric END = $1::int8 AND $2::numeric < CASE WHEN isfinite(t0."tz") THEN extract(second FROM (t0."tz" AT TIME ZONE 'UTC'))::numeric END) AND ($3::text = $4::text)) AND ($5::text = $6::text)) AND t0."id" IS NOT NULL AND t0."tz" IS NOT NULL
+) q
+
+-- params
+$1 = "2"
+$2 = "7.25"
+$3 = "-05:00"
+$4 = "-05:00"
+$5 = "PT5H30M"
+$6 = "PT5H30M"

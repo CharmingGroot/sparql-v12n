@@ -284,6 +284,14 @@ PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运�
 
 `RAND` 作为不支持的功能拒绝。其值在每一行、每次执行中都不同。
 
+`YEAR`、`MONTH`、`DAY`、`HOURS`、`MINUTES`、`SECONDS`、`TIMEZONE` 与 `TZ`（SPARQL 1.1 §17.4.5）接受来自 `timestamp` 或 `timestamptz` 列、常量或 `NOW` 的 `xsd:dateTime`，并给出其在自身时区中的组成部分（XPath F&O 3.1 §9.5）。`YEAR` 至 `MINUTES` 给出 `xsd:integer`，`SECONDS` 给出带小数部分的 `xsd:decimal`，例如 `58.25`。`TIMEZONE` 给出 `xsd:dayTimeDuration`，例如 `-PT5H30M`，对不带时区的值为错误。`TZ` 给出书写的时区，例如 `-05:30` 或 `Z`，对不带时区的值为 `""`。不是 `xsd:dateTime` 的参数为错误，作为普通字面量的无穷 `timestamp` 与 `timestamptz` 值也是错误。
+
+这些函数与引擎写出的词法形式一致。`timestamp` 没有时区：其 `TZ` 为 `""`，`TIMEZONE` 为错误。`timestamptz` 以 UTC 加 `Z` 写出，因此无论会话时区如何，其组成部分均为 UTC 下的值，`TZ` 为 `Z`，`TIMEZONE` 为 `PT0S`。存入 `timestamptz` 列的 `2025-01-01T03:00:00+05:00` 写作 `2024-12-31T22:00:00Z`，其 `YEAR` 为 `2024`。在 SQL 中，组成部分是对列的 `extract`，`timestamptz` 以 `AT TIME ZONE 'UTC'` 读取，列为无穷值时为 `NULL`。PostgreSQL 将公元 1 年之前的一年记为 -1 年，而引擎将其写作 `0000`，因此 `YEAR` 对 1 年之前的年份加 1。常量在发送查询之前计算：`HOURS("2024-12-31T22:59:00-05:00"^^xsd:dateTime)` 为 `22`，其 `TZ` 为 `-05:00`，`24:00:00` 为次日的第一个时刻。
+
+`NOW`（SPARQL 1.1 §17.4.5.1）是整个查询中唯一的 UTC `xsd:dateTime`，精确到微秒，在渲染查询时取得，并作为一个 `timestamptz` 参数发送。查询中的每个 `NOW` 都是该值，因此 `?t < NOW()` 将每一行与同一时刻比较。其 `TZ` 为 `Z`。
+
+对来自 `date` 与 `time` 列或常量的 `xsd:date` 与 `xsd:time` 值，`YEAR` 等函数作为不支持的功能拒绝。SPARQL 1.1 仅为 `xsd:dateTime` 定义这些函数，而扩展它们的引擎结果各不相同。`TIMEZONE` 的结果与 `xsd:dayTimeDuration` 常量的比较与运算符映射之外的其他数据类型一样被拒绝；`STR(TIMEZONE(?t)) = "PT0S"` 比较其词法形式。
+
 列的 `STR` 与 `DATATYPE` 在其词法形式或自然数据类型可在 SQL 中确定时可用，与连接相同。`date` 与 `timestamp` 的无穷值是普通字面量，因此其 `DATATYPE` 为 `xsd:string`。
 
 `REGEX` 将 XPath 正则表达式翻译为匹配结果相同的 PostgreSQL 模式。该模式在 `COLLATE "C"` 下以 `~` 应用。
@@ -334,10 +342,11 @@ PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运�
   - `rr:datatype` 为该列自然数据类型以外的数值、布尔或 dateTime 数据类型的列的值；
   - `xsd:float` 与派生整数类型；
   - 超出公元 1 至 9999 年范围或精度细于微秒的 dateTime 常量；
-- 包括 `RAND` 与 `SHA1` 在内的其他函数、`EXISTS`，以及以 term（变量、常量、算术，以及它们的 `STR`、`LANG`、`DATATYPE`、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、字符串函数或哈希函数）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
+- 包括 `RAND` 与 `SHA1` 在内的其他函数、`EXISTS`，以及以 term（变量、常量、算术、`NOW`，以及它们的 `STR`、`LANG`、`DATATYPE`、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、字符串函数、哈希函数或 dateTime 函数）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
 - 模式的匹配在 XPath 与 PostgreSQL 中可能不同、引用第九个之后的分组，或模式、替换字符串、标志不是常量的 `REPLACE`；
 - 非常量或不是 `xsd:integer`（例如 `1.5`）的 `SUBSTR` 起始位置与长度：SPARQL 1.1 中为类型错误，而像 `fn:substring` 那样取整的引擎会给出答案；
 - 作用于 `date` 或 `timestamp` 列的字符串函数与哈希函数，其无穷值为 plain literal；
+- 作用于 `xsd:date` 与 `xsd:time` 值的 dateTime 函数，以及 `NOW` 的 `sameTerm`；
 - 在编码不是 UTF-8 的数据库中进行字符串排序、`REGEX`、字符串函数与哈希函数。
 
 ## BIND 与 SELECT 表达式
@@ -347,6 +356,7 @@ PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运�
 - 变量给出其 term，常量给出其自身。
 - 算术给出一个数，其数据类型遵循 XPath 的类型提升，并以规范形式写出（见[字面量](#字面量)）。在整数列上，`?qty * 2` 为 `xsd:integer`，`?qty / 4` 为 `xsd:decimal`。XPath 将 decimal 除法的精度留给实现决定，此处采用 PostgreSQL `numeric` 除法的精度。`?qty * 1.5e0` 为 `xsd:double`，例如 `1.5E0`、`-0.0E0`、`INF` 或 `NaN`。`SELECT DISTINCT` 区分 `-0.0E0` 与 `0.0E0`，它们是不同的 term。
 - `ABS`、`ROUND`、`CEIL` 与 `FLOOR` 给出与其参数数据类型相同的数。在 `numeric` 列上，`ROUND(?price)` 为 `xsd:decimal`，例如 `3`；在整数列上，`ROUND(?qty)` 即 `?qty`。
+- `YEAR`、`MONTH`、`DAY`、`HOURS` 与 `MINUTES` 给出 `xsd:integer`，`SECONDS` 给出 `xsd:decimal`，例如 `58.25` 或 `0`。无穷 timestamp 使 `?v` 保持未绑定。
 - `IF` 与 `COALESCE` 给出其所选参数的数值。在 `?n` 为零或未绑定的解中，`COALESCE(?qty / ?n, 0)` 为 `0`。在 `?n` 未绑定的解中，`IF(?n > 0, ?qty / ?n, 0)` 的条件为错误，因此 `?v` 保持未绑定。
 - 发生错误时（例如除以零，或操作数不是数字），`?v` 保持未绑定。该解仍被保留。
 
@@ -354,7 +364,7 @@ SPARQL 在 `BIND` 所在组的解上对其求值。v12n 在连接之后，在整
 
 以下情形作为不支持的功能拒绝：
 
-- 变量、常量、算术、数值函数、`STRLEN`，以及对算术与数值常量的 `IF` 与 `COALESCE` 以外的表达式，例如 `STR`、比较、`IN`、`UCASE` 等字符串函数、哈希函数，以及结果可以是任意 term 的 `COALESCE(?x, 0)`。在 SQL 中，计算得到的变量只保存数值；
+- 变量、常量、算术、数值函数、`STRLEN`、`YEAR` 至 `SECONDS`，以及对算术与数值常量的 `IF` 与 `COALESCE` 以外的表达式，例如 `STR`、比较、`IN`、`UCASE` 等字符串函数、哈希函数、`TZ`、`TIMEZONE`、`NOW`，以及结果可以是任意 term 的 `COALESCE(?x, 0)`。在 SQL 中，计算得到的变量只保存数值；
 - `OPTIONAL` 或 `UNION` 内部的 `BIND`；
 - 对其所在组可能未绑定、而模式后续部分会绑定的变量使用 `BIND`；
 - 在三元组模式、`FILTER`、`ORDER BY` 或其他表达式中使用由 `BIND` 或 `SELECT` 计算的变量。
@@ -446,4 +456,4 @@ WHERE t2."id" IS NULL AND …
 - 作用于带时区与不带时区的值的比较项；
 - 作用于 `real` 列的比较项；
 - 作用于编码不是 UTF-8 的数据库中字符串的比较项；
-- 与 `FILTER` 中一样，其他函数、算术、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、`STRSTARTS`、`STRENDS` 与 `CONTAINS` 以外的字符串函数、哈希函数，以及 SQL 无法计算的字符串形式。
+- 与 `FILTER` 中一样，其他函数、算术、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、`STRSTARTS`、`STRENDS` 与 `CONTAINS` 以外的字符串函数、哈希函数、dateTime 函数、`NOW`，以及 SQL 无法计算的字符串形式。

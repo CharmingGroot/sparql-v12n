@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT ?e WHERE { ?e ex:ts ?u FILTER(TZ("2024-01-01T00:00:00-05:00"^^xsd:dateTime) = "-05:00" && YEAR(?u) = 1999) }

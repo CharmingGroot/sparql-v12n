@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A timestamp has no time zone.
+SELECT ?e WHERE { ?e ex:ts ?u FILTER(TZ(?u) = "") }
