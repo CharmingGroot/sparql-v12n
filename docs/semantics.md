@@ -554,6 +554,27 @@ be not `NULL`. `IN` is an `OR` of the comparisons, each written as `=` is,
 so `?qty IN (5, 7)` is `qty = $1::int8 OR qty = $2::int8`, and an index on
 the column can be used.
 
+`ABS`, `ROUND`, `CEIL` and `FLOOR` (SPARQL 1.1 §17.4.4) follow `fn:abs`,
+`fn:round`, `fn:ceiling` and `fn:floor` (XPath F&O 3.1 §4.4). The result
+has the datatype of the argument: an integer for an integer, a decimal
+for a decimal and a double for a double. An argument that is not a
+number is an error, and so is a `numeric` NaN or infinity. `ROUND` rounds
+halves towards positive infinity: `ROUND(2.5)` is `3`, `ROUND(-2.5)` is
+`-2`, and `ROUND(-0.5e0)` is `-0.0E0`.
+
+In SQL, an integer is its own rounding, ceiling and floor. Decimals are
+computed in `numeric`. `ROUND` of a decimal is `floor(x + 0.5)`, because
+PostgreSQL's `round(numeric)` rounds halves away from zero. For doubles,
+`abs`, `ceil` and `floor` of `float8` keep NaN, the infinities and the
+sign of a zero, as XPath requires. PostgreSQL's `round(float8)` rounds
+halves to even, and `floor(x + 0.5)` is wrong where the sum rounds, as
+for 0.49999999999999994. `ROUND` of a double is therefore a `CASE`
+expression that is exact for every double. NaN, the infinities and values
+of 2^52 or more in magnitude are their own rounding, values from -0.5 to
+-0 give -0, and the other values compare `x - floor(x)` with 0.5.
+
+`RAND` is rejected as unsupported. Its value differs per row and per run.
+
 `STR` and `DATATYPE` of a column work where its lexical form or natural
 datatype is known in SQL, as for joins. The infinities of `date` and
 `timestamp` are plain literals, so their `DATATYPE` is `xsd:string`.
@@ -600,18 +621,20 @@ differently from engines that extend SPARQL:
   - `xsd:float` and the derived integer types;
   - dateTime constants outside the years 1 to 9999, or finer than a
     microsecond;
-- other functions, `EXISTS`, and expressions other than terms
-  (variables, constants, arithmetic, and `STR`, `LANG`, `DATATYPE`, `IF`
-  or `COALESCE` of them) as operands, such as a comparison as an argument
-  of `IF`, `COALESCE` or `IN`;
+- other functions, `RAND` among them, `EXISTS`, and expressions other
+  than terms (variables, constants, arithmetic, and `STR`, `LANG`,
+  `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`, `IF` or `COALESCE` of them)
+  as operands, such as a comparison as an argument of `IF`, `COALESCE` or
+  `IN`;
 - string ordering and `REGEX` in a database whose encoding is not UTF-8.
 
 ## BIND and SELECT expressions
 
 `BIND(expr AS ?v)` and `SELECT (expr AS ?v)` give `?v` the value of the
 expression in each solution (SPARQL 1.1 §18.5, Extend). The expression is
-a variable, a constant, arithmetic as in [`FILTER`](#filter), or `IF` and
-`COALESCE` whose results are arithmetic or numeric constants:
+a variable, a constant, arithmetic and the numeric functions as in
+[`FILTER`](#filter), or `IF` and `COALESCE` whose results are arithmetic
+or numeric constants:
 
 - A variable gives its term, and a constant gives itself.
 - Arithmetic gives a number whose datatype follows XPath's type
@@ -622,6 +645,10 @@ a variable, a constant, arithmetic as in [`FILTER`](#filter), or `IF` and
   `?qty * 1.5e0` is an `xsd:double`, such as `1.5E0`, `-0.0E0`, `INF` or
   `NaN`. `SELECT DISTINCT` keeps `-0.0E0` and `0.0E0` apart, which are
   different terms.
+- `ABS`, `ROUND`, `CEIL` and `FLOOR` give a number of the datatype of
+  their argument. Over a `numeric` column, `ROUND(?price)` is an
+  `xsd:decimal`, such as `3`, and over an integer column, `ROUND(?qty)`
+  is `?qty`.
 - `IF` and `COALESCE` give the number of the argument they choose.
   `COALESCE(?qty / ?n, 0)` is `0` where `?n` is zero or unbound, and
   `IF(?n > 0, ?qty / ?n, 0)` leaves `?v` unbound where `?n` is unbound,
@@ -636,8 +663,9 @@ of the variables of the expression that the group may leave unbound.
 
 The following are rejected as unsupported:
 
-- expressions other than variables, constants, arithmetic, and `IF` and
-  `COALESCE` over arithmetic and numeric constants. `STR`, comparisons,
+- expressions other than variables, constants, arithmetic, numeric
+  functions, and `IF` and `COALESCE` over arithmetic and numeric
+  constants. `STR`, comparisons,
   `IN`, and `COALESCE(?x, 0)`, whose result can be any term, are examples.
   A computed variable holds only numbers in SQL;
 - `BIND` inside `OPTIONAL` or `UNION`;
@@ -764,5 +792,5 @@ The following are rejected as unsupported:
 - comparators over values with and without a time zone;
 - comparators over `real` columns;
 - comparators over strings in a database whose encoding is not UTF-8;
-- as in `FILTER`, other functions, arithmetic, `IF`, `COALESCE` and
-  string forms that SQL cannot compute.
+- as in `FILTER`, other functions, arithmetic, `ABS`, `ROUND`, `CEIL`,
+  `FLOOR`, `IF`, `COALESCE` and string forms that SQL cannot compute.

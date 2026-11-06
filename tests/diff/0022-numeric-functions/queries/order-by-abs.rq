@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# Numeric functions in ORDER BY come with the other expressions there
+# (#108).
+SELECT ?r ?i WHERE { ?r ex:i ?i } ORDER BY ABS(?i)

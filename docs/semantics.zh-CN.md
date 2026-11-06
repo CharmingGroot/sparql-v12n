@@ -278,6 +278,12 @@ PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运�
 
 在 SQL 中，`IF` 与 `COALESCE` 是每个参数对应一个分支的 `CASE` 表达式。`COALESCE` 中对算术的分支还要求值不为 `NULL`。`IN` 是各比较的 `OR`，每个比较的写法与 `=` 相同，因此 `?qty IN (5, 7)` 即 `qty = $1::int8 OR qty = $2::int8`，可以使用该列上的索引。
 
+`ABS`、`ROUND`、`CEIL` 与 `FLOOR`（SPARQL 1.1 §17.4.4）遵循 `fn:abs`、`fn:round`、`fn:ceiling` 与 `fn:floor`（XPath F&O 3.1 §4.4）。结果的数据类型与参数相同：整数的结果为整数，decimal 的结果为 decimal，double 的结果为 double。不是数字的参数为错误，`numeric` 的 NaN 与无穷值也是错误。`ROUND` 将 .5 向正无穷方向舍入：`ROUND(2.5)` 为 `3`，`ROUND(-2.5)` 为 `-2`，`ROUND(-0.5e0)` 为 `-0.0E0`。
+
+在 SQL 中，整数的舍入、向上取整与向下取整都是其自身。decimal 以 `numeric` 计算。PostgreSQL 的 `round(numeric)` 将 .5 向远离零的方向舍入，因此 decimal 的 `ROUND` 为 `floor(x + 0.5)`。对于 double，`float8` 的 `abs`、`ceil` 与 `floor` 按 XPath 的要求保留 NaN、无穷值与零的符号。PostgreSQL 的 `round(float8)` 将 .5 向偶数舍入，而 `floor(x + 0.5)` 在和被舍入时出错，例如 0.49999999999999994。因此 double 的 `ROUND` 是对每个 double 都精确的 `CASE` 表达式：NaN、无穷值以及绝对值不小于 2^52 的值舍入为其自身，-0.5 到 -0 之间的值得到 -0，其余的值将 `x - floor(x)` 与 0.5 比较。
+
+`RAND` 作为不支持的功能拒绝。其值在每一行、每次执行中都不同。
+
 列的 `STR` 与 `DATATYPE` 在其词法形式或自然数据类型可在 SQL 中确定时可用，与连接相同。`date` 与 `timestamp` 的无穷值是普通字面量，因此其 `DATATYPE` 为 `xsd:string`。
 
 `REGEX` 将 XPath 正则表达式翻译为匹配结果相同的 PostgreSQL 模式。该模式在 `COLLATE "C"` 下以 `~` 应用。
@@ -313,15 +319,16 @@ PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运�
   - `rr:datatype` 为该列自然数据类型以外的数值、布尔或 dateTime 数据类型的列的值；
   - `xsd:float` 与派生整数类型；
   - 超出公元 1 至 9999 年范围或精度细于微秒的 dateTime 常量；
-- 其他函数、`EXISTS`，以及以 term（变量、常量、算术，以及它们的 `STR`、`LANG`、`DATATYPE`、`IF` 或 `COALESCE`）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
+- 包括 `RAND` 在内的其他函数、`EXISTS`，以及以 term（变量、常量、算术，以及它们的 `STR`、`LANG`、`DATATYPE`、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF` 或 `COALESCE`）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
 - 在编码不是 UTF-8 的数据库中进行字符串排序和 `REGEX`。
 
 ## BIND 与 SELECT 表达式
 
-`BIND(expr AS ?v)` 与 `SELECT (expr AS ?v)` 在每个解中将表达式的值绑定到 `?v`（SPARQL 1.1 §18.5，Extend）。表达式为变量、常量、与 [`FILTER`](#filter) 中相同的算术，或结果为算术或数值常量的 `IF` 与 `COALESCE`：
+`BIND(expr AS ?v)` 与 `SELECT (expr AS ?v)` 在每个解中将表达式的值绑定到 `?v`（SPARQL 1.1 §18.5，Extend）。表达式为变量、常量、与 [`FILTER`](#filter) 中相同的算术与数值函数，或结果为算术或数值常量的 `IF` 与 `COALESCE`：
 
 - 变量给出其 term，常量给出其自身。
 - 算术给出一个数，其数据类型遵循 XPath 的类型提升，并以规范形式写出（见[字面量](#字面量)）。在整数列上，`?qty * 2` 为 `xsd:integer`，`?qty / 4` 为 `xsd:decimal`。XPath 将 decimal 除法的精度留给实现决定，此处采用 PostgreSQL `numeric` 除法的精度。`?qty * 1.5e0` 为 `xsd:double`，例如 `1.5E0`、`-0.0E0`、`INF` 或 `NaN`。`SELECT DISTINCT` 区分 `-0.0E0` 与 `0.0E0`，它们是不同的 term。
+- `ABS`、`ROUND`、`CEIL` 与 `FLOOR` 给出与其参数数据类型相同的数。在 `numeric` 列上，`ROUND(?price)` 为 `xsd:decimal`，例如 `3`；在整数列上，`ROUND(?qty)` 即 `?qty`。
 - `IF` 与 `COALESCE` 给出其所选参数的数值。在 `?n` 为零或未绑定的解中，`COALESCE(?qty / ?n, 0)` 为 `0`。在 `?n` 未绑定的解中，`IF(?n > 0, ?qty / ?n, 0)` 的条件为错误，因此 `?v` 保持未绑定。
 - 发生错误时（例如除以零，或操作数不是数字），`?v` 保持未绑定。该解仍被保留。
 
@@ -329,7 +336,7 @@ SPARQL 在 `BIND` 所在组的解上对其求值。v12n 在连接之后，在整
 
 以下情形作为不支持的功能拒绝：
 
-- 变量、常量、算术，以及对算术与数值常量的 `IF` 与 `COALESCE` 以外的表达式，例如 `STR`、比较、`IN`，以及结果可以是任意 term 的 `COALESCE(?x, 0)`。在 SQL 中，计算得到的变量只保存数值；
+- 变量、常量、算术、数值函数，以及对算术与数值常量的 `IF` 与 `COALESCE` 以外的表达式，例如 `STR`、比较、`IN`，以及结果可以是任意 term 的 `COALESCE(?x, 0)`。在 SQL 中，计算得到的变量只保存数值；
 - `OPTIONAL` 或 `UNION` 内部的 `BIND`；
 - 对其所在组可能未绑定、而模式后续部分会绑定的变量使用 `BIND`；
 - 在三元组模式、`FILTER`、`ORDER BY` 或其他表达式中使用由 `BIND` 或 `SELECT` 计算的变量。
@@ -396,4 +403,4 @@ SPARQL 将数据与其所在组的解连接。v12n 将其与整个模式的解�
 - 作用于带时区与不带时区的值的比较项；
 - 作用于 `real` 列的比较项；
 - 作用于编码不是 UTF-8 的数据库中字符串的比较项；
-- 与 `FILTER` 中一样，其他函数、算术、`IF`、`COALESCE` 和 SQL 无法计算的字符串形式。
+- 与 `FILTER` 中一样，其他函数、算术、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE` 和 SQL 无法计算的字符串形式。

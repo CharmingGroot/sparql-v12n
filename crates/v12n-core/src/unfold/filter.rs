@@ -201,6 +201,14 @@ impl<'a> Context<'_, 'a> {
             Expression::Lang(a) => derived(a, FilterValue::Lang),
             Expression::Datatype(a) => derived(a, FilterValue::Datatype),
             Expression::Negate(a) => derived(a, FilterValue::Negate),
+            Expression::Numeric(function, a) => Ok(self
+                .operand(a)?
+                .into_iter()
+                .map(|(guards, leaf)| {
+                    let value = FilterValue::Numeric(*function, Box::new(leaf.value));
+                    (guards, Leaf { value, term: None })
+                })
+                .collect()),
             // One case per pair of ways the operands are bound, as for a
             // comparison.
             Expression::Arith(op, a, b) => {

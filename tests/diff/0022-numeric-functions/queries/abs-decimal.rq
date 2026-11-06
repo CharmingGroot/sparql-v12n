@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# fn:abs of a decimal: rows 1 and 2.
+SELECT ?r WHERE { ?r ex:d ?d FILTER(ABS(?d) = 2.5) }
