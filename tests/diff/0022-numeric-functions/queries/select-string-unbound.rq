@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A type error leaves ?x unbound.
+SELECT ?r ?x WHERE { ?r ex:name ?n BIND(ABS(?n) AS ?x) }

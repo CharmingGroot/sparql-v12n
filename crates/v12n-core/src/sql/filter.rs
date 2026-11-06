@@ -12,7 +12,7 @@ use crate::Error;
 use crate::dialect::{Dialect, SqlType};
 use crate::mapping::TermType;
 use crate::solution::canonical_double;
-use crate::sparql::{ArithOp, CompareOp, StrTest, TermTest};
+use crate::sparql::{ArithOp, CompareOp, NumericFunction, StrTest, TermTest};
 use crate::xsd::{self, Num, Number, Value, XSD};
 
 mod double;
@@ -101,12 +101,15 @@ pub(super) struct Operand<'v> {
     pub(super) infinite: bool,
 }
 
-/// Whether the value is a number computed in SQL, by arithmetic or by
-/// `STRLEN`.
+/// Whether the value is a number computed in SQL, by arithmetic, a
+/// numeric function or `STRLEN`.
 fn is_arith(value: &FilterValue) -> bool {
     matches!(
         value,
-        FilterValue::Arith(..) | FilterValue::Negate(_) | FilterValue::StrLen(_)
+        FilterValue::Arith(..)
+            | FilterValue::Negate(_)
+            | FilterValue::Numeric(..)
+            | FilterValue::StrLen(_)
     )
 }
 
@@ -328,7 +331,9 @@ impl<'a> Renderer<'a> {
             FilterValue::Arith(op, a, b) => {
                 return self.arith(value, Some(*op), &[self.operand(a), self.operand(b)]);
             }
-            FilterValue::Negate(a) => return self.arith(value, None, &[self.operand(a)]),
+            FilterValue::Negate(a) | FilterValue::Numeric(_, a) => {
+                return self.arith(value, None, &[self.operand(a)]);
+            }
             FilterValue::StrLen(a) => {
                 return match string_argument(&self.operand(a)) {
                     Kind::String | Kind::Lang(_) => Operand {
@@ -553,6 +558,29 @@ impl<'a> Renderer<'a> {
             FilterValue::Negate(a) => {
                 self.sql.push_str("(-");
                 self.numeric_value(a)?;
+                self.sql.push(')');
+            }
+            FilterValue::Numeric(function, a) => {
+                // An integer is its own ceiling, floor and rounding
+                // (fn:ceiling, fn:floor, fn:round on xs:integer).
+                let integer = matches!(
+                    self.operand(a).kind,
+                    Kind::Numeric(Num::Integer) | Kind::Unknown
+                );
+                match function {
+                    NumericFunction::Abs => self.sql.push_str("abs("),
+                    _ if integer => return self.numeric_value(a),
+                    NumericFunction::Ceil => self.sql.push_str("ceil("),
+                    NumericFunction::Floor | NumericFunction::Round => self.sql.push_str("floor("),
+                }
+                self.numeric_value(a)?;
+                // fn:round takes the integer nearest to the decimal and, of
+                // two, the one towards positive infinity, which `numeric`
+                // computes exactly as floor(x + 0.5). PostgreSQL's
+                // round(numeric) rounds halves away from zero instead.
+                if *function == NumericFunction::Round {
+                    self.sql.push_str(" + 0.5");
+                }
                 self.sql.push(')');
             }
             // Characters are code points in a UTF-8 database.
@@ -2191,6 +2219,129 @@ pub(super) mod tests {
             "{sql}"
         );
         assert!(rejected("?s ex:f4 ?x", "COALESCE(?x + 1, 0) > 0").contains("float4"));
+    }
+
+    #[test]
+    fn numeric_functions_of_integers_and_decimals_are_computed_in_numeric() {
+        // An integer is its own rounding, ceiling and floor, and its
+        // absolute value is an integer, compared as one.
+        assert_eq!(x("i4", "ROUND(?x) = 2"), "t0.\"i4\"::numeric = $1::int8");
+        assert_eq!(x("i4", "CEIL(?x) > 2"), "t0.\"i4\"::numeric > $1::int8");
+        assert_eq!(x("i4", "FLOOR(?x) = ?x"), "t0.\"i4\"::numeric = t0.\"i4\"");
+        assert_eq!(x("i8", "ABS(?x) = 2"), "abs(t0.\"i8\"::numeric) = $1::int8");
+        // A decimal rounds halves towards positive infinity (fn:round),
+        // which PostgreSQL's round(numeric) does not.
+        assert_eq!(
+            x("i4", "ROUND(?x / 2) = 1"),
+            "floor((t0.\"i4\"::numeric / NULLIF($1::numeric, 0)) + 0.5) = $2::numeric"
+        );
+        let decimal = "CASE WHEN t0.\"dec\"::text NOT IN ('NaN', 'Infinity', '-Infinity') THEN \
+                       t0.\"dec\" END";
+        assert_eq!(
+            x("dec", "CEIL(?x) = 3"),
+            format!("ceil({decimal}) = $1::numeric")
+        );
+        assert_eq!(
+            x("dec", "FLOOR(?x) < 3"),
+            format!("floor({decimal}) < $1::numeric")
+        );
+        assert_eq!(
+            x("dec", "ABS(?x) > 1"),
+            format!("abs({decimal}) > $1::numeric")
+        );
+        assert_eq!(x("i4", "ROUND(?x)"), "(t0.\"i4\"::numeric <> 0)");
+        assert_eq!(x("i4", "isLiteral(ABS(?x))"), "true");
+        // A division by zero is an error, which COALESCE skips.
+        assert_eq!(
+            x("i4", "COALESCE(ROUND(?x / 0), 1) = 1"),
+            "CASE WHEN (floor((t0.\"i4\"::numeric / NULLIF($1::numeric, 0)) + 0.5) IS NOT NULL) \
+             THEN floor((t0.\"i4\"::numeric / NULLIF($2::numeric, 0)) + 0.5) = $3::numeric \
+             WHEN true THEN $4::int8 = $5::int8 END"
+        );
+    }
+
+    #[test]
+    fn numeric_functions_of_anything_but_numbers_are_type_errors() {
+        assert_eq!(x("txt", "ROUND(?x) = 3"), "NULL::bool");
+        assert_eq!(x("txt", "!(ABS(?x) > 0)"), "NOT (NULL::bool)");
+        assert_eq!(x("link", "CEIL(?x) = 1"), "NULL::bool");
+        assert_eq!(x("i4", "FLOOR(\"1\") = ?x"), "NULL::bool");
+        // A number is not a string.
+        assert_eq!(x("i4", "ROUND(?x) = \"a\""), "NULL::bool");
+        assert!(rejected("?s ex:f4 ?x", "ABS(?x) > 0").contains("float4"));
+        assert!(rejected("?s ex:i4 ?x", "STR(ROUND(?x)) = \"1\"").contains("STR, LANG"));
+    }
+
+    #[test]
+    fn numeric_functions_of_doubles_keep_nan_infinities_and_signed_zeros() {
+        // abs, ceil and floor of a float8 cannot fail and are cheap to
+        // repeat.
+        assert_eq!(
+            x("f8", "ABS(?x) = 3"),
+            "(abs(t0.\"f8\") = $1::float8 AND abs(t0.\"f8\") <> 'NaN'::float8)"
+        );
+        assert_eq!(
+            x("f8", "FLOOR(?x) < 0"),
+            "(floor(t0.\"f8\") < $1::float8 AND floor(t0.\"f8\") <> 'NaN'::float8)"
+        );
+        assert_eq!(
+            x("f8", "CEIL(?x) < 0"),
+            "(ceil(t0.\"f8\") < $1::float8 AND ceil(t0.\"f8\") <> 'NaN'::float8)"
+        );
+        // ROUND is computed once, and rounds halves towards positive
+        // infinity, where round(float8) rounds them to even.
+        assert_eq!(
+            x("f8", "ROUND(?x) = 3"),
+            "(SELECT (x = $1::float8 AND x <> 'NaN'::float8) FROM (SELECT CASE WHEN NOT \
+             (abs(t0.\"f8\") < '4.503599627370496e15'::float8) THEN t0.\"f8\" WHEN t0.\"f8\" < 0 \
+             AND t0.\"f8\" >= '-5e-1'::float8 THEN '-0e0'::float8 WHEN t0.\"f8\" - \
+             floor(t0.\"f8\") >= '5e-1'::float8 THEN floor(t0.\"f8\") + 1 ELSE floor(t0.\"f8\") \
+             END AS x) AS d)"
+        );
+        // An integer argument is rounded in numeric, then promoted.
+        let sql = x("i4", "ROUND(?x / 2) < 1e0");
+        assert!(
+            sql.contains(
+                "FROM (SELECT floor((t0.\"i4\"::numeric / NULLIF($1::numeric, 0)) + 0.5) AS x) \
+                 AS d)"
+            ),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn numeric_functions_of_double_constants_are_computed_before_binding() {
+        for (constant, rounded) in [
+            ("2.5e0", "3.0E0"),
+            ("-2.5e0", "-2.0E0"),
+            ("0.5e0", "1.0E0"),
+            ("-0.5e0", "-0.0E0"),
+            ("-0.2e0", "-0.0E0"),
+            ("0.49999999999999994e0", "0.0E0"),
+            ("4503599627370497e0", "4.503599627370497E15"),
+            ("\"NaN\"^^xsd:double", "NaN"),
+            ("\"-INF\"^^xsd:double", "-INF"),
+        ] {
+            assert_eq!(
+                params(&format!(
+                    "SELECT ?s WHERE {{ ?s ex:i4 ?x FILTER(?x < ROUND({constant})) }}"
+                ))[0],
+                rounded,
+                "{constant}"
+            );
+        }
+        assert_eq!(
+            params("SELECT ?s WHERE { ?s ex:i4 ?x FILTER(?x < CEIL(-0.5e0)) }")[0],
+            "-0.0E0"
+        );
+        assert_eq!(
+            params("SELECT ?s WHERE { ?s ex:i4 ?x FILTER(?x < ABS(-0e0)) }")[0],
+            "0.0E0"
+        );
+        assert_eq!(
+            params("SELECT ?s WHERE { ?s ex:i4 ?x FILTER(?x < FLOOR(-1.5e0)) }")[0],
+            "-2.0E0"
+        );
     }
 
     /// The parameters of `FILTER(filter)` over `?s ex:txt ?x`.

@@ -709,6 +709,209 @@ async fn string_tests_use_an_index_and_ignore_the_column_collation() {
     drop_schema(&url, "v12n_str103").await;
 }
 
+/// `ABS`, `ROUND`, `CEIL` and `FLOOR` (#104) over integers and decimals:
+/// the result has the class of the argument, `ROUND` takes halves towards
+/// positive infinity (XPath F&O 3.1 §4.4.4), and a `numeric` NaN and a
+/// string are errors.
+#[tokio::test]
+async fn numeric_functions_keep_the_class_of_their_argument() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        "SELECT * FROM (VALUES \
+           (1, 7::int4, 2::int8, 2.50::numeric, 'x'::text), \
+           (2, -3::int4, -5::int8, -2.50::numeric, 'y'::text), \
+           (3, 0::int4, 0::int8, 0.50::numeric, 'z'::text), \
+           (4, 12::int4, 1::int8, -0.50::numeric, 'w'::text), \
+           (5, -8::int4, 3::int8, 'NaN'::numeric, 'v'::text), \
+           (6, 1::int4, '-9223372036854775808'::int8, -1.75::numeric, 'u'::text)) \
+           v(id, a, b, d, s)",
+        &["a", "b", "d", "s"],
+    );
+    let rows = |filter: &'static str| {
+        let (url, mapping) = (url.clone(), mapping.clone());
+        async move {
+            filtered_rows(
+                &url,
+                &mapping,
+                "?row ex:a ?a ; ex:b ?b ; ex:d ?d ; ex:s ?s",
+                filter,
+            )
+            .await
+        }
+    };
+    let none = Vec::<String>::new();
+    // fn:round(-2.5) is -2 and fn:round(-0.5) is 0, where PostgreSQL's
+    // round(numeric) gives -3 and -1.
+    assert_eq!(rows("ROUND(?d) = -2").await, ["2", "6"]);
+    assert_eq!(rows("ROUND(?d) = 0").await, ["4"]);
+    assert_eq!(rows("ROUND(?d) = 1").await, ["3"]);
+    assert_eq!(rows("ROUND(?d) = 3").await, ["1"]);
+    assert_eq!(rows("CEIL(?d) = -2 || FLOOR(?d) = -2").await, ["2", "6"]);
+    // A numeric NaN is not an xsd:decimal: an error, also under negation.
+    assert_eq!(rows("!(ROUND(?d) = 3)").await, ["2", "3", "4", "6"]);
+    assert_eq!(rows("COALESCE(FLOOR(?d), 9) = 9").await, ["5"]);
+    assert_eq!(
+        rows("ROUND(?a) = ?a && CEIL(?a) = ?a && FLOOR(?a) = ?a").await,
+        ["1", "2", "3", "4", "5", "6"]
+    );
+    // ABS of the smallest int8 is beyond int8; an integer stays an
+    // integer, so its quotient is a decimal.
+    assert_eq!(rows("ABS(?b) > 9223372036854775807").await, ["6"]);
+    assert_eq!(rows("ABS(?a) / 2 = 1.5").await, ["2"]);
+    assert_eq!(rows("ROUND(?s) = 1 || !(ABS(?s) > 0)").await, none);
+    assert_eq!(rows("!(CEIL(?s) = 1)").await, none);
+
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?row (ABS(?a) AS ?abs) (ABS(?b) AS ?big) (ROUND(?d) AS ?round)
+          (CEIL(?d) AS ?ceil) (FLOOR(?d) AS ?floor) (ROUND(?s) AS ?error)
+        WHERE { ?row ex:a ?a ; ex:b ?b ; ex:d ?d ; ex:s ?s }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    let integer =
+        |lexical: &str| format!("\"{lexical}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
+    let decimal =
+        |lexical: &str| format!("\"{lexical}\"^^<http://www.w3.org/2001/XMLSchema#decimal>");
+    let row = |id: u8, abs: &str, big: &str, rounded: Option<[&str; 3]>| {
+        let mut out = format!(
+            "?row=<http://example.org/row/{id}> ?abs={} ?big={}",
+            integer(abs),
+            integer(big)
+        );
+        if let Some([round, ceil, floor]) = rounded {
+            out.push_str(&format!(
+                " ?round={} ?ceil={} ?floor={}",
+                decimal(round),
+                decimal(ceil),
+                decimal(floor)
+            ));
+        }
+        out
+    };
+    assert_eq!(
+        rows,
+        [
+            row(1, "7", "2", Some(["3", "3", "2"])),
+            row(2, "3", "5", Some(["-2", "-2", "-3"])),
+            row(3, "0", "0", Some(["1", "1", "0"])),
+            row(4, "12", "1", Some(["0", "0", "-1"])),
+            row(5, "8", "3", None),
+            row(6, "1", "9223372036854775808", Some(["-2", "-1", "-2"])),
+        ]
+    );
+}
+
+/// fn:round (XPath F&O 3.1 §4.4.4) from Rust's `round`, which rounds
+/// halves away from zero: halves towards positive infinity, and `-0` for
+/// values from -0.5 to -0.
+fn xpath_round(x: f64) -> f64 {
+    let r = if x.fract() == -0.5 {
+        x.round() + 1.0
+    } else {
+        x.round()
+    };
+    if r == 0.0 && x.is_sign_negative() {
+        -0.0
+    } else {
+        r
+    }
+}
+
+/// `ABS`, `ROUND`, `CEIL` and `FLOOR` of doubles (#104) give the results
+/// of XPath F&O 3.1 §4.4 over edge values, halves, values next to them and
+/// to 2^52, from where every double is an integer, and random values.
+/// PostgreSQL's round(float8) rounds halves to even, and `floor(x + 0.5)`
+/// is wrong where the sum rounds.
+#[tokio::test]
+async fn numeric_functions_of_doubles_give_xpath_results() {
+    let Some(url) = database_url() else { return };
+    let mut values = double_edges();
+    let below = |x: f64| f64::from_bits(x.to_bits() - 1);
+    for x in [
+        0.5,
+        2.5,
+        1.5,
+        0.2,
+        1.7,
+        below(0.5),
+        2f64.powi(52),
+        2f64.powi(52) + 1.0,
+        2f64.powi(52) - 0.5,
+        below(2f64.powi(52)),
+        2f64.powi(53) + 2.0,
+    ] {
+        values.extend([x, -x]);
+    }
+    values.push(-0.0);
+    let mut bits = Bits(0x2545_f491_4f6c_dd1d);
+    for exponent in -4..=54 {
+        let x = bits.mantissa() * 2f64.powi(exponent);
+        values.extend([x, -x, x.floor() + 0.5, -x.floor() - 0.5]);
+    }
+    values.extend((0..200).map(|_| bits.double()));
+    let pairs: Vec<(f64, f64)> = values.iter().map(|&x| (x, 0.0)).collect();
+    let mapping = double_pairs_table(&url, "v12n_num104", &pairs).await;
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?row (ABS(?a) AS ?abs) (ROUND(?a) AS ?round) (CEIL(?a) AS ?ceil)
+          (FLOOR(?a) AS ?floor) (ROUND(?a * 2) AS ?twice)
+        WHERE { ?row ex:a ?a }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    let mut expected: Vec<String> = values
+        .iter()
+        .enumerate()
+        .map(|(id, &x)| {
+            let terms = [
+                ("abs", x.abs()),
+                ("round", xpath_round(x)),
+                ("ceil", x.ceil()),
+                ("floor", x.floor()),
+                ("twice", xpath_round(x * 2.0)),
+            ];
+            let mut row = format!("?row=<http://example.org/row/{id}>");
+            for (variable, value) in terms {
+                row.push_str(&format!(" ?{variable}={}", double_term(value)));
+            }
+            row
+        })
+        .collect();
+    expected.sort();
+    for (row, expected) in rows.iter().zip(&expected) {
+        assert_eq!(row, expected);
+    }
+    assert_eq!(rows.len(), expected.len());
+
+    // NaN is not ordered, also under negation.
+    type Test = fn(f64) -> bool;
+    let filters: [(&str, Test); 4] = [
+        ("ROUND(?a) = ?a", |x| xpath_round(x) == x),
+        ("!(ROUND(?a) > 0)", |x| xpath_round(x) <= 0.0 || x.is_nan()),
+        ("CEIL(?a) - FLOOR(?a) = 1", |x| x.ceil() - x.floor() == 1.0),
+        ("ABS(?a) >= 2.5", |x| x.abs() >= 2.5),
+    ];
+    for (filter, test) in filters {
+        let keeps: Vec<usize> = (0..values.len()).filter(|&id| test(values[id])).collect();
+        assert_eq!(
+            double_filter_rows(&url, &mapping, filter).await,
+            keeps,
+            "{filter}"
+        );
+    }
+    // Constants are computed before the query is sent.
+    for (constant, rounded) in [("2.5e0", 3.0), ("-2.5e0", -2.0), ("0.5e0", 1.0)] {
+        let keeps: Vec<usize> = (0..values.len())
+            .filter(|&id| values[id] == rounded)
+            .collect();
+        assert_eq!(
+            double_filter_rows(&url, &mapping, &format!("?a = ROUND({constant})")).await,
+            keeps,
+            "{constant}"
+        );
+    }
+    drop_schema(&url, "v12n_num104").await;
+}
+
 /// Doubles where IEEE 754 arithmetic has its edges: zeros of both signs,
 /// subnormals, the largest double, the infinities and NaN, and powers of
 /// two around the bounds that the SQL of each operator checks.

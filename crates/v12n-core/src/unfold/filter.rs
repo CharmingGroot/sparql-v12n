@@ -252,6 +252,14 @@ impl<'a> Context<'_, 'a> {
                     })
                     .collect())
             }
+            Expression::Numeric(function, a) => Ok(self
+                .operand(a)?
+                .into_iter()
+                .map(|(guards, leaf)| {
+                    let value = FilterValue::Numeric(*function, Box::new(leaf.value));
+                    (guards, Leaf { value, term: None })
+                })
+                .collect()),
             // One case per pair of ways the operands are bound, as for a
             // comparison.
             Expression::Arith(op, a, b) => {

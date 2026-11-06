@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# fn:round rounds halves towards positive infinity, so fn:round(-2.5) is -2:
+# row 2. PostgreSQL's round(numeric) gives -3.
+SELECT ?r WHERE { ?r ex:d ?d FILTER(ROUND(?d) = -2) }

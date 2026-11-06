@@ -1,0 +1,13 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"SELECT ?o WHERE { ?o ex:amount ?a \\\n         FILTER(ABS(?a - 500) < 100 && ROUND(?a / 3) = 33 && CEIL(?a) = ?a) }\")"
+---
+SELECT t0."id" AS "o"
+FROM "orders" t0
+WHERE ((abs((t0."amount"::numeric - $1::numeric)) < $2::int8 AND floor((t0."amount"::numeric / NULLIF($3::numeric, 0)) + 0.5) = $4::numeric) AND t0."amount"::numeric = t0."amount") AND t0."id" IS NOT NULL AND t0."amount" IS NOT NULL
+
+-- params
+$1 = "500"
+$2 = "100"
+$3 = "3"
+$4 = "33"

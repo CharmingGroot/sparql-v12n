@@ -8,7 +8,7 @@ use oxrdf::Term;
 
 use crate::dialect::{Dialect, SqlType};
 use crate::mapping::{BaseIri, LogicalTable, TemplatePart, TermType};
-use crate::sparql::{ArithOp, CompareOp, QueryForm, StrTest, TermTest};
+use crate::sparql::{ArithOp, CompareOp, NumericFunction, QueryForm, StrTest, TermTest};
 
 pub(super) const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -365,6 +365,9 @@ pub enum FilterValue {
     Arith(ArithOp, Box<FilterValue>, Box<FilterValue>),
     /// The negation of a number (op:numeric-unary-minus).
     Negate(Box<FilterValue>),
+    /// `ABS`, `ROUND`, `CEIL` or `FLOOR` of a number (SPARQL 1.1 §17.4.4),
+    /// of the number's class, and an error for anything else.
+    Numeric(NumericFunction, Box<FilterValue>),
     /// `STRLEN`: the number of characters of a string literal (SPARQL 1.1
     /// §17.4.3.2).
     StrLen(Box<FilterValue>),
@@ -396,7 +399,8 @@ impl FilterValue {
             | Self::StrLen(v)
             | Self::Substr { text: v, .. }
             | Self::UCase(v)
-            | Self::LCase(v) => v.terms(),
+            | Self::LCase(v)
+            | Self::Numeric(_, v) => v.terms(),
             Self::Arith(_, a, b) => {
                 let mut terms = a.terms();
                 terms.extend(b.terms());
@@ -417,7 +421,8 @@ impl FilterValue {
             | Self::StrLen(v)
             | Self::Substr { text: v, .. }
             | Self::UCase(v)
-            | Self::LCase(v) => v.terms_mut(),
+            | Self::LCase(v)
+            | Self::Numeric(_, v) => v.terms_mut(),
             Self::Arith(_, a, b) => {
                 let mut terms = a.terms_mut();
                 terms.extend(b.terms_mut());

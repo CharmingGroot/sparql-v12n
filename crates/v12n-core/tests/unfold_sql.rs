@@ -1030,6 +1030,27 @@ fn bind_strlen() {
     ));
 }
 
+/// `ABS`, `ROUND`, `CEIL` and `FLOOR` keep the class of their argument:
+/// an integer is its own ceiling, and a decimal rounds halves towards
+/// positive infinity as `floor(x + 0.5)`.
+#[test]
+fn filter_numeric_functions_keep_the_class_of_their_argument() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?o WHERE { ?o ex:amount ?a \
+         FILTER(ABS(?a - 500) < 100 && ROUND(?a / 3) = 33 && CEIL(?a) = ?a) }"
+    ));
+}
+
+/// A computed value of a numeric function has one result column per
+/// class of number of its argument.
+#[test]
+fn bind_numeric_functions_over_numbers() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?o (ROUND(?a / 3) AS ?r) (ABS(-?a) AS ?m) (FLOOR(?a * 1.5e0) AS ?f) \
+         WHERE { ?o ex:amount ?a }"
+    ));
+}
+
 /// A table with one column of each type whose SQL the snapshot queries
 /// above do not reach.
 const TYPED: &str = r#"

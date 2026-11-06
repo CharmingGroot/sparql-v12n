@@ -15,7 +15,7 @@ use super::{Kind, Operand, decimal_guard, is_arith};
 use crate::Error;
 use crate::dialect::{Dialect, SqlType};
 use crate::solution::canonical_double;
-use crate::sparql::{ArithOp, CompareOp};
+use crate::sparql::{ArithOp, CompareOp, NumericFunction};
 use crate::xsd::{Num, Value};
 
 /// A `float8` value as SQL.
@@ -118,6 +118,23 @@ impl Renderer<'_> {
                     ..a
                 })
             }
+            (Kind::Numeric(Num::Double), FilterValue::Numeric(function, a)) => {
+                let a = self.double(a)?;
+                let sql = match function {
+                    // abs, ceil and floor of a float8 cannot fail, and keep
+                    // NaN, the infinities and the sign of a zero as F&O 3.1
+                    // §4.4 requires (ceil(-0.5) is -0).
+                    NumericFunction::Abs => format!("abs({})", a.sql),
+                    NumericFunction::Ceil => format!("ceil({})", a.sql),
+                    NumericFunction::Floor => format!("floor({})", a.sql),
+                    NumericFunction::Round => {
+                        let dialect = self.dialect;
+                        let sql = bind(&[&a], |o| round(dialect, o[0]));
+                        return Ok(Double::computed(sql, a.nan));
+                    }
+                };
+                Ok(Double { sql, ..a })
+            }
             (Kind::Numeric(_), _) if is_arith(value) => self.promoted(value),
             _ => Ok(self.leaf_double(value)),
         }
@@ -196,6 +213,17 @@ impl Renderer<'_> {
             }
             FilterValue::Negate(a) if self.operand(value).kind == Kind::Numeric(Num::Double) => {
                 Some(-self.constant_double(a)?)
+            }
+            FilterValue::Numeric(function, a)
+                if self.operand(value).kind == Kind::Numeric(Num::Double) =>
+            {
+                let a = self.constant_double(a)?;
+                Some(match function {
+                    NumericFunction::Abs => a.abs(),
+                    NumericFunction::Ceil => a.ceil(),
+                    NumericFunction::Floor => a.floor(),
+                    NumericFunction::Round => round_half_up(a),
+                })
             }
             _ => None,
         }
@@ -405,6 +433,38 @@ fn divide(dialect: &dyn Dialect, a: &str, b: &str) -> String {
         signed(dialect, &opposite, f64::INFINITY),
         signed(dialect, &opposite, 0.0)
     )
+}
+
+/// fn:round of a double (F&O 3.1 §4.4.4): the integer nearest to `x`, of
+/// two the one towards positive infinity, and `-0` for `x` from -0.5 to
+/// -0. NaN, the infinities and values of 2^52 or more in magnitude, which
+/// are integers, are their own rounding.
+///
+/// PostgreSQL's round(float8) rounds halves to even, and `floor(x + 0.5)`
+/// is wrong where the sum rounds, as for 0.49999999999999994 and 2^52 + 1.
+/// `x - floor(x)` and `floor(x) + 1` are exact below 2^52. `abs(x) < 2^52`
+/// is false for NaN, which PostgreSQL orders above every number.
+fn round(dialect: &dyn Dialect, x: &str) -> String {
+    format!(
+        "CASE WHEN NOT (abs({x}) < {}) THEN {x} WHEN {x} < 0 AND {x} >= {} THEN {} \
+         WHEN {x} - floor({x}) >= {} THEN floor({x}) + 1 ELSE floor({x}) END",
+        literal(dialect, 2f64.powi(52)),
+        literal(dialect, -0.5),
+        literal(dialect, -0.0),
+        literal(dialect, 0.5),
+    )
+}
+
+/// [`round`] in Rust, for constants.
+fn round_half_up(x: f64) -> f64 {
+    if x.is_nan() || x.abs() >= 2f64.powi(52) {
+        return x;
+    }
+    if (-0.5..0.0).contains(&x) {
+        return -0.0;
+    }
+    let floor = x.floor();
+    if x - floor >= 0.5 { floor + 1.0 } else { floor }
 }
 
 /// The `numeric` decimal `d` promoted to a double: the nearest double,

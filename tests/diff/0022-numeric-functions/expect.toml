@@ -1,0 +1,36 @@
+# RAND has a new value in every call, so results differ per row and per
+# run (SPARQL 1.1 §17.4.4.5).
+[query.rand]
+expect = "rejected"
+
+# Numeric functions in ORDER BY come with the other expressions there (#108).
+[query.order-by-abs]
+expect = "rejected"
+
+# fn:round rounds halves towards positive infinity (XPath F&O 3.1 §4.4.4).
+# Ontop uses PostgreSQL's round, which rounds a numeric half away from
+# zero (round(-2.5) is -3, round(-0.5) is -1) and a float8 half to even
+# (round(2.5e0) is 2, round(0.5e0) is 0) (#104).
+[query.round-decimal-negative-half]
+expect = "mismatch"
+issue = 104
+
+[query.round-decimal-small-halves]
+expect = "mismatch"
+issue = 104
+
+[query.round-double-positive-half]
+expect = "mismatch"
+issue = 104
+
+[query.round-double-small-half]
+expect = "mismatch"
+issue = 104
+
+[query.round-double-negative-zero]
+expect = "mismatch"
+issue = 104
+
+[query.select-round-decimal]
+expect = "mismatch"
+issue = 104

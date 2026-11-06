@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# fn:round(0.5e0) is 1: row 3. PostgreSQL's round(float8) gives 0.
+SELECT ?r WHERE { ?r ex:f ?f FILTER(ROUND(?f) = 1) }

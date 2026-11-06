@@ -150,6 +150,8 @@ pub enum Expression {
     /// Unary minus of an expression that is not a numeric literal
     /// (op:numeric-unary-minus).
     Negate(Box<Expression>),
+    /// `ABS`, `ROUND`, `CEIL` or `FLOOR` (SPARQL 1.1 §17.4.4) of a number.
+    Numeric(NumericFunction, Box<Expression>),
     /// `IF(cond, a, b)` (SPARQL 1.1 §17.4.1.2): `a` where the effective
     /// boolean value of `cond` is true, `b` where it is false, and an
     /// error where it is an error.
@@ -208,7 +210,8 @@ impl Expression {
             | Self::StrLen(a)
             | Self::Substr(a, _, _)
             | Self::UCase(a)
-            | Self::LCase(a) => a.collect_variables(out),
+            | Self::LCase(a)
+            | Self::Numeric(_, a) => a.collect_variables(out),
             Self::If(c, a, b) => {
                 c.collect_variables(out);
                 a.collect_variables(out);
@@ -235,6 +238,7 @@ impl Expression {
                 | Self::Datatype(_)
                 | Self::Arith(..)
                 | Self::Negate(_)
+                | Self::Numeric(..)
                 | Self::If(..)
                 | Self::Coalesce(_)
                 | Self::StrLen(_)
@@ -274,6 +278,21 @@ impl ArithOp {
             Self::Divide => "/",
         }
     }
+}
+
+/// The numeric functions of SPARQL 1.1 §17.4.4 other than `RAND`. The
+/// result has the class of the argument: an integer for an integer, a
+/// decimal for a decimal and a double for a double (XPath F&O 3.1 §4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericFunction {
+    /// `fn:abs`.
+    Abs,
+    /// `fn:round`, which rounds halves towards positive infinity.
+    Round,
+    /// `fn:ceiling`.
+    Ceil,
+    /// `fn:floor`.
+    Floor,
 }
 
 /// The relational operators of SPARQL 1.1 §17.3, `!=` aside.
@@ -686,7 +705,8 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
         | Expression::Variable(_)
         | Expression::Arith(..)
         | Expression::Negate(_)
-        | Expression::StrLen(_) => return Ok(expression),
+        | Expression::StrLen(_)
+        | Expression::Numeric(..) => return Ok(expression),
         // The value of a computed variable is a number in SQL, so every
         // result must be one or an error.
         Expression::If(..) | Expression::Coalesce(_) if numeric_results(&expression) => {
@@ -723,7 +743,10 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
 /// error.
 fn numeric_results(expression: &Expression) -> bool {
     match expression {
-        Expression::Arith(..) | Expression::Negate(_) | Expression::StrLen(_) => true,
+        Expression::Arith(..)
+        | Expression::Negate(_)
+        | Expression::StrLen(_)
+        | Expression::Numeric(..) => true,
         Expression::Constant(Term::Literal(literal)) => matches!(
             crate::xsd::value(literal.value(), literal.datatype().as_str()),
             crate::xsd::Value::Numeric(_)
@@ -1045,6 +1068,19 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
                 }
             }
         }
+        // RAND has a new value in every call (SPARQL 1.1 §17.4.4.5), so
+        // results differ per row and per run, and no other engine can
+        // confirm them.
+        SparqlExpression::FunctionCall(Function::Rand, _) => {
+            return Err(unsupported("RAND, whose value differs per row and per run"));
+        }
+        // Expressions in ORDER BY come with #108.
+        SparqlExpression::FunctionCall(
+            function @ (Function::Abs | Function::Round | Function::Ceil | Function::Floor),
+            _,
+        ) if matches!(site, Site::OrderBy) => {
+            return Err(in_site(&format!("{function}")));
+        }
         // Expressions in ORDER BY come with #108.
         SparqlExpression::FunctionCall(
             function @ (Function::StrLen
@@ -1075,12 +1111,17 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
                     | Function::IsLiteral
                     | Function::Str
                     | Function::Lang
-                    | Function::Datatype => {
+                    | Function::Datatype
+                    | Function::Abs
+                    | Function::Round
+                    | Function::Ceil
+                    | Function::Floor => {
                         Error::QuerySyntax(format!("{function} takes one argument"))
                     }
                     other => in_site(&format!("the {other} function")),
                 });
             };
+            let numeric = |f| Ok::<_, Error>(Expression::Numeric(f, operand(arg)?));
             match function {
                 Function::IsIri => Expression::Test(TermTest::IsIri, operand(arg)?),
                 Function::IsBlank => Expression::Test(TermTest::IsBlank, operand(arg)?),
@@ -1088,6 +1129,10 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
                 Function::Str => Expression::Str(operand(arg)?),
                 Function::Lang => Expression::Lang(operand(arg)?),
                 Function::Datatype => Expression::Datatype(operand(arg)?),
+                Function::Abs => numeric(NumericFunction::Abs)?,
+                Function::Round => numeric(NumericFunction::Round)?,
+                Function::Ceil => numeric(NumericFunction::Ceil)?,
+                Function::Floor => numeric(NumericFunction::Floor)?,
                 other => return Err(in_site(&format!("the {other} function"))),
             }
         }
@@ -1836,6 +1881,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_numeric_functions() {
+        let q = parse_ok(
+            "SELECT * WHERE { ?o ex:amount ?a FILTER(ROUND(?a / 2) = ABS(-?a) && CEIL(FLOOR(?a))) }",
+        );
+        let Pattern::Filter(_, Expression::And(compare, ebv)) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        let Expression::Compare(CompareOp::Equal, round, abs) = compare.as_ref() else {
+            panic!("{compare:?}")
+        };
+        assert_eq!(
+            **round,
+            Expression::Numeric(
+                NumericFunction::Round,
+                Box::new(Expression::Arith(
+                    ArithOp::Divide,
+                    variable("a"),
+                    integer(2)
+                ))
+            )
+        );
+        assert_eq!(
+            **abs,
+            Expression::Numeric(
+                NumericFunction::Abs,
+                Box::new(Expression::Negate(variable("a")))
+            )
+        );
+        assert_eq!(
+            **ebv,
+            Expression::Numeric(
+                NumericFunction::Ceil,
+                Box::new(Expression::Numeric(NumericFunction::Floor, variable("a")))
+            )
+        );
+        assert!(ebv.is_term());
+        assert_eq!(ebv.variables(), ["a"]);
+
+        // A number or an error, as the value of BIND and SELECT.
+        let q = parse_ok(
+            "SELECT ?o (ROUND(?a) AS ?r) (COALESCE(ABS(?a), 0) AS ?m) \
+             WHERE { ?o ex:amount ?a BIND(FLOOR(?a * 1.5) AS ?f) }",
+        );
+        assert_eq!(q.bindings.len(), 3);
+    }
+
+    #[test]
     fn parse_unsupported_features_are_rejected_by_name() {
         let cases = [
             (
@@ -1909,6 +2001,26 @@ mod tests {
             (
                 "SELECT * WHERE { ?c ex:name ?n } ORDER BY COALESCE(?n, \"\")",
                 "COALESCE in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(RAND() < 1) }",
+                "RAND, whose value differs per row and per run",
+            ),
+            (
+                "SELECT ?c (RAND() AS ?x) WHERE { ?c ex:tier ?t }",
+                "RAND, whose value differs per row and per run",
+            ),
+            (
+                "SELECT * WHERE { ?o ex:amount ?a } ORDER BY ABS(?a)",
+                "ABS in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?o ex:amount ?a } ORDER BY DESC(ROUND(?a)) ?o",
+                "ROUND in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?o ex:amount ?a FILTER(ABS(?a > 1) = 1) }",
+                "expressions other than terms",
             ),
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(MD5(?t) = \"a\") }",

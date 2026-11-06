@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# fn:ceiling(-0.5e0) and fn:ceiling(-0.2e0) are -0, which equals 0: rows 4
+# and 5.
+SELECT ?r WHERE { ?r ex:f ?f FILTER(CEIL(?f) = 0) }
