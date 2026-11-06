@@ -1396,6 +1396,127 @@ async fn values_rows_match_in_the_branches_that_can_produce_them() {
     );
 }
 
+/// `MINUS` (#114) removes a solution where a solution of the right side
+/// shares a variable with it and has the same RDF term there, compared as
+/// in a join, so a string never matches an integer column and the SQL
+/// types of the two sides need not agree.
+#[tokio::test]
+async fn minus_removes_the_solutions_that_share_a_term() {
+    let Some(url) = database_url() else { return };
+    let rows = |query: &str| {
+        let url = url.clone();
+        let query = format!("PREFIX ex: <http://example.org/>\n{query}");
+        async move {
+            run(&url, Limits::default(), &plan(SHOP, &query))
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .0
+        }
+    };
+    let names =
+        |names: &[&str]| -> Vec<String> { names.iter().map(|n| format!("?n=\"{n}\"")).collect() };
+    assert_eq!(
+        rows("SELECT ?n WHERE { ?c ex:name ?n MINUS { ?c ex:tier \"VIP\" } }").await,
+        names(&["Lee"])
+    );
+    // SPARQL 1.1 §8.3.2: no variable in common removes nothing.
+    assert_eq!(
+        rows("SELECT ?n WHERE { ?c ex:name ?n MINUS { ?o ex:amount ?a } }").await,
+        names(&["Kim", "Lee", "Park"])
+    );
+    // SPARQL 1.1 §8.3.3: ?n is unbound inside MINUS.
+    assert_eq!(
+        rows("SELECT ?n WHERE { ?c ex:name ?n MINUS { ?c ex:tier ?t FILTER(?t != ?n) } }").await,
+        names(&["Kim", "Lee", "Park"])
+    );
+    let order = |id: &str| format!("?o=<http://example.org/order/{id}>");
+    assert_eq!(
+        rows("SELECT ?o WHERE { ?o ex:amount ?a MINUS { ?o ex:amount 120000 } }").await,
+        [order("1002"), order("1003"), order("1004")]
+    );
+    // Terms, not values: neither is the integer 120000.
+    for constant in ["\"120000\"", "0120000"] {
+        assert_eq!(
+            rows(&format!(
+                "SELECT ?o WHERE {{ ?o ex:amount ?a MINUS {{ ?o ex:amount {constant} }} }}"
+            ))
+            .await
+            .len(),
+            4,
+            "{constant}"
+        );
+    }
+    // An integer column against a text column.
+    assert_eq!(
+        rows("SELECT ?o WHERE { ?o ex:amount ?a MINUS { ?c ex:name ?a } }")
+            .await
+            .len(),
+        4
+    );
+}
+
+/// A variable that `OPTIONAL` leaves unbound on either side is shared
+/// only where both sides bind it, and compatible with any term where one
+/// does not (SPARQL 1.1 §18.3, §18.5 Minus).
+#[tokio::test]
+async fn minus_shares_a_variable_only_where_both_sides_bind_it() {
+    let Some(url) = database_url() else { return };
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#Person> rr:logicalTable [ rr:sqlQuery """
+            SELECT * FROM (VALUES (1, 'a'), (2, NULL), (3, 'c')) p(id, city)""" ] ;
+          rr:subjectMap [ rr:template "http://example.org/person/{id}" ; rr:class ex:Person ] ;
+          rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] .
+        <#Visit> rr:logicalTable [ rr:sqlQuery """
+            SELECT * FROM (VALUES (10, 2, 'a'), (11, 3, NULL), (12, 1, 'b')) v(id, person, city)""" ] ;
+          rr:subjectMap [ rr:template "http://example.org/visit/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:by ;
+            rr:objectMap [ rr:template "http://example.org/person/{person}" ] ] ;
+          rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] .
+    "#;
+    let rows = |query: &str| {
+        let url = url.clone();
+        let query = format!("PREFIX ex: <http://example.org/>\n{query}");
+        async move {
+            run(&url, Limits::default(), &plan(mapping, &query))
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .0
+        }
+    };
+    let person = |id: u8| format!("?p=<http://example.org/person/{id}>");
+    // Only ?c in common: person 2 has no city and shares nothing.
+    assert_eq!(
+        rows(
+            "SELECT ?p WHERE { ?p a ex:Person OPTIONAL { ?p ex:city ?c } \
+             MINUS { ?v ex:by ?q ; ex:city ?c } }"
+        )
+        .await,
+        [person(2), person(3)]
+    );
+    // ?p in common too: visit 10 is compatible with person 2, whose city
+    // is unbound.
+    assert_eq!(
+        rows(
+            "SELECT ?p WHERE { ?p a ex:Person OPTIONAL { ?p ex:city ?c } \
+             MINUS { ?v ex:by ?p ; ex:city ?c } }"
+        )
+        .await,
+        [person(1), person(3)]
+    );
+    // Unbound on the right: visit 11 has no city, so it shares only ?p
+    // with person 3 and removes it.
+    assert_eq!(
+        rows(
+            "SELECT ?p WHERE { ?p a ex:Person ; ex:city ?c \
+             MINUS { ?v ex:by ?p OPTIONAL { ?v ex:city ?c } } }"
+        )
+        .await,
+        [person(1)]
+    );
+}
+
 #[tokio::test]
 async fn constants_round_trip_through_the_result_formatting() {
     let Some(url) = database_url() else { return };

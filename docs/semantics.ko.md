@@ -660,6 +660,47 @@ SPARQL은 데이터를 그것이 쓰인 그룹의 해와 조인한다. v12n은 �
   행이 그 예다
 - 변수가 없는 `VALUES`
 
+## MINUS
+
+`A MINUS { B }`는 `B`의 어떤 해도 제거하지 않는 `A`의 해를 유지한다(SPARQL 1.1
+§8.3, §18.5 Minus). `B`의 해가 `A`의 해와 호환되고, 두 해가 모두 바인딩한 변수를
+하나 이상 공유하면 `B`의 해는 `A`의 해를 제거한다. `B`의 변수는 해에 포함되지
+않는다.
+
+`B`의 triples map 선택 하나와 `B` 안의 `UNION`의 각 쪽은 SQL에서 anti-join
+하나가 된다. anti-join은 왼쪽 행을 제거하는 경우에 `ON` 절이 참이 되는 `LEFT
+JOIN`과, `WHERE`의 해당 테이블 컬럼 하나에 대한 `IS NULL`로 구성된다. shop
+예제에서 `?o ex:placedBy ?c ; ex:amount ?a`와 `MINUS { ?c ex:tier "VIP" }`는
+다음 SQL이 된다.
+
+```sql
+FROM "orders" t0
+JOIN "orders" t1 ON t1."id" = t0."id"
+LEFT JOIN "customers" t2 ON t2."tier" = $1 AND t2."id" = t0."customer_id"
+WHERE t2."id" IS NULL AND …
+```
+
+- 공유 변수는 조인과 같이 RDF term으로 비교한다. 문자열은 같은 숫자로 된
+  정수와 같지 않고, SQL 타입이 다른 컬럼끼리도 비교할 수 있다.
+- `OPTIONAL` 부분만 바인딩하는 공유 변수는 한쪽에서 바인딩되지 않을 수 있다.
+  이 변수는 [`OPTIONAL`](#optional)과 같이 모든 값과 호환된다. 공유 변수는 두
+  쪽이 모두 바인딩한 경우에만 공유된 것으로 보므로, 모든 행에서 바인딩되는
+  공유 변수가 없으면 `ON` 절은 공유 변수 하나가 두 쪽에서 바인딩되었다는
+  조건(`IS NOT NULL`)도 요구한다.
+- 왼쪽과 공유하는 변수가 없거나 왼쪽과 호환될 수 없는 `B`의 선택은 아무것도
+  제거하지 않으며 `LEFT JOIN`을 추가하지 않는다(§8.3.2).
+- `B`는 독립적으로 평가된다(§8.3.3). `B` 안의 `FILTER`는 `B`의 변수만 보고,
+  왼쪽의 변수는 `B` 안에서 바인딩되지 않은 상태다.
+- `MINUS`는 그룹에서 `MINUS` 앞에 쓴 부분에 적용된다. `MINUS` 뒤의 패턴은
+  남은 행과 조인되고, 그룹의 `FILTER`는 그룹 전체에 적용된다.
+- 유일한 테이블이 왼쪽의 테이블이고 `NOT NULL` 고유 키로 조인되는 `LEFT JOIN`은
+  `OPTIONAL`과 같이 조인 대신 해당 행을 읽는다.
+
+다음은 미지원으로 거부한다.
+
+- `OPTIONAL`, `UNION`, 다른 `MINUS` 안의 `MINUS`
+- `MINUS` 안의 `BIND`와 `VALUES`
+
 ## ORDER BY, LIMIT, OFFSET
 
 해 수정자(solution modifier)는 algebra가 정의하는 순서대로 적용된다(SPARQL

@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# MINUS applies to the part of the group before it, then joins the rest.
+SELECT ?p ?n ?o WHERE { ?p ex:name ?n MINUS { ?p ex:city "Seoul" } ?o ex:buyer ?p }

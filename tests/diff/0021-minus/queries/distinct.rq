@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# DISTINCT over the solutions that are left.
+SELECT DISTINCT ?a WHERE { ?o ex:amount ?a MINUS { ?o ex:shipCity "Seoul" } }
