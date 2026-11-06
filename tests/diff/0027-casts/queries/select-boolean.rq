@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A computed variable holds only numbers (#100).
+SELECT ?r (xsd:boolean(?s) AS ?x) WHERE { ?r ex:s ?s }

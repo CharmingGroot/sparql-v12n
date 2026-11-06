@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# An xsd:dateTime casts to no number and no boolean: errors, also
+# under negation. No row.
+SELECT ?r WHERE { ?r ex:t ?t
+  FILTER(xsd:integer(?t) = 1 || xsd:boolean(?t) || !(xsd:double(?t) > 0)) }

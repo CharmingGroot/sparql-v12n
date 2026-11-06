@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Doubles as integers: 2, -2, 0, 0, 100000000000000000000, 0 and 3.
+SELECT ?r (xsd:integer(?f) AS ?n) WHERE { ?r ex:f ?f }

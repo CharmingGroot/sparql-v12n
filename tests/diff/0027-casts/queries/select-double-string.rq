@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Canonical doubles of strings: 4.2E1, 1.5E0, 1.0E3 and 0.0E0. Row 2,
+# with whitespace, is in string-integer-whitespace.
+SELECT ?r (xsd:double(?s) AS ?x) WHERE { ?r ex:s ?s FILTER(?r != ex:val\/2) }

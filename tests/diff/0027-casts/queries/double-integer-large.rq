@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# 1e20 is beyond int8: row 5.
+SELECT ?r WHERE { ?r ex:f ?f FILTER(xsd:integer(?f) = 100000000000000000000) }

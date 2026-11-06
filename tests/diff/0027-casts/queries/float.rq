@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# xsd:float values are not supported.
+SELECT ?r WHERE { ?r ex:f ?f FILTER(xsd:float(?f) = 2.5) }

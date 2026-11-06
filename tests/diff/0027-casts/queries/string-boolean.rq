@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# true and 0 are booleans: row 6 is true, row 7 false.
+SELECT ?r WHERE { ?r ex:s ?s FILTER(xsd:boolean(?s) || !xsd:boolean(?s)) }

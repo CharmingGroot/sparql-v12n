@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A sign is in the lexical space of xsd:integer: row 1.
+SELECT ?r WHERE { ?r ex:i ?i FILTER(?i = xsd:integer("+7")) }

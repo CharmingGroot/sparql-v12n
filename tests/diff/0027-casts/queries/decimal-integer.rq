@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A decimal loses its fraction: -2.50 is -2, row 2.
+SELECT ?r WHERE { ?r ex:d ?d FILTER(xsd:integer(?d) = -2) }

@@ -561,6 +561,53 @@ PostgreSQL은 1년 앞의 해를 -1년으로 세고 엔진은 그 해를 `0000`�
 다른 데이터타입과 마찬가지로 거부한다. `STR(TIMEZONE(?t)) = "PT0S"`는
 lexical form을 비교한다.
 
+XPath 생성자 함수 `xsd:integer`, `xsd:decimal`, `xsd:double`,
+`xsd:boolean`(SPARQL 1.1 §17.5)은 XPath F&O 1.0 §17.1의 정의대로 term을 각
+데이터타입으로 변환한다.
+
+| 원래 값 | `xsd:integer` | `xsd:decimal` | `xsd:double` | `xsd:boolean` |
+|---|---|---|---|---|
+| 문자열(단순 리터럴, `xsd:string`) | lexical form | lexical form | lexical form | `true`, `1`, `false`, `0` |
+| `xsd:integer` | 같은 값 | 같은 값 | 가장 가까운 double | 0이면 `false` |
+| `xsd:decimal` | 소수부를 버린 값 | 같은 값 | 가장 가까운 double | 0이면 `false` |
+| `xsd:double` | 소수부를 버린 값. NaN과 무한대는 오류 | 거부 | 같은 값 | 0, -0, NaN이면 `false` |
+| `xsd:boolean` | 1 또는 0 | 1 또는 0 | `1.0E0` 또는 `0.0E0` | 같은 값 |
+| `xsd:dateTime`, IRI, 언어 태그가 있는 리터럴, 그 밖의 데이터타입 | 오류 | 오류 | 오류 | 오류 |
+
+- 문자열은 앞뒤의 공백, 탭, 줄바꿈을 제거한 뒤 대상 데이터타입의 lexical
+  space(XML Schema 1.1 Part 2)로 읽는다. 패싯 `whiteSpace` `collapse`와 같은
+  처리다. `xsd:integer(" +01 ")`은 `1`, `xsd:double("1e3")`은 `1000`이고,
+  `xsd:integer("1.50")`, `xsd:integer("abc")`, `xsd:boolean("TRUE")`는
+  오류다(err:FORG0001). `xsd:double`은 `INF`, `+INF`, `-INF`, `NaN`을 읽고
+  `-0`의 부호를 유지하며, 리터럴을 읽을 때와 같이 가장 가까운 double로
+  반올림한다. 따라서 `"1e400"`은 `INF`, `"1e-400"`은 `0`이다.
+- 1000자를 넘는 문자열을 숫자 데이터타입으로 변환하면 오류다. XPath가
+  허용하는 구현의 한계다(err:FOCA0003, err:FOCA0006).
+- double의 `xsd:integer`는 크기와 관계없이 정확하다. `xsd:integer(1e20)`은
+  `100000000000000000000`이다.
+- 오류는 부정 안에서도 `FILTER`를 거짓으로 만들고, `COALESCE`는 오류를
+  건너뛴다.
+- 결과는 대상 데이터타입의 리터럴이고, `BIND`와 `SELECT`에서는 `1`,
+  `1.5`, `1.0E3` 같은 정규 표기로 쓴다([리터럴](#리터럴) 참고).
+
+SQL에서는 먼저 `COLLATE "C"`로 문자열을 lexical space의 정규식과 대조하고
+길이를 확인한다. 그다음에 `numeric`으로 변환하므로, 유효하지 않은 lexical
+form은 `NULL`이 되고 SQL 문을 실패시키지 않는다. double로 읽는 문자열은
+decimal과 같은 방식으로 `numeric`에서 변환한다. PostgreSQL의 `float8` 입력은
+`1e400`에 오류를 내기 때문이다. 다섯 자리 이상의 지수는 무한대나 0이 된다.
+double은 크기가 2^63보다 작으면 `int8`로, 그 이상이면 `int8`과 정확한 2의
+거듭제곱으로 정수가 된다. 상수의 변환은 쿼리를 보내기 전에 계산한다.
+
+다음 변환은 미지원으로 거부한다.
+
+- `xsd:double`의 `xsd:decimal`. XPath는 구현이 표현할 수 있는 decimal
+  가운데 double에 가장 가까운 값을 결과로 하며, 이 값은 엔진마다 다르다.
+- 엔진에 값이 없는 `xsd:float`, 그리고 비교와 마찬가지로 파생 정수 타입과
+  `real` 컬럼의 변환.
+- `xsd:string`, `xsd:dateTime`, 그 밖의 생성자 함수.
+- SQL이 아직 lexical form을 계산하지 않는 변환 결과에 대한 `STR`, `LANG`,
+  `DATATYPE`, `sameTerm`, 그리고 `ORDER BY` 안의 변환(#108).
+
 컬럼에 대한 `STR`과 `DATATYPE`은 조인과 마찬가지로 SQL에서 그 컬럼의 문자열
 표기나 자연 데이터타입을 알 수 있을 때 동작한다. `date`와 `timestamp`의
 무한대 값은 일반 리터럴이므로 그 `DATATYPE`은 `xsd:string`이다.
@@ -689,9 +736,9 @@ SQL에서 계산한 문자열은 모두 `COLLATE "C"`를 적용한다. 따라서
   - 1년부터 9999년 범위를 벗어나거나 마이크로초보다 정밀한 dateTime 상수
 - `RAND`, `SHA1`을 포함한 그 밖의 함수, 그리고 term(변수, 상수, 산술,
   `NOW`, 이들에 대한 `STR`, `LANG`, `DATATYPE`, `ABS`, `ROUND`, `CEIL`,
-  `FLOOR`, `IF`, `COALESCE`, 문자열 함수, 해시 함수, dateTime 함수)이 아닌
-  식을 피연산자로 쓰는 것. `IF`, `COALESCE`, `IN`의 인자로 쓰는 비교가 그
-  예다
+  `FLOOR`, `IF`, `COALESCE`, 문자열 함수, 해시 함수, dateTime 함수,
+  변환)이 아닌 식을 피연산자로 쓰는 것. `IF`, `COALESCE`, `IN`의 인자로 쓰는
+  비교가 그 예다
 - XPath와 PostgreSQL이 다른 일치를 선택할 수 있는 패턴(위 참고), 아홉
   번째 이후 그룹에 대한 참조, 상수가 아닌 패턴, 치환 문자열, 플래그를 쓰는
   `REPLACE`
@@ -725,6 +772,9 @@ SQL에서 계산한 문자열은 모두 `COLLATE "C"`를 적용한다. 따라서
 - `YEAR`, `MONTH`, `DAY`, `HOURS`, `MINUTES`는 `xsd:integer`를, `SECONDS`는
   `58.25`나 `0` 같은 `xsd:decimal`을 값으로 한다. 무한대 timestamp에서는
   `?v`를 바인딩하지 않는다.
+- `xsd:integer`, `xsd:decimal`, `xsd:double`은 각 데이터타입의 숫자를 값으로
+  한다. 정수가 아닌 이름에 대한 `xsd:integer(?name)`처럼 변환이 오류인
+  해에서는 `?v`를 바인딩하지 않는다.
 - `IF`와 `COALESCE`는 선택한 인자의 숫자를 값으로 한다.
   `COALESCE(?qty / ?n, 0)`은 `?n`이 0이거나 바인딩되지 않은 해에서 `0`이다.
   `IF(?n > 0, ?qty / ?n, 0)`은 `?n`이 바인딩되지 않은 해에서 조건이 오류이므로
@@ -739,8 +789,9 @@ SPARQL은 `BIND`를 그것이 쓰인 그룹의 해에 대해 평가한다. v12n�
 다음은 미지원으로 거부한다.
 
 - 변수, 상수, 산술, 숫자 함수, `STRLEN`, `YEAR`부터 `SECONDS`까지의 함수,
-  그리고 산술과 숫자 상수에 대한 `IF`와 `COALESCE`가 아닌 식. `STR`, 비교,
-  `IN`, `UCASE`를 비롯한 문자열 함수, 해시 함수, `TZ`, `TIMEZONE`, `NOW`,
+  `xsd:integer`, `xsd:decimal`, `xsd:double`로의 변환, 그리고 산술과 숫자
+  상수에 대한 `IF`와 `COALESCE`가 아닌 식. `STR`, 비교, `IN`, `UCASE`를
+  비롯한 문자열 함수, 해시 함수, `TZ`, `TIMEZONE`, `NOW`, `xsd:boolean`,
   결과가 임의의 term일 수 있는 `COALESCE(?x, 0)`이 그 예다. SQL에서 계산된
   변수는 숫자만 담는다
 - `OPTIONAL`이나 `UNION` 안의 `BIND`

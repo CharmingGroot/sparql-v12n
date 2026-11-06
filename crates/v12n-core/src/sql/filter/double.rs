@@ -11,12 +11,13 @@
 //! nested arithmetic stays linear in size.
 
 use super::super::{FilterValue, Renderer, SqlExpr};
+use super::cast::{self, Source};
 use super::{Kind, Operand, decimal_guard, is_arith};
 use crate::Error;
 use crate::dialect::{Dialect, SqlType};
 use crate::solution::canonical_double;
 use crate::sparql::{ArithOp, CompareOp, NumericFunction};
-use crate::xsd::{Num, Value};
+use crate::xsd::{MAX_CAST_LENGTH, Num, Value};
 
 /// A `float8` value as SQL.
 struct Double {
@@ -135,9 +136,106 @@ impl Renderer<'_> {
                 };
                 Ok(Double { sql, ..a })
             }
+            (Kind::Numeric(Num::Double), FilterValue::Cast(_, a)) => self.double_cast(a),
             (Kind::Numeric(_), _) if is_arith(value) => self.promoted(value),
             _ => Ok(self.leaf_double(value)),
         }
+    }
+
+    /// A cast to `xsd:double` of `a`: a number promoted to a double, 1 or
+    /// 0 for a boolean, and a string read in the lexical space of
+    /// `xsd:double` (XPath F&O 1.0 §17.1.1, §17.1.3.2).
+    fn double_cast(&mut self, a: &FilterValue) -> Result<Double, Error> {
+        match cast::source(&self.operand(a)) {
+            Source::Number(_) => self.double(a),
+            Source::Boolean => {
+                let boolean = self.rendered(|this| this.boolean_value(a))?;
+                let sql = format!(
+                    "CASE {boolean} WHEN true THEN {} WHEN false THEN {} END",
+                    literal(self.dialect, 1.0),
+                    literal(self.dialect, 0.0)
+                );
+                Ok(Double::computed(sql, false))
+            }
+            Source::String => {
+                let sql = self.rendered(|this| this.string_double(a))?;
+                Ok(Double::computed(sql, true))
+            }
+            Source::Error => Ok(Double::simple(
+                self.dialect.cast("NULL", &SqlType::Double),
+                false,
+            )),
+            Source::Unsupported(reason) => Err(super::unsupported(&reason)),
+        }
+    }
+
+    /// A string as a double: the nearest double to the decimal it writes,
+    /// with the sign of a zero and an infinity or a zero beyond the range
+    /// (XML Schema 1.1 Part 2 §3.3.5.2, `floatingPointRound`). PostgreSQL's
+    /// `float8` input raises an error there instead, so the value is read
+    /// as `numeric` and rounded as decimals are. Within the length limit,
+    /// an exponent of five digits or more decides an infinity or a zero.
+    fn string_double(&mut self, a: &FilterValue) -> Result<(), Error> {
+        let valid = self.matches("s", cast::DOUBLE);
+        let negative = self.matches("s", "^[\\t\\n\\r ]*-");
+        let nan = self.matches("s", "NaN");
+        let infinite = self.matches("s", "INF");
+        let large = self.matches("s", "[eE][+]?0*[1-9][0-9]{4}");
+        let small = self.matches("s", "[eE]-0*[1-9][0-9]{4}");
+        let zero = self.matches("s", "^[\\t\\n\\r ]*[+-]?[0.]*([eE]|[\\t\\n\\r ]*$)");
+        let dialect = self.dialect;
+        let infinity = signed(dialect, "n", f64::INFINITY);
+        let signed_zero = signed(dialect, "n", 0.0);
+        let finite = format!(
+            "(SELECT CASE WHEN d = 0 THEN {signed_zero} ELSE {} END FROM (SELECT {} AS d) AS r)",
+            from_numeric(dialect, "d", None),
+            dialect.cast("s", &SqlType::Numeric)
+        );
+        let body = format!(
+            "CASE WHEN v THEN CASE WHEN {nan} THEN {} WHEN {infinite} THEN {infinity} \
+             WHEN {zero} OR {small} THEN {signed_zero} WHEN {large} THEN {infinity} \
+             ELSE {finite} END END",
+            literal(dialect, f64::NAN),
+        );
+        let length = dialect.char_length("s");
+        let flags = format!(
+            "(SELECT {body} FROM (SELECT {length} <= {MAX_CAST_LENGTH} AND {valid} AS v, \
+             {negative} AS n) AS f)"
+        );
+        self.with_string(a, &flags)
+    }
+
+    /// A double as an `xsd:integer`, its fraction discarded, in `numeric`;
+    /// an error for NaN and the infinities (XPath F&O 1.0 §17.1.3.4,
+    /// err:FOCA0002). Below 2^63 in magnitude `int8` holds the integer
+    /// exactly. Above, the double is an integer, and scaled by a power of
+    /// two to between 2^56 and 2^60 it is still one, exactly, so `int8`
+    /// holds it and `numeric` scales it back exactly.
+    pub(super) fn integer_of_double(&mut self, a: &FilterValue) -> Result<(), Error> {
+        let x = self.double(a)?;
+        let dialect = self.dialect;
+        let sql = bind(&[&x], |o| {
+            let x = o[0];
+            let int8 = |e: &str| dialect.cast(e, &SqlType::BigInt);
+            let numeric = |e: &str| dialect.cast(e, &SqlType::Numeric);
+            let two = dialect.cast("2", &SqlType::Double);
+            let scale = dialect.cast(
+                &format!("(floor(ln(abs({x})) / ln({two})) - 57)"),
+                &SqlType::Integer,
+            );
+            format!(
+                "CASE WHEN {x} >= {} AND {x} < {} THEN {} WHEN abs({x}) <= {} THEN \
+                 (SELECT trunc({} * {} ^ e) FROM (SELECT {scale} AS e) AS p) END",
+                literal(dialect, -(2f64.powi(63))),
+                literal(dialect, 2f64.powi(63)),
+                numeric(&int8(&format!("trunc({x})"))),
+                literal(dialect, f64::MAX),
+                numeric(&int8(&format!("({x} / {two} ^ e)"))),
+                dialect.cast("2", &SqlType::Numeric),
+            )
+        });
+        self.sql.push_str(&sql);
+        Ok(())
     }
 
     fn double_arith(

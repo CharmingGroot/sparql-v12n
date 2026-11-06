@@ -17,8 +17,8 @@ use crate::mapping::{
     TermMapValue, TermType, TriplesMap,
 };
 use crate::sparql::{
-    ArithOp, DateTimeFunction, Expression, InlineData, Pattern, PatternTerm, QueryForm, RDF_TYPE,
-    SelectQuery, TriplePattern,
+    ArithOp, Cast, DateTimeFunction, Expression, InlineData, Pattern, PatternTerm, QueryForm,
+    RDF_TYPE, SelectQuery, TriplePattern,
 };
 use crate::sql::{
     Condition, LeftJoin, OrderKey, ProjectedTerm, ResultTerm, ResultValue, SqlBranch, SqlExpr,
@@ -1913,10 +1913,11 @@ fn value_kinds(expression: &Expression) -> Vec<ValueKind> {
 }
 
 /// Whether the expression reads a variable other than through a function
-/// of SPARQL 1.1 §17.4.5, whose results are never doubles.
+/// of SPARQL 1.1 §17.4.5 or a cast, whose results are never doubles or
+/// always are.
 fn reads_numbers(expression: &Expression) -> bool {
     match expression {
-        Expression::DateTime(..) => false,
+        Expression::DateTime(..) | Expression::Cast(..) => false,
         Expression::Arith(_, a, b) => reads_numbers(a) || reads_numbers(b),
         Expression::Negate(inner) | Expression::Numeric(_, inner) => reads_numbers(inner),
         Expression::If(c, a, b) => {
@@ -1935,6 +1936,9 @@ fn exact_kinds(expression: &Expression) -> Vec<ValueKind> {
         Expression::DateTime(..) => return vec![ValueKind::Integer],
         Expression::Negate(inner) | Expression::Numeric(_, inner) => return exact_kinds(inner),
         Expression::StrLen(_) => return vec![ValueKind::Integer],
+        Expression::Cast(Cast::Integer, _) => return vec![ValueKind::Integer],
+        Expression::Cast(Cast::Decimal, _) => return vec![ValueKind::Decimal],
+        Expression::Cast(..) => return Vec::new(),
         Expression::If(_, a, b) => vec![a, b],
         Expression::Coalesce(args) => args.iter().collect(),
         _ => return vec![ValueKind::Integer, ValueKind::Decimal],
@@ -1962,8 +1966,11 @@ fn chooses_double(expression: &Expression) -> bool {
     }
 }
 
+/// Whether the expression is a double wherever it is a number: a double
+/// constant, a cast to `xsd:double`, or arithmetic with one.
 fn has_double_constant(expression: &Expression) -> bool {
     match expression {
+        Expression::Cast(cast, _) => *cast == Cast::Double,
         Expression::Constant(Term::Literal(literal)) => matches!(
             crate::xsd::value(literal.value(), literal.datatype().as_str()),
             crate::xsd::Value::Numeric(n) if n.class == crate::xsd::Num::Double

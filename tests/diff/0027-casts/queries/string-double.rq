@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# 1e3 is the double 1000: row 4.
+SELECT ?r WHERE { ?r ex:s ?s FILTER(xsd:double(?s) = 1000) }

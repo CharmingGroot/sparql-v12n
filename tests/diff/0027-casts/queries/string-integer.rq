@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A string in the lexical space of xsd:integer: row 1.
+SELECT ?r WHERE { ?r ex:s ?s FILTER(xsd:integer(?s) = 42) }

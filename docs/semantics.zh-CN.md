@@ -292,6 +292,32 @@ PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运�
 
 对来自 `date` 与 `time` 列或常量的 `xsd:date` 与 `xsd:time` 值，`YEAR` 等函数作为不支持的功能拒绝。SPARQL 1.1 仅为 `xsd:dateTime` 定义这些函数，而扩展它们的引擎结果各不相同。`TIMEZONE` 的结果与 `xsd:dayTimeDuration` 常量的比较与运算符映射之外的其他数据类型一样被拒绝；`STR(TIMEZONE(?t)) = "PT0S"` 比较其词法形式。
 
+XPath 构造函数 `xsd:integer`、`xsd:decimal`、`xsd:double` 与 `xsd:boolean`（SPARQL 1.1 §17.5）按 XPath F&O 1.0 §17.1 的定义将 term 转换为各自的数据类型：
+
+| 源 | `xsd:integer` | `xsd:decimal` | `xsd:double` | `xsd:boolean` |
+|---|---|---|---|---|
+| 字符串（简单字面量、`xsd:string`） | 词法形式 | 词法形式 | 词法形式 | `true`、`1`、`false`、`0` |
+| `xsd:integer` | 自身 | 相同的值 | 最接近的 double | 0 为 `false` |
+| `xsd:decimal` | 舍去小数部分 | 自身 | 最接近的 double | 0 为 `false` |
+| `xsd:double` | 舍去小数部分；NaN 与无穷为错误 | 拒绝 | 自身 | 0、-0 与 NaN 为 `false` |
+| `xsd:boolean` | 1 或 0 | 1 或 0 | `1.0E0` 或 `0.0E0` | 自身 |
+| `xsd:dateTime`、IRI、带语言标签的字面量、其他数据类型 | 错误 | 错误 | 错误 | 错误 |
+
+- 字符串在去除前后的空格、制表符与换行之后，按目标数据类型的词法空间（XML Schema 1.1 Part 2）读取，与 `whiteSpace` 刻面 `collapse` 相同。`xsd:integer(" +01 ")` 为 `1`，`xsd:double("1e3")` 为 `1000`，`xsd:integer("1.50")`、`xsd:integer("abc")` 与 `xsd:boolean("TRUE")` 为错误（err:FORG0001）。`xsd:double` 读取 `INF`、`+INF`、`-INF` 与 `NaN`，保留 `-0` 的符号，并像读取字面量一样舍入到最接近的 double，因此 `"1e400"` 为 `INF`，`"1e-400"` 为 `0`。
+- 超过 1000 个字符的字符串转换为数值数据类型时为错误，这是 XPath 允许的实现限制（err:FOCA0003、err:FOCA0006）。
+- double 的 `xsd:integer` 在任何量级上都是精确的：`xsd:integer(1e20)` 为 `100000000000000000000`。
+- 错误在否定之下也使 `FILTER` 为假，`COALESCE` 跳过错误。
+- 结果是目标数据类型的字面量，在 `BIND` 与 `SELECT` 中以规范形式写出（见[字面量](#字面量)）：`1`、`1.5`、`1.0E3`。
+
+在 SQL 中，字符串先在 `COLLATE "C"` 下与词法空间的正则表达式匹配并检查长度，之后才转换为 `numeric`，因此无效的词法形式为 `NULL`，不会使语句失败。读取为 double 的字符串像 decimal 一样从 `numeric` 转换，因为 PostgreSQL 的 `float8` 输入对 `1e400` 报错；五位及以上的指数给出无穷或零。double 的绝对值小于 2^63 时经 `int8` 转为整数，更大时经 `int8` 与精确的 2 的幂转为整数。常量的转换在发送查询之前计算。
+
+以下转换作为不支持的功能拒绝：
+
+- `xsd:double` 的 `xsd:decimal`。XPath 取实现能够表示的 decimal 中最接近该 double 的值，各引擎的结果不同。
+- 引擎没有其值的 `xsd:float`，以及与比较相同的派生整数类型与 `real` 列的转换。
+- `xsd:string`、`xsd:dateTime` 与其他构造函数。
+- SQL 尚未计算其词法形式的转换结果的 `STR`、`LANG`、`DATATYPE` 与 `sameTerm`，以及 `ORDER BY` 中的转换（#108）。
+
 列的 `STR` 与 `DATATYPE` 在其词法形式或自然数据类型可在 SQL 中确定时可用，与连接相同。`date` 与 `timestamp` 的无穷值是普通字面量，因此其 `DATATYPE` 为 `xsd:string`。
 
 `REGEX` 将 XPath 正则表达式翻译为匹配结果相同的 PostgreSQL 模式。该模式在 `COLLATE "C"` 下以 `~` 应用。
@@ -342,7 +368,7 @@ PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运�
   - `rr:datatype` 为该列自然数据类型以外的数值、布尔或 dateTime 数据类型的列的值；
   - `xsd:float` 与派生整数类型；
   - 超出公元 1 至 9999 年范围或精度细于微秒的 dateTime 常量；
-- 包括 `RAND` 与 `SHA1` 在内的其他函数，以及以 term（变量、常量、算术、`NOW`，以及它们的 `STR`、`LANG`、`DATATYPE`、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、字符串函数、哈希函数或 dateTime 函数）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
+- 包括 `RAND` 与 `SHA1` 在内的其他函数，以及以 term（变量、常量、算术、`NOW`，以及它们的 `STR`、`LANG`、`DATATYPE`、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、字符串函数、哈希函数、dateTime 函数或转换）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
 - 模式的匹配在 XPath 与 PostgreSQL 中可能不同、引用第九个之后的分组，或模式、替换字符串、标志不是常量的 `REPLACE`；
 - 非常量或不是 `xsd:integer`（例如 `1.5`）的 `SUBSTR` 起始位置与长度：SPARQL 1.1 中为类型错误，而像 `fn:substring` 那样取整的引擎会给出答案；
 - 作用于 `date` 或 `timestamp` 列的字符串函数与哈希函数，其无穷值为 plain literal；
@@ -364,7 +390,7 @@ SPARQL 在 `BIND` 所在组的解上对其求值。v12n 在连接之后，在整
 
 以下情形作为不支持的功能拒绝：
 
-- 变量、常量、算术、数值函数、`STRLEN`、`YEAR` 至 `SECONDS`，以及对算术与数值常量的 `IF` 与 `COALESCE` 以外的表达式，例如 `STR`、比较、`IN`、`UCASE` 等字符串函数、哈希函数、`TZ`、`TIMEZONE`、`NOW`，以及结果可以是任意 term 的 `COALESCE(?x, 0)`。在 SQL 中，计算得到的变量只保存数值；
+- 变量、常量、算术、数值函数、`STRLEN`、`YEAR` 至 `SECONDS`、到 `xsd:integer`、`xsd:decimal` 与 `xsd:double` 的转换，以及对算术与数值常量的 `IF` 与 `COALESCE` 以外的表达式，例如 `STR`、比较、`IN`、`UCASE` 等字符串函数、哈希函数、`TZ`、`TIMEZONE`、`NOW`、`xsd:boolean`，以及结果可以是任意 term 的 `COALESCE(?x, 0)`。在 SQL 中，计算得到的变量只保存数值；
 - `OPTIONAL` 或 `UNION` 内部的 `BIND`；
 - 对其所在组可能未绑定、而模式后续部分会绑定的变量使用 `BIND`；
 - 在三元组模式、`FILTER`、`ORDER BY` 或其他表达式中使用由 `BIND` 或 `SELECT` 计算的变量。

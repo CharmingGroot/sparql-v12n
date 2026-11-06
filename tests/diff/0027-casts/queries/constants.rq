@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# Constants are cast before the query is sent: row 1.
+SELECT ?r WHERE { ?r ex:i ?i FILTER(?i = xsd:integer("07") && xsd:boolean("1")) }
