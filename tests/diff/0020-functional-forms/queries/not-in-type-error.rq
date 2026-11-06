@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# Every row but the one with 7 compares a number with a string, an error
+# (SPARQL 1.1 §17.4.1.10), so no row is kept.
+SELECT ?r WHERE { ?r ex:a ?a FILTER(?a NOT IN (7, "x")) }

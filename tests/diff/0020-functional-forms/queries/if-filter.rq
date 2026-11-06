@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?r WHERE { ?r ex:a ?a ; ex:b ?b FILTER(IF(?a > 5, ?a, ?b) > 4) }

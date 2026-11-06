@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# An empty list: IN is false and NOT IN is true (SPARQL 1.1 §17.4.1.9,
+# §17.4.1.10).
+SELECT ?r WHERE { ?r ex:a ?a FILTER(?a IN ()) }

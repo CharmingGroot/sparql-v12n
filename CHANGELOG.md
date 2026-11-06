@@ -14,6 +14,10 @@ Design decisions are recorded in the `Decision:` Discussions.
   whose subject templates can produce the same IRI. Each warning is a
   `warning: ...` line on stderr and an entry of `warnings` in JSON, and
   the exit code stays 0.
+- `IF`, `COALESCE`, `IN` and `NOT IN` in `FILTER`, with the error rules of
+  SPARQL 1.1 §17.4.1, and `IF` and `COALESCE` over numbers in `BIND` and
+  `SELECT (expr AS ?v)`. `IN` over constants keeps a comparison of the
+  column that an index can serve.
 - `BIND` and `SELECT (expr AS ?v)` over variables, constants and arithmetic
   on integers and decimals. An error leaves the variable unbound.
 - Arithmetic on `xsd:double` values in `FILTER`, `BIND` and `SELECT`, with

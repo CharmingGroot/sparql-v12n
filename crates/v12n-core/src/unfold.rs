@@ -1444,13 +1444,15 @@ enum Computed<'q> {
 /// The classes of number an arithmetic expression can give, by XPath's
 /// type promotion: a double constant makes every enclosing result a
 /// double; otherwise a division gives a decimal (op:numeric-divide), and
-/// a variable may be a double column.
+/// a variable may be a double column. A result of `IF` or `COALESCE` is
+/// one of their arguments, so a double constant there does not make the
+/// whole result a double.
 fn value_kinds(expression: &Expression) -> Vec<ValueKind> {
     if has_double_constant(expression) {
         return vec![ValueKind::Double];
     }
     let mut kinds = exact_kinds(expression);
-    if !expression.variables().is_empty() {
+    if !expression.variables().is_empty() || chooses_double(expression) {
         kinds.push(ValueKind::Double);
     }
     kinds
@@ -1458,10 +1460,33 @@ fn value_kinds(expression: &Expression) -> Vec<ValueKind> {
 
 /// The classes of an arithmetic expression over integers and decimals.
 fn exact_kinds(expression: &Expression) -> Vec<ValueKind> {
+    let choices: Vec<&Expression> = match expression {
+        Expression::Arith(ArithOp::Divide, ..) => return vec![ValueKind::Decimal],
+        Expression::Negate(inner) => return exact_kinds(inner),
+        Expression::If(_, a, b) => vec![a, b],
+        Expression::Coalesce(args) => args.iter().collect(),
+        _ => return vec![ValueKind::Integer, ValueKind::Decimal],
+    };
+    let kinds: Vec<ValueKind> = choices.into_iter().flat_map(exact_kinds).collect();
+    [ValueKind::Integer, ValueKind::Decimal]
+        .into_iter()
+        .filter(|k| kinds.contains(k))
+        .collect()
+}
+
+/// Whether an argument of `IF` or `COALESCE` in the expression can be a
+/// double.
+fn chooses_double(expression: &Expression) -> bool {
     match expression {
-        Expression::Arith(ArithOp::Divide, ..) => vec![ValueKind::Decimal],
-        Expression::Negate(inner) => exact_kinds(inner),
-        _ => vec![ValueKind::Integer, ValueKind::Decimal],
+        Expression::Arith(_, a, b) => chooses_double(a) || chooses_double(b),
+        Expression::Negate(inner) => chooses_double(inner),
+        Expression::If(_, a, b) => [a, b]
+            .iter()
+            .any(|e| has_double_constant(e) || chooses_double(e)),
+        Expression::Coalesce(args) => args
+            .iter()
+            .any(|e| has_double_constant(e) || chooses_double(e)),
+        _ => false,
     }
 }
 

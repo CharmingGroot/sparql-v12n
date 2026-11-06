@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# An unbound variable is an error.
+SELECT ?r WHERE { ?r ex:a ?a OPTIONAL { ?r ex:opt ?o } FILTER(?o IN (10, -1)) }
