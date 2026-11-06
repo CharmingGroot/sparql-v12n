@@ -735,8 +735,8 @@ differently from engines that extend SPARQL:
   - `xsd:float` and the derived integer types;
   - dateTime constants outside the years 1 to 9999, or finer than a
     microsecond;
-- other functions, `RAND` among them, `EXISTS`, and expressions other
-  than terms (variables, constants, arithmetic, `NOW`, and `STR`, `LANG`,
+- other functions, `RAND` among them, and expressions other than terms
+  (variables, constants, arithmetic, `NOW`, and `STR`, `LANG`,
   `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`, `IF`, `COALESCE`, the
   functions on strings or the functions of dateTimes of them) as operands,
   such as a comparison as an argument of `IF`, `COALESCE` or `IN`;
@@ -899,6 +899,52 @@ The following are rejected as unsupported:
 
 - `MINUS` inside `OPTIONAL`, inside `UNION`, and inside another `MINUS`;
 - `BIND` and `VALUES` inside `MINUS`.
+
+## EXISTS and NOT EXISTS
+
+`FILTER EXISTS { P }` keeps the solutions for which `P` has a solution
+once the variables of the solution are replaced by their values (SPARQL
+1.1 §8.1, §18.6 substitute). `FILTER NOT EXISTS { P }` keeps the others.
+Both combine with other conditions through `&&`, `||` and `!`, and are
+never an error. The variables of `P` are not in the solutions.
+
+Each choice of triples maps for `P`, and each side of a `UNION` in it, is
+a correlated `EXISTS` subquery in SQL, and `EXISTS` holds where one of
+them has a row. In the shop example, `?c ex:name ?n` with
+`FILTER EXISTS { ?o ex:placedBy ?c ; ex:amount ?a }` gives the following.
+
+```sql
+FROM "customers" t0
+WHERE EXISTS (SELECT 1 FROM "orders" t1
+JOIN "orders" t2 ON t2."id" = t1."id" WHERE t1."customer_id" = t0."id" AND …) AND …
+```
+
+- A variable of the solution that `P` binds is compared with its value as
+  an RDF term, as in joins. A string is never the integer of the same
+  digits, and columns of different SQL types can be compared.
+- A `FILTER` inside `P` reads the values of the solution's variables,
+  also in a group of `P` that does not bind them. The right side of
+  `MINUS` does not see them (§8.3.3).
+- A `P` that shares no variable with the solution is tested on its own.
+  `NOT EXISTS` of a pattern with solutions removes every solution, while
+  `MINUS` removes none (§8.3.2).
+- In the `FILTER` of `OPTIONAL`, the subquery is in the `ON` clause and
+  reads the variables of both sides (§18.5 LeftJoin).
+- `OPTIONAL` and `UNION` inside `P` are supported.
+- A choice of `P` whose terms can never be those of the solution adds no
+  subquery. `EXISTS` without any subquery is false.
+
+The following are rejected as unsupported, since substitution and a join
+with the solution give different answers there, or no case tests them:
+
+- `EXISTS` over a variable that `OPTIONAL` may leave unbound in the
+  solutions it filters;
+- `EXISTS` over a variable of the solution that `P` binds only inside
+  `OPTIONAL`;
+- `MINUS`, `BIND`, `VALUES`, subqueries and `EXISTS` inside `P`, and a `P`
+  without triple patterns;
+- `EXISTS` inside `MINUS` and inside the condition of `IF`;
+- `EXISTS` in `BIND`, `SELECT` expressions and `ORDER BY`.
 
 ## ORDER BY, LIMIT and OFFSET
 

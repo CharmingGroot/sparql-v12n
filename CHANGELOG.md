@@ -62,6 +62,15 @@ Design decisions are recorded in the `Decision:` Discussions.
   variables that `OPTIONAL` leaves unbound on either side follow
   SPARQL 1.1 §18.5. `MINUS` inside `OPTIONAL`, `UNION` or another `MINUS`,
   and `BIND` or `VALUES` inside `MINUS`, are rejected.
+- `EXISTS` and `NOT EXISTS` in `FILTER` (#115), also with `&&`, `||` and
+  `!` and in the `FILTER` of `OPTIONAL`, as correlated `EXISTS`
+  subqueries. The variables of the solution are substituted in the
+  pattern (SPARQL 1.1 §18.6): the pattern compares them with its terms as
+  RDF terms, and a `FILTER` inside it reads their values. A variable that
+  `OPTIONAL` may leave unbound in the solution, or that the pattern binds
+  only inside `OPTIONAL`, is rejected, and so are `MINUS`, `BIND`,
+  `VALUES`, subqueries and `EXISTS` inside the pattern, and `EXISTS`
+  outside `FILTER`. `sql::LeftJoin` has the new public field `exists`.
 - Arithmetic on `xsd:double` values in `FILTER`, `BIND` and `SELECT`, with
   IEEE 754 results: infinities and signed zeros where PostgreSQL's
   `float8` operators raise errors, and NaN neither equal to nor ordered

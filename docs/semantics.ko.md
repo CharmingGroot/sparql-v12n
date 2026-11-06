@@ -674,7 +674,7 @@ SQL에서 계산한 문자열은 모두 `COLLATE "C"`를 적용한다. 따라서
     데이터타입인 컬럼의 값
   - `xsd:float`와 파생 정수 타입
   - 1년부터 9999년 범위를 벗어나거나 마이크로초보다 정밀한 dateTime 상수
-- `RAND`를 포함한 그 밖의 함수, `EXISTS`, 그리고 term(변수, 상수, 산술,
+- `RAND`를 포함한 그 밖의 함수, 그리고 term(변수, 상수, 산술,
   `NOW`, 이들에 대한 `STR`, `LANG`, `DATATYPE`, `ABS`, `ROUND`, `CEIL`,
   `FLOOR`, `IF`, `COALESCE`, 문자열 함수, dateTime 함수)이 아닌 식을
   피연산자로 쓰는 것. `IF`, `COALESCE`, `IN`의 인자로 쓰는 비교가 그 예다
@@ -819,6 +819,49 @@ WHERE t2."id" IS NULL AND …
 
 - `OPTIONAL`, `UNION`, 다른 `MINUS` 안의 `MINUS`
 - `MINUS` 안의 `BIND`와 `VALUES`
+
+## EXISTS와 NOT EXISTS
+
+`FILTER EXISTS { P }`는 해의 변수를 그 값으로 대입했을 때 `P`에 해가 있는
+해를 유지한다(SPARQL 1.1 §8.1, §18.6 substitute). `FILTER NOT EXISTS { P }`는
+나머지 해를 유지한다. 두 식은 `&&`, `||`, `!`로 다른 조건과 결합할 수 있고,
+오류가 되지 않는다. `P`의 변수는 해에 포함되지 않는다.
+
+`P`의 triples map 선택 하나와 `P` 안의 `UNION`의 각 쪽은 SQL에서 상관
+`EXISTS` 하위 쿼리 하나가 되고, `EXISTS`는 하위 쿼리 중 하나에 행이 있으면
+참이다. shop 예제에서 `?c ex:name ?n`과
+`FILTER EXISTS { ?o ex:placedBy ?c ; ex:amount ?a }`는 다음 SQL이 된다.
+
+```sql
+FROM "customers" t0
+WHERE EXISTS (SELECT 1 FROM "orders" t1
+JOIN "orders" t2 ON t2."id" = t1."id" WHERE t1."customer_id" = t0."id" AND …) AND …
+```
+
+- `P`가 바인딩하는 해의 변수는 조인과 같이 그 값과 RDF term으로 비교한다.
+  문자열은 같은 숫자로 된 정수와 같지 않고, SQL 타입이 다른 컬럼끼리도
+  비교할 수 있다.
+- `P` 안의 `FILTER`는 해의 변수의 값을 읽는다. 해당 변수를 바인딩하지 않는
+  `P` 안의 그룹에서도 같다. `MINUS`의 오른쪽은 이 값을 보지 않는다(§8.3.3).
+- 해와 공유하는 변수가 없는 `P`는 독립적으로 검사한다. 해가 있는 패턴의
+  `NOT EXISTS`는 모든 해를 제거하고, `MINUS`는 아무것도 제거하지 않는다
+  (§8.3.2).
+- `OPTIONAL`의 `FILTER`에서 하위 쿼리는 `ON` 절에 들어가고 양쪽의 변수를
+  읽는다(§18.5 LeftJoin).
+- `P` 안의 `OPTIONAL`과 `UNION`을 지원한다.
+- term이 해의 term과 같을 수 없는 `P`의 선택은 하위 쿼리를 추가하지 않는다.
+  하위 쿼리가 없는 `EXISTS`는 거짓이다.
+
+다음은 대입과 해와의 조인이 다른 결과를 내거나 검증하는 케이스가 없으므로
+미지원으로 거부한다.
+
+- 필터링하는 해에서 `OPTIONAL`이 바인딩하지 않을 수 있는 변수에 대한
+  `EXISTS`
+- `P`가 `OPTIONAL` 안에서만 바인딩하는 해의 변수에 대한 `EXISTS`
+- `P` 안의 `MINUS`, `BIND`, `VALUES`, 하위 쿼리, `EXISTS`, 그리고 트리플
+  패턴이 없는 `P`
+- `MINUS` 안과 `IF`의 조건 안의 `EXISTS`
+- `BIND`, `SELECT` 식, `ORDER BY` 안의 `EXISTS`
 
 ## ORDER BY, LIMIT, OFFSET
 

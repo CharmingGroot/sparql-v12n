@@ -340,7 +340,7 @@ PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运�
   - `rr:datatype` 为该列自然数据类型以外的数值、布尔或 dateTime 数据类型的列的值；
   - `xsd:float` 与派生整数类型；
   - 超出公元 1 至 9999 年范围或精度细于微秒的 dateTime 常量；
-- 包括 `RAND` 在内的其他函数、`EXISTS`，以及以 term（变量、常量、算术、`NOW`，以及它们的 `STR`、`LANG`、`DATATYPE`、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、字符串函数或 dateTime 函数）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
+- 包括 `RAND` 在内的其他函数，以及以 term（变量、常量、算术、`NOW`，以及它们的 `STR`、`LANG`、`DATATYPE`、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、字符串函数或 dateTime 函数）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
 - 模式的匹配在 XPath 与 PostgreSQL 中可能不同、引用第九个之后的分组，或模式、替换字符串、标志不是常量的 `REPLACE`；
 - 非常量或不是 `xsd:integer`（例如 `1.5`）的 `SUBSTR` 起始位置与长度：SPARQL 1.1 中为类型错误，而像 `fn:substring` 那样取整的引擎会给出答案；
 - 作用于 `date` 或 `timestamp` 列的字符串函数，其无穷值为 plain literal；
@@ -416,6 +416,33 @@ WHERE t2."id" IS NULL AND …
 
 - `OPTIONAL`、`UNION` 或另一个 `MINUS` 内部的 `MINUS`；
 - `MINUS` 内部的 `BIND` 与 `VALUES`。
+
+## EXISTS 与 NOT EXISTS
+
+`FILTER EXISTS { P }` 保留这样的解：将解中的变量替换为其值之后，`P` 有解（SPARQL 1.1 §8.1，§18.6 substitute）。`FILTER NOT EXISTS { P }` 保留其余的解。二者可以通过 `&&`、`||` 与 `!` 与其他条件组合，且永远不会出错。`P` 的变量不出现在解中。
+
+`P` 的每种 triples map 选择，以及 `P` 内 `UNION` 的每一侧，在 SQL 中都是一个相关 `EXISTS` 子查询，其中任一子查询有行时 `EXISTS` 成立。在 shop 示例中，`?c ex:name ?n` 与 `FILTER EXISTS { ?o ex:placedBy ?c ; ex:amount ?a }` 给出以下 SQL：
+
+```sql
+FROM "customers" t0
+WHERE EXISTS (SELECT 1 FROM "orders" t1
+JOIN "orders" t2 ON t2."id" = t1."id" WHERE t1."customer_id" = t0."id" AND …) AND …
+```
+
+- `P` 绑定的解变量与连接中一样，作为 RDF term 与其值比较。字符串永远不等于由相同数字组成的整数，不同 SQL 类型的列也可以比较。
+- `P` 内的 `FILTER` 读取解变量的值，在 `P` 中不绑定该变量的组里也是如此。`MINUS` 的右侧看不到这些值（§8.3.3）。
+- 与解没有共享变量的 `P` 独立检查。有解的模式的 `NOT EXISTS` 移除所有解，而 `MINUS` 不移除任何解（§8.3.2）。
+- 在 `OPTIONAL` 的 `FILTER` 中，子查询位于 `ON` 子句中，并读取两侧的变量（§18.5 LeftJoin）。
+- 支持 `P` 内的 `OPTIONAL` 与 `UNION`。
+- term 永远不可能是解的 term 的 `P` 的选择不添加子查询。没有任何子查询的 `EXISTS` 为假。
+
+以下情形中，替换与和解的连接给出不同的结果，或没有测试用例覆盖，因此作为不支持的功能拒绝：
+
+- 对在被过滤的解中可能由 `OPTIONAL` 留下未绑定的变量使用 `EXISTS`；
+- 对 `P` 只在 `OPTIONAL` 内部绑定的解变量使用 `EXISTS`；
+- `P` 内部的 `MINUS`、`BIND`、`VALUES`、子查询与 `EXISTS`，以及没有三元组模式的 `P`；
+- `MINUS` 内部与 `IF` 条件内部的 `EXISTS`；
+- `BIND`、`SELECT` 表达式与 `ORDER BY` 中的 `EXISTS`。
 
 ## ORDER BY、LIMIT 与 OFFSET
 

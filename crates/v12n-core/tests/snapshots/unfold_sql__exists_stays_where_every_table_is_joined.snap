@@ -1,0 +1,18 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "shop(\"SELECT ?o ?c WHERE { ?o ex:amount ?a . ?c ex:name ?n ; ex:tier ?t \\\n         FILTER((?a > 50000 || ?n = \\\"Lee\\\") && EXISTS { ?d ex:tier ?t ; ex:name \\\"Kim\\\" }) }\")"
+---
+SELECT q."o", q."c"
+FROM (
+SELECT DISTINCT t0."id" AS "o", t0."amount" AS "a", t1."id" AS "c", t1."name" AS "n", t2."tier" AS "t"
+FROM "orders" t0
+CROSS JOIN "customers" t1
+JOIN "customers" t2 ON t2."id" = t1."id"
+WHERE ((t0."amount" > $1::int8 OR (t1."name" = $2)) AND EXISTS (SELECT 1 FROM "customers" t3
+JOIN "customers" t4 ON t4."id" = t3."id" WHERE t4."name" = $3 AND t3."tier" = t2."tier")) AND t0."id" IS NOT NULL AND t0."amount" IS NOT NULL AND t1."name" IS NOT NULL AND t2."tier" IS NOT NULL
+) q
+
+-- params
+$1 = "50000"
+$2 = "Lee"
+$3 = "Kim"

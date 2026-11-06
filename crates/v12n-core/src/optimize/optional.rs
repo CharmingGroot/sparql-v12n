@@ -49,6 +49,10 @@ pub(super) fn same_rows(branch: &SqlBranch, keys: &TableKeys) -> Vec<(usize, Sam
     // A nested part comes after the part it is nested in, so in reverse
     // order its own rule is known when the outer part needs it.
     for part in (0..branch.left_joins.len()).rev() {
+        // An `EXISTS` subquery is not joined, so there is no join to save.
+        if branch.left_joins[part].exists {
+            continue;
+        }
         let reads_row = |nested: usize| found.iter().any(|(p, _)| *p == nested);
         if let Some(same_row) = same_row(branch, part, keys, &reads_row) {
             found.push((part, same_row));

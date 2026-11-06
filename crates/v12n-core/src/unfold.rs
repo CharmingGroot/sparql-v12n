@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Unfolding: triple patterns to SQL fragments, shared variables to joins,
-//! `OPTIONAL` to left joins, `MINUS` to anti-joins.
+//! `OPTIONAL` to left joins, `MINUS` to anti-joins, `EXISTS` to correlated
+//! subqueries.
 
 mod filter;
 mod term;
@@ -531,7 +532,8 @@ enum Attempt<'a> {
     Matched(Fork<'a>, usize),
 }
 
-/// An `OPTIONAL` part of a branch, or the right side of a `MINUS`.
+/// An `OPTIONAL` part of a branch, the right side of a `MINUS`, or the
+/// pattern of an `EXISTS`.
 #[derive(Debug, Clone)]
 struct Group {
     /// The number of its LeftJoin in the pattern (see [`Branch::walk`]),
@@ -540,7 +542,14 @@ struct Group {
     parent: Scope,
     tables: Range<usize>,
     conditions: Vec<Condition>,
+    /// The pattern of an `EXISTS` (see [`LeftJoin::exists`]).
+    exists: bool,
 }
+
+/// The pattern of one `EXISTS` of a filter, with the parts of the branch
+/// that evaluate it, one per choice of arm and triples maps and per branch
+/// that choice gives (see [`Branch::exists`]).
+type Exists<'a> = (&'a Pattern, Vec<usize>);
 
 /// A branch under construction: one candidate per required pattern,
 /// joined, with its `OPTIONAL` parts left joined.
@@ -562,6 +571,12 @@ struct Branch<'a> {
     terms: Vec<(TermExpr<'a>, Scope)>,
     /// The variables of the whole pattern.
     env: Env<'a>,
+    /// While the pattern of an `EXISTS` is walked, the variables of the
+    /// current solution that it mentions, each with the source bound
+    /// wherever the `EXISTS` is evaluated. Substitution fixes them in the
+    /// whole pattern (SPARQL 1.1 §18.6), so a `FILTER` inside it that does
+    /// not bind one of them reads it here.
+    outer: Env<'a>,
 }
 
 impl<'a> Branch<'a> {
@@ -582,6 +597,7 @@ impl<'a> Branch<'a> {
             groups: Vec::new(),
             terms: Vec::new(),
             env: Vec::new(),
+            outer: Vec::new(),
         };
         let mut chosen = chosen.iter().copied();
         let mut sides = arm.iter().copied();
@@ -745,8 +761,10 @@ impl<'a> Branch<'a> {
             // it sees the variables of P only (SPARQL 1.1 §18.2.2.6).
             Pattern::Filter(inner, expression) => {
                 let mut out = Vec::new();
-                for (mut branch, env) in self.walk(inner, scope, node, sides, chosen, context)? {
-                    let filter = branch.filter(expression, &env, &[scope])?;
+                for (branch, env) in self.walk(inner, scope, node, sides, chosen, context)? {
+                    let (mut branch, exists) =
+                        branch.exists(expression, &env, &[scope], scope, node, context)?;
+                    let filter = branch.filter(expression, &env, &[scope], &exists)?;
                     branch.conditions_mut(scope).push(Condition::Filter(filter));
                     out.push((branch, env));
                 }
@@ -949,6 +967,7 @@ impl<'a> Branch<'a> {
             parent: scope,
             tables: start..start,
             conditions: Vec::new(),
+            exists: false,
         });
         let mut sides = arm.iter().copied();
         let mut chosen = chosen.iter().copied();
@@ -1049,6 +1068,181 @@ impl<'a> Branch<'a> {
             .map(Some)
     }
 
+    /// The parts that evaluate each `EXISTS` of `expression`, a filter
+    /// over the solutions `env` evaluated in `scope`, where the sources in
+    /// `certain` are bound (see [`Branch::filter`]).
+    ///
+    /// `EXISTS` holds where its pattern has a solution once the variables
+    /// of the current solution are replaced by their values (SPARQL 1.1
+    /// §18.6). Each choice of arm and triples maps for the pattern, and
+    /// each branch it gives, is a part nested in `scope` that adds no rows:
+    /// rendering makes it a correlated `EXISTS (SELECT 1 …)` subquery where
+    /// the filter reads it, so the `EXISTS` holds where one of its parts
+    /// has a row. A variable of the current solution that the pattern
+    /// binds is compared with its value as an RDF term through `term_eq`,
+    /// as in a join, and a `FILTER` inside the pattern that does not bind
+    /// it reads the value (see [`Branch::outer`]). The other variables of
+    /// the pattern are free, and the current solution's variables stay as
+    /// they are, since `EXISTS` binds none.
+    ///
+    /// Substitution and a join agree only where the value is bound in
+    /// every solution filtered and the pattern binds the variable in every
+    /// one of its own. The other cases are rejected: a variable of the
+    /// current solution that `OPTIONAL` may leave unbound, or that the
+    /// pattern binds only inside `OPTIONAL`.
+    fn exists(
+        self,
+        expression: &'a Expression,
+        env: &Env<'a>,
+        certain: &[Scope],
+        scope: Scope,
+        node: usize,
+        context: &Context<'a>,
+    ) -> Result<(Self, Vec<Exists<'a>>), Error> {
+        let patterns = expression.exists_patterns();
+        if patterns.is_empty() {
+            return Ok((self, Vec::new()));
+        }
+        let mut branch = self;
+        // A split inside the pattern gives parts, not branches, so the arm
+        // of the branch stays.
+        let arm = branch.arm.clone();
+        let mut out = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            let mut outer: Env<'a> = Vec::new();
+            for variable in pattern.mentioned_variables() {
+                if outer.iter().any(|(v, _)| *v == variable) {
+                    continue;
+                }
+                let Some((name, sources)) = env.iter().find(|(v, _)| *v == variable) else {
+                    continue;
+                };
+                let Some(source) = sources.iter().find(|s| certain.contains(&s.scope)) else {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "EXISTS over ?{variable}, which the solutions it filters may leave \
+                         unbound"
+                    )));
+                };
+                outer.push((name, vec![*source]));
+            }
+            let arms = pattern.arms(MAX_BRANCHES).ok_or_else(too_many)?;
+            let mut parts = Vec::new();
+            for a in &arms {
+                let patterns = pattern.required_triple_patterns(a);
+                for chosen in choices(&patterns, context.mapping, context.index)? {
+                    // Each outcome that can have a row is added to the
+                    // branch built so far, as in `minus`.
+                    let matching: Vec<usize> = branch
+                        .clone()
+                        .exists_part(&outer, pattern, scope, node, a, &chosen, context)?
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, outcome)| outcome.is_some().then_some(k))
+                        .collect();
+                    for k in matching {
+                        let Some(Some((next, part))) = branch
+                            .exists_part(&outer, pattern, scope, node, a, &chosen, context)?
+                            .into_iter()
+                            .nth(k)
+                        else {
+                            unreachable!("a choice matches the same way on any branch");
+                        };
+                        branch = next;
+                        parts.push(part);
+                        check_count(parts.len())?;
+                    }
+                }
+            }
+            out.push((pattern, parts));
+        }
+        branch.arm = arm;
+        Ok((branch, out))
+    }
+
+    /// The pattern of an `EXISTS` with these choices, as a new part nested
+    /// in `scope`, with `outer` the variables of the current solution it
+    /// mentions: one outcome per branch the pattern gives, with the index
+    /// of the part, or `None` for one that can never have a row.
+    #[allow(clippy::too_many_arguments)]
+    fn exists_part(
+        self,
+        outer: &Env<'a>,
+        pattern: &'a Pattern,
+        scope: Scope,
+        node: usize,
+        arm: &[bool],
+        chosen: &[Candidate<'a>],
+        context: &Context<'a>,
+    ) -> Result<Vec<Option<(Self, usize)>>, Error> {
+        let mut branch = self;
+        let group = branch.groups.len();
+        let start = branch.from.len();
+        branch.groups.push(Group {
+            node,
+            parent: scope,
+            tables: start..start,
+            conditions: Vec::new(),
+            exists: true,
+        });
+        let enclosing = std::mem::replace(&mut branch.outer, outer.clone());
+        let mut sides = arm.iter().copied();
+        let mut chosen = chosen.iter().copied();
+        let forks = branch.walk(
+            pattern,
+            Some(group),
+            node + 1,
+            &mut sides,
+            &mut chosen,
+            context,
+        )?;
+        let mut out = Vec::with_capacity(forks.len());
+        for (mut part, inner) in forks {
+            part.outer = enclosing.clone();
+            part.groups[group].tables.end = part.from.len();
+            if part.groups[group].tables.is_empty() {
+                return Err(Error::UnsupportedFeature(
+                    "EXISTS over a pattern without triple patterns".to_owned(),
+                ));
+            }
+            let inner = settle(inner, Some(group));
+            if part.substitute(outer, &inner, group)? {
+                out.push(Some((part, group)));
+            } else {
+                out.push(None);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fixes each variable of `outer` that the `EXISTS` part `group` binds
+    /// to its value, comparing the two as RDF terms (SPARQL 1.1 §18.6).
+    /// `false` when they can never be the same term, so that the part has
+    /// no row.
+    fn substitute(
+        &mut self,
+        outer: &Env<'a>,
+        inner: &Env<'a>,
+        group: usize,
+    ) -> Result<bool, Error> {
+        for (variable, sources) in inner {
+            let Some((_, fixed)) = outer.iter().find(|(v, _)| v == variable) else {
+                continue;
+            };
+            // Where only `OPTIONAL` binds it, substitution keeps a solution
+            // of the pattern that a join with the value drops.
+            let Some(inside) = sources.iter().find(|s| s.scope == Some(group)) else {
+                return Err(Error::UnsupportedFeature(format!(
+                    "EXISTS over ?{variable}, which its pattern binds only inside OPTIONAL"
+                )));
+            };
+            match term_eq(&inside.term, &fixed[0].term) {
+                Equality::Never => return Ok(false),
+                Equality::When(conditions) => self.groups[group].conditions.extend(conditions),
+            }
+        }
+        Ok(true)
+    }
+
     /// The right side of a LeftJoin with these choices, as a new `OPTIONAL`
     /// part of the branch: one outcome per branch the side gives.
     #[allow(clippy::too_many_arguments)]
@@ -1071,6 +1265,7 @@ impl<'a> Branch<'a> {
             parent: scope,
             tables: start..start,
             conditions: Vec::new(),
+            exists: false,
         });
         let mut sides = arm.iter().copied();
         let mut chosen = chosen.iter().copied();
@@ -1104,10 +1299,16 @@ impl<'a> Branch<'a> {
             if let Some(expression) = expression {
                 // In the `ON` clause, the left side's row and the part's
                 // candidate row both exist.
-                let filter = attempt.filter(expression, &env, &[scope, Some(group)])?;
+                let certain = [scope, Some(group)];
+                let (next, exists) =
+                    attempt.exists(expression, &env, &certain, Some(group), node, context)?;
+                attempt = next;
+                let filter = attempt.filter(expression, &env, &certain, &exists)?;
                 attempt.groups[group]
                     .conditions
                     .push(Condition::Filter(filter));
+                // The parts of its `EXISTS` are nested in the part.
+                attempt.groups[group].tables.end = attempt.from.len();
             }
             out.push(Attempt::Matched((attempt, env), group));
         }
@@ -2070,6 +2271,7 @@ fn plan(
                     parent: g.parent,
                     conditions: g.conditions.clone(),
                     same_row: None,
+                    exists: g.exists,
                 })
                 .collect(),
             fixed_columns: branch.fixed_columns(),

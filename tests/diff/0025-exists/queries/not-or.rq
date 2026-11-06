@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# The negation of a disjunction of EXISTS.
+SELECT ?p WHERE { ?p a ex:Person FILTER(!(EXISTS { ?p ex:city "Seoul" } || EXISTS { ?o ex:buyer ?p ; ex:amount 1 })) }
