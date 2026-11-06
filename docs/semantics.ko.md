@@ -557,19 +557,35 @@ decimal의 `ROUND`는 `floor(x + 0.5)`다. double에서 `float8`의 `abs`, `ceil
 
 잘못된 패턴이나 플래그는 XPath와 마찬가지로 오류다.
 
-`STRLEN`, `SUBSTR`, `UCASE`, `LCASE`, `STRSTARTS`, `STRENDS`, `CONTAINS`,
-`CONCAT`은 SPARQL 1.1 §17.4.3을 따른다.
+문자열 함수 `STRLEN`, `SUBSTR`, `UCASE`, `LCASE`, `STRSTARTS`, `STRENDS`,
+`CONTAINS`, `STRBEFORE`, `STRAFTER`, `ENCODE_FOR_URI`, `CONCAT`, `REPLACE`는
+SPARQL 1.1 §17.4.3을 따른다.
 
 - 인자는 문자열 리터럴, 곧 단순 리터럴, `xsd:string`, 언어 태그가 있는
   리터럴이다(§17.4.3.1.1). 숫자, IRI, 바인딩되지 않은 변수 같은 다른 term이면
   함수는 오류다.
-- `STRSTARTS`, `STRENDS`, `CONTAINS`의 인자는 호환되어야 한다(§17.4.3.1.2).
+- `STRSTARTS`, `STRENDS`, `CONTAINS`, `STRBEFORE`, `STRAFTER`의 인자는
+  호환되어야 한다(§17.4.3.1.2).
   두 인자 모두 언어 태그가 없거나, 같은 태그가 있거나, 첫 인자에만 태그가
   있어야 한다. `CONTAINS(?label, "pie")`는 `"Apple pie"@en`에 적용되고,
   `CONTAINS(?name, "pie"@en)`은 `"pie"`에 대해 오류다.
-- `SUBSTR`, `UCASE`, `LCASE`는 인자의 언어 태그를 유지한다. `CONCAT`은 모든
-  인자에 같은 언어 태그가 있으면 그 태그를 유지하고, 그렇지 않으면 단순
-  리터럴을 반환한다(§17.4.3.12).
+- `SUBSTR`, `UCASE`, `LCASE`, `REPLACE`는 첫 인자의 언어 태그를 유지한다.
+  `CONCAT`은 모든 인자에 같은 언어 태그가 있으면 그 태그를 유지하고,
+  그렇지 않으면 단순 리터럴을 반환한다(§17.4.3.12). `ENCODE_FOR_URI`는 단순
+  리터럴을 반환한다.
+- `STRBEFORE`와 `STRAFTER`는 두 번째 문자열이 처음 나오는 위치의 앞과 뒤
+  문자를 첫 인자의 언어 태그와 함께 반환한다. 두 번째 문자열이 없으면 단순
+  리터럴 `""`를 반환한다(§17.4.3.9, §17.4.3.10). `STRBEFORE("abc"@en, "z")`는
+  `""`이고, `STRBEFORE("abc"@en, "")`는 `""@en`이다.
+- `ENCODE_FOR_URI`는 `A-Z`, `a-z`, `0-9`, `-`, `_`, `.`, `~`를 제외한 모든
+  문자를 UTF-8 바이트마다 대문자 `%XX`로 쓴다(F&O 3.1 §6.2). `"café"`는
+  `"caf%C3%A9"`가 된다.
+- `REPLACE(arg, pattern, replacement, flags)`는 `fn:replace`와 같이 패턴의
+  일치를 각각 치환한다(F&O 3.1 §5.6.4). 패턴, 치환 문자열, 플래그는 단순
+  리터럴 상수이고, 패턴은 위의 `REGEX`와 같이 변환한다. 치환 문자열에서
+  `$N`은 `N`번째 그룹, `$0`은 일치 전체이고, `\$`와 `\\`는 `$`와 `\`다.
+  존재하지 않는 그룹에 대한 참조는 `$9`까지 빈 문자열이다. `a*`처럼 빈
+  문자열과 일치하는 패턴과, 그 밖의 `$`나 `\`를 쓴 치환 문자열은 오류다.
 - 길이와 위치는 문자, 곧 Unicode 코드 포인트 단위로 센다. `"e\u0301"`(`e`와
   결합 악센트)의 `STRLEN`은 2이고, 이모지 하나의 `STRLEN`은 1이다.
   `SUBSTR(s, start, length)`는 XPath의 `fn:substring`과 같이 1부터 센 위치
@@ -593,7 +609,20 @@ SQL에서 계산한 문자열은 모두 `COLLATE "C"`를 적용한다. 따라서
 `name COLLATE "C" LIKE 'Kim%'`이다. `COLLATE "C"`를 적용한 컬럼 인덱스나
 연산자 클래스 `text_pattern_ops`를 쓴 인덱스를 `STRSTARTS`에 사용할 수 있다.
 상수 대신 행에서 계산한 문자열을 찾으면 `starts_with`, `right`, `strpos`를
-쓴다.
+쓴다. `STRBEFORE`와 `STRAFTER`는 `strpos`와 `substr`을 쓴다. 첫 인자에 언어
+태그가 있으면 값의 case가 `CONTAINS`로 일치 여부를 구분하므로, `LANG`과
+`=`는 태그나 단순 리터럴을 구분한다. `REPLACE`는 플래그 `g`를 쓰는
+`regexp_replace`이고, 변환한 패턴과 치환 문자열을 파라미터로 넘긴다. 따라서
+`$1`은 `\1`이 된다.
+
+`REPLACE`의 결과는 한 위치에서 시작하는 일치가 여러 개일 때 어느 일치를
+선택하는지에도 좌우된다. XPath는 첫 번째 대안을 선택하고, 각 greedy
+반복자가 나머지 패턴이 허용하는 만큼 차례로 문자를 가져간다. PostgreSQL은
+패턴 전체의 가장 긴 일치를 선택한다. 따라서 `REPLACE`는 두 엔진이 같은
+일치를 선택하는 패턴만 받는다. `|`, reluctant 반복자, 그룹에 대한 반복자가
+없어야 하고, 반복하는 문자 집합 뒤에는 그 집합에 속하지 않는 문자만 올 수
+있어야 한다. `\s+`, `[^,]+,`, `a+$`는 허용하고, `a|ab`, `^\s+|\s+$`,
+`(ab)+`, `x.*y`는 거부한다.
 
 `STRLEN`은 숫자이므로 `BIND`와 `SELECT` 식의 값이 될 수 있다(아래 참고). 그 밖의
 함수는 문자열을 반환하며, 계산된 변수는 현재 문자열을 담지 않는다.
@@ -615,6 +644,9 @@ SQL에서 계산한 문자열은 모두 `COLLATE "C"`를 적용한다. 따라서
   이들에 대한 `STR`, `LANG`, `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`,
   `IF`, `COALESCE`, 문자열 함수)이 아닌 식을 피연산자로 쓰는 것.
   `IF`, `COALESCE`, `IN`의 인자로 쓰는 비교가 그 예다
+- XPath와 PostgreSQL이 다른 일치를 선택할 수 있는 패턴(위 참고), 아홉
+  번째 이후 그룹에 대한 참조, 상수가 아닌 패턴, 치환 문자열, 플래그를 쓰는
+  `REPLACE`
 - 상수가 아니거나 `1.5`처럼 `xsd:integer`가 아닌 `SUBSTR`의 시작 위치와
   길이. SPARQL 1.1에서는 타입 오류이고, `fn:substring`처럼 반올림하는 엔진은
   값을 반환한다

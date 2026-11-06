@@ -14,6 +14,12 @@ Design decisions are recorded in the `Decision:` Discussions.
   `SELECT (expr AS ?v)`, with a result of the argument's datatype.
   `ROUND` rounds halves towards positive infinity, as `fn:round` does,
   for decimals and doubles. `RAND` is rejected as unsupported.
+- `STRBEFORE`, `STRAFTER`, `ENCODE_FOR_URI` and `REPLACE` in `FILTER`.
+  `STRBEFORE` and `STRAFTER` give the simple literal `""` where the second
+  string does not occur. `REPLACE` translates the pattern as `REGEX` does
+  and the `$N` references of the replacement, and rejects patterns whose
+  matches XPath and PostgreSQL can choose differently, such as
+  alternatives.
 - `STRLEN`, `SUBSTR`, `UCASE`, `LCASE`, `STRSTARTS`, `STRENDS`, `CONTAINS`
   and `CONCAT` in `FILTER`, and `STRLEN` in `BIND` and `SELECT (expr AS
   ?v)`, with the argument compatibility and language tag rules of SPARQL

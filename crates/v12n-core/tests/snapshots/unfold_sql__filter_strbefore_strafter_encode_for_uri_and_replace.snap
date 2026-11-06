@@ -1,0 +1,17 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_shop_with_types(\"SELECT ?c WHERE { ?c ex:name ?n ; ex:tier ?t \\\n         FILTER(STRBEFORE(?n, \\\"m\\\") = \\\"Ki\\\" && STRAFTER(?n, ?t) != \\\"\\\" \\\n         && ENCODE_FOR_URI(?n) = \\\"Kim\\\" && REPLACE(?t, \\\"(I)P\\\", \\\"$1-\\\", \\\"i\\\") = \\\"VI-\\\") }\")"
+---
+SELECT t0."id" AS "c"
+FROM "customers" t0
+JOIN "customers" t1 ON t1."id" = t0."id" AND (((((CASE WHEN strpos((t0."name"::text) COLLATE "C", $1::text COLLATE "C") > 0 THEN substr((t0."name"::text) COLLATE "C", 1, strpos((t0."name"::text) COLLATE "C", $1::text COLLATE "C") - 1) ELSE '' END COLLATE "C") = $2::text) AND NOT (((CASE WHEN strpos((t0."name"::text) COLLATE "C", (t1."tier"::text) COLLATE "C") > 0 THEN substr((t0."name"::text) COLLATE "C", strpos((t0."name"::text) COLLATE "C", (t1."tier"::text) COLLATE "C") + char_length((t1."tier"::text) COLLATE "C")) ELSE '' END COLLATE "C") = $3::text))) AND ((CASE WHEN ((t0."name"::text) COLLATE "C") ~ '^[-.0-9A-Z_a-z~]*$' THEN ((t0."name"::text) COLLATE "C") WHEN ((t0."name"::text) COLLATE "C") IS NOT NULL THEN (SELECT coalesce(string_agg(CASE WHEN c ~ '^[-.0-9A-Z_a-z~]$' THEN c ELSE regexp_replace(upper(encode(convert_to(c, 'UTF8'), 'hex')), '(..)', '%\1', 'g') END, '' ORDER BY n), '') FROM generate_series(1, char_length(((t0."name"::text) COLLATE "C"))) AS n, substr(((t0."name"::text) COLLATE "C"), n, 1) AS c) END COLLATE "C") = $4::text)) AND ((regexp_replace((t1."tier"::text) COLLATE "C", $5::text, $6::text, 'g') COLLATE "C") = $7::text))
+WHERE t0."name" IS NOT NULL AND t1."tier" IS NOT NULL
+
+-- params
+$1 = "m"
+$2 = "Ki"
+$3 = ""
+$4 = "Kim"
+$5 = "([Ii\\u0131])[Pp]"
+$6 = "\\1-"
+$7 = "VI-"

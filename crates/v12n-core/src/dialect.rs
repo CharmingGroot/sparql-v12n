@@ -54,6 +54,20 @@ pub trait Dialect {
     /// `length` of them or all the rest.
     fn substring(&self, text: &str, start: &str, length: Option<&str>) -> String;
 
+    /// The 1-based position of the first occurrence of `search` in `text`,
+    /// both under the code point collation, and 0 where there is none.
+    fn position(&self, text: &str, search: &str) -> String;
+
+    /// `text` with each match of the regular expression `pattern` (see
+    /// [`regex_match`](Self::regex_match)) replaced by `replacement`, in
+    /// which `\N` is the `N`th group, `\&` the match and `\\` a backslash.
+    fn regex_replace(&self, text: &str, pattern: &str, replacement: &str) -> String;
+
+    /// `text` with every character outside `A-Z`, `a-z`, `0-9`, `-`, `_`,
+    /// `.` and `~` as `%XX` per UTF-8 byte, upper case (XPath F&O 3.1
+    /// §6.2, fn:encode-for-uri).
+    fn encode_for_uri(&self, text: &str) -> String;
+
     /// `text` with every character mapped to its upper case (`upper`) or
     /// its lower case by the full case mappings of Unicode without
     /// tailoring (XPath F&O 3.1 §5.4.7 and §5.4.8), whatever the locale of
