@@ -114,7 +114,8 @@ impl SqlPlan {
             self.arms()
                 .into_iter()
                 .map(|arm| {
-                    let dedup = arm_has_duplicates(&self.branches[arm.clone()], options.keys);
+                    let dedup = self.counts_duplicates()
+                        && arm_has_duplicates(&self.branches[arm.clone()], options.keys);
                     (arm, dedup)
                 })
                 .collect()
@@ -1365,6 +1366,7 @@ pub(super) mod tests {
                 fixed_columns: Vec::new(),
             }],
             distinct: true,
+            form: crate::sparql::QueryForm::Select,
             base_iri: None,
         };
         let rendered = plan.to_sql().unwrap();
@@ -1416,6 +1418,7 @@ pub(super) mod tests {
             projection: Vec::new(),
             branches: vec![branch("1", None), branch("2", Some("http://ex/dt"))],
             distinct: false,
+            form: crate::sparql::QueryForm::Select,
             base_iri: None,
         };
         let rendered = plan
@@ -1480,6 +1483,7 @@ pub(super) mod tests {
             projection: Vec::new(),
             branches: vec![branch],
             distinct: false,
+            form: crate::sparql::QueryForm::Select,
             base_iri: None,
         };
         let rendered = plan
@@ -1528,6 +1532,7 @@ pub(super) mod tests {
                 fixed_columns: vec![BTreeSet::new()],
             }],
             distinct: true,
+            form: crate::sparql::QueryForm::Select,
             base_iri: None,
         };
         let double = ColumnType {
@@ -1634,6 +1639,7 @@ pub(super) mod tests {
                 fixed_columns: Vec::new(),
             }],
             distinct: false,
+            form: crate::sparql::QueryForm::Select,
             base_iri: None,
         };
         assert_eq!(plan.term_columns().len(), 2);
@@ -1723,6 +1729,7 @@ pub(super) mod tests {
             projection: Vec::new(),
             branches: Vec::new(),
             distinct: false,
+            form: crate::sparql::QueryForm::Select,
             base_iri: None,
         };
         assert_eq!(plan.to_sql().unwrap().sql, "SELECT 1 WHERE false");

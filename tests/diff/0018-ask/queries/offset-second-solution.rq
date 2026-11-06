@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Two solutions: Ann and Bob.
+ASK { ?p ex:name ?n } OFFSET 1

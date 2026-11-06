@@ -254,6 +254,7 @@ mod tests {
     use super::super::TableKeys;
     use super::super::renderer::tests::column;
     use super::*;
+    use crate::sparql::QueryForm;
 
     #[test]
     fn resolved_columns_are_rendered_as_delimited_identifiers() {
@@ -294,6 +295,7 @@ mod tests {
                 fixed_columns: Vec::new(),
             }],
             distinct: false,
+            form: QueryForm::Select,
             base_iri: None,
         };
         assert_eq!(
@@ -340,6 +342,7 @@ mod tests {
                 fixed_columns: vec![["ID".to_owned()].into()],
             }],
             distinct: false,
+            form: QueryForm::Select,
             base_iri: None,
         };
         let resolved = HashMap::from([((table.clone(), "ID".to_owned()), "id".to_owned())]);

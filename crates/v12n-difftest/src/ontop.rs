@@ -127,6 +127,19 @@ fn post(endpoint: &str, body: &str) -> Result<(u16, String), String> {
 pub fn parse_results(json: &str) -> Result<Results, String> {
     let value: Value =
         serde_json::from_str(json).map_err(|e| format!("invalid JSON results: {e}"))?;
+    // An ASK result (JSON §4) compares as the solutions v12n returns for
+    // it: no variables, and one empty solution for `true`.
+    if let Some(boolean) = value.get("boolean") {
+        let boolean = boolean.as_bool().ok_or("boolean is not true or false")?;
+        return Ok(Results {
+            variables: Vec::new(),
+            rows: if boolean {
+                vec![Row::new()]
+            } else {
+                Vec::new()
+            },
+        });
+    }
     let variables = value["head"]["vars"]
         .as_array()
         .ok_or("results have no head.vars")?
@@ -218,6 +231,21 @@ mod tests {
                 vec!["?o=\"y\""],
             ]
         );
+    }
+
+    #[test]
+    fn parse_results_reads_a_boolean_as_one_empty_solution_or_none() {
+        let yes = parse_results(r#"{ "head": {}, "boolean": true }"#).unwrap();
+        assert_eq!(
+            yes,
+            Results {
+                variables: Vec::new(),
+                rows: vec![Row::new()]
+            }
+        );
+        let no = parse_results(r#"{ "head": {}, "boolean": false }"#).unwrap();
+        assert_eq!(no, Results::default());
+        assert!(parse_results(r#"{ "head": {}, "boolean": "true" }"#).is_err());
     }
 
     const CME: &str = "java.util.ConcurrentModificationException\n\tat java.base/java.util.HashMap";

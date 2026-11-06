@@ -439,10 +439,67 @@ fn query_invalid_timeout_exits_one() {
 fn query_unsupported_feature_fails_before_connecting() {
     let output = v12n(
         &["query", "--db", "postgresql://127.0.0.1:1/shop", SHOP, "-"],
-        "ASK { ?c a <http://example.org/Customer> }",
+        "DESCRIBE ?c WHERE { ?c a <http://example.org/Customer> }",
     );
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(stdout_json(&output)["error"]["kind"], json!("unsupported"));
+}
+
+const ASK_KIM: &str = r#"ASK { ?c <http://example.org/name> "Kim" }"#;
+const ASK_NOBODY: &str = r#"ASK { ?c <http://example.org/name> "Nobody" }"#;
+
+/// SPARQL 1.1 Query Results CSV and TSV are for SELECT results only (§1).
+#[test]
+fn query_ask_in_csv_or_tsv_fails_before_connecting() {
+    for format in ["csv", "tsv"] {
+        let output = v12n(
+            &[
+                "query",
+                "--format",
+                format,
+                "--db",
+                "postgresql://127.0.0.1:1/shop",
+                SHOP,
+                "--query",
+                ASK_KIM,
+            ],
+            "",
+        );
+        assert_eq!(output.status.code(), Some(1), "{format}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("no form for ASK results"), "{stderr}");
+        assert!(output.stdout.is_empty(), "{format}");
+    }
+}
+
+/// Runs against the `testenv` PostgreSQL; skipped unless
+/// `V12N_TEST_DATABASE_URL` is set.
+#[test]
+fn query_ask_prints_a_boolean_and_exits_zero_either_way() {
+    let Ok(url) = std::env::var("V12N_TEST_DATABASE_URL") else {
+        eprintln!("skipped: V12N_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let run = |format: &str, query: &str| {
+        let output = v12n(
+            &[
+                "query", "--format", format, "--db", &url, SHOP, "--query", query,
+            ],
+            "",
+        );
+        assert_eq!(output.status.code(), Some(0), "{format} {query}");
+        assert!(output.stderr.is_empty(), "{format} {query}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(run("json", ASK_KIM), "{\"head\":{},\"boolean\":true}\n");
+    assert_eq!(run("json", ASK_NOBODY), "{\"head\":{},\"boolean\":false}\n");
+    assert_eq!(
+        run("xml", ASK_KIM),
+        "<?xml version=\"1.0\"?>\n<sparql xmlns=\"http://www.w3.org/2005/sparql-results#\">\
+         <head></head><boolean>true</boolean></sparql>\n"
+    );
+    assert_eq!(run("table", ASK_KIM), "true\n");
+    assert_eq!(run("table", ASK_NOBODY), "false\n");
 }
 
 /// Runs against the `testenv` PostgreSQL; skipped unless

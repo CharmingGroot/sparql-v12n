@@ -4,6 +4,7 @@ use oxrdf::{BlankNode, Literal, NamedNode, Term};
 
 use super::*;
 use crate::mapping::{Mapping, MappingIndex, TemplatePart, TermType};
+use crate::sparql::QueryForm;
 use crate::sql::{ProjectedTerm, ResultTerm, ResultValue, SqlPlan};
 use crate::{sparql, unfold};
 
@@ -83,6 +84,7 @@ fn plan(columns: &[&str], projection: Vec<(&str, Option<ResultTerm>)>) -> SqlPla
             .collect(),
         branches: Vec::new(),
         distinct: false,
+        form: QueryForm::Select,
         base_iri: None,
     }
 }

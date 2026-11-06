@@ -10,6 +10,11 @@ Design decisions are recorded in the `Decision:` Discussions.
 
 ### Added
 
+- `ASK` queries. The SQL reads at most one row and removes no duplicates.
+  The answer is the JSON or XML boolean result from the endpoint and from
+  `v12n query`, which prints `true` or `false` in the table format and
+  exits with 0 for both. CSV and TSV, which define no boolean result, are
+  refused (exit code 1, HTTP 406), and so are `LIMIT` and `OFFSET` in `ASK`.
 - `v12n check` warns about triples maps over different logical tables
   whose subject templates can produce the same IRI. Each warning is a
   `warning: ...` line on stderr and an entry of `warnings` in JSON, and

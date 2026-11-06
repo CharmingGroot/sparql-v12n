@@ -8,6 +8,7 @@ use std::ops::Range;
 use crate::Error;
 use crate::dialect::SqlType;
 use crate::mapping::{LogicalTable, TermType};
+use crate::sparql::QueryForm;
 
 use super::identifier::describe_table;
 use super::plan::{Part, XSD_STRING, visit_cases};
@@ -31,17 +32,26 @@ impl SqlPlan {
 
     /// Whether two SQL rows may give the same solution of an arm of the
     /// pattern, so that rendering removes duplicates (see
-    /// [`SqlBranch::arm`]). Never under `DISTINCT`, which already does.
-    /// Otherwise true unless every arm has one branch and `keys` holds,
-    /// for every table that branch reads, a unique key among the table's
+    /// [`SqlBranch::arm`]). Never under `DISTINCT`, which already does, nor
+    /// where duplicates cannot change the answer
+    /// ([`counts_duplicates`](Self::counts_duplicates)). Otherwise true
+    /// unless every arm has one branch and `keys` holds, for every table
+    /// that branch reads, a unique key among the table's
     /// [`SqlBranch::fixed_columns`]: then each solution fixes one row of
     /// every table, and so one row of the result.
     pub fn has_duplicates(&self, keys: Option<&TableKeys>) -> bool {
         !self.distinct
+            && self.counts_duplicates()
             && self
                 .arms()
                 .into_iter()
                 .any(|arm| arm_has_duplicates(&self.branches[arm], keys))
+    }
+
+    /// Whether removing duplicate rows can change the answer: not under
+    /// `ASK`, where any one row gives `true` (SPARQL 1.1 §16.3).
+    pub fn counts_duplicates(&self) -> bool {
+        self.form == QueryForm::Select
     }
 
     /// The tables whose keys can show that an arm has no duplicates
@@ -567,6 +577,7 @@ mod tests {
             lexical_hidden_columns: Default::default(),
             branches: vec![branch("a"), branch("b")],
             distinct: false,
+            form: QueryForm::Select,
             base_iri: None,
         }
     }
@@ -781,6 +792,7 @@ mod tests {
                 fixed_columns: vec![fixed.iter().map(|c| c.to_string()).collect()],
             }],
             distinct: false,
+            form: QueryForm::Select,
             base_iri: None,
         }
     }

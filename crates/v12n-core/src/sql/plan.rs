@@ -8,7 +8,7 @@ use oxrdf::Term;
 
 use crate::dialect::{Dialect, SqlType};
 use crate::mapping::{BaseIri, LogicalTable, TemplatePart, TermType};
-use crate::sparql::{ArithOp, CompareOp, TermTest};
+use crate::sparql::{ArithOp, CompareOp, QueryForm, TermTest};
 
 pub(super) const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -57,6 +57,8 @@ pub struct SqlPlan {
     /// No branches means the query has no answers.
     pub branches: Vec<SqlBranch>,
     pub distinct: bool,
+    /// Under [`QueryForm::Ask`], only whether a row exists matters.
+    pub form: QueryForm,
     /// The base IRI that relative IRIs of the results resolve against
     /// (R2RML §11.2), from the mapping.
     pub base_iri: Option<BaseIri>,

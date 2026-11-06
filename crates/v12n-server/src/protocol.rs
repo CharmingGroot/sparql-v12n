@@ -14,12 +14,12 @@ const SPARQL_QUERY: &str = "application/sparql-query";
 /// Percent-encoding at most triples the size of a query in a form body.
 const FORM_OVERHEAD: usize = 3;
 
-/// The results format for the `Accept` header, or `None` when it allows
-/// none of [`ResultsFormat::ALL`]. Each format gets the quality of the most
+/// The results format of `offered` for the `Accept` header, or `None`
+/// when it allows none of them. Each format gets the quality of the most
 /// specific media range that matches it (RFC 9110 §12.5.1), so `*/*` does
 /// not override an explicit `q=0`. The highest quality wins, and a tie goes
-/// to the earlier format, so `*/*` and a missing `Accept` give JSON.
-pub(crate) fn negotiate(headers: &HeaderMap) -> Option<ResultsFormat> {
+/// to the earlier format, so `*/*` and a missing `Accept` give the first.
+pub(crate) fn negotiate(headers: &HeaderMap, offered: &[ResultsFormat]) -> Option<ResultsFormat> {
     let ranges: Vec<(String, f32)> = headers
         .get_all(header::ACCEPT)
         .iter()
@@ -38,10 +38,10 @@ pub(crate) fn negotiate(headers: &HeaderMap) -> Option<ResultsFormat> {
         })
         .collect();
     if ranges.is_empty() {
-        return Some(ResultsFormat::Json);
+        return offered.first().copied();
     }
     let mut best: Option<(ResultsFormat, f32)> = None;
-    for format in ResultsFormat::ALL {
+    for &format in offered {
         let quality = quality(&ranges, format.media_type());
         if quality > 0.0 && best.is_none_or(|(_, q)| quality > q) {
             best = Some((format, quality));
@@ -204,11 +204,28 @@ mod tests {
     use super::*;
 
     fn accept(values: &[&str]) -> Option<ResultsFormat> {
+        accept_among(values, &ResultsFormat::ALL)
+    }
+
+    fn accept_among(values: &[&str], offered: &[ResultsFormat]) -> Option<ResultsFormat> {
         let mut headers = HeaderMap::new();
         for value in values {
             headers.append(header::ACCEPT, HeaderValue::from_str(value).unwrap());
         }
-        negotiate(&headers)
+        negotiate(&headers, offered)
+    }
+
+    #[test]
+    fn ask_results_are_offered_in_json_and_xml_only() {
+        let boolean = |values: &[&str]| accept_among(values, &ResultsFormat::BOOLEAN);
+        assert_eq!(boolean(&[]), Some(ResultsFormat::Json));
+        assert_eq!(boolean(&["*/*"]), Some(ResultsFormat::Json));
+        assert_eq!(
+            boolean(&["text/csv, application/sparql-results+xml;q=0.5"]),
+            Some(ResultsFormat::Xml)
+        );
+        assert_eq!(boolean(&["text/csv", "text/tab-separated-values"]), None);
+        assert_eq!(boolean(&["text/*"]), None);
     }
 
     #[test]

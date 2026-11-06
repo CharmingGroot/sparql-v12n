@@ -98,9 +98,55 @@ async fn syntax_error_is_400_and_unsupported_feature_is_501() {
     let response = send(&app, get("SELECT ?x WHERE {")).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(text(response).await.contains("query syntax error"));
-    let response = send(&app, post_direct("ASK { ?s ?p ?o }")).await;
+    let response = send(&app, post_direct("DESCRIBE ?s WHERE { ?s ?p ?o }")).await;
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    assert!(text(response).await.contains("ASK"));
+    assert!(text(response).await.contains("DESCRIBE"));
+}
+
+const ASK_KIM: &str = r#"ASK { ?c <http://example.org/name> "Kim" }"#;
+const ASK_NOBODY: &str = r#"ASK { ?c <http://example.org/name> "Nobody" }"#;
+
+/// CSV and TSV have no form for ASK results (SPARQL 1.1 Query Results CSV
+/// and TSV §1), so a client that accepts only them gets 406, before the
+/// database is reached.
+#[tokio::test]
+async fn ask_accepting_only_csv_or_tsv_is_406() {
+    for accept in ["text/csv", "text/tab-separated-values", "text/*"] {
+        let response = send(&offline(), get_as(ASK_KIM, accept)).await;
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE, "{accept}");
+        let body = text(response).await;
+        assert!(
+            body.contains("ASK results")
+                && body.contains("application/sparql-results+xml")
+                && !body.contains("text/csv"),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ask_answers_true_or_false_in_json_and_xml() {
+    let Some(url) = database_url() else { return };
+    let app = new_app(SHOP, &url, ServerLimits::default());
+    for (query, value) in [(ASK_KIM, true), (ASK_NOBODY, false), (ASK_KIM, true)] {
+        let response = send(&app, get(query)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], JSON);
+        let json: Value = serde_json::from_str(&text(response).await).unwrap();
+        assert_eq!(json, serde_json::json!({ "head": {}, "boolean": value }));
+    }
+    let response = send(
+        &app,
+        get_as(ASK_NOBODY, "text/csv, application/sparql-results+xml;q=0.5"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], XML);
+    assert_eq!(
+        text(response).await,
+        "<?xml version=\"1.0\"?>\n<sparql xmlns=\"http://www.w3.org/2005/sparql-results#\">\
+         <head></head><boolean>false</boolean></sparql>\n"
+    );
 }
 
 #[tokio::test]

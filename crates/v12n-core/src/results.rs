@@ -13,7 +13,8 @@ const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const XSD_DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
 const XSD_DOUBLE: &str = "http://www.w3.org/2001/XMLSchema#double";
 
-/// A SPARQL 1.1 query results format for `SELECT` results.
+/// A SPARQL 1.1 query results format for `SELECT` results, and for `ASK`
+/// results in [`BOOLEAN`](Self::BOOLEAN) formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResultsFormat {
     /// SPARQL 1.1 Query Results JSON Format.
@@ -30,6 +31,11 @@ impl ResultsFormat {
     /// Every format, in the order a server prefers them when a client
     /// accepts several equally.
     pub const ALL: [Self; 4] = [Self::Json, Self::Xml, Self::Csv, Self::Tsv];
+
+    /// The formats that can hold an `ASK` result, in the same order: JSON
+    /// (SPARQL 1.1 Query Results JSON §4) and XML (§2.3.2). CSV and TSV are
+    /// for `SELECT` results only (SPARQL 1.1 Query Results CSV and TSV §1).
+    pub const BOOLEAN: [Self; 2] = [Self::Json, Self::Xml];
 
     /// The media type without parameters, as an `Accept` header names it.
     pub fn media_type(self) -> &'static str {
@@ -50,6 +56,26 @@ impl ResultsFormat {
             Self::Tsv => "text/tab-separated-values; charset=utf-8",
             other => other.media_type(),
         }
+    }
+}
+
+/// Writes the result of an `ASK` query, a complete document. Fails with
+/// [`io::ErrorKind::InvalidInput`] for a format outside
+/// [`ResultsFormat::BOOLEAN`].
+pub fn write_boolean(format: ResultsFormat, out: &mut impl Write, value: bool) -> io::Result<()> {
+    match format {
+        // JSON §4: a `head` member, empty without links, and `boolean`.
+        ResultsFormat::Json => writeln!(out, "{{\"head\":{{}},\"boolean\":{value}}}"),
+        // XML §2.2: a boolean result has no `variable` in `head`.
+        ResultsFormat::Xml => writeln!(
+            out,
+            "<?xml version=\"1.0\"?>\n<sparql xmlns=\"http://www.w3.org/2005/sparql-results#\">\
+             <head></head><boolean>{value}</boolean></sparql>"
+        ),
+        ResultsFormat::Csv | ResultsFormat::Tsv => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CSV and TSV have no form for ASK results",
+        )),
     }
 }
 
@@ -530,6 +556,39 @@ mod tests {
     use oxrdf::{BlankNode, Literal, NamedNode};
 
     use super::*;
+
+    fn boolean(format: ResultsFormat, value: bool) -> io::Result<String> {
+        let mut out = Vec::new();
+        write_boolean(format, &mut out, value)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn boolean_results_in_json_and_xml_and_none_in_csv_or_tsv() {
+        assert_eq!(
+            boolean(ResultsFormat::Json, true).unwrap(),
+            "{\"head\":{},\"boolean\":true}\n"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&boolean(ResultsFormat::Json, false).unwrap()).unwrap();
+        assert_eq!(json, serde_json::json!({ "head": {}, "boolean": false }));
+        assert_eq!(
+            boolean(ResultsFormat::Xml, false).unwrap(),
+            "<?xml version=\"1.0\"?>\n<sparql xmlns=\"http://www.w3.org/2005/sparql-results#\">\
+             <head></head><boolean>false</boolean></sparql>\n"
+        );
+        for format in ResultsFormat::ALL {
+            let written = boolean(format, true);
+            assert_eq!(
+                written.is_ok(),
+                ResultsFormat::BOOLEAN.contains(&format),
+                "{format:?}"
+            );
+            if let Err(e) = written {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            }
+        }
+    }
 
     fn write(variables: &[&str], solutions: Vec<Solution>) -> String {
         let variables: Vec<String> = variables.iter().map(|v| (*v).to_owned()).collect();
