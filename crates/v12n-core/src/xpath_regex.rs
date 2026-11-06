@@ -22,6 +22,16 @@
 //! whose Unicode classes PostgreSQL does not have independently of the
 //! locale; back-references; character class subtraction; counts above
 //! 255 (PostgreSQL's limit); and the `q` flag (XPath 3.0).
+//!
+//! `REPLACE` (SPARQL 1.1 §17.4.3.15) also depends on which match is
+//! chosen where several start at one position. XPath takes the first
+//! alternative and the greedy or reluctant choice of each quantifier in
+//! turn (F&O 3.1 §5.6.4), PostgreSQL the longest match of the whole
+//! pattern. [`translate_replace`] accepts only patterns where both choose
+//! the same match: no alternatives, reluctant quantifiers or quantified
+//! groups, and every repeated character set followed by characters it
+//! cannot match. Each repetition then takes as many characters as it can,
+//! whichever engine runs it.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
@@ -43,6 +53,136 @@ const MAX_CASE_RANGE: u32 = 0x3000;
 
 /// The PostgreSQL pattern for `pattern` with `flags`.
 pub(crate) fn translate(pattern: &str, flags: &str) -> Result<String, Untranslated> {
+    Ok(parse(pattern, flags)?.out)
+}
+
+/// A pattern and a replacement string for PostgreSQL's `regexp_replace`
+/// with the flag `g`, which replace what `fn:replace` replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Replacement {
+    pub pattern: String,
+    pub replacement: String,
+}
+
+/// The `regexp_replace` arguments for `fn:replace(input, pattern,
+/// replacement, flags)` (F&O 3.1 §5.6.4).
+pub(crate) fn translate_replace(
+    pattern: &str,
+    flags: &str,
+    replacement: &str,
+) -> Result<Replacement, Untranslated> {
+    let parser = parse(pattern, flags)?;
+    // err:FORX0003: the pattern matches the empty string.
+    if parser.nullable {
+        return Err(Untranslated::Invalid);
+    }
+    let replacement = replacement_string(replacement, parser.groups)?;
+    if parser.ambiguous {
+        return Err(unsupported(AMBIGUOUS));
+    }
+    for (i, item) in parser.items.iter().enumerate() {
+        if let Item::Chars { set, min, max } = item
+            && Some(*min) != *max
+            && set.intersects(&follow(&parser.items[i + 1..], parser.multi_line))
+        {
+            return Err(unsupported(AMBIGUOUS));
+        }
+    }
+    Ok(Replacement {
+        pattern: parser.out,
+        replacement,
+    })
+}
+
+const AMBIGUOUS: &str = "REPLACE with a pattern where XPath and PostgreSQL can choose different \
+                         matches: alternatives, reluctant quantifiers, quantified groups, or a \
+                         repeated character that what follows can also start with";
+
+/// The characters that can come right after a piece followed by `rest`
+/// in a match, with nothing after the end of the string.
+fn follow(rest: &[Item], multi_line: bool) -> Chars {
+    let mut out = Chars::default();
+    for item in rest {
+        match item {
+            Item::Chars { set, min, .. } => {
+                out = out.union(set);
+                if *min > 0 {
+                    break;
+                }
+            }
+            Item::Start => {}
+            // Only the end of the string, or with `m` a newline, follows.
+            Item::End => {
+                if multi_line {
+                    out = out.union(&Chars::of(&['\n']));
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The replacement string of `fn:replace` as one for `regexp_replace`:
+/// `$N` is group `N` (`$0` the whole match), `\$` and `\\` are `$` and
+/// `\`, and the rest stands for itself. With `groups` groups, a reference
+/// to a group that does not exist is the empty string for `N` up to 9;
+/// above, its last digit is a character after the reference without it.
+/// err:FORX0004 for a `$` without a digit or another `\`.
+fn replacement_string(replacement: &str, groups: usize) -> Result<String, Untranslated> {
+    fn reference(digits: &str, groups: usize) -> Result<String, Untranslated> {
+        let n: usize = digits.parse().unwrap_or(usize::MAX);
+        if n == 0 {
+            Ok("\\&".to_owned())
+        } else if n <= groups {
+            if n > 9 {
+                return Err(unsupported(
+                    "REPLACE with a reference to a group after the ninth, which PostgreSQL's \
+                     replacement strings cannot name",
+                ));
+            }
+            Ok(format!("\\{n}"))
+        } else if n <= 9 {
+            Ok(String::new())
+        } else {
+            let (head, last) = digits.split_at(digits.len() - 1);
+            Ok(reference(head, groups)? + last)
+        }
+    }
+    let chars: Vec<char> = replacement.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        match c {
+            '\\' => {
+                match chars.get(i) {
+                    Some('\\') => out.push_str("\\\\"),
+                    Some('$') => out.push('$'),
+                    _ => return Err(Untranslated::Invalid),
+                }
+                i += 1;
+            }
+            '$' => {
+                let digits: String = chars[i..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if digits.is_empty() {
+                    return Err(Untranslated::Invalid);
+                }
+                out.push_str(&reference(&digits, groups)?);
+                i += digits.len();
+            }
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+/// The parser after reading `pattern` with `flags`.
+fn parse(pattern: &str, flags: &str) -> Result<Parser, Untranslated> {
     let mut parser = Parser {
         chars: Vec::new(),
         pos: 0,
@@ -50,6 +190,10 @@ pub(crate) fn translate(pattern: &str, flags: &str) -> Result<String, Untranslat
         multi_line: false,
         case_insensitive: false,
         out: String::new(),
+        groups: 0,
+        nullable: false,
+        ambiguous: false,
+        items: Vec::new(),
     };
     let mut extended = false;
     for flag in flags.chars() {
@@ -67,12 +211,12 @@ pub(crate) fn translate(pattern: &str, flags: &str) -> Result<String, Untranslat
     } else {
         pattern.chars().collect()
     };
-    parser.reg_exp()?;
+    parser.nullable = parser.reg_exp()?;
     if parser.pos < parser.chars.len() {
         // An unmatched `)`.
         return Err(Untranslated::Invalid);
     }
-    Ok(parser.out)
+    Ok(parser)
 }
 
 /// The `x` flag: whitespace is removed, except inside character class
@@ -119,6 +263,90 @@ struct Parser {
     multi_line: bool,
     case_insensitive: bool,
     out: String,
+    /// Capturing groups, which keep their numbers in `out`.
+    groups: usize,
+    /// Whether the pattern matches the empty string.
+    nullable: bool,
+    /// Whether it has an alternative, a reluctant quantifier or a
+    /// quantified group.
+    ambiguous: bool,
+    /// The pieces in the order written, those inside groups included.
+    items: Vec<Item>,
+}
+
+/// A piece of a pattern, for the choice of matches by `REPLACE`.
+#[derive(Debug, Clone)]
+enum Item {
+    /// A character of `set`, from `min` to `max` (no bound for `None`)
+    /// times.
+    Chars {
+        set: Chars,
+        min: u32,
+        max: Option<u32>,
+    },
+    /// `^`.
+    Start,
+    /// `$`.
+    End,
+}
+
+/// A set of characters, as sorted, disjoint, non-adjacent ranges of code
+/// points.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Chars(Vec<(u32, u32)>);
+
+impl Chars {
+    fn of(chars: &[char]) -> Self {
+        Self::ranges(chars.iter().map(|&c| (u32::from(c), u32::from(c))))
+    }
+
+    fn ranges(ranges: impl IntoIterator<Item = (u32, u32)>) -> Self {
+        let mut ranges: Vec<(u32, u32)> = ranges.into_iter().collect();
+        ranges.sort_unstable();
+        let mut out: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+        for (low, high) in ranges {
+            match out.last_mut() {
+                Some(last) if low <= last.1.saturating_add(1) => last.1 = last.1.max(high),
+                _ => out.push((low, high)),
+            }
+        }
+        Self(out)
+    }
+
+    fn union(&self, other: &Self) -> Self {
+        Self::ranges(self.0.iter().chain(&other.0).copied())
+    }
+
+    fn complement(&self) -> Self {
+        let mut out = Vec::new();
+        let mut next = 0;
+        for &(low, high) in &self.0 {
+            if low > next {
+                out.push((next, low - 1));
+            }
+            next = high + 1;
+        }
+        if next <= 0x10FFFF {
+            out.push((next, 0x10FFFF));
+        }
+        Self(out)
+    }
+
+    fn intersects(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .any(|&(a, b)| other.0.iter().any(|&(c, d)| a <= d && c <= b))
+    }
+}
+
+/// What an atom is.
+struct Atom {
+    /// Whether it can take a quantifier.
+    quantifiable: bool,
+    nullable: bool,
+    /// For a character, `.`, an escape or a class: the characters it
+    /// matches.
+    chars: Option<Chars>,
 }
 
 impl Parser {
@@ -132,40 +360,59 @@ impl Parser {
         c
     }
 
-    fn reg_exp(&mut self) -> Result<(), Untranslated> {
-        self.branch()?;
+    /// Returns whether the expression matches the empty string.
+    fn reg_exp(&mut self) -> Result<bool, Untranslated> {
+        let mut nullable = self.branch()?;
         while self.peek() == Some('|') {
             self.pos += 1;
             self.out.push('|');
-            self.branch()?;
+            self.ambiguous = true;
+            nullable |= self.branch()?;
         }
-        Ok(())
+        Ok(nullable)
     }
 
-    fn branch(&mut self) -> Result<(), Untranslated> {
+    fn branch(&mut self) -> Result<bool, Untranslated> {
+        let mut nullable = true;
         while let Some(c) = self.peek() {
             if c == '|' || c == ')' {
                 break;
             }
-            self.piece()?;
+            nullable &= self.piece()?;
         }
-        Ok(())
+        Ok(nullable)
     }
 
-    fn piece(&mut self) -> Result<(), Untranslated> {
-        let quantifiable = self.atom()?;
-        if matches!(self.peek(), Some('?' | '*' | '+' | '{')) {
-            if !quantifiable {
-                return Err(unsupported("a quantifier on ^ or $ in REGEX"));
+    fn piece(&mut self) -> Result<bool, Untranslated> {
+        let atom = self.atom()?;
+        if !matches!(self.peek(), Some('?' | '*' | '+' | '{')) {
+            return Ok(atom.nullable);
+        }
+        if !atom.quantifiable {
+            return Err(unsupported("a quantifier on ^ or $ in REGEX"));
+        }
+        let (min, max) = self.quantifier()?;
+        match atom.chars {
+            Some(set) => {
+                let last = self.items.last_mut().expect("the atom's item");
+                *last = Item::Chars { set, min, max };
             }
-            self.quantifier()?;
+            None => self.ambiguous = true,
         }
-        Ok(())
+        Ok(atom.nullable || min == 0)
     }
 
-    fn quantifier(&mut self) -> Result<(), Untranslated> {
-        match self.next() {
-            Some(c @ ('?' | '*' | '+')) => self.out.push(c),
+    /// Returns the least and the most repetitions, `None` for no bound.
+    fn quantifier(&mut self) -> Result<(u32, Option<u32>), Untranslated> {
+        let bounds = match self.next() {
+            Some(c @ ('?' | '*' | '+')) => {
+                self.out.push(c);
+                match c {
+                    '?' => (0, Some(1)),
+                    '*' => (0, None),
+                    _ => (1, None),
+                }
+            }
             Some('{') => {
                 let min = self.count()?.ok_or(Untranslated::Invalid)?;
                 let max = match self.next() {
@@ -191,15 +438,17 @@ impl Parser {
                     Some(max) => format!("{{{min},{max}}}"),
                     None => format!("{{{min},}}"),
                 });
+                (min, max)
             }
             _ => return Err(Untranslated::Invalid),
-        }
+        };
         // A reluctant quantifier matches the same strings; PostgreSQL has it.
         if self.peek() == Some('?') {
             self.pos += 1;
             self.out.push('?');
+            self.ambiguous = true;
         }
-        Ok(())
+        Ok(bounds)
     }
 
     /// Decimal digits, `None` when there are none.
@@ -216,55 +465,89 @@ impl Parser {
         Ok(Some(digits.parse().unwrap_or(u32::MAX)))
     }
 
-    /// Returns whether the atom can take a quantifier.
-    fn atom(&mut self) -> Result<bool, Untranslated> {
+    fn atom(&mut self) -> Result<Atom, Untranslated> {
+        let anchor = |this: &mut Self, item: Item| {
+            this.items.push(item);
+            Ok(Atom {
+                quantifiable: false,
+                nullable: true,
+                chars: None,
+            })
+        };
         let c = self.next().ok_or(Untranslated::Invalid)?;
-        match c {
+        let chars = match c {
             '(' => {
                 if self.chars.get(self.pos..self.pos + 2) == Some(&['?', ':']) {
                     self.pos += 2;
                     self.out.push_str("(?:");
                 } else {
                     self.out.push('(');
+                    self.groups += 1;
                 }
-                self.reg_exp()?;
+                let nullable = self.reg_exp()?;
                 if self.next() != Some(')') {
                     return Err(Untranslated::Invalid);
                 }
                 self.out.push(')');
+                return Ok(Atom {
+                    quantifiable: true,
+                    nullable,
+                    chars: None,
+                });
             }
             '[' => self.class()?,
-            '.' if self.dot_all => self.out.push('.'),
-            '.' => self.out.push_str("[^\\u000A\\u000D]"),
+            '.' if self.dot_all => {
+                self.out.push('.');
+                Chars::default().complement()
+            }
+            '.' => {
+                self.out.push_str("[^\\u000A\\u000D]");
+                Chars::of(&['\n', '\r']).complement()
+            }
             '^' if self.multi_line => {
                 // After a newline that is not the last character.
                 self.out.push_str("(?:^|(?<=\\u000A)(?!$))");
-                return Ok(false);
+                return anchor(self, Item::Start);
             }
             '^' => {
                 self.out.push('^');
-                return Ok(false);
+                return anchor(self, Item::Start);
             }
             '$' if self.multi_line => {
                 // Before a newline, or at the end when no newline ends it.
                 self.out.push_str("(?:(?=\\u000A)|(?<!\\u000A)$)");
-                return Ok(false);
+                return anchor(self, Item::End);
             }
             '$' => {
                 self.out.push('$');
-                return Ok(false);
+                return anchor(self, Item::End);
             }
             '\\' => match self.escape()? {
                 Member::Char(c) => self.literal(c),
-                Member::Space => self.out.push_str("[\\u0020\\u0009\\u000A\\u000D]"),
-                Member::NotSpace => self.out.push_str("[^\\u0020\\u0009\\u000A\\u000D]"),
+                Member::Space => {
+                    self.out.push_str("[\\u0020\\u0009\\u000A\\u000D]");
+                    space()
+                }
+                Member::NotSpace => {
+                    self.out.push_str("[^\\u0020\\u0009\\u000A\\u000D]");
+                    space().complement()
+                }
                 Member::Range(..) => unreachable!("an escape is one character or a class"),
             },
             // Metacharacters that must be escaped to stand for themselves.
             '?' | '*' | '+' | '{' | '}' | ')' | ']' | '|' => return Err(Untranslated::Invalid),
             c => self.literal(c),
-        }
-        Ok(true)
+        };
+        self.items.push(Item::Chars {
+            set: chars.clone(),
+            min: 1,
+            max: Some(1),
+        });
+        Ok(Atom {
+            quantifiable: true,
+            nullable: false,
+            chars: Some(chars),
+        })
     }
 
     /// What the escape after a `\` stands for.
@@ -289,8 +572,9 @@ impl Parser {
         }))
     }
 
-    /// A character class expression, after its `[`.
-    fn class(&mut self) -> Result<(), Untranslated> {
+    /// A character class expression, after its `[`; returns the
+    /// characters it matches.
+    fn class(&mut self) -> Result<Chars, Untranslated> {
         let negated = self.peek() == Some('^');
         if negated {
             self.pos += 1;
@@ -381,16 +665,23 @@ impl Parser {
                 Member::Space | Member::NotSpace => false,
             })
         };
+        let mut set = Chars::ranges(members.iter().flat_map(|m| match *m {
+            Member::Char(c) => vec![(u32::from(c), u32::from(c))],
+            Member::Range(low, high) => vec![(u32::from(low), u32::from(high))],
+            Member::Space => space().0,
+            Member::NotSpace => unreachable!("rejected while parsing"),
+        }));
+        set = set.union(&Chars::of(&extra.iter().copied().collect::<Vec<_>>()));
         for c in extra.into_iter().filter(|&c| !covered(c)) {
             self.out.push_str(&escaped(c));
         }
         self.out.push(']');
-        Ok(())
+        Ok(if negated { set.complement() } else { set })
     }
 
     /// A character that stands for itself, with its case variants under
-    /// the `i` flag.
-    fn literal(&mut self, c: char) {
+    /// the `i` flag; returns the characters it matches.
+    fn literal(&mut self, c: char) -> Chars {
         let variants = if self.case_insensitive {
             case_variants(c)
         } else {
@@ -398,14 +689,20 @@ impl Parser {
         };
         if variants.len() <= 1 {
             self.out.push_str(&escaped(c));
-            return;
+            return Chars::of(&[c]);
         }
         self.out.push('[');
-        for v in variants {
+        for &v in &variants {
             self.out.push_str(&escaped(v));
         }
         self.out.push(']');
+        Chars::of(&variants.into_iter().collect::<Vec<_>>())
     }
+}
+
+/// The characters of `\s`.
+fn space() -> Chars {
+    Chars::of(&[' ', '\t', '\n', '\r'])
 }
 
 /// `c` as itself when it is an ASCII letter or digit, else as a
@@ -573,5 +870,115 @@ mod tests {
                 "{pattern:?}"
             );
         }
+    }
+
+    fn replace(pattern: &str, flags: &str, replacement: &str) -> Result<(String, String), Untranslated> {
+        translate_replace(pattern, flags, replacement).map(|r| (r.pattern, r.replacement))
+    }
+
+    #[test]
+    fn replacement_strings_name_groups_as_postgresql_does() {
+        let groups = |replacement: &str| replace("(a)(b)c", "", replacement).map(|r| r.1);
+        assert_eq!(groups("[$1-$2]"), Ok("[\\1-\\2]".to_owned()));
+        assert_eq!(groups("$0"), Ok("\\&".to_owned()));
+        // F&O 3.1 §5.6.4: a group that does not exist is empty up to 9;
+        // above, the last digit is a character of its own.
+        assert_eq!(groups("$3$9"), Ok(String::new()));
+        assert_eq!(groups("$12"), Ok("\\12".to_owned()));
+        assert_eq!(groups("$100"), Ok("\\100".to_owned()));
+        assert_eq!(groups("$01"), Ok("\\1".to_owned()));
+        assert_eq!(groups("\\$1 \\\\ & \\1"), Err(Untranslated::Invalid));
+        assert_eq!(groups("\\$1 \\\\ &"), Ok("$1 \\\\ &".to_owned()));
+        // err:FORX0004.
+        assert_eq!(groups("$"), Err(Untranslated::Invalid));
+        assert_eq!(groups("a$b"), Err(Untranslated::Invalid));
+        assert_eq!(groups("\\a"), Err(Untranslated::Invalid));
+        assert_eq!(groups("\\"), Err(Untranslated::Invalid));
+        let many = replace("(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)", "", "$9");
+        assert_eq!(many.map(|r| r.1), Ok("\\9".to_owned()));
+        assert!(matches!(
+            replace("(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)", "", "$10"),
+            Err(Untranslated::Unsupported(reason)) if reason.contains("ninth")
+        ));
+        // Non-capturing groups keep the numbers of the others.
+        assert_eq!(
+            replace("(?:a)(b)", "", "$1").map(|r| r.1),
+            Ok("\\1".to_owned())
+        );
+    }
+
+    #[test]
+    fn replace_rejects_patterns_that_match_the_empty_string() {
+        // err:FORX0003, whether or not the pattern has other matches.
+        for pattern in ["", "a*", "a?", "(a|)", "^", "$", "a{0,2}", "(?:a*)b?", "x*|y"] {
+            assert_eq!(replace(pattern, "", "z"), Err(Untranslated::Invalid), "{pattern:?}");
+        }
+        assert_eq!(replace("a+", "", "z"), Ok(("a+".to_owned(), "z".to_owned())));
+        assert_eq!(replace("^a", "m", "z").map(|r| r.1), Ok("z".to_owned()));
+    }
+
+    #[test]
+    fn replace_takes_patterns_whose_matches_both_engines_choose_alike() {
+        // Each repetition stops where nothing it matches can follow.
+        for (pattern, flags) in [
+            ("b", ""),
+            ("a+b", ""),
+            ("\\s+", ""),
+            ("[^,]+,", ""),
+            ("x[0-9]{1,3}y", ""),
+            ("(\\s+)(-)", ""),
+            ("a{2}a", ""),
+            ("^\\s+", ""),
+            ("a+$", ""),
+            ("[a-z]+\\.", "i"),
+            ("x.*", ""),
+            ("[^\\n]+$", "m"),
+            ("a.b", ""),
+        ] {
+            assert!(replace(pattern, flags, "").is_ok(), "{pattern:?} {flags:?}");
+        }
+        for (pattern, flags) in [
+            // XPath takes the first alternative, PostgreSQL the longest.
+            ("a|ab", ""),
+            ("^\\s+|\\s+$", ""),
+            ("a+?", ""),
+            ("(ab)+", ""),
+            ("(a)?b", ""),
+            // a* followed by an a: XPath backtracks one, as PostgreSQL's
+            // longest match does here, but not in general.
+            ("a*ab", ""),
+            ("[a-z]+[0-9a-z]", ""),
+            ("a+b?a", ""),
+            ("x.*y", ""),
+            ("a+A", "i"),
+            ("[a\\n]+$", "m"),
+            (".+\\n", "s"),
+        ] {
+            assert!(
+                matches!(
+                    replace(pattern, flags, ""),
+                    Err(Untranslated::Unsupported(reason)) if reason.contains("REPLACE")
+                ),
+                "{pattern:?} {flags:?}"
+            );
+        }
+        // Not supported in REGEX either.
+        assert!(matches!(replace("\\d+", "", ""), Err(Untranslated::Unsupported(_))));
+        assert_eq!(replace("(", "", ""), Err(Untranslated::Invalid));
+        assert_eq!(replace("a", "g", ""), Err(Untranslated::Invalid));
+    }
+
+    #[test]
+    fn character_sets() {
+        let set = Chars::of(&['c', 'a', 'b', 'x']);
+        assert_eq!(set, Chars(vec![(97, 99), (120, 120)]));
+        assert_eq!(
+            set.complement(),
+            Chars(vec![(0, 96), (100, 119), (121, 0x10FFFF)])
+        );
+        assert!(set.intersects(&Chars::of(&['x'])));
+        assert!(!set.intersects(&Chars::of(&['d', 'w'])));
+        assert_eq!(Chars::default().complement(), Chars(vec![(0, 0x10FFFF)]));
+        assert_eq!(Chars::default().complement().complement(), Chars::default());
     }
 }

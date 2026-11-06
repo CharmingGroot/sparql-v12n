@@ -76,6 +76,18 @@ impl Dialect for MarkerDialect {
         }
     }
 
+    fn position(&self, text: &str, search: &str) -> String {
+        format!("<<POSITION {text}, {search}>>")
+    }
+
+    fn regex_replace(&self, text: &str, pattern: &str, replacement: &str) -> String {
+        format!("<<REGEX_REPLACE {text}, {pattern}, {replacement}>>")
+    }
+
+    fn encode_for_uri(&self, text: &str) -> String {
+        format!("<<ENCODE_FOR_URI {text}>>")
+    }
+
     fn case_map(&self, text: &str, upper: bool) -> String {
         let case = if upper { "UPPER" } else { "LOWER" };
         format!("<<CASE_MAP_{case} {text}>>")
