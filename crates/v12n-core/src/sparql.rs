@@ -13,12 +13,13 @@ use crate::Error;
 /// IRI of `rdf:type`, whose constant objects are looked up as classes.
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
-/// A `SELECT` query in the supported subset: a graph pattern with the
-/// solution modifiers in the order SPARQL 1.1 §18.2.5 applies them
-/// (Converting Solution Modifiers): `ORDER BY`, projection, `DISTINCT`,
-/// then `OFFSET` and `LIMIT`.
+/// A `SELECT` or `ASK` query in the supported subset: a graph pattern
+/// with the solution modifiers in the order SPARQL 1.1 §18.2.5 applies
+/// them (Converting Solution Modifiers): `ORDER BY`, projection,
+/// `DISTINCT`, then `OFFSET` and `LIMIT`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectQuery {
+    pub form: QueryForm,
     /// Projected variable names, without `?`, in `SELECT` order.
     pub variables: Vec<String>,
     pub distinct: bool,
@@ -32,6 +33,16 @@ pub struct SelectQuery {
     pub offset: usize,
     /// Most solutions returned (`LIMIT`).
     pub limit: Option<usize>,
+}
+
+/// The query form (SPARQL 1.1 §16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryForm {
+    Select,
+    /// `ASK` (§16.3): whether the pattern has a solution. The query
+    /// projects no variable and returns at most one solution, whose
+    /// presence is the answer, so duplicates need not be removed.
+    Ask,
 }
 
 /// `Extend(P, ?v, expr)` from `BIND(expr AS ?v)` or `SELECT (expr AS ?v)`
@@ -444,11 +455,13 @@ pub fn parse(query: &str) -> Result<SelectQuery, Error> {
     let query = SparqlParser::new()
         .parse_query(query)
         .map_err(|e| Error::QuerySyntax(e.to_string()))?;
-    let (dataset, pattern) = match query {
+    let (form, dataset, pattern) = match query {
         Query::Select {
             dataset, pattern, ..
-        } => (dataset, pattern),
-        Query::Ask { .. } => return Err(unsupported("ASK queries")),
+        } => (QueryForm::Select, dataset, pattern),
+        Query::Ask {
+            dataset, pattern, ..
+        } => (QueryForm::Ask, dataset, pattern),
         Query::Construct { .. } => return Err(unsupported("CONSTRUCT queries")),
         Query::Describe { .. } => return Err(unsupported("DESCRIBE queries")),
     };
@@ -466,6 +479,12 @@ pub fn parse(query: &str) -> Result<SelectQuery, Error> {
         } => (start, length, *inner),
         other => (0, None, other),
     };
+    // SPARQL 1.1 §18.2.5 slices the solutions before ASK tests whether one
+    // is left, so `LIMIT 0` gives false. Engines differ here, so a sliced
+    // ASK is rejected rather than answered differently from some of them.
+    if form == QueryForm::Ask && (offset > 0 || limit.is_some()) {
+        return Err(unsupported("LIMIT and OFFSET in ASK queries"));
+    }
     let (distinct, projected) = match sliced {
         GraphPattern::Distinct { inner } => (true, *inner),
         other => (false, other),
@@ -474,6 +493,8 @@ pub fn parse(query: &str) -> Result<SelectQuery, Error> {
         return Err(unsupported(describe(&projected)));
     };
     let (order_by, inner) = match *inner {
+        // The order never adds or removes a solution (SPARQL 1.1 §15.1).
+        GraphPattern::OrderBy { inner, .. } if form == QueryForm::Ask => (Vec::new(), *inner),
         GraphPattern::OrderBy { inner, expression } => {
             let conditions = expression
                 .iter()
@@ -489,8 +510,17 @@ pub fn parse(query: &str) -> Result<SelectQuery, Error> {
         return Err(unsupported("empty graph patterns"));
     }
     let bindings = check_extends(&pattern, extends, &order_by)?;
+    let (variables, limit) = match form {
+        QueryForm::Select => (
+            variables.iter().map(|v| v.as_str().to_owned()).collect(),
+            limit,
+        ),
+        // The first solution decides the answer (SPARQL 1.1 §16.3).
+        QueryForm::Ask => (Vec::new(), Some(1)),
+    };
     Ok(SelectQuery {
-        variables: variables.iter().map(|v| v.as_str().to_owned()).collect(),
+        form,
+        variables,
         distinct,
         pattern,
         bindings,
@@ -1058,6 +1088,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_ask_projects_nothing_and_asks_for_one_solution() {
+        let q = parse_ok("ASK { ?c ex:name ?n }");
+        assert_eq!(q.form, QueryForm::Ask);
+        assert!(q.variables.is_empty());
+        assert!(!q.distinct);
+        assert_eq!((q.offset, q.limit), (0, Some(1)));
+        assert_eq!(q.pattern.triple_patterns().len(), 1);
+
+        // ORDER BY is not even checked, since it cannot change the answer.
+        let q = parse_ok("ASK { ?c ex:name ?n } ORDER BY UCASE(?n)");
+        assert!(q.order_by.is_empty());
+
+        let select = parse_ok("SELECT * WHERE { ?c ex:name ?n }");
+        assert_eq!(select.form, QueryForm::Select);
+    }
+
+    #[test]
+    fn parse_ask_rejects_slices_and_what_select_rejects() {
+        for (query, feature) in [
+            ("ASK { ?c ex:name ?n } LIMIT 0", "LIMIT and OFFSET in ASK"),
+            ("ASK { ?c ex:name ?n } LIMIT 1", "LIMIT and OFFSET in ASK"),
+            ("ASK { ?c ex:name ?n } OFFSET 1", "LIMIT and OFFSET in ASK"),
+            ("ASK FROM ex:g { ?c ex:name ?n }", "FROM"),
+            ("ASK { ?c ?p ?o }", "variable predicates"),
+            ("ASK { ?c ex:name ?n FILTER(UCASE(?n) = \"A\") }", "UCASE"),
+        ] {
+            let Error::UnsupportedFeature(message) = parse_err(query) else {
+                panic!("{query}")
+            };
+            assert!(message.contains(feature), "{query}: {message}");
+        }
+    }
+
+    #[test]
     fn parse_select_bgp_keeps_projection_and_patterns() {
         let q = parse_ok(r#"SELECT ?c ?n WHERE { ?c a ex:Customer ; ex:name ?n ; ex:tier "VIP" }"#);
         assert_eq!(q.variables, ["c", "n"]);
@@ -1525,7 +1589,6 @@ mod tests {
                 "EXISTS",
             ),
             ("SELECT * WHERE { ?c ?p ?o }", "variable predicates"),
-            ("ASK { ?c ex:name ?n }", "ASK"),
             (
                 "CONSTRUCT { ?c ex:label ?n } WHERE { ?c ex:name ?n }",
                 "CONSTRUCT",

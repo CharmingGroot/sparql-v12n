@@ -157,6 +157,50 @@ async fn constant_without_natural_lexical_form_matches_nothing() {
     assert!(rows.is_empty(), "{rows:?}");
 }
 
+/// `ASK` (SPARQL 1.1 §16.3) gives one solution without variables when the
+/// pattern has a solution, and none otherwise; a row limit of 1 does not
+/// cut it off.
+#[tokio::test]
+async fn ask_returns_one_empty_solution_or_none() {
+    let Some(url) = database_url() else { return };
+    // Two rows that give the same triple; duplicates are not removed.
+    let repeated = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <#Repeated> rr:logicalTable [ rr:sqlQuery "SELECT 1 AS id UNION ALL SELECT 1" ] ;
+          rr:subjectMap [ rr:template "http://example.org/r/{id}" ] ;
+          rr:predicateObjectMap [ rr:predicate ex:id ; rr:objectMap [ rr:column "id" ] ] .
+    "#;
+    let limits = Limits {
+        row_limit: 1,
+        ..Limits::default()
+    };
+    for (mapping, query, answer) in [
+        (SHOP, "ASK { ?o ex:placedBy ?c }", true),
+        (SHOP, r#"ASK { ?c ex:name "Nobody" }"#, false),
+        (SHOP, "ASK { ?o ex:amount ?a FILTER(?a > 100000) }", true),
+        (SHOP, "ASK { ?o ex:amount ?a FILTER(?a > 200000) }", false),
+        (SHOP, "ASK { ?o ex:placedBy ?c . ?c ex:tier ?t }", true),
+        (
+            SHOP,
+            r#"ASK { ?o ex:placedBy ?c . ?c ex:tier "NONE" }"#,
+            false,
+        ),
+        (SHOP, "ASK { ?c ex:name ?n } ORDER BY DESC(?n)", true),
+        (repeated, "ASK { ?r ex:id ?v }", true),
+        (repeated, "ASK { ?r ex:id 2 }", false),
+    ] {
+        let plan = plan(
+            mapping,
+            &format!("PREFIX ex: <http://example.org/>\n{query}"),
+        );
+        let (rows, truncated) = run(&url, limits, &plan).await.unwrap();
+        let expected: &[&str] = if answer { &[""] } else { &[] };
+        assert_eq!(rows, expected, "{query}");
+        assert!(!truncated, "{query}");
+    }
+}
+
 #[tokio::test]
 async fn row_limit_cuts_off_and_reports_truncation() {
     let Some(url) = database_url() else { return };

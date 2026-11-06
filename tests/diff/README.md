@@ -38,6 +38,8 @@ Every directory with a `mapping.ttl` or a `case.toml` under `examples/`,
   the same term (RDF 1.1). Values are never normalized.
 - An unbound variable differs from every bound one.
 - Variables are compared as a set; their order in `SELECT *` may differ.
+- An `ASK` result compares as no variables and one empty solution for
+  `true`, none for `false`, which is what v12n returns for it.
 - Results with blank nodes fail the check, since comparing them needs graph
   isomorphism.
 
@@ -85,6 +87,7 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0011-time/time-filter-equal` | `=` on `xsd:time`: no row of the operator mapping (SPARQL 1.1 §17.3), so a type error, which engines that extend SPARQL compare as values (Discussion #57). |
 | `0013-bind/bind-in-optional` | `BIND` inside `OPTIONAL`: the variable is computed only where the part matches, which the first step of `BIND` leaves out (#100). |
 | `0013-bind/filter-over-bind` | `FILTER` over a variable that `BIND` computes, which the first step of `BIND` leaves out (#100). |
+| `0018-ask/limit-zero`, `offset-second-solution`, `offset-duplicate-triple` | `LIMIT` and `OFFSET` in `ASK`: SPARQL 1.1 §18.2.5 slices the solutions before `ASK` tests for one, so `LIMIT 0` answers false; Ontop answers from the pattern alone. |
 | `0020-functional-forms/bind-coalesce-variable`, `bind-in` | `COALESCE` whose result can be a term other than a number, and `IN` as the value of `BIND`: a computed variable holds only numbers (#100). |
 | `0020-functional-forms/order-by-if` | `IF` in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0008-order/distinct-over-hidden` | `ORDER BY` over a variable that `SELECT DISTINCT` does not project: one solution stands for several that the order puts at different places (Discussion #63). |

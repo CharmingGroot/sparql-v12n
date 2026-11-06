@@ -1,0 +1,17 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#PersonMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "people" ] ;
+  rr:subjectMap [ rr:template "http://example.org/person/{id}" ; rr:class ex:Person ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] .
+
+<#PetMap> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "pets" ] ;
+  rr:subjectMap [ rr:template "http://example.org/pet/{id}" ] ;
+  rr:predicateObjectMap [
+    rr:predicate ex:owner ;
+    rr:objectMap [ rr:template "http://example.org/person/{owner}" ]
+  ] ;
+  rr:predicateObjectMap [ rr:predicate ex:kind ; rr:objectMap [ rr:column "kind" ] ] .
