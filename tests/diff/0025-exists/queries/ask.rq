@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# ASK over NOT EXISTS.
+ASK { ?p a ex:Person FILTER NOT EXISTS { ?p ex:city ?c } }

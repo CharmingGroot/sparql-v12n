@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?w WHERE { ?w ex:name ?n FILTER(SHA384(?n) = "2cdfc954d7a8196d23976d00454d78a0cb675238261fc52251e7863ee76a329085429b2f7e57894ce50e42c02941cc2d") }

@@ -357,6 +357,8 @@ XPath 构造函数 `xsd:integer`、`xsd:decimal`、`xsd:double` 与 `xsd:boolean
 
 在 SQL 中，所有计算得到的字符串都在 `COLLATE "C"` 下，因此其比较、查找与连接按码位进行，与列的 collation 无关。`STRLEN` 为 `char_length`，`SUBSTR` 为 `substr`，在 UTF-8 数据库中按码位计数。`UCASE` 与 `LCASE` 为 ICU collation `"und-x-icu"`（root 区域设置）下的 `upper` 与 `lower`，未启用 ICU 构建的 PostgreSQL 服务器会拒绝该语句。与常量比较的 `STRSTARTS`、`STRENDS` 与 `CONTAINS` 为 `LIKE`，常量作为参数传递，其中的 `%`、`_` 与 `\` 被转义；列上 `COLLATE "C"` 的索引或使用 `text_pattern_ops` 的索引可用于 `STRSTARTS`。`STRBEFORE` 与 `STRAFTER` 使用 `strpos` 与 `substr`；`REPLACE` 为带 `g` 标志的 `regexp_replace`，翻译后的模式与替换字符串作为参数传递。XPath 在同一位置有多个匹配时选择第一个分支并依次让贪婪量词尽量多取，PostgreSQL 则选择整个模式的最长匹配，因此 `REPLACE` 只接受两者选择相同匹配的模式：不含 `|`、非贪婪量词与作用于分组的量词，且每个重复的字符集合之后只能出现其不包含的字符。`STRLEN` 为数值，可以作为 `BIND` 与 `SELECT` 表达式的值；其他函数给出字符串，计算得到的变量目前不保存字符串。
 
+哈希函数 `MD5`、`SHA256`、`SHA384` 与 `SHA512` 遵循 SPARQL 1.1 §17.4.6。参数为简单字面量或 `xsd:string`，其他 term（包括带语言标签的字面量）使函数成为错误。其值为简单字面量，内容是参数 UTF-8 编码的摘要，以小写十六进制数字表示：`MD5("abc")` 为 `"900150983cd24fb0d6963f7d28e17f72"`。在 SQL 中，参数通过 `convert_to(text, 'UTF8')` 转换为 UTF-8 字节；`MD5` 为这些字节的 `md5`，`SHA256`、`SHA384` 与 `SHA512` 为 `encode(sha256(...), 'hex')` 等形式，与其他计算得到的字符串一样在 `COLLATE "C"` 下。与字符串函数相同，数据库必须使用 UTF-8 编码。摘要为字符串，因此哈希函数与字符串函数一样在 `BIND`、`SELECT` 与 `ORDER BY` 中被拒绝。`SHA1` 作为不支持的功能拒绝：PostgreSQL 仅在安装 `pgcrypto` 扩展时计算 SHA-1，而 v12n 不要求该扩展。
+
 以下情形作为不支持的功能拒绝，而不是给出与扩展了 SPARQL 的引擎不同的答案：
 
 - 当数据类型不在上表中时（例如 `xsd:date`），对该数据类型的两个字面量进行排序或比较；
@@ -366,12 +368,12 @@ XPath 构造函数 `xsd:integer`、`xsd:decimal`、`xsd:double` 与 `xsd:boolean
   - `rr:datatype` 为该列自然数据类型以外的数值、布尔或 dateTime 数据类型的列的值；
   - `xsd:float` 与派生整数类型；
   - 超出公元 1 至 9999 年范围或精度细于微秒的 dateTime 常量；
-- 包括 `RAND` 在内的其他函数、`EXISTS`，以及以 term（变量、常量、算术、`NOW`，以及它们的 `STR`、`LANG`、`DATATYPE`、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、字符串函数、dateTime 函数或转换）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
+- 包括 `RAND` 与 `SHA1` 在内的其他函数，以及以 term（变量、常量、算术、`NOW`，以及它们的 `STR`、`LANG`、`DATATYPE`、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、字符串函数、哈希函数、dateTime 函数或转换）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
 - 模式的匹配在 XPath 与 PostgreSQL 中可能不同、引用第九个之后的分组，或模式、替换字符串、标志不是常量的 `REPLACE`；
 - 非常量或不是 `xsd:integer`（例如 `1.5`）的 `SUBSTR` 起始位置与长度：SPARQL 1.1 中为类型错误，而像 `fn:substring` 那样取整的引擎会给出答案；
-- 作用于 `date` 或 `timestamp` 列的字符串函数，其无穷值为 plain literal；
+- 作用于 `date` 或 `timestamp` 列的字符串函数与哈希函数，其无穷值为 plain literal；
 - 作用于 `xsd:date` 与 `xsd:time` 值的 dateTime 函数，以及 `NOW` 的 `sameTerm`；
-- 在编码不是 UTF-8 的数据库中进行字符串排序、`REGEX` 与字符串函数。
+- 在编码不是 UTF-8 的数据库中进行字符串排序、`REGEX`、字符串函数与哈希函数。
 
 ## BIND 与 SELECT 表达式
 
@@ -388,7 +390,7 @@ SPARQL 在 `BIND` 所在组的解上对其求值。v12n 在连接之后，在整
 
 以下情形作为不支持的功能拒绝：
 
-- 变量、常量、算术、数值函数、`STRLEN`、`YEAR` 至 `SECONDS`、到 `xsd:integer`、`xsd:decimal` 与 `xsd:double` 的转换，以及对算术与数值常量的 `IF` 与 `COALESCE` 以外的表达式，例如 `STR`、比较、`IN`、`UCASE` 等字符串函数、`TZ`、`TIMEZONE`、`NOW`、`xsd:boolean`，以及结果可以是任意 term 的 `COALESCE(?x, 0)`。在 SQL 中，计算得到的变量只保存数值；
+- 变量、常量、算术、数值函数、`STRLEN`、`YEAR` 至 `SECONDS`、到 `xsd:integer`、`xsd:decimal` 与 `xsd:double` 的转换，以及对算术与数值常量的 `IF` 与 `COALESCE` 以外的表达式，例如 `STR`、比较、`IN`、`UCASE` 等字符串函数、哈希函数、`TZ`、`TIMEZONE`、`NOW`、`xsd:boolean`，以及结果可以是任意 term 的 `COALESCE(?x, 0)`。在 SQL 中，计算得到的变量只保存数值；
 - `OPTIONAL` 或 `UNION` 内部的 `BIND`；
 - 对其所在组可能未绑定、而模式后续部分会绑定的变量使用 `BIND`；
 - 在三元组模式、`FILTER`、`ORDER BY` 或其他表达式中使用由 `BIND` 或 `SELECT` 计算的变量。
@@ -443,6 +445,33 @@ WHERE t2."id" IS NULL AND …
 - `OPTIONAL`、`UNION` 或另一个 `MINUS` 内部的 `MINUS`；
 - `MINUS` 内部的 `BIND` 与 `VALUES`。
 
+## EXISTS 与 NOT EXISTS
+
+`FILTER EXISTS { P }` 保留这样的解：将解中的变量替换为其值之后，`P` 有解（SPARQL 1.1 §8.1，§18.6 substitute）。`FILTER NOT EXISTS { P }` 保留其余的解。二者可以通过 `&&`、`||` 与 `!` 与其他条件组合，且永远不会出错。`P` 的变量不出现在解中。
+
+`P` 的每种 triples map 选择，以及 `P` 内 `UNION` 的每一侧，在 SQL 中都是一个相关 `EXISTS` 子查询，其中任一子查询有行时 `EXISTS` 成立。在 shop 示例中，`?c ex:name ?n` 与 `FILTER EXISTS { ?o ex:placedBy ?c ; ex:amount ?a }` 给出以下 SQL：
+
+```sql
+FROM "customers" t0
+WHERE EXISTS (SELECT 1 FROM "orders" t1
+JOIN "orders" t2 ON t2."id" = t1."id" WHERE t1."customer_id" = t0."id" AND …) AND …
+```
+
+- `P` 绑定的解变量与连接中一样，作为 RDF term 与其值比较。字符串永远不等于由相同数字组成的整数，不同 SQL 类型的列也可以比较。
+- `P` 内的 `FILTER` 读取解变量的值，在 `P` 中不绑定该变量的组里也是如此。`MINUS` 的右侧看不到这些值（§8.3.3）。
+- 与解没有共享变量的 `P` 独立检查。有解的模式的 `NOT EXISTS` 移除所有解，而 `MINUS` 不移除任何解（§8.3.2）。
+- 在 `OPTIONAL` 的 `FILTER` 中，子查询位于 `ON` 子句中，并读取两侧的变量（§18.5 LeftJoin）。
+- 支持 `P` 内的 `OPTIONAL` 与 `UNION`。
+- term 永远不可能是解的 term 的 `P` 的选择不添加子查询。没有任何子查询的 `EXISTS` 为假。
+
+以下情形中，替换与和解的连接给出不同的结果，或没有测试用例覆盖，因此作为不支持的功能拒绝：
+
+- 对在被过滤的解中可能由 `OPTIONAL` 留下未绑定的变量使用 `EXISTS`；
+- 对 `P` 只在 `OPTIONAL` 内部绑定的解变量使用 `EXISTS`；
+- `P` 内部的 `MINUS`、`BIND`、`VALUES`、子查询与 `EXISTS`，以及没有三元组模式的 `P`；
+- `MINUS` 内部与 `IF` 条件内部的 `EXISTS`；
+- `BIND`、`SELECT` 表达式与 `ORDER BY` 中的 `EXISTS`。
+
 ## ORDER BY、LIMIT 与 OFFSET
 
 解修饰符按代数定义的顺序应用（SPARQL 1.1 §18.2.5）。该顺序为 `ORDER BY`，然后是投影、`DISTINCT`、`OFFSET` 与 `LIMIT`。它们全部在 SQL 中应用。
@@ -480,4 +509,4 @@ WHERE t2."id" IS NULL AND …
 - 作用于带时区与不带时区的值的比较项；
 - 作用于 `real` 列的比较项；
 - 作用于编码不是 UTF-8 的数据库中字符串的比较项；
-- 与 `FILTER` 中一样，其他函数、算术、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、`STRSTARTS`、`STRENDS` 与 `CONTAINS` 以外的字符串函数、dateTime 函数、`NOW`，以及 SQL 无法计算的字符串形式。
+- 与 `FILTER` 中一样，其他函数、算术、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、`STRSTARTS`、`STRENDS` 与 `CONTAINS` 以外的字符串函数、哈希函数、dateTime 函数、`NOW`，以及 SQL 无法计算的字符串形式。

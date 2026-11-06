@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# NOT EXISTS of a pattern without solutions keeps every solution.
+SELECT ?p ?n WHERE { ?p ex:name ?n FILTER NOT EXISTS { ?o ex:amount 99 } }

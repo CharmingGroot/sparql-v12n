@@ -1,0 +1,11 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<#Word> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "words" ] ;
+  rr:subjectMap [ rr:template "http://example.org/word/{id}" ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:typed ; rr:objectMap [ rr:column "name" ; rr:datatype xsd:string ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ; rr:language "en" ] ] ;
+  rr:predicateObjectMap [ rr:predicate ex:code ; rr:objectMap [ rr:column "id" ] ] .

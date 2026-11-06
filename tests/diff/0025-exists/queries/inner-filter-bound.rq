@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# inner-filter with ?s bound inside the pattern as well, which Ontop answers.
+SELECT ?p ?s WHERE { ?p ex:score ?s FILTER NOT EXISTS { ?o ex:buyer ?p ; ex:amount ?a . ?p ex:score ?s FILTER(?a > ?s) } }

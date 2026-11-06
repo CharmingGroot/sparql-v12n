@@ -93,6 +93,8 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0019-values/values-overlapping-rows` | Two `VALUES` rows that one solution can match, which the join would repeat (#113). |
 | `0021-minus/minus-in-optional`, `minus-in-union`, `nested-minus` | `MINUS` inside `OPTIONAL`, `UNION` or another `MINUS`, whose anti-join would apply to a part of a branch that none of the cases tests (#114). |
 | `0021-minus/bind-in-minus`, `values-in-minus` | `BIND` and `VALUES` inside `MINUS`: both are computed for the whole pattern, not for the right side of `MINUS` (#114). |
+| `0025-exists/optional-variable`, `optional-variable-in-filter`, `only-inside-optional` | `EXISTS` over a variable that `OPTIONAL` may leave unbound in the solution, or that the pattern binds only inside `OPTIONAL`: substitution (SPARQL 1.1 §18.6) and a join with the solution give different answers there (#115). |
+| `0025-exists/minus-inside`, `bind-inside`, `values-inside`, `nested-exists`, `exists-in-minus`, `exists-in-bind`, `exists-in-order-by` | `MINUS`, `BIND`, `VALUES` and `EXISTS` inside `EXISTS`, `EXISTS` inside `MINUS`, and `EXISTS` outside `FILTER`, which no case tests (#115). |
 | `0020-functional-forms/bind-coalesce-variable`, `bind-in` | `COALESCE` whose result can be a term other than a number, and `IN` as the value of `BIND`: a computed variable holds only numbers (#100). |
 | `0020-functional-forms/order-by-if` | `IF` in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0022-numeric-functions/rand` | `RAND`: its value differs per row and per run, so no other engine can confirm the results. |
@@ -105,6 +107,9 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0024-date-time-functions/order-by-year` | `YEAR` in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0024-date-time-functions/select-tz`, `select-now` | `TZ` and `NOW` as the value of `SELECT`: a computed variable holds only numbers (#100). |
 | `0024-date-time-functions/now-timestamp` | `NOW`, which has a time zone, against a `timestamp`, which has none: their order depends on an implicit time zone (Discussion #57). |
+| `0026-hash-functions/sha1` | `SHA1`: PostgreSQL computes SHA-1 only with the `pgcrypto` extension, which v12n does not require. |
+| `0026-hash-functions/bind-md5` | A hash function as the value of `BIND`: a computed variable holds only numbers (#100). |
+| `0026-hash-functions/order-by-sha256` | A hash function in `ORDER BY`, which comes with the other expressions there (#108). |
 | `0027-casts/decimal-of-double` | `xsd:decimal` of an `xsd:double`: the decimal closest to the double that the implementation can represent (XPath F&O 1.0 §17.1.3.3), which differs between engines. |
 | `0027-casts/float` | `xsd:float`: the engine has no `xsd:float` values. |
 | `0027-casts/select-boolean` | `xsd:boolean` as the value of `SELECT`: a computed variable holds only numbers (#100). |
@@ -131,6 +136,8 @@ answer differently from SPARQL 1.1 or from engines that extend it:
 | `0011-time/time-results`, `time-constant-midnight`, `time-constant-24`, `time-join`, `time-distinct`, `time-key-subject`, `time-order` | #37 | Ontop writes a `time` of `24:00:00` as is and treats it as another term than `00:00:00`; v12n writes the canonical form `00:00:00` for both and treats them as one term, as decided in Discussion #91. |
 | `0012-arithmetic/big-no-overflow`, `0013-bind/big-no-overflow` (Ontop error) | #99 | Ontop adds `bigint` values as `bigint` and fails with "bigint out of range"; `xsd:integer` has no bound, and v12n computes in `numeric`. |
 | `0017-double-arithmetic/filter-effective-boolean-value` (Ontop error) | #99 | Ontop writes the NaN test of a double's effective boolean value as an unquoted `NaN`, which PostgreSQL reads as a column name. |
+| `0025-exists/in-optional-left` | #115 | The `FILTER` of `OPTIONAL` is evaluated over the solutions of both sides (SPARQL 1.1 §18.5 LeftJoin), so `NOT EXISTS` there reads `?c` of the left side; Ontop leaves `?c` free inside the pattern. |
+| `0025-exists/no-shared-variable`, `no-shared-variable-exists`, `no-solutions`, `inner-filter`, `inner-filter-only`, `inner-filter-nested-group`, `optional-inside-filter` (Ontop error) | #115 | Ontop refuses `EXISTS` whose pattern shares no variable with the solution, and a `FILTER` inside the pattern over a variable that only the solution binds; SPARQL 1.1 §18.6 substitutes the solution's values in the pattern. |
 | `0002-constants/uuid-uppercase` | #26 | Ontop matches a `uuid` constant by value; the terms differ in case. |
 | `0006-filter/string-order-code-points`, `0008-order/string-accent`, `0008-order/string-hangul` | #26 | Ontop orders strings by the database collation; SPARQL orders them by code point. |
 | `0023-string-functions/ucase-sharp-s`, `lcase-final-sigma` | #26 | Ontop maps case with `UPPER` and `LOWER` under the database collation, one character at a time (`"STRAßE"`, `"οδοσ"`); XPath uses Unicode's full case mappings (`"STRASSE"`, `"οδος"`, F&O 3.1 §5.4.7, §5.4.8). |

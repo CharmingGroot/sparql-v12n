@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?w WHERE { ?w ex:name ?n FILTER(MD5(?n) = "2b28f46e64b4e84814aa8dc22ab1c36d") }

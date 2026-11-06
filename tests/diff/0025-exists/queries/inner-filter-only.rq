@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# A variable of the current solution that only the FILTER inside reads.
+SELECT ?p ?b WHERE { ?p ex:bonus ?b FILTER EXISTS { ?o ex:amount ?a FILTER(?a = ?b) } }

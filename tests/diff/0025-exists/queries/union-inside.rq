@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# Each side of a UNION inside the pattern can make it hold.
+SELECT ?p WHERE { ?p a ex:Person FILTER EXISTS { { ?p ex:city "Daegu" } UNION { ?o ex:buyer ?p ; ex:amount 3 } } }

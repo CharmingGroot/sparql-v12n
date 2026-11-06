@@ -1,0 +1,83 @@
+# Ontop refuses EXISTS whose pattern shares no variable with the current
+# solution ("not supported with no common variables"), and a FILTER inside
+# the pattern over a variable that only the current solution binds ("Some
+# of the variables in the EXISTS subquery are unbound"). SPARQL 1.1 §18.6
+# substitutes the current solution, so the pattern is tested on its own,
+# and the FILTER reads the value (#115).
+[query.no-shared-variable]
+expect = "ontop-error"
+issue = 115
+solutions = 0
+
+[query.no-shared-variable-exists]
+expect = "ontop-error"
+issue = 115
+solutions = 6
+
+[query.no-solutions]
+expect = "ontop-error"
+issue = 115
+solutions = 6
+
+[query.inner-filter]
+expect = "ontop-error"
+issue = 115
+solutions = 2
+
+[query.inner-filter-only]
+expect = "ontop-error"
+issue = 115
+solutions = 2
+
+[query.inner-filter-nested-group]
+expect = "ontop-error"
+issue = 115
+solutions = 2
+
+[query.optional-inside-filter]
+expect = "ontop-error"
+issue = 115
+solutions = 1
+
+# The FILTER of OPTIONAL is evaluated over the solutions of both sides
+# (SPARQL 1.1 §18.5 LeftJoin), so NOT EXISTS sees ?c of the left side:
+# order 13 ships to Incheon, not to Busan, and extends person 3. Ontop
+# leaves ?c free there, finds a ship city, and does not extend it (#115).
+[query.in-optional-left]
+expect = "mismatch"
+issue = 115
+
+# A variable of the current solution that OPTIONAL may leave unbound, or
+# that the pattern binds only inside OPTIONAL: substitution and a join
+# with the current solution give different answers there (#115).
+[query.optional-variable]
+expect = "rejected"
+
+[query.optional-variable-in-filter]
+expect = "rejected"
+
+[query.only-inside-optional]
+expect = "rejected"
+
+# MINUS, BIND, VALUES and EXISTS inside EXISTS, EXISTS inside MINUS, and
+# EXISTS outside FILTER (#115).
+[query.minus-inside]
+expect = "rejected"
+
+[query.bind-inside]
+expect = "rejected"
+
+[query.values-inside]
+expect = "rejected"
+
+[query.nested-exists]
+expect = "rejected"
+
+[query.exists-in-minus]
+expect = "rejected"
+
+[query.exists-in-bind]
+expect = "rejected"
+
+[query.exists-in-order-by]
+expect = "rejected"

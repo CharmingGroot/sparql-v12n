@@ -201,6 +201,14 @@ pub enum Expression {
     /// An XPath constructor function (SPARQL 1.1 §17.5), such as
     /// `xsd:integer(?x)`.
     Cast(Cast, Box<Expression>),
+    /// `MD5`, `SHA256`, `SHA384` or `SHA512` (SPARQL 1.1 §17.4.6) of a
+    /// simple literal or `xsd:string`.
+    Hash(HashFunction, Box<Expression>),
+    /// `EXISTS { P }` (SPARQL 1.1 §8.1, §17.4.1.4): whether `P` has a
+    /// solution once the variables of the current solution are replaced
+    /// by their values (substitution, §18.6). Never an error, and it binds
+    /// no variable. `NOT EXISTS` is its negation.
+    Exists(Box<Pattern>),
 }
 
 impl Expression {
@@ -239,6 +247,7 @@ impl Expression {
             | Self::LCase(a)
             | Self::EncodeForUri(a)
             | Self::Replace(a, ..)
+            | Self::Hash(_, a)
             | Self::Numeric(_, a)
             | Self::DateTime(_, a)
             | Self::Cast(_, a) => a.collect_variables(out),
@@ -254,6 +263,30 @@ impl Expression {
                 a.collect_variables(out);
                 list.iter().for_each(|b| b.collect_variables(out));
             }
+            Self::Exists(pattern) => out.extend(pattern.mentioned_variables()),
+        }
+    }
+
+    /// The patterns of the `EXISTS` and `NOT EXISTS` in the expression, in
+    /// the order they are written.
+    pub(crate) fn exists_patterns(&self) -> Vec<&Pattern> {
+        let mut out = Vec::new();
+        self.collect_exists(&mut out);
+        out
+    }
+
+    fn collect_exists<'e>(&'e self, out: &mut Vec<&'e Pattern>) {
+        match self {
+            Self::Exists(pattern) => out.push(pattern),
+            Self::Or(a, b) | Self::And(a, b) => {
+                a.collect_exists(out);
+                b.collect_exists(out);
+            }
+            Self::Not(a) => a.collect_exists(out),
+            Self::If(c, ..) => c.collect_exists(out),
+            // The arguments of the other expressions, and the results of
+            // `IF`, are terms (see `operand`), which `EXISTS` is not.
+            _ => {}
         }
     }
 
@@ -283,6 +316,7 @@ impl Expression {
                 | Self::EncodeForUri(_)
                 | Self::Replace(..)
                 | Self::Cast(..)
+                | Self::Hash(..)
         )
     }
 }
@@ -396,6 +430,18 @@ impl Cast {
             .into_iter()
             .find(|cast| cast.datatype() == iri)
     }
+}
+
+/// The hash functions of SPARQL 1.1 §17.4.6 that the engine computes,
+/// `SHA1` aside. The value is the digest of the UTF-8 encoding of the
+/// argument's lexical form, as a simple literal of lower-case hexadecimal
+/// digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashFunction {
+    Md5,
+    Sha256,
+    Sha384,
+    Sha512,
 }
 
 /// The relational operators of SPARQL 1.1 §17.3, `!=` aside.
@@ -583,6 +629,39 @@ impl Pattern {
                 let mut out = inner.filter_variables();
                 out.extend(expression.variables());
                 out
+            }
+        }
+    }
+
+    /// Every variable the pattern mentions, in its triple patterns and its
+    /// `FILTER` expressions, those of `EXISTS` included.
+    pub(crate) fn mentioned_variables(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .triple_patterns()
+            .into_iter()
+            .flat_map(TriplePattern::variables)
+            .collect();
+        out.extend(self.filter_variables());
+        out
+    }
+
+    /// Whether a `FILTER` expression of the pattern, or of an `OPTIONAL`
+    /// in it, holds `EXISTS` or `NOT EXISTS`.
+    fn has_exists(&self) -> bool {
+        match self {
+            Self::Bgp(_) => false,
+            Self::Join(left, right) | Self::Union(left, right) | Self::Minus(left, right) => {
+                left.has_exists() || right.has_exists()
+            }
+            Self::LeftJoin(left, right, expression) => {
+                left.has_exists()
+                    || right.has_exists()
+                    || expression
+                        .as_ref()
+                        .is_some_and(|e| !e.exists_patterns().is_empty())
+            }
+            Self::Filter(inner, expression) => {
+                inner.has_exists() || !expression.exists_patterns().is_empty()
             }
         }
     }
@@ -803,11 +882,13 @@ fn check_extends(
 /// Where a group is written, for the `BIND`s it may hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Place {
-    /// Outside `OPTIONAL`, `UNION` and the right side of `MINUS`.
+    /// Outside `OPTIONAL`, `UNION`, the right side of `MINUS` and the
+    /// pattern of `EXISTS`.
     Required,
     Optional,
     Union,
     Minus,
+    Exists,
 }
 
 impl Place {
@@ -818,6 +899,7 @@ impl Place {
             Self::Optional => "OPTIONAL",
             Self::Union => "UNION",
             Self::Minus => "MINUS",
+            Self::Exists => "EXISTS",
         }
     }
 }
@@ -853,6 +935,7 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
             "IF and COALESCE with a result other than arithmetic or a numeric constant"
         }
         Expression::In(..) => "IN and NOT IN",
+        Expression::Exists(_) => "EXISTS and NOT EXISTS",
         Expression::Or(..) | Expression::And(..) | Expression::Not(_) => "logical operators",
         Expression::Compare(..) | Expression::SameTerm(..) => "comparisons",
         Expression::Bound(_) => "BOUND",
@@ -878,6 +961,10 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
         Expression::Now => "NOW",
         // A computed variable holds only numbers in SQL (#100).
         Expression::Cast(Cast::Boolean, _) => "xsd:boolean",
+        Expression::Hash(HashFunction::Md5, _) => "MD5",
+        Expression::Hash(HashFunction::Sha256, _) => "SHA256",
+        Expression::Hash(HashFunction::Sha384, _) => "SHA384",
+        Expression::Hash(HashFunction::Sha512, _) => "SHA512",
     };
     Err(unsupported(&format!(
         "{what} as the value of BIND and SELECT expressions"
@@ -1025,6 +1112,9 @@ fn group(
             }
             let left = nested(left, place)?;
             let right = nested(right, Place::Minus)?;
+            if right.has_exists() {
+                return Err(unsupported("EXISTS and NOT EXISTS inside MINUS"));
+            }
             Ok(Pattern::Minus(Box::new(left), Box::new(right)))
         }
         other => Err(unsupported(describe(other))),
@@ -1263,10 +1353,21 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
             | Function::StrBefore
             | Function::StrAfter
             | Function::EncodeForUri
-            | Function::Replace),
+            | Function::Replace
+            | Function::Md5
+            | Function::Sha256
+            | Function::Sha384
+            | Function::Sha512),
             _,
         ) if matches!(site, Site::OrderBy) => {
             return Err(in_site(&format!("the {function} function")));
+        }
+        // PostgreSQL computes SHA-1 only with the pgcrypto extension, which
+        // the engine does not require.
+        SparqlExpression::FunctionCall(Function::Sha1, _) => {
+            return Err(unsupported(
+                "SHA1, which PostgreSQL computes only with the pgcrypto extension",
+            ));
         }
         SparqlExpression::FunctionCall(
             function @ (Function::StrLen
@@ -1287,6 +1388,21 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
             if iri.as_str().starts_with(crate::xsd::XSD) =>
         {
             cast(iri, args, site)?
+        }
+        SparqlExpression::FunctionCall(
+            function @ (Function::Md5 | Function::Sha256 | Function::Sha384 | Function::Sha512),
+            args,
+        ) => {
+            let [arg] = args.as_slice() else {
+                return Err(Error::QuerySyntax(format!("{function} takes one argument")));
+            };
+            let hash = match function {
+                Function::Md5 => HashFunction::Md5,
+                Function::Sha256 => HashFunction::Sha256,
+                Function::Sha384 => HashFunction::Sha384,
+                _ => HashFunction::Sha512,
+            };
+            Expression::Hash(hash, operand(arg)?)
         }
         SparqlExpression::FunctionCall(function, args) => {
             let [arg] = args.as_slice() else {
@@ -1346,7 +1462,11 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
             }));
         }
         SparqlExpression::If(condition, a, b) => {
-            Expression::If(boxed(condition)?, operand(a)?, operand(b)?)
+            let condition = boxed(condition)?;
+            if !condition.exists_patterns().is_empty() {
+                return Err(unsupported("EXISTS and NOT EXISTS inside IF"));
+            }
+            Expression::If(condition, operand(a)?, operand(b)?)
         }
         SparqlExpression::Coalesce(args) => Expression::Coalesce(
             args.iter()
@@ -1359,7 +1479,10 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
                 .map(|b| operand(b).map(|b| *b))
                 .collect::<Result<_, _>>()?,
         ),
-        SparqlExpression::Exists(_) => return Err(unsupported("EXISTS and NOT EXISTS")),
+        SparqlExpression::Exists(pattern) => match site {
+            Site::Filter => Expression::Exists(Box::new(exists_pattern(pattern)?)),
+            Site::OrderBy | Site::Bind => return Err(in_site("EXISTS and NOT EXISTS")),
+        },
         SparqlExpression::UnaryMinus(inner) | SparqlExpression::UnaryPlus(inner)
             if numeric_literal(inner).is_some() =>
         {
@@ -1500,6 +1623,23 @@ fn string_function(
         (Function::Replace, _) => return Err(arity("three or four arguments")),
         _ => return Err(arity("one argument")),
     })
+}
+
+/// The pattern of an `EXISTS`, or an error for one that unfolding cannot
+/// evaluate with substitution (SPARQL 1.1 §18.6). `BIND`, `VALUES` and
+/// `MINUS` inside it are rejected with [`Place::Exists`]: the first two are
+/// computed for the whole query, and substitution would also replace the
+/// variables of the right side of `MINUS`, which are evaluated on their own
+/// (§8.3.3).
+fn exists_pattern(pattern: &GraphPattern) -> Result<Pattern, Error> {
+    let pattern = group(pattern, Place::Exists, &mut Vec::new(), &mut Vec::new())?;
+    if pattern.has_exists() {
+        return Err(unsupported("EXISTS and NOT EXISTS inside EXISTS"));
+    }
+    if pattern.triple_patterns().is_empty() {
+        return Err(unsupported("EXISTS over a pattern without triple patterns"));
+    }
+    Ok(pattern)
 }
 
 /// A literal of a numeric datatype the grammar produces, `-3` being the
@@ -1675,7 +1815,7 @@ mod tests {
             ("ASK { ?c ex:name ?n } OFFSET 1", "LIMIT and OFFSET in ASK"),
             ("ASK FROM ex:g { ?c ex:name ?n }", "FROM"),
             ("ASK { ?c ?p ?o }", "variable predicates"),
-            ("ASK { ?c ex:name ?n FILTER(MD5(?n) = \"A\") }", "MD5"),
+            ("ASK { ?c ex:name ?n FILTER(SHA1(?n) = \"A\") }", "SHA1"),
         ] {
             let Error::UnsupportedFeature(message) = parse_err(query) else {
                 panic!("{query}")
@@ -1805,6 +1945,47 @@ mod tests {
              MINUS { ?x ex:tier ?t } }",
         );
         assert_eq!(q.bindings.len(), 1);
+    }
+
+    #[test]
+    fn parse_exists_is_an_expression_of_its_pattern() {
+        let q = parse_ok(
+            "SELECT ?c WHERE { ?c ex:name ?n \
+             FILTER(!EXISTS { ?o ex:placedBy ?c FILTER(?n != \"Kim\") } || ?n = \"Lee\") }",
+        );
+        let Pattern::Filter(inner, filter) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        assert_eq!(**inner, bgp(&[("c", "name", "n")]));
+        let Expression::Or(left, _) = filter else {
+            panic!("{filter:?}")
+        };
+        let Expression::Not(exists) = left.as_ref() else {
+            panic!("{left:?}")
+        };
+        let Expression::Exists(pattern) = exists.as_ref() else {
+            panic!("{exists:?}")
+        };
+        assert!(
+            matches!(&**pattern, Pattern::Filter(p, _) if **p == bgp(&[("o", "placedBy", "c")]))
+        );
+        assert_eq!(filter.exists_patterns(), [pattern.as_ref()]);
+        // The variables of the pattern count as variables of the filter,
+        // and its triple patterns as none of the query.
+        assert_eq!(filter.variables(), ["o", "c", "n", "n"]);
+        assert_eq!(q.pattern.triple_patterns().len(), 1);
+        assert_eq!(q.pattern.left_joins(), 0);
+
+        // OPTIONAL and UNION inside EXISTS, and EXISTS in the FILTER of
+        // OPTIONAL.
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n OPTIONAL { ?c ex:tier ?t \
+             FILTER EXISTS { { ?o ex:placedBy ?c } UNION { ?o ex:amount ?t OPTIONAL { ?o ex:x ?y } } } } }",
+        );
+        let Pattern::LeftJoin(_, _, Some(Expression::Exists(pattern))) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        assert!(matches!(&**pattern, Pattern::Union(..)));
     }
 
     #[test]
@@ -2215,6 +2396,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_hash_functions() {
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n \
+             FILTER(MD5(?n) = SHA256(?x) && STRSTARTS(SHA384(UCASE(?n)), SHA512(\"a\"))) }",
+        );
+        let Pattern::Filter(_, filter) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        assert_eq!(filter.variables(), ["n", "x", "n"]);
+        let Expression::And(compare, starts) = filter else {
+            panic!("{filter:?}")
+        };
+        let Expression::Compare(CompareOp::Equal, md5, sha256) = compare.as_ref() else {
+            panic!("{compare:?}")
+        };
+        assert_eq!(**md5, Expression::Hash(HashFunction::Md5, variable("n")));
+        assert_eq!(
+            **sha256,
+            Expression::Hash(HashFunction::Sha256, variable("x"))
+        );
+        let Expression::StrTest(StrTest::Starts, sha384, sha512) = starts.as_ref() else {
+            panic!("{starts:?}")
+        };
+        assert_eq!(
+            **sha384,
+            Expression::Hash(
+                HashFunction::Sha384,
+                Box::new(Expression::UCase(variable("n")))
+            )
+        );
+        assert_eq!(
+            **sha512,
+            Expression::Hash(
+                HashFunction::Sha512,
+                Box::new(Expression::Constant(
+                    Literal::new_simple_literal("a").into()
+                ))
+            )
+        );
+        assert!(md5.is_term() && sha512.is_term());
+        assert!(matches!(
+            parse_err("SELECT * WHERE { ?c ex:name ?n FILTER(MD5(?n, ?n) = \"a\") }"),
+            Error::QuerySyntax(_)
+        ));
+    }
+
+    #[test]
     fn parse_numeric_functions() {
         let q = parse_ok(
             "SELECT * WHERE { ?o ex:amount ?a FILTER(ROUND(?a / 2) = ABS(-?a) && CEIL(FLOOR(?a))) }",
@@ -2535,16 +2763,32 @@ mod tests {
                 "expressions other than terms",
             ),
             (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(MD5(?t) = \"a\") }",
-                "the MD5 function",
-            ),
-            (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(STR(SHA1(?t)) = \"A\") }",
-                "the SHA1 function",
+                "SHA1, which PostgreSQL computes only with the pgcrypto extension",
             ),
             (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(SHA256(?t)) }",
-                "the SHA256 function",
+                "SELECT (SHA1(?t) AS ?h) WHERE { ?c ex:tier ?t }",
+                "SHA1, which PostgreSQL computes only with the pgcrypto extension",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t } ORDER BY SHA1(?t)",
+                "SHA1, which PostgreSQL computes only with the pgcrypto extension",
+            ),
+            (
+                "SELECT (MD5(?t) AS ?h) WHERE { ?c ex:tier ?t }",
+                "MD5 as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t BIND(SHA512(?t) AS ?h) }",
+                "SHA512 as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t } ORDER BY SHA256(?t)",
+                "the SHA256 function in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t } ORDER BY (SHA384(?t) = \"a\")",
+                "the SHA384 function in ORDER BY",
             ),
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(SUBSTR(?t, STRLEN(?t)) = \"a\") }",
@@ -2621,10 +2865,6 @@ mod tests {
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER(REGEX(?t, ?t)) }",
                 "REGEX with a pattern or flags that are not constants",
-            ),
-            (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER EXISTS { ?c ex:name ?n } }",
-                "EXISTS",
             ),
             ("SELECT * WHERE { ?c ?p ?o }", "variable predicates"),
             (
@@ -2726,6 +2966,59 @@ mod tests {
             (
                 "SELECT * WHERE { MINUS { ?c ex:name ?n } }",
                 "empty graph patterns",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n } ORDER BY ASC(EXISTS { ?c ex:tier ?t })",
+                "EXISTS and NOT EXISTS in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n BIND(EXISTS { ?c ex:tier ?t } AS ?x) }",
+                "EXISTS and NOT EXISTS in BIND and SELECT expressions",
+            ),
+            (
+                "SELECT (NOT EXISTS { ?c ex:tier ?t } AS ?x) WHERE { ?c ex:name ?n }",
+                "EXISTS and NOT EXISTS in BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER EXISTS { ?c ex:tier ?t MINUS { ?c ex:city ?y } } }",
+                "MINUS inside EXISTS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER EXISTS { ?c ex:tier ?t BIND(?t AS ?u) } }",
+                "BIND inside EXISTS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER EXISTS { ?c ex:tier ?t VALUES ?t { \"VIP\" } } }",
+                "VALUES inside EXISTS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER EXISTS { { SELECT ?c WHERE { ?c ex:tier ?t } } } }",
+                "subqueries",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n \
+                 FILTER EXISTS { ?c ex:tier ?t FILTER NOT EXISTS { ?c ex:city ?y } } }",
+                "EXISTS and NOT EXISTS inside EXISTS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n MINUS { ?c ex:tier ?t FILTER EXISTS { ?c ex:city ?y } } }",
+                "EXISTS and NOT EXISTS inside MINUS",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER(IF(EXISTS { ?c ex:tier ?t }, ?n, \"\") = ?n) }",
+                "EXISTS and NOT EXISTS inside IF",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER EXISTS { FILTER(?n = \"Kim\") } }",
+                "EXISTS over a pattern without triple patterns",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n BIND(?n AS ?m) FILTER EXISTS { ?d ex:name ?m } }",
+                "FILTER over ?m, which BIND or SELECT computes",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER(EXISTS { ?c ex:tier ?t } = true) }",
+                "expressions other than terms",
             ),
         ];
         for (query, feature) in cases {

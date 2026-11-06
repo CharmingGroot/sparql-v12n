@@ -9,7 +9,7 @@ use v12n_core::catalog::{
 };
 use v12n_core::dialect::{Dialect, PostgresDialect, SqlType};
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
-use v12n_core::sparql::StrTest;
+use v12n_core::sparql::{HashFunction, StrTest};
 use v12n_core::sql::{
     ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, RenderedSql, SqlPlan, TableKeys,
     TermNormal,
@@ -41,6 +41,11 @@ const POSTGRES_SYNTAX: &[&str] = &[
     "starts_with",
     "strpos",
     "right(",
+    "convert_to",
+    "md5(",
+    "sha256(",
+    "sha384(",
+    "sha512(",
 ];
 
 /// Writes each construct of [`Dialect`] as a marker, such as
@@ -86,6 +91,10 @@ impl Dialect for MarkerDialect {
 
     fn encode_for_uri(&self, text: &str) -> String {
         format!("<<ENCODE_FOR_URI {text}>>")
+    }
+
+    fn hash(&self, function: HashFunction, text: &str) -> String {
+        format!("<<HASH_{function:?} {text}>>")
     }
 
     fn case_map(&self, text: &str, upper: bool) -> String {
@@ -1076,6 +1085,18 @@ fn bind_casts_to_numbers() {
     ));
 }
 
+/// `MD5`, `SHA256`, `SHA384` and `SHA512` digest the UTF-8 encoding of
+/// the lexical form, as lower-case hexadecimal digits under the code
+/// point collation.
+#[test]
+fn filter_hash_functions() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c WHERE { ?c ex:name ?n ; ex:tier ?t \
+         FILTER(MD5(?n) = \"f55fbaaca148300ac11f7752528cae3d\" \
+         && STRSTARTS(SHA256(?t), \"986e\") && SHA384(?n) != SHA512(?t)) }"
+    ));
+}
+
 /// `ABS`, `ROUND`, `CEIL` and `FLOOR` keep the class of their argument:
 /// an integer is its own ceiling, and a decimal rounds halves towards
 /// positive infinity as `floor(x + 0.5)`.
@@ -1421,5 +1442,44 @@ fn minus_with_a_union_has_one_anti_join_per_side() {
 fn self_join_minus_reads_the_left_row() {
     insta::assert_snapshot!(explain_merged(
         "SELECT ?asset WHERE { ?asset a ex:Asset . MINUS { ?asset ex:criticality ?c } }"
+    ));
+}
+
+/// EXISTS is a correlated subquery whose conditions compare the variables
+/// of the current solution with its own terms, as a join does.
+#[test]
+fn exists_is_a_correlated_subquery_on_the_current_solution() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?c WHERE { ?c ex:name ?n FILTER EXISTS { ?o ex:placedBy ?c ; ex:amount ?a } }"
+    ));
+}
+
+/// SPARQL 1.1 §8.3.3: unlike MINUS, the FILTER inside NOT EXISTS sees
+/// `?n`, whose value substitution puts in the pattern.
+#[test]
+fn not_exists_filter_sees_the_current_solution() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?c WHERE { ?c ex:name ?n FILTER NOT EXISTS { ?d ex:tier ?t FILTER(?t = ?n) } }"
+    ));
+}
+
+/// A FILTER with EXISTS stays in `WHERE`, also where it links two tables:
+/// the subquery reads `t2`, which the `ON` clause of `t1` cannot.
+#[test]
+fn exists_stays_where_every_table_is_joined() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?o ?c WHERE { ?o ex:amount ?a . ?c ex:name ?n ; ex:tier ?t \
+         FILTER((?a > 50000 || ?n = \"Lee\") && EXISTS { ?d ex:tier ?t ; ex:name \"Kim\" }) }"
+    ));
+}
+
+/// EXISTS combines with other conditions, and in the FILTER of OPTIONAL it
+/// is a subquery of the `ON` clause that reads both sides.
+#[test]
+fn exists_in_a_disjunction_and_in_optional() {
+    insta::assert_snapshot!(shop(
+        "SELECT ?c ?o WHERE { ?c ex:tier ?t \
+         OPTIONAL { ?o ex:placedBy ?c FILTER(!EXISTS { ?o ex:amount 10 }) } \
+         FILTER(?t = \"VIP\" || EXISTS { ?x ex:placedBy ?c }) }"
     ));
 }

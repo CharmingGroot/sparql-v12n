@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# EXISTS in the FILTER of OPTIONAL over a variable of the left side.
+SELECT ?p ?o WHERE { ?p ex:city ?c OPTIONAL { ?o ex:buyer ?p FILTER NOT EXISTS { ?o ex:shipCity ?c } } }

@@ -773,6 +773,22 @@ repeated character set followed by characters it cannot match. `\s+`,
 expressions (see below). The other functions give strings, which a
 computed variable does not hold yet.
 
+The hash functions `MD5`, `SHA256`, `SHA384` and `SHA512` follow SPARQL
+1.1 §17.4.6. Their argument is a simple literal or an `xsd:string`, and
+any other term, a language-tagged literal included, makes the function
+an error. The value is a simple literal with the digest of the UTF-8
+encoding of the argument in lower-case hexadecimal digits:
+`MD5("abc")` is `"900150983cd24fb0d6963f7d28e17f72"`. In SQL, the
+argument is converted to its UTF-8 bytes with `convert_to(text,
+'UTF8')`. `MD5` is `md5` of the bytes, and `SHA256`, `SHA384` and
+`SHA512` are `encode(sha256(...), 'hex')` and the like, under
+`COLLATE "C"` as the other computed strings. As for the functions on
+strings, the database must use the UTF-8 encoding. The digests are
+strings, so the hash functions are rejected in `BIND`, `SELECT` and
+`ORDER BY` as the functions on strings are. `SHA1` is rejected as
+unsupported: PostgreSQL computes SHA-1 only with the `pgcrypto`
+extension, which v12n does not require.
+
 The following are rejected as unsupported, rather than answered
 differently from engines that extend SPARQL:
 
@@ -788,24 +804,24 @@ differently from engines that extend SPARQL:
   - `xsd:float` and the derived integer types;
   - dateTime constants outside the years 1 to 9999, or finer than a
     microsecond;
-- other functions, `RAND` among them, `EXISTS`, and expressions other
+- other functions, `RAND` and `SHA1` among them, and expressions other
   than terms (variables, constants, arithmetic, `NOW`, and `STR`, `LANG`,
   `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`, `IF`, `COALESCE`, the
-  functions on strings, the functions of dateTimes or the casts of them)
-  as operands,
-  such as a comparison as an argument of `IF`, `COALESCE` or `IN`;
+  functions on strings, the hash functions, the functions of dateTimes
+  or the casts of them) as operands, such as a comparison as an argument
+  of `IF`, `COALESCE` or `IN`;
 - `REPLACE` with a pattern whose matches XPath and PostgreSQL can choose
   differently (see above), with a reference to a group after the ninth,
   or with a pattern, replacement or flags that are not constants;
 - a starting location or length of `SUBSTR` that is not a constant, or
   not an `xsd:integer`, such as `1.5`: SPARQL 1.1 makes it a type error,
   and engines that round it as `fn:substring` does answer;
-- functions on strings of a `date` or `timestamp` column, whose infinite
-  values are plain literals;
+- functions on strings and hash functions of a `date` or `timestamp`
+  column, whose infinite values are plain literals;
 - the functions of dateTimes over `xsd:date` and `xsd:time` values, and
   `sameTerm` of `NOW`;
-- string ordering, `REGEX` and the functions on strings in a database
-  whose encoding is not UTF-8.
+- string ordering, `REGEX`, the functions on strings and the hash
+  functions in a database whose encoding is not UTF-8.
 
 ## BIND and SELECT expressions
 
@@ -853,9 +869,9 @@ The following are rejected as unsupported:
   functions, `STRLEN`, `YEAR` to `SECONDS`, casts to `xsd:integer`,
   `xsd:decimal` and `xsd:double`, and `IF` and `COALESCE` over arithmetic
   and numeric constants. `STR`, comparisons, `IN`, `UCASE` and the other
-  functions on strings, `TZ`, `TIMEZONE`, `NOW`, `xsd:boolean`, and
-  `COALESCE(?x, 0)`, whose result can be any term, are examples. A
-  computed variable holds only numbers in SQL;
+  functions on strings, the hash functions, `TZ`, `TIMEZONE`, `NOW`,
+  `xsd:boolean`, and `COALESCE(?x, 0)`, whose result can be any term, are
+  examples. A computed variable holds only numbers in SQL;
 - `BIND` inside `OPTIONAL` or `UNION`;
 - `BIND` over a variable that its group may leave unbound and a later
   part of the pattern binds;
@@ -958,6 +974,52 @@ The following are rejected as unsupported:
 - `MINUS` inside `OPTIONAL`, inside `UNION`, and inside another `MINUS`;
 - `BIND` and `VALUES` inside `MINUS`.
 
+## EXISTS and NOT EXISTS
+
+`FILTER EXISTS { P }` keeps the solutions for which `P` has a solution
+once the variables of the solution are replaced by their values (SPARQL
+1.1 §8.1, §18.6 substitute). `FILTER NOT EXISTS { P }` keeps the others.
+Both combine with other conditions through `&&`, `||` and `!`, and are
+never an error. The variables of `P` are not in the solutions.
+
+Each choice of triples maps for `P`, and each side of a `UNION` in it, is
+a correlated `EXISTS` subquery in SQL, and `EXISTS` holds where one of
+them has a row. In the shop example, `?c ex:name ?n` with
+`FILTER EXISTS { ?o ex:placedBy ?c ; ex:amount ?a }` gives the following.
+
+```sql
+FROM "customers" t0
+WHERE EXISTS (SELECT 1 FROM "orders" t1
+JOIN "orders" t2 ON t2."id" = t1."id" WHERE t1."customer_id" = t0."id" AND …) AND …
+```
+
+- A variable of the solution that `P` binds is compared with its value as
+  an RDF term, as in joins. A string is never the integer of the same
+  digits, and columns of different SQL types can be compared.
+- A `FILTER` inside `P` reads the values of the solution's variables,
+  also in a group of `P` that does not bind them. The right side of
+  `MINUS` does not see them (§8.3.3).
+- A `P` that shares no variable with the solution is tested on its own.
+  `NOT EXISTS` of a pattern with solutions removes every solution, while
+  `MINUS` removes none (§8.3.2).
+- In the `FILTER` of `OPTIONAL`, the subquery is in the `ON` clause and
+  reads the variables of both sides (§18.5 LeftJoin).
+- `OPTIONAL` and `UNION` inside `P` are supported.
+- A choice of `P` whose terms can never be those of the solution adds no
+  subquery. `EXISTS` without any subquery is false.
+
+The following are rejected as unsupported, since substitution and a join
+with the solution give different answers there, or no case tests them:
+
+- `EXISTS` over a variable that `OPTIONAL` may leave unbound in the
+  solutions it filters;
+- `EXISTS` over a variable of the solution that `P` binds only inside
+  `OPTIONAL`;
+- `MINUS`, `BIND`, `VALUES`, subqueries and `EXISTS` inside `P`, and a `P`
+  without triple patterns;
+- `EXISTS` inside `MINUS` and inside the condition of `IF`;
+- `EXISTS` in `BIND`, `SELECT` expressions and `ORDER BY`.
+
 ## ORDER BY, LIMIT and OFFSET
 
 The solution modifiers apply in the order that the algebra defines
@@ -1026,5 +1088,5 @@ The following are rejected as unsupported:
 - comparators over strings in a database whose encoding is not UTF-8;
 - as in `FILTER`, other functions, arithmetic, `ABS`, `ROUND`, `CEIL`,
   `FLOOR`, `IF`, `COALESCE`, the functions on strings other than
-  `STRSTARTS`, `STRENDS` and `CONTAINS`, the functions of dateTimes, `NOW`,
-  and string forms that SQL cannot compute.
+  `STRSTARTS`, `STRENDS` and `CONTAINS`, the hash functions, the functions
+  of dateTimes, `NOW`, and string forms that SQL cannot compute.
