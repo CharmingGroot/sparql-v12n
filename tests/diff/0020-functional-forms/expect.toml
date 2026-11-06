@@ -1,0 +1,11 @@
+# IF and COALESCE whose result can be a term other than a number, and IN as
+# the value of BIND: a computed variable holds only numbers (#100).
+[query.bind-coalesce-variable]
+expect = "rejected"
+
+[query.bind-in]
+expect = "rejected"
+
+# IF and COALESCE in ORDER BY come with the other expressions there (#108).
+[query.order-by-if]
+expect = "rejected"

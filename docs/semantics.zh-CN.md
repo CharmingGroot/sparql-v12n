@@ -270,6 +270,14 @@ PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运�
 
 支持 `sameTerm`、`BOUND`、`isIRI`、`isBlank`、`isLiteral`、`STR`、`LANG` 与 `DATATYPE`。在需要布尔值的位置，term 代表其有效布尔值。空字符串与零为假。
 
+`IF`、`COALESCE`、`IN` 与 `NOT IN` 遵循 SPARQL 1.1 §17.4.1：
+
+- 当 `cond` 的有效布尔值为真时，`IF(cond, a, b)` 为 `a`，为假时为 `b`。`cond` 为错误时，`IF` 为错误。只对被选中的参数求值，因此另一个参数中的错误不影响结果。
+- `COALESCE(e1, e2, ...)` 为第一个不是错误的参数。未绑定变量、除以零以及对字符串的算术都是错误，`COALESCE` 跳过这些参数。所有参数都是错误时，`COALESCE` 为错误。
+- `lhs IN (e1, e2, ...)` 即 `(lhs = e1) || (lhs = e2) || ...`，`NOT IN` 是其否定。除非另一个比较为真，单个比较中的错误使结果为错误。因此当 `?x` 为 `"b"` 时，`?x NOT IN ("a", 1)` 为错误。列表为空时，`IN` 为假，`NOT IN` 为真。
+
+在 SQL 中，`IF` 与 `COALESCE` 是每个参数对应一个分支的 `CASE` 表达式。`COALESCE` 中对算术的分支还要求值不为 `NULL`。`IN` 是各比较的 `OR`，每个比较的写法与 `=` 相同，因此 `?qty IN (5, 7)` 即 `qty = $1::int8 OR qty = $2::int8`，可以使用该列上的索引。
+
 列的 `STR` 与 `DATATYPE` 在其词法形式或自然数据类型可在 SQL 中确定时可用，与连接相同。`date` 与 `timestamp` 的无穷值是普通字面量，因此其 `DATATYPE` 为 `xsd:string`。
 
 `REGEX` 将 XPath 正则表达式翻译为匹配结果相同的 PostgreSQL 模式。该模式在 `COLLATE "C"` 下以 `~` 应用。
@@ -305,22 +313,23 @@ PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运�
   - `rr:datatype` 为该列自然数据类型以外的数值、布尔或 dateTime 数据类型的列的值；
   - `xsd:float` 与派生整数类型；
   - 超出公元 1 至 9999 年范围或精度细于微秒的 dateTime 常量；
-- 其他函数、`IN`、`EXISTS`，以及以 term（变量、常量，以及它们的 `STR`、`LANG` 或 `DATATYPE`）和算术以外的表达式作为操作数；
+- 其他函数、`EXISTS`，以及以 term（变量、常量、算术，以及它们的 `STR`、`LANG`、`DATATYPE`、`IF` 或 `COALESCE`）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
 - 在编码不是 UTF-8 的数据库中进行字符串排序和 `REGEX`。
 
 ## BIND 与 SELECT 表达式
 
-`BIND(expr AS ?v)` 与 `SELECT (expr AS ?v)` 在每个解中将表达式的值绑定到 `?v`（SPARQL 1.1 §18.5，Extend）。表达式为变量、常量，或与 [`FILTER`](#filter) 中相同的算术：
+`BIND(expr AS ?v)` 与 `SELECT (expr AS ?v)` 在每个解中将表达式的值绑定到 `?v`（SPARQL 1.1 §18.5，Extend）。表达式为变量、常量、与 [`FILTER`](#filter) 中相同的算术，或结果为算术或数值常量的 `IF` 与 `COALESCE`：
 
 - 变量给出其 term，常量给出其自身。
 - 算术给出一个数，其数据类型遵循 XPath 的类型提升，并以规范形式写出（见[字面量](#字面量)）。在整数列上，`?qty * 2` 为 `xsd:integer`，`?qty / 4` 为 `xsd:decimal`。XPath 将 decimal 除法的精度留给实现决定，此处采用 PostgreSQL `numeric` 除法的精度。`?qty * 1.5e0` 为 `xsd:double`，例如 `1.5E0`、`-0.0E0`、`INF` 或 `NaN`。`SELECT DISTINCT` 区分 `-0.0E0` 与 `0.0E0`，它们是不同的 term。
+- `IF` 与 `COALESCE` 给出其所选参数的数值。在 `?n` 为零或未绑定的解中，`COALESCE(?qty / ?n, 0)` 为 `0`。在 `?n` 未绑定的解中，`IF(?n > 0, ?qty / ?n, 0)` 的条件为错误，因此 `?v` 保持未绑定。
 - 发生错误时（例如除以零，或操作数不是数字），`?v` 保持未绑定。该解仍被保留。
 
 SPARQL 在 `BIND` 所在组的解上对其求值。v12n 在连接之后，在整个模式的解上计算它。当表达式中该组可能未绑定的变量不被模式的其余部分绑定时，两者给出相同的值。
 
 以下情形作为不支持的功能拒绝：
 
-- 变量、常量与算术以外的表达式，例如 `STR`、比较、`IF` 与 `COALESCE`；
+- 变量、常量、算术，以及对算术与数值常量的 `IF` 与 `COALESCE` 以外的表达式，例如 `STR`、比较、`IN`，以及结果可以是任意 term 的 `COALESCE(?x, 0)`。在 SQL 中，计算得到的变量只保存数值；
 - `OPTIONAL` 或 `UNION` 内部的 `BIND`；
 - 对其所在组可能未绑定、而模式后续部分会绑定的变量使用 `BIND`；
 - 在三元组模式、`FILTER`、`ORDER BY` 或其他表达式中使用由 `BIND` 或 `SELECT` 计算的变量。
@@ -387,4 +396,4 @@ SPARQL 将数据与其所在组的解连接。v12n 将其与整个模式的解�
 - 作用于带时区与不带时区的值的比较项；
 - 作用于 `real` 列的比较项；
 - 作用于编码不是 UTF-8 的数据库中字符串的比较项；
-- 与 `FILTER` 中一样，其他函数、算术和 SQL 无法计算的字符串形式。
+- 与 `FILTER` 中一样，其他函数、算术、`IF`、`COALESCE` 和 SQL 无法计算的字符串形式。

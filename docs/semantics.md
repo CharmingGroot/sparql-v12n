@@ -532,6 +532,28 @@ casts the integer column to `numeric`, and `?qty < 5.5e0` casts it to
 `DATATYPE` are supported. A term where a boolean is expected stands for
 its effective boolean value. An empty string and zero are false.
 
+`IF`, `COALESCE`, `IN` and `NOT IN` follow SPARQL 1.1 §17.4.1:
+
+- `IF(cond, a, b)` is `a` where the effective boolean value of `cond` is
+  true and `b` where it is false. Where `cond` is an error, `IF` is an
+  error. Only the chosen argument is evaluated, so an error in the other
+  one has no effect.
+- `COALESCE(e1, e2, ...)` is the first argument that is not an error. An
+  unbound variable, a division by zero and arithmetic over a string are
+  errors, and `COALESCE` skips them. Where every argument is an error,
+  `COALESCE` is an error.
+- `lhs IN (e1, e2, ...)` is `(lhs = e1) || (lhs = e2) || ...`, and
+  `NOT IN` is its negation. An error in one comparison makes the result an
+  error unless another comparison is true. `?x NOT IN ("a", 1)` is
+  therefore an error where `?x` is `"b"`. With an empty list, `IN` is
+  false and `NOT IN` is true.
+
+In SQL, `IF` and `COALESCE` are `CASE` expressions with one case per
+argument. A case of `COALESCE` over arithmetic also requires the value to
+be not `NULL`. `IN` is an `OR` of the comparisons, each written as `=` is,
+so `?qty IN (5, 7)` is `qty = $1::int8 OR qty = $2::int8`, and an index on
+the column can be used.
+
 `STR` and `DATATYPE` of a column work where its lexical form or natural
 datatype is known in SQL, as for joins. The infinities of `date` and
 `timestamp` are plain literals, so their `DATATYPE` is `xsd:string`.
@@ -578,16 +600,18 @@ differently from engines that extend SPARQL:
   - `xsd:float` and the derived integer types;
   - dateTime constants outside the years 1 to 9999, or finer than a
     microsecond;
-- other functions, `IN`, `EXISTS`, and
-  expressions other than terms and arithmetic (variables, constants, and `STR`, `LANG` or `DATATYPE` of
-  them) as operands;
+- other functions, `EXISTS`, and expressions other than terms
+  (variables, constants, arithmetic, and `STR`, `LANG`, `DATATYPE`, `IF`
+  or `COALESCE` of them) as operands, such as a comparison as an argument
+  of `IF`, `COALESCE` or `IN`;
 - string ordering and `REGEX` in a database whose encoding is not UTF-8.
 
 ## BIND and SELECT expressions
 
 `BIND(expr AS ?v)` and `SELECT (expr AS ?v)` give `?v` the value of the
 expression in each solution (SPARQL 1.1 §18.5, Extend). The expression is
-a variable, a constant, or arithmetic as in [`FILTER`](#filter):
+a variable, a constant, arithmetic as in [`FILTER`](#filter), or `IF` and
+`COALESCE` whose results are arithmetic or numeric constants:
 
 - A variable gives its term, and a constant gives itself.
 - Arithmetic gives a number whose datatype follows XPath's type
@@ -598,6 +622,10 @@ a variable, a constant, or arithmetic as in [`FILTER`](#filter):
   `?qty * 1.5e0` is an `xsd:double`, such as `1.5E0`, `-0.0E0`, `INF` or
   `NaN`. `SELECT DISTINCT` keeps `-0.0E0` and `0.0E0` apart, which are
   different terms.
+- `IF` and `COALESCE` give the number of the argument they choose.
+  `COALESCE(?qty / ?n, 0)` is `0` where `?n` is zero or unbound, and
+  `IF(?n > 0, ?qty / ?n, 0)` leaves `?v` unbound where `?n` is unbound,
+  since its condition is an error there.
 - An error, such as a division by zero or an operand that is not a
   number, leaves `?v` unbound. The solution is kept.
 
@@ -608,8 +636,10 @@ of the variables of the expression that the group may leave unbound.
 
 The following are rejected as unsupported:
 
-- expressions other than variables, constants and arithmetic, such as
-  `STR`, comparisons, `IF` and `COALESCE`;
+- expressions other than variables, constants, arithmetic, and `IF` and
+  `COALESCE` over arithmetic and numeric constants. `STR`, comparisons,
+  `IN`, and `COALESCE(?x, 0)`, whose result can be any term, are examples.
+  A computed variable holds only numbers in SQL;
 - `BIND` inside `OPTIONAL` or `UNION`;
 - `BIND` over a variable that its group may leave unbound and a later
   part of the pattern binds;
@@ -734,5 +764,5 @@ The following are rejected as unsupported:
 - comparators over values with and without a time zone;
 - comparators over `real` columns;
 - comparators over strings in a database whose encoding is not UTF-8;
-- as in `FILTER`, other functions, arithmetic and string forms that SQL
-  cannot compute.
+- as in `FILTER`, other functions, arithmetic, `IF`, `COALESCE` and
+  string forms that SQL cannot compute.

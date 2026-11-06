@@ -919,6 +919,45 @@ fn bind_copies_a_variable_and_binds_a_constant() {
     ));
 }
 
+/// `IN` is `=` with each member, joined with `OR`: the column is compared
+/// with each constant as it is, and an IRI through its template.
+#[test]
+fn filter_in_compares_the_column_with_each_constant() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?o WHERE { ?o ex:amount ?a ; ex:placedBy ?c \
+         FILTER(?a IN (100, 200.0) && ?c NOT IN (<http://example.org/customer/7>)) }"
+    ));
+}
+
+/// `IF` takes the cases of the branch that its condition chooses, so an
+/// error in the condition takes neither; `COALESCE` takes the first case
+/// whose argument is bound and not an error.
+#[test]
+fn filter_if_and_coalesce_choose_by_cases() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c WHERE { ?c ex:tier ?t OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a } \
+         FILTER(IF(BOUND(?a), ?a, 0) < 500 && COALESCE(1000 / ?a, ?a, 0) > 1) }"
+    ));
+}
+
+/// A computed value of `IF` and `COALESCE` is a number by the same cases,
+/// with one result column per class of number of the arguments.
+#[test]
+fn bind_if_and_coalesce_over_numbers() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c ?n ?h WHERE { ?c ex:tier ?t OPTIONAL { ?o ex:placedBy ?c ; ex:amount ?a } \
+         BIND(COALESCE(?a * 1, 0) AS ?n) BIND(IF(?t = \"VIP\", ?a / 2, 0) AS ?h) }"
+    ));
+}
+
+/// `IN` in `ORDER BY` is a boolean comparator.
+#[test]
+fn order_by_in() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c ?t WHERE { ?c ex:tier ?t } ORDER BY DESC(?t IN (\"VIP\", \"Gold\")) ?c"
+    ));
+}
+
 /// A table with one column of each type whose SQL the snapshot queries
 /// above do not reach.
 const TYPED: &str = r#"

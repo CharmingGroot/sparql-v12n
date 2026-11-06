@@ -357,6 +357,97 @@ async fn bind_and_select_expressions_follow_xpath_numbers() {
     );
 }
 
+/// `IF`, `COALESCE`, `IN` and `NOT IN` (#101) with the errors of SPARQL 1.1
+/// §17.4.1: a division by zero, a `numeric` NaN, a string compared with a
+/// number and an unbound variable.
+#[tokio::test]
+async fn functional_forms_follow_sparql_errors() {
+    let Some(url) = database_url() else { return };
+    let mapping = sql_query_mapping(
+        "SELECT * FROM (VALUES \
+           (1, 7::int4, 2::int8, 1.5::numeric, 'x'::text, 1.5::float8, 10::int4), \
+           (2, -3::int4, 0::int8, 'NaN'::numeric, 'y'::text, 'NaN'::float8, NULL::int4), \
+           (3, 4::int4, 9223372036854775807::int8, 2.25::numeric, 'z'::text, '-0'::float8, -1::int4)) \
+           v(id, a, b, d, s, f, opt)",
+        &["a", "b", "d", "s", "f", "opt"],
+    );
+    let rows = |filter: &'static str| {
+        let (url, mapping) = (url.clone(), mapping.clone());
+        async move {
+            filtered_rows(
+                &url,
+                &mapping,
+                "?row ex:a ?a ; ex:b ?b ; ex:d ?d ; ex:s ?s ; ex:f ?f OPTIONAL { ?row ex:opt ?o }",
+                filter,
+            )
+            .await
+        }
+    };
+    let none = Vec::<String>::new();
+    // -3 = "x" is an error, which only a true comparison overrules.
+    assert_eq!(rows("?a IN (7, 4.0, \"x\")").await, ["1", "3"]);
+    assert_eq!(rows("!(?a IN (7, \"x\"))").await, none);
+    assert_eq!(rows("?a NOT IN (7, 4)").await, ["2"]);
+    assert_eq!(rows("?s NOT IN (\"x\", 1)").await, none);
+    assert_eq!(rows("?s NOT IN (\"x\", \"y\")").await, ["3"]);
+    assert_eq!(rows("?a IN ()").await, none);
+    assert_eq!(rows("?a NOT IN ()").await, ["1", "2", "3"]);
+    // A numeric NaN is not an xsd:decimal, so comparing it is an error.
+    assert_eq!(rows("?d IN (1.5, 2.25)").await, ["1", "3"]);
+    assert_eq!(rows("!(?d IN (1.5))").await, ["3"]);
+    assert_eq!(rows("?row IN (<http://example.org/row/2>)").await, ["2"]);
+    assert_eq!(rows("?o IN (10, -1)").await, ["1", "3"]);
+
+    // An error in the condition is an error; only the chosen branch is
+    // evaluated, so row 2 does not divide by zero.
+    assert_eq!(rows("IF(?a / ?b > 1, ?a, ?b) = 7").await, ["1"]);
+    assert_eq!(rows("!(IF(?a / ?b > 1, ?a, ?b) = 7)").await, ["3"]);
+    assert_eq!(rows("IF(?s = \"y\", ?a / ?b, 1) = 1").await, ["1", "3"]);
+    assert_eq!(rows("IF(?b = 0, 0, ?a / ?b) >= 0").await, ["1", "2", "3"]);
+    assert_eq!(rows("IF(BOUND(?o), ?o, 0) = 0").await, ["2"]);
+    assert_eq!(rows("IF(?o > 0, true, false)").await, ["1"]);
+
+    // The first argument that is not an error, unbound variables
+    // included; a double NaN is a value, not an error.
+    assert_eq!(rows("COALESCE(?a / ?b, -1) < 0").await, ["2"]);
+    assert_eq!(rows("COALESCE(?o, ?a) > 5").await, ["1"]);
+    assert_eq!(rows("COALESCE(?s + 1, ?d * 2, 0) = 0").await, ["2"]);
+    assert_eq!(rows("!(COALESCE(?d * 2, ?a) = -3)").await, ["1", "3"]);
+    assert_eq!(rows("COALESCE(?f * 2, 1) = 0").await, ["3"]);
+    assert_eq!(rows("COALESCE(?f * 2, 1) = 1").await, none);
+    assert_eq!(rows("COALESCE(?nothing, ?s + 1) = 1").await, none);
+
+    let query = "PREFIX ex: <http://example.org/>
+        SELECT ?row (COALESCE(?a / ?b, -1) AS ?q) (IF(?o > 0, ?o * 2, 0.5) AS ?h)
+        WHERE { ?row ex:a ?a ; ex:b ?b OPTIONAL { ?row ex:opt ?o } }";
+    let (rows, _) = run(&url, Limits::default(), &plan(&mapping, query))
+        .await
+        .unwrap();
+    let xsd = |lexical: &str, datatype: &str| {
+        format!("\"{lexical}\"^^<http://www.w3.org/2001/XMLSchema#{datatype}>")
+    };
+    assert_eq!(
+        rows,
+        [
+            format!(
+                "?row=<http://example.org/row/1> ?q={} ?h={}",
+                xsd("3.5", "decimal"),
+                xsd("20", "integer")
+            ),
+            // Where ?o is unbound, the condition is an error, and ?h is unbound.
+            format!(
+                "?row=<http://example.org/row/2> ?q={}",
+                xsd("-1", "integer")
+            ),
+            format!(
+                "?row=<http://example.org/row/3> ?q={} ?h={}",
+                xsd("0.000000000000000000433680868994201774", "decimal"),
+                xsd("0.5", "decimal")
+            ),
+        ]
+    );
+}
+
 /// Doubles where IEEE 754 arithmetic has its edges: zeros of both signs,
 /// subnormals, the largest double, the infinities and NaN, and powers of
 /// two around the bounds that the SQL of each operator checks.

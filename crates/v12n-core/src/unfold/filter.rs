@@ -5,7 +5,7 @@ use super::{Branch, Env, Scope, Source};
 use oxrdf::Term;
 
 use crate::Error;
-use crate::sparql::Expression;
+use crate::sparql::{CompareOp, Expression};
 use crate::sql::{Condition, Filter, FilterTerm, FilterValue, OrderValue, TermMatch, ValueCases};
 use crate::xpath_regex::{Untranslated, translate};
 
@@ -101,12 +101,22 @@ impl<'a> Context<'_, 'a> {
             Expression::Or(a, b) => Filter::Or(boxed(a)?, boxed(b)?),
             Expression::And(a, b) => Filter::And(boxed(a)?, boxed(b)?),
             Expression::Not(a) => Filter::Not(boxed(a)?),
-            Expression::Compare(op, a, b) => self.binary(a, b, |l, r| Filter::Compare {
-                op: *op,
-                left: l.value.clone(),
-                right: r.value.clone(),
-                same_term: same_term(l, r),
-            })?,
+            Expression::Compare(op, a, b) => self.compare(*op, a, b)?,
+            // An error in one comparison is overruled by a true one, as
+            // `||` does (SPARQL 1.1 §17.4.1.9). Each comparison keeps the
+            // form of `=`, so a column compared with constants is a
+            // disjunction of conditions on the column.
+            Expression::In(a, list) => {
+                let mut out: Option<Filter> = None;
+                for b in list {
+                    let equal = self.compare(CompareOp::Equal, a, b)?;
+                    out = Some(match out {
+                        Some(left) => Filter::Or(Box::new(left), Box::new(equal)),
+                        None => equal,
+                    });
+                }
+                out.unwrap_or(Filter::Constant(Some(false)))
+            }
             Expression::SameTerm(a, b) => self.binary(a, b, |l, r| Filter::SameTerm {
                 left: l.value.clone(),
                 right: r.value.clone(),
@@ -146,6 +156,20 @@ impl<'a> Context<'_, 'a> {
             // A term where a boolean is expected stands for its effective
             // boolean value (SPARQL 1.1 §17.2.2).
             _ => self.unary(expression, |leaf| Filter::Ebv(leaf.value.clone()))?,
+        })
+    }
+
+    fn compare(
+        &self,
+        op: CompareOp,
+        a: &'a Expression,
+        b: &'a Expression,
+    ) -> Result<Filter, Error> {
+        self.binary(a, b, |l, r| Filter::Compare {
+            op,
+            left: l.value.clone(),
+            right: r.value.clone(),
+            same_term: same_term(l, r),
         })
     }
 
@@ -191,6 +215,44 @@ impl<'a> Context<'_, 'a> {
                             Box::new(right.value.clone()),
                         );
                         out.push((guards, Leaf { value, term: None }));
+                    }
+                }
+                Ok(out)
+            }
+            // The cases of the branch that the condition chooses, so where
+            // it is an error no case holds (SPARQL 1.1 §17.4.1.2).
+            Expression::If(condition, a, b) => {
+                let chosen = self.boolean(condition)?;
+                match constant(&chosen) {
+                    Some(Some(true)) => return self.operand(a),
+                    Some(Some(false)) => return self.operand(b),
+                    Some(None) => return Ok(Vec::new()),
+                    None => {}
+                }
+                let not_chosen = Filter::Not(Box::new(chosen.clone()));
+                let mut out = Vec::new();
+                for (guard, branch) in [(chosen, a), (not_chosen, b)] {
+                    let guard = Condition::Filter(guard);
+                    for (mut guards, leaf) in self.operand(branch)? {
+                        guards.insert(0, guard.clone());
+                        out.push((guards, leaf));
+                    }
+                }
+                Ok(out)
+            }
+            // The cases of every argument in order, each also where its
+            // value is not an error, so that the first case that holds is
+            // the first argument that is not an error (SPARQL 1.1
+            // §17.4.1.3). A variable or a constant is never an error where
+            // it is bound.
+            Expression::Coalesce(args) => {
+                let mut out = Vec::new();
+                for arg in args {
+                    for (mut guards, leaf) in self.operand(arg)? {
+                        if !matches!(leaf.value, FilterValue::Term(_) | FilterValue::Constant(_)) {
+                            guards.push(Condition::Filter(Filter::NoError(leaf.value.clone())));
+                        }
+                        out.push((guards, leaf));
                     }
                 }
                 Ok(out)
@@ -258,6 +320,16 @@ impl<'a> Context<'_, 'a> {
             }
         }
         Ok(out)
+    }
+}
+
+/// The value of a filter that does not depend on the row, `None` for one
+/// that does.
+fn constant(filter: &Filter) -> Option<Option<bool>> {
+    match filter {
+        Filter::Constant(value) => Some(*value),
+        Filter::Not(inner) => constant(inner).map(|value| value.map(|b| !b)),
+        _ => None,
     }
 }
 
