@@ -1,0 +1,67 @@
+# SPARQL 1.1 defines the functions of §17.4.5 only for xsd:dateTime, while
+# engines that extend them to xsd:date differ.
+[query.date-year]
+expect = "rejected"
+
+# Date and time functions in ORDER BY come with the other expressions there
+# (#108).
+[query.order-by-year]
+expect = "rejected"
+
+# A computed variable holds a number, and TZ gives a string, NOW a
+# dateTime.
+[query.select-tz]
+expect = "rejected"
+
+[query.select-now]
+expect = "rejected"
+
+# NOW has a time zone and a timestamp has none: their order depends on an
+# implicit time zone (Discussion #57).
+[query.now-timestamp]
+expect = "rejected"
+
+# TZ is the time zone of the lexical form (SPARQL 1.1 §17.4.5.9): "" for a
+# timestamp, "Z" for a timestamptz, which the engine writes in UTC with Z,
+# and "-05:00" for a constant written with -05:00. Ontop gives "00:00" for
+# all of them (#105).
+[query.tz-timestamp-empty]
+expect = "mismatch"
+issue = 105
+
+[query.tz-timestamptz]
+expect = "mismatch"
+issue = 105
+
+[query.constant-tz]
+expect = "mismatch"
+issue = 105
+
+# HOURS of a constant is the hour in its own time zone (XPath F&O 3.1
+# §9.5.4): 22 for 2024-12-31T22:59:00-05:00. Ontop gives the hour in UTC,
+# 3 (#105).
+[query.constant-local-hours]
+expect = "mismatch"
+issue = 105
+
+# Ontop does not support TIMEZONE (#105).
+[query.timezone-timestamptz]
+expect = "ontop-error"
+issue = 105
+solutions = 5
+
+[query.timezone-timestamp-error]
+expect = "ontop-error"
+issue = 105
+solutions = 5
+
+[query.constant-timezone]
+expect = "ontop-error"
+issue = 105
+solutions = 1
+
+# Ontop keeps the scale of the numeric that PostgreSQL extracts
+# (58.250000); v12n writes the canonical form (58.25) (#25).
+[query.select-seconds]
+expect = "mismatch"
+issue = 25

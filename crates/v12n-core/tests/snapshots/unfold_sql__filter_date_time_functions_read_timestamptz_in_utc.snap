@@ -1,0 +1,24 @@
+---
+source: crates/v12n-core/tests/unfold_sql.rs
+expression: "explain_events(\"SELECT ?e WHERE { ?e ex:ts ?u ; ex:tz ?z \\\n         FILTER(YEAR(?z) = 2024 && MONTH(?u) = 12 && DAY(?z) < DAY(?u) && HOURS(?z) >= 23 \\\n         && MINUTES(?u) = 59 && SECONDS(?z) > 1.5 && TZ(?z) = \\\"Z\\\" && TZ(?u) = \\\"\\\" \\\n         && STR(TIMEZONE(?z)) = \\\"PT0S\\\") }\")"
+---
+SELECT q."e"
+FROM (
+SELECT DISTINCT t0."id" AS "e", t0."ts" AS "u", t1."tz" AS "z"
+FROM "events" t0
+JOIN "events" t1 ON t1."id" = t0."id" AND ((((((((CASE WHEN isfinite(t1."tz") THEN CASE WHEN (t1."tz" AT TIME ZONE 'UTC') < '0001-01-01T00:00:00'::timestamp THEN extract(year FROM (t1."tz" AT TIME ZONE 'UTC'))::numeric + 1 ELSE extract(year FROM (t1."tz" AT TIME ZONE 'UTC'))::numeric END END = $1::int8 AND CASE WHEN isfinite(t0."ts") THEN extract(month FROM t0."ts")::numeric END = $2::int8) AND CASE WHEN isfinite(t1."tz") THEN extract(day FROM (t1."tz" AT TIME ZONE 'UTC'))::numeric END < CASE WHEN isfinite(t0."ts") THEN extract(day FROM t0."ts")::numeric END) AND CASE WHEN isfinite(t1."tz") THEN extract(hour FROM (t1."tz" AT TIME ZONE 'UTC'))::numeric END >= $3::int8) AND CASE WHEN isfinite(t0."ts") THEN extract(minute FROM t0."ts")::numeric END = $4::int8) AND CASE WHEN isfinite(t1."tz") THEN extract(second FROM (t1."tz" AT TIME ZONE 'UTC'))::numeric END > $5::numeric) AND (CASE WHEN isfinite(t1."tz") THEN $6::text END = $7::text)) AND (CASE WHEN isfinite(t0."ts") THEN $8::text END = $9::text)) AND (CASE WHEN isfinite(t1."tz") THEN $10::text END = $11::text))
+WHERE t0."ts" IS NOT NULL AND t1."tz" IS NOT NULL
+) q
+
+-- params
+$1 = "2024"
+$2 = "12"
+$3 = "23"
+$4 = "59"
+$5 = "1.5"
+$6 = "Z"
+$7 = "Z"
+$8 = ""
+$9 = ""
+$10 = "PT0S"
+$11 = "PT0S"

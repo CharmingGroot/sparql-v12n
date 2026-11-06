@@ -17,8 +17,8 @@ use crate::mapping::{
     TermMapValue, TermType, TriplesMap,
 };
 use crate::sparql::{
-    ArithOp, Expression, InlineData, Pattern, PatternTerm, QueryForm, RDF_TYPE, SelectQuery,
-    TriplePattern,
+    ArithOp, DateTimeFunction, Expression, InlineData, Pattern, PatternTerm, QueryForm, RDF_TYPE,
+    SelectQuery, TriplePattern,
 };
 use crate::sql::{
     Condition, LeftJoin, OrderKey, ProjectedTerm, ResultTerm, ResultValue, SqlBranch, SqlExpr,
@@ -1906,16 +1906,33 @@ fn value_kinds(expression: &Expression) -> Vec<ValueKind> {
         return vec![ValueKind::Double];
     }
     let mut kinds = exact_kinds(expression);
-    if !expression.variables().is_empty() || chooses_double(expression) {
+    if reads_numbers(expression) || chooses_double(expression) {
         kinds.push(ValueKind::Double);
     }
     kinds
+}
+
+/// Whether the expression reads a variable other than through a function
+/// of SPARQL 1.1 §17.4.5, whose results are never doubles.
+fn reads_numbers(expression: &Expression) -> bool {
+    match expression {
+        Expression::DateTime(..) => false,
+        Expression::Arith(_, a, b) => reads_numbers(a) || reads_numbers(b),
+        Expression::Negate(inner) | Expression::Numeric(_, inner) => reads_numbers(inner),
+        Expression::If(c, a, b) => {
+            !c.variables().is_empty() || reads_numbers(a) || reads_numbers(b)
+        }
+        Expression::Coalesce(args) => args.iter().any(reads_numbers),
+        other => !other.variables().is_empty(),
+    }
 }
 
 /// The classes of an arithmetic expression over integers and decimals.
 fn exact_kinds(expression: &Expression) -> Vec<ValueKind> {
     let choices: Vec<&Expression> = match expression {
         Expression::Arith(ArithOp::Divide, ..) => return vec![ValueKind::Decimal],
+        Expression::DateTime(DateTimeFunction::Seconds, _) => return vec![ValueKind::Decimal],
+        Expression::DateTime(..) => return vec![ValueKind::Integer],
         Expression::Negate(inner) | Expression::Numeric(_, inner) => return exact_kinds(inner),
         Expression::StrLen(_) => return vec![ValueKind::Integer],
         Expression::If(_, a, b) => vec![a, b],

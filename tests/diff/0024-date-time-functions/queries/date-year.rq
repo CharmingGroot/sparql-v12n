@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# SPARQL 1.1 defines YEAR only for xsd:dateTime.
+SELECT ?e WHERE { ?e ex:day ?d FILTER(YEAR(?d) = 2024) }

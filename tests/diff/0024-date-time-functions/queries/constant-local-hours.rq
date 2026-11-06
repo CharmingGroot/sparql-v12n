@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# A constant is read in its own time zone (XPath F&O 3.1 §9.5): its
+# HOURS is 22.
+SELECT ?e WHERE { ?e ex:ts ?u FILTER(HOURS(?u) < HOURS("2024-12-31T22:59:00-05:00"^^xsd:dateTime)) }

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Rendering of a plan as SQL text with bound parameters.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Error;
 use crate::dialect::{Dialect, PostgresDialect, SqlType};
@@ -369,6 +371,9 @@ pub(super) struct Renderer<'a> {
     /// when it is the table of an `OPTIONAL` part that reads a row of its
     /// left side.
     row_of: Vec<Option<RowOf>>,
+    /// The value of `NOW()`, taken once per rendering so that every use
+    /// in the query has the same value (SPARQL 1.1 §17.4.5.1).
+    now: OnceCell<crate::xsd::DateTime>,
 }
 
 /// The SQL of a [`SameRow`](super::SameRow): the table whose row is read,
@@ -398,7 +403,21 @@ impl<'a> Renderer<'a> {
             from: &[],
             branch: None,
             row_of: Vec::new(),
+            now: OnceCell::new(),
         }
+    }
+
+    /// The current instant in UTC, to the microsecond, the same for the
+    /// whole rendering.
+    pub(super) fn now(&self) -> crate::xsd::DateTime {
+        self.now
+            .get_or_init(|| {
+                let micros = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
+                crate::xsd::utc_date_time(micros).expect("the current year is between 1 and 9999")
+            })
+            .clone()
     }
 
     /// Runs `render`, then replaces the SQL it wrote with `wrap` of it.

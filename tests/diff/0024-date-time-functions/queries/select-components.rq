@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?e (YEAR(?z) AS ?y) (MONTH(?z) AS ?m) (DAY(?z) AS ?d) (HOURS(?u) AS ?h) (MINUTES(?u) AS ?n)
+WHERE { ?e ex:ts ?u ; ex:tz ?z }

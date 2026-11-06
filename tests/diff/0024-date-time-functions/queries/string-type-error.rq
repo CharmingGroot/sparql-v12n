@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+
+# A string is not an xsd:dateTime, so each comparison is an error: no
+# row, also under negation.
+SELECT ?e WHERE { ?e ex:name ?n FILTER(YEAR(?n) = 2024 || !(HOURS(?n) > 0) || TZ(?n) = "") }

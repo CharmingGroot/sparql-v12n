@@ -575,6 +575,43 @@ of 2^52 or more in magnitude are their own rounding, values from -0.5 to
 
 `RAND` is rejected as unsupported. Its value differs per row and per run.
 
+`YEAR`, `MONTH`, `DAY`, `HOURS`, `MINUTES`, `SECONDS`, `TIMEZONE` and `TZ`
+(SPARQL 1.1 §17.4.5) take an `xsd:dateTime` from a `timestamp` or
+`timestamptz` column, a constant or `NOW`, and give its components in its
+own time zone (XPath F&O 3.1 §9.5). `YEAR` to `MINUTES` give an
+`xsd:integer`, and `SECONDS` an `xsd:decimal` with the fraction, such as
+`58.25`. `TIMEZONE` gives an `xsd:dayTimeDuration`, such as `-PT5H30M`,
+and is an error for a value without a time zone. `TZ` gives the time zone
+as written, such as `-05:30` or `Z`, and `""` for a value without one.
+Anything that is not an `xsd:dateTime` is an error, and so is an infinite
+`timestamp` or `timestamptz`, which is a plain literal.
+
+The functions agree with the lexical forms the engine writes. A
+`timestamp` has no time zone: its `TZ` is `""` and its `TIMEZONE` an
+error. A `timestamptz` is written in UTC with `Z`, so its components are
+those in UTC, its `TZ` is `Z` and its `TIMEZONE` is `PT0S`, whatever the
+session time zone. `2025-01-01T03:00:00+05:00` stored in a `timestamptz`
+column is written `2024-12-31T22:00:00Z`, and its `YEAR` is `2024`. In
+SQL, a component is `extract` over the column, read `AT TIME ZONE 'UTC'`
+for a `timestamptz`, and `NULL` where the column is infinite. PostgreSQL
+numbers the year before 1 as -1, which the engine writes as `0000`, so
+`YEAR` adds 1 to years before 1. A constant is computed before the query
+is sent: `HOURS("2024-12-31T22:59:00-05:00"^^xsd:dateTime)` is `22`,
+`TZ` of it is `-05:00`, and `24:00:00` is the first instant of the next
+day.
+
+`NOW` (SPARQL 1.1 §17.4.5.1) is one `xsd:dateTime` in UTC for the whole
+query, to the microsecond, taken when the query is rendered and sent as
+one `timestamptz` parameter. Every `NOW` in the query has that value, so
+`?t < NOW()` compares each row with the same instant. Its `TZ` is `Z`.
+
+`YEAR` and the other functions are rejected as unsupported for `xsd:date`
+and `xsd:time` values, from `date` and `time` columns or constants.
+SPARQL 1.1 defines them only for `xsd:dateTime`, and engines that extend
+them differ. Comparing a `TIMEZONE` result with an `xsd:dayTimeDuration`
+constant is rejected as for other datatypes outside the operator mapping;
+`STR(TIMEZONE(?t)) = "PT0S"` compares its lexical form.
+
 `STR` and `DATATYPE` of a column work where its lexical form or natural
 datatype is known in SQL, as for joins. The infinities of `date` and
 `timestamp` are plain literals, so their `DATATYPE` is `xsd:string`.
@@ -699,10 +736,10 @@ differently from engines that extend SPARQL:
   - dateTime constants outside the years 1 to 9999, or finer than a
     microsecond;
 - other functions, `RAND` among them, and expressions other than terms
-  (variables, constants, arithmetic, and `STR`, `LANG`,
-  `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`, `IF`, `COALESCE` or the
-  functions on strings of them) as operands, such as a comparison as an
-  argument of `IF`, `COALESCE` or `IN`;
+  (variables, constants, arithmetic, `NOW`, and `STR`, `LANG`,
+  `DATATYPE`, `ABS`, `ROUND`, `CEIL`, `FLOOR`, `IF`, `COALESCE`, the
+  functions on strings or the functions of dateTimes of them) as operands,
+  such as a comparison as an argument of `IF`, `COALESCE` or `IN`;
 - `REPLACE` with a pattern whose matches XPath and PostgreSQL can choose
   differently (see above), with a reference to a group after the ninth,
   or with a pattern, replacement or flags that are not constants;
@@ -711,6 +748,8 @@ differently from engines that extend SPARQL:
   and engines that round it as `fn:substring` does answer;
 - functions on strings of a `date` or `timestamp` column, whose infinite
   values are plain literals;
+- the functions of dateTimes over `xsd:date` and `xsd:time` values, and
+  `sameTerm` of `NOW`;
 - string ordering, `REGEX` and the functions on strings in a database
   whose encoding is not UTF-8.
 
@@ -736,6 +775,9 @@ arithmetic or numeric constants:
   their argument. Over a `numeric` column, `ROUND(?price)` is an
   `xsd:decimal`, such as `3`, and over an integer column, `ROUND(?qty)`
   is `?qty`.
+- `YEAR`, `MONTH`, `DAY`, `HOURS` and `MINUTES` give an `xsd:integer`,
+  and `SECONDS` an `xsd:decimal`, such as `58.25` or `0`. An infinite
+  timestamp leaves `?v` unbound.
 - `IF` and `COALESCE` give the number of the argument they choose.
   `COALESCE(?qty / ?n, 0)` is `0` where `?n` is zero or unbound, and
   `IF(?n > 0, ?qty / ?n, 0)` leaves `?v` unbound where `?n` is unbound,
@@ -751,9 +793,10 @@ of the variables of the expression that the group may leave unbound.
 The following are rejected as unsupported:
 
 - expressions other than variables, constants, arithmetic, numeric
-  functions, `STRLEN`, and `IF` and `COALESCE` over arithmetic and numeric
-  constants. `STR`, comparisons, `IN`, `UCASE` and the other functions on
-  strings, and `COALESCE(?x, 0)`, whose result can be any term, are
+  functions, `STRLEN`, `YEAR` to `SECONDS`, and `IF` and `COALESCE` over
+  arithmetic and numeric constants. `STR`, comparisons, `IN`, `UCASE` and
+  the other functions on strings, `TZ`, `TIMEZONE`, `NOW`, and
+  `COALESCE(?x, 0)`, whose result can be any term, are
   examples. A computed variable holds only numbers in SQL;
 - `BIND` inside `OPTIONAL` or `UNION`;
 - `BIND` over a variable that its group may leave unbound and a later
@@ -971,5 +1014,5 @@ The following are rejected as unsupported:
 - comparators over strings in a database whose encoding is not UTF-8;
 - as in `FILTER`, other functions, arithmetic, `ABS`, `ROUND`, `CEIL`,
   `FLOOR`, `IF`, `COALESCE`, the functions on strings other than
-  `STRSTARTS`, `STRENDS` and `CONTAINS`, and string forms that SQL cannot
-  compute.
+  `STRSTARTS`, `STRENDS` and `CONTAINS`, the functions of dateTimes, `NOW`,
+  and string forms that SQL cannot compute.

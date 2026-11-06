@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?e (MONTH(?n) AS ?m) WHERE { ?e ex:name ?n }
