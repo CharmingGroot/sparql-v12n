@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?e WHERE { ?e ex:ts ?u FILTER(MONTH(?u) = 2 && DAY(?u) = 29) }

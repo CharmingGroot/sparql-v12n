@@ -190,12 +190,9 @@ const MICROS_PER_DAY: i64 = 86_400_000_000;
 /// PostgreSQL cannot hold exactly are an error: years outside 1 to 9999,
 /// and fractions of a second below a microsecond.
 fn date_time(lexical: &str) -> Result<Option<DateTime>, &'static str> {
-    let Some((date, rest)) = lexical.split_once('T') else {
+    let (local, zone) = split_zone(lexical);
+    let Some((date, time)) = local.split_once('T') else {
         return Ok(None);
-    };
-    let (time, zone) = match rest.find(['Z', '+', '-']) {
-        Some(at) => (&rest[..at], Some(&rest[at..])),
-        None => (rest, None),
     };
     let mut parts = date.splitn(3, '-');
     let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
@@ -269,9 +266,32 @@ fn date_time(lexical: &str) -> Result<Option<DateTime>, &'static str> {
     if let Some(offset) = offset_minutes {
         micros -= offset * 60_000_000;
     }
+    let Some(canonical) = canonical_date_time(micros, offset_minutes.is_some()) else {
+        return Err("xsd:dateTime constants outside the years 1 to 9999");
+    };
+    Ok(Some(DateTime {
+        canonical,
+        zoned: offset_minutes.is_some(),
+    }))
+}
+
+/// The lexical form without its time zone, and the time zone as written.
+fn split_zone(lexical: &str) -> (&str, Option<&str>) {
+    let Some(t) = lexical.find('T') else {
+        return (lexical, None);
+    };
+    match lexical[t..].find(['Z', '+', '-']) {
+        Some(at) => (&lexical[..t + at], Some(&lexical[t + at..])),
+        None => (lexical, None),
+    }
+}
+
+/// The form the engine writes for `micros` from 1970-01-01T00:00:00, with
+/// `Z` when `zoned`; `None` outside the years 1 to 9999.
+fn canonical_date_time(micros: i64, zoned: bool) -> Option<String> {
     let (year, month, day) = civil_from_days(micros.div_euclid(MICROS_PER_DAY));
     if !(1..=9999).contains(&year) {
-        return Err("xsd:dateTime constants outside the years 1 to 9999");
+        return None;
     }
     let time = micros.rem_euclid(MICROS_PER_DAY);
     let seconds = time / 1_000_000;
@@ -284,13 +304,110 @@ fn date_time(lexical: &str) -> Result<Option<DateTime>, &'static str> {
     if time % 1_000_000 != 0 {
         canonical.push_str(format!(".{:06}", time % 1_000_000).trim_end_matches('0'));
     }
-    if offset_minutes.is_some() {
+    if zoned {
         canonical.push('Z');
     }
-    Ok(Some(DateTime {
-        canonical,
-        zoned: offset_minutes.is_some(),
+    Some(canonical)
+}
+
+/// The UTC `xsd:dateTime` `micros` from 1970-01-01T00:00:00Z, in the form
+/// the engine writes `timestamptz` values; `None` outside the years 1 to
+/// 9999.
+pub(crate) fn utc_date_time(micros: i64) -> Option<DateTime> {
+    Some(DateTime {
+        canonical: canonical_date_time(micros, true)?,
+        zoned: true,
+    })
+}
+
+/// The components of an `xsd:dateTime` in its own time zone, which the
+/// functions of SPARQL 1.1 §17.4.5 return (XPath F&O 3.1 §9.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DateTimeParts {
+    pub year: i64,
+    pub month: i64,
+    pub day: i64,
+    pub hours: i64,
+    pub minutes: i64,
+    /// The seconds with their fraction, as a canonical `xsd:decimal`.
+    pub seconds: String,
+    /// The time zone as written and its offset in minutes.
+    pub zone: Option<(String, i64)>,
+}
+
+/// The components of the `xsd:dateTime` lexical form `lexical`: `Ok(None)`
+/// when it is not one, and an error for a value the engine does not
+/// support, as for comparisons. `24:00:00` is the first instant of the
+/// next day (XML Schema 1.1 Part 2 §3.3.7).
+pub(crate) fn date_time_parts(lexical: &str) -> Result<Option<DateTimeParts>, &'static str> {
+    if date_time(lexical)?.is_none() {
+        return Ok(None);
+    }
+    let (local, zone) = split_zone(lexical);
+    let local = date_time(local)?.expect("the lexical form without its time zone is valid");
+    let c = local.canonical.as_str();
+    let field = |range: std::ops::Range<usize>| -> i64 {
+        c[range].parse().expect("canonical dateTime digits")
+    };
+    let fraction = c.get(20..).unwrap_or("");
+    let seconds = field(17..19);
+    let zone = zone.map(|zone| {
+        let minutes = match zone.as_bytes() {
+            [sign, h1, h2, b':', m1, m2] => {
+                let digit = |d: &u8| i64::from(d - b'0');
+                let minutes = (digit(h1) * 10 + digit(h2)) * 60 + digit(m1) * 10 + digit(m2);
+                if *sign == b'-' { -minutes } else { minutes }
+            }
+            _ => 0,
+        };
+        (zone.to_owned(), minutes)
+    });
+    Ok(Some(DateTimeParts {
+        year: field(0..4),
+        month: field(5..7),
+        day: field(8..10),
+        hours: field(11..13),
+        minutes: field(14..16),
+        seconds: if fraction.is_empty() {
+            seconds.to_string()
+        } else {
+            format!("{seconds}.{fraction}")
+        },
+        zone,
     }))
+}
+
+/// Why an `xsd:date` or `xsd:time` argument of a function of SPARQL 1.1
+/// §17.4.5 is rejected.
+pub(crate) const DATE_OR_TIME_ARGUMENT: &str = "YEAR, MONTH, DAY, HOURS, MINUTES, SECONDS, \
+     TIMEZONE and TZ of xsd:date and xsd:time values: SPARQL 1.1 defines them only for \
+     xsd:dateTime, while engines that extend them differ";
+
+/// Whether `datatype` is `xsd:date` or `xsd:time`.
+pub(crate) fn is_date_or_time(datatype: &str) -> bool {
+    matches!(datatype.strip_prefix(XSD), Some("date" | "time"))
+}
+
+/// The canonical `xsd:dayTimeDuration` of a time zone offset in minutes
+/// (the canonical mapping of `duration`, XML Schema 1.1 Part 2), as
+/// fn:timezone-from-dateTime returns it.
+pub(crate) fn zone_duration(minutes: i64) -> String {
+    if minutes == 0 {
+        return "PT0S".to_owned();
+    }
+    let mut out = String::new();
+    if minutes < 0 {
+        out.push('-');
+    }
+    out.push_str("PT");
+    let (h, m) = (minutes.abs() / 60, minutes.abs() % 60);
+    if h > 0 {
+        out.push_str(&format!("{h}H"));
+    }
+    if m > 0 {
+        out.push_str(&format!("{m}M"));
+    }
+    out
 }
 
 /// Exactly `len` ASCII digits.
@@ -440,6 +557,74 @@ mod tests {
                 "{lexical}"
             );
         }
+    }
+
+    #[test]
+    fn date_time_parts_are_local_to_the_time_zone() {
+        let p = date_time_parts("2024-03-01T02:05:09.120-05:30")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                p.year,
+                p.month,
+                p.day,
+                p.hours,
+                p.minutes,
+                p.seconds.as_str()
+            ),
+            (2024, 3, 1, 2, 5, "9.12")
+        );
+        assert_eq!(p.zone, Some(("-05:30".to_owned(), -330)));
+        let p = date_time_parts("2023-12-31T24:00:00Z").unwrap().unwrap();
+        assert_eq!((p.year, p.month, p.day, p.hours), (2024, 1, 1, 0));
+        assert_eq!(
+            (p.seconds.as_str(), p.zone),
+            ("0", Some(("Z".to_owned(), 0)))
+        );
+        let p = date_time_parts("0001-01-01T00:00:00.000001")
+            .unwrap()
+            .unwrap();
+        assert_eq!((p.year, p.seconds.as_str(), p.zone), (1, "0.000001", None));
+        assert_eq!(
+            date_time_parts("2024-01-01T00:00:00+14:00")
+                .unwrap()
+                .unwrap()
+                .zone,
+            Some(("+14:00".to_owned(), 840))
+        );
+        assert_eq!(date_time_parts("2024-02-30T00:00:00"), Ok(None));
+        assert_eq!(date_time_parts("2024-01-01"), Ok(None));
+        assert!(date_time_parts("10000-01-01T00:00:00").is_err());
+        // The instant is in year 10000.
+        assert!(date_time_parts("9999-12-31T23:00:00-01:00").is_err());
+    }
+
+    #[test]
+    fn zone_durations_are_canonical() {
+        for (minutes, duration) in [
+            (0, "PT0S"),
+            (60, "PT1H"),
+            (-300, "-PT5H"),
+            (330, "PT5H30M"),
+            (-45, "-PT45M"),
+            (840, "PT14H"),
+        ] {
+            assert_eq!(zone_duration(minutes), duration);
+        }
+    }
+
+    #[test]
+    fn utc_date_times_are_written_as_timestamptz_values() {
+        assert_eq!(utc_date_time(0).unwrap().canonical, "1970-01-01T00:00:00Z");
+        assert_eq!(
+            utc_date_time(1_700_000_000_123_400).unwrap().canonical,
+            "2023-11-14T22:13:20.1234Z"
+        );
+        assert_eq!(
+            date_time_value(&utc_date_time(-1).unwrap().canonical).canonical,
+            "1969-12-31T23:59:59.999999Z"
+        );
     }
 
     #[test]

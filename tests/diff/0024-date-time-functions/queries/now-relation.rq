@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+
+# NOW differs per run, so only a relation with it is compared.
+SELECT ?e WHERE { ?e ex:tz ?z FILTER(?z < NOW() && YEAR(?z) <= YEAR(NOW())) }

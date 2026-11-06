@@ -152,6 +152,12 @@ pub enum Expression {
     Negate(Box<Expression>),
     /// `ABS`, `ROUND`, `CEIL` or `FLOOR` (SPARQL 1.1 §17.4.4) of a number.
     Numeric(NumericFunction, Box<Expression>),
+    /// `YEAR`, `MONTH`, `DAY`, `HOURS`, `MINUTES`, `SECONDS`, `TIMEZONE`
+    /// or `TZ` (SPARQL 1.1 §17.4.5) of an `xsd:dateTime`.
+    DateTime(DateTimeFunction, Box<Expression>),
+    /// `NOW()` (SPARQL 1.1 §17.4.5.1): one `xsd:dateTime` with a time zone
+    /// for the whole query.
+    Now,
     /// `IF(cond, a, b)` (SPARQL 1.1 §17.4.1.2): `a` where the effective
     /// boolean value of `cond` is true, `b` where it is false, and an
     /// error where it is an error.
@@ -175,7 +181,7 @@ impl Expression {
 
     fn collect_variables<'e>(&'e self, out: &mut Vec<&'e str>) {
         match self {
-            Self::Constant(_) => {}
+            Self::Constant(_) | Self::Now => {}
             Self::Variable(v) | Self::Bound(v) => out.push(v),
             Self::Or(a, b)
             | Self::And(a, b)
@@ -192,7 +198,8 @@ impl Expression {
             | Self::Datatype(a)
             | Self::Regex(a, _, _)
             | Self::Negate(a)
-            | Self::Numeric(_, a) => a.collect_variables(out),
+            | Self::Numeric(_, a)
+            | Self::DateTime(_, a) => a.collect_variables(out),
             Self::If(c, a, b) => {
                 c.collect_variables(out);
                 a.collect_variables(out);
@@ -218,6 +225,8 @@ impl Expression {
                 | Self::Arith(..)
                 | Self::Negate(_)
                 | Self::Numeric(..)
+                | Self::DateTime(..)
+                | Self::Now
                 | Self::If(..)
                 | Self::Coalesce(_)
         )
@@ -258,6 +267,38 @@ pub enum NumericFunction {
     Ceil,
     /// `fn:floor`.
     Floor,
+}
+
+/// The functions on `xsd:dateTime` values of SPARQL 1.1 §17.4.5 other
+/// than `NOW`. The components are those of the value in its own time zone
+/// (XPath F&O 3.1 §9.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateTimeFunction {
+    /// `fn:year-from-dateTime`, an `xsd:integer`.
+    Year,
+    /// `fn:month-from-dateTime`, an `xsd:integer`.
+    Month,
+    /// `fn:day-from-dateTime`, an `xsd:integer`.
+    Day,
+    /// `fn:hours-from-dateTime`, an `xsd:integer`.
+    Hours,
+    /// `fn:minutes-from-dateTime`, an `xsd:integer`.
+    Minutes,
+    /// `fn:seconds-from-dateTime`, an `xsd:decimal` with the fraction.
+    Seconds,
+    /// `fn:timezone-from-dateTime`, an `xsd:dayTimeDuration`, and an
+    /// error for a value without a time zone.
+    Timezone,
+    /// The time zone as a simple literal, empty for a value without one.
+    Tz,
+}
+
+impl DateTimeFunction {
+    /// Whether the result is a number: an integer, or a decimal for
+    /// `SECONDS`.
+    pub fn is_numeric(self) -> bool {
+        !matches!(self, Self::Timezone | Self::Tz)
+    }
 }
 
 /// The relational operators of SPARQL 1.1 §17.3, `!=` aside.
@@ -671,6 +712,7 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
         | Expression::Arith(..)
         | Expression::Negate(_)
         | Expression::Numeric(..) => return Ok(expression),
+        Expression::DateTime(function, _) if function.is_numeric() => return Ok(expression),
         // The value of a computed variable is a number in SQL, so every
         // result must be one or an error.
         Expression::If(..) | Expression::Coalesce(_) if numeric_results(&expression) => {
@@ -688,6 +730,10 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
         Expression::Lang(_) => "LANG",
         Expression::Datatype(_) => "DATATYPE",
         Expression::Regex(..) => "REGEX",
+        // The value of a computed variable is a number in SQL.
+        Expression::DateTime(DateTimeFunction::Timezone, _) => "TIMEZONE",
+        Expression::DateTime(..) => "TZ",
+        Expression::Now => "NOW",
     };
     Err(unsupported(&format!(
         "{what} as the value of BIND and SELECT expressions"
@@ -700,6 +746,7 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
 fn numeric_results(expression: &Expression) -> bool {
     match expression {
         Expression::Arith(..) | Expression::Negate(_) | Expression::Numeric(..) => true,
+        Expression::DateTime(function, _) => function.is_numeric(),
         Expression::Constant(Term::Literal(literal)) => matches!(
             crate::xsd::value(literal.value(), literal.datatype().as_str()),
             crate::xsd::Value::Numeric(_)
@@ -1029,10 +1076,28 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
         }
         // Expressions in ORDER BY come with #108.
         SparqlExpression::FunctionCall(
-            function @ (Function::Abs | Function::Round | Function::Ceil | Function::Floor),
+            function @ (Function::Abs
+            | Function::Round
+            | Function::Ceil
+            | Function::Floor
+            | Function::Year
+            | Function::Month
+            | Function::Day
+            | Function::Hours
+            | Function::Minutes
+            | Function::Seconds
+            | Function::Timezone
+            | Function::Tz
+            | Function::Now),
             _,
         ) if matches!(site, Site::OrderBy) => {
             return Err(in_site(&format!("{function}")));
+        }
+        SparqlExpression::FunctionCall(Function::Now, args) => {
+            if !args.is_empty() {
+                return Err(Error::QuerySyntax("NOW takes no arguments".into()));
+            }
+            Expression::Now
         }
         SparqlExpression::FunctionCall(function, args) => {
             let [arg] = args.as_slice() else {
@@ -1046,13 +1111,20 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
                     | Function::Abs
                     | Function::Round
                     | Function::Ceil
-                    | Function::Floor => {
-                        Error::QuerySyntax(format!("{function} takes one argument"))
-                    }
+                    | Function::Floor
+                    | Function::Year
+                    | Function::Month
+                    | Function::Day
+                    | Function::Hours
+                    | Function::Minutes
+                    | Function::Seconds
+                    | Function::Timezone
+                    | Function::Tz => Error::QuerySyntax(format!("{function} takes one argument")),
                     other => in_site(&format!("the {other} function")),
                 });
             };
             let numeric = |f| Ok::<_, Error>(Expression::Numeric(f, operand(arg)?));
+            let date_time = |f| Ok::<_, Error>(Expression::DateTime(f, operand(arg)?));
             match function {
                 Function::IsIri => Expression::Test(TermTest::IsIri, operand(arg)?),
                 Function::IsBlank => Expression::Test(TermTest::IsBlank, operand(arg)?),
@@ -1064,6 +1136,14 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
                 Function::Round => numeric(NumericFunction::Round)?,
                 Function::Ceil => numeric(NumericFunction::Ceil)?,
                 Function::Floor => numeric(NumericFunction::Floor)?,
+                Function::Year => date_time(DateTimeFunction::Year)?,
+                Function::Month => date_time(DateTimeFunction::Month)?,
+                Function::Day => date_time(DateTimeFunction::Day)?,
+                Function::Hours => date_time(DateTimeFunction::Hours)?,
+                Function::Minutes => date_time(DateTimeFunction::Minutes)?,
+                Function::Seconds => date_time(DateTimeFunction::Seconds)?,
+                Function::Timezone => date_time(DateTimeFunction::Timezone)?,
+                Function::Tz => date_time(DateTimeFunction::Tz)?,
                 other => return Err(in_site(&format!("the {other} function"))),
             }
         }
@@ -1739,6 +1819,80 @@ mod tests {
     }
 
     #[test]
+    fn parse_date_time_functions() {
+        let q = parse_ok(
+            "SELECT * WHERE { ?e ex:at ?t \
+             FILTER(YEAR(?t) = 2024 && TZ(?t) = \"Z\" && STR(TIMEZONE(?t)) != \"\" && ?t < NOW()) }",
+        );
+        let Pattern::Filter(_, filter) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        let Expression::And(rest, now) = filter else {
+            panic!("{filter:?}")
+        };
+        assert_eq!(
+            **now,
+            Expression::Compare(CompareOp::Less, variable("t"), Box::new(Expression::Now))
+        );
+        let Expression::And(rest, _) = rest.as_ref() else {
+            panic!("{rest:?}")
+        };
+        let Expression::And(year, tz) = rest.as_ref() else {
+            panic!("{rest:?}")
+        };
+        assert_eq!(
+            **year,
+            Expression::Compare(
+                CompareOp::Equal,
+                Box::new(Expression::DateTime(DateTimeFunction::Year, variable("t"))),
+                integer(2024)
+            )
+        );
+        let Expression::Compare(_, tz, _) = tz.as_ref() else {
+            panic!("{tz:?}")
+        };
+        assert_eq!(
+            **tz,
+            Expression::DateTime(DateTimeFunction::Tz, variable("t"))
+        );
+        assert!(tz.is_term() && Expression::Now.is_term());
+        assert!(Expression::Now.variables().is_empty());
+        for (name, function) in [
+            ("MONTH", DateTimeFunction::Month),
+            ("DAY", DateTimeFunction::Day),
+            ("HOURS", DateTimeFunction::Hours),
+            ("MINUTES", DateTimeFunction::Minutes),
+            ("SECONDS", DateTimeFunction::Seconds),
+            ("TIMEZONE", DateTimeFunction::Timezone),
+        ] {
+            let q = parse_ok(&format!(
+                "SELECT * WHERE {{ ?e ex:at ?t FILTER({name}(?t)) }}"
+            ));
+            assert_eq!(
+                q.pattern,
+                Pattern::Filter(
+                    Box::new(Pattern::Bgp(
+                        q.pattern.triple_patterns().into_iter().cloned().collect()
+                    )),
+                    Expression::DateTime(function, variable("t"))
+                ),
+                "{name}"
+            );
+        }
+
+        // Numbers, as the value of BIND and SELECT.
+        let q = parse_ok(
+            "SELECT ?e (YEAR(?t) AS ?y) (SECONDS(?t) + 1 AS ?s) (COALESCE(HOURS(?t), 0) AS ?h) \
+             WHERE { ?e ex:at ?t BIND(MINUTES(NOW()) AS ?m) }",
+        );
+        assert_eq!(q.bindings.len(), 4);
+        assert!(matches!(
+            parse("SELECT * WHERE { ?e ex:at ?t FILTER(YEAR(?t, ?t) = 1) }"),
+            Err(Error::QuerySyntax(_))
+        ));
+    }
+
+    #[test]
     fn parse_unsupported_features_are_rejected_by_name() {
         let cases = [
             (
@@ -1828,6 +1982,38 @@ mod tests {
             (
                 "SELECT * WHERE { ?o ex:amount ?a } ORDER BY DESC(ROUND(?a)) ?o",
                 "ROUND in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?e ex:at ?t } ORDER BY YEAR(?t)",
+                "YEAR in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?e ex:at ?t } ORDER BY DESC(TZ(?t))",
+                "TZ in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?e ex:at ?t } ORDER BY NOW()",
+                "NOW in ORDER BY",
+            ),
+            (
+                "SELECT ?e (TZ(?t) AS ?z) WHERE { ?e ex:at ?t }",
+                "TZ as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?e ex:at ?t BIND(TIMEZONE(?t) AS ?z) }",
+                "TIMEZONE as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT ?e (NOW() AS ?n) WHERE { ?e ex:at ?t }",
+                "NOW as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT ?e (COALESCE(TZ(?t), 0) AS ?n) WHERE { ?e ex:at ?t }",
+                "IF and COALESCE with a result other than arithmetic or a numeric constant",
+            ),
+            (
+                "SELECT * WHERE { ?e ex:at ?t FILTER(YEAR(?t > 1) = 1) }",
+                "expressions other than terms",
             ),
             (
                 "SELECT * WHERE { ?o ex:amount ?a FILTER(ABS(?a > 1) = 1) }",

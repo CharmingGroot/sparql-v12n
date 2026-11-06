@@ -8,7 +8,7 @@ use oxrdf::Term;
 
 use crate::dialect::{Dialect, SqlType};
 use crate::mapping::{BaseIri, LogicalTable, TemplatePart, TermType};
-use crate::sparql::{ArithOp, CompareOp, NumericFunction, QueryForm, TermTest};
+use crate::sparql::{ArithOp, CompareOp, DateTimeFunction, NumericFunction, QueryForm, TermTest};
 
 pub(super) const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -361,6 +361,12 @@ pub enum FilterValue {
     /// `ABS`, `ROUND`, `CEIL` or `FLOOR` of a number (SPARQL 1.1 §17.4.4),
     /// of the number's class, and an error for anything else.
     Numeric(NumericFunction, Box<FilterValue>),
+    /// A function of SPARQL 1.1 §17.4.5 of an `xsd:dateTime`, and an error
+    /// for anything else.
+    DateTime(DateTimeFunction, Box<FilterValue>),
+    /// `NOW()`: one `xsd:dateTime` in UTC per rendering of the plan, sent
+    /// as a parameter (SPARQL 1.1 §17.4.5.1).
+    Now,
 }
 
 impl FilterValue {
@@ -368,12 +374,13 @@ impl FilterValue {
     fn terms(&self) -> Vec<&FilterTerm> {
         match self {
             Self::Term(t) => vec![t],
-            Self::Constant(_) => Vec::new(),
+            Self::Constant(_) | Self::Now => Vec::new(),
             Self::Str(v)
             | Self::Lang(v)
             | Self::Datatype(v)
             | Self::Negate(v)
-            | Self::Numeric(_, v) => v.terms(),
+            | Self::Numeric(_, v)
+            | Self::DateTime(_, v) => v.terms(),
             Self::Arith(_, a, b) => {
                 let mut terms = a.terms();
                 terms.extend(b.terms());
@@ -385,12 +392,13 @@ impl FilterValue {
     fn terms_mut(&mut self) -> Vec<&mut FilterTerm> {
         match self {
             Self::Term(t) => vec![t],
-            Self::Constant(_) => Vec::new(),
+            Self::Constant(_) | Self::Now => Vec::new(),
             Self::Str(v)
             | Self::Lang(v)
             | Self::Datatype(v)
             | Self::Negate(v)
-            | Self::Numeric(_, v) => v.terms_mut(),
+            | Self::Numeric(_, v)
+            | Self::DateTime(_, v) => v.terms_mut(),
             Self::Arith(_, a, b) => {
                 let mut terms = a.terms_mut();
                 terms.extend(b.terms_mut());
