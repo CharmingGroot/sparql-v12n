@@ -3,6 +3,7 @@
 
 use super::{Dialect, SqlType};
 use crate::mapping::template::UCSCHAR;
+use crate::sparql::StrTest;
 
 /// PostgreSQL 13 or later.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -36,6 +37,52 @@ impl Dialect for PostgresDialect {
         format!("{text} ~ {pattern}")
     }
 
+    /// `char_length` counts characters, which are code points in a UTF-8
+    /// database, as `substr` does.
+    fn char_length(&self, text: &str) -> String {
+        format!("char_length({text})")
+    }
+
+    fn substring(&self, text: &str, start: &str, length: Option<&str>) -> String {
+        match length {
+            Some(length) => format!("substr({text}, {start}, {length})"),
+            None => format!("substr({text}, {start})"),
+        }
+    }
+
+    fn position(&self, text: &str, search: &str) -> String {
+        format!("strpos({text}, {search})")
+    }
+
+    fn regex_replace(&self, text: &str, pattern: &str, replacement: &str) -> String {
+        format!("regexp_replace({text}, {pattern}, {replacement}, 'g')")
+    }
+
+    fn encode_for_uri(&self, text: &str) -> String {
+        percent_encoded(text, "[-.0-9A-Z_a-z~]")
+    }
+
+    /// The root locale of ICU applies Unicode's default case operations,
+    /// full mappings (`ß` to `SS`) and the final sigma included, while
+    /// `upper` and `lower` under a libc locale map one character at a time
+    /// and under `"C"` only ASCII. Needs a server built with ICU.
+    fn case_map(&self, text: &str, upper: bool) -> String {
+        let function = if upper { "upper" } else { "lower" };
+        format!("{function}({text} COLLATE \"und-x-icu\")")
+    }
+
+    fn like(&self, text: &str, pattern: &str) -> String {
+        format!("{text} LIKE {pattern}")
+    }
+
+    fn str_test(&self, test: StrTest, text: &str, search: &str) -> String {
+        match test {
+            StrTest::Starts => format!("starts_with({text}, {search})"),
+            StrTest::Ends => format!("right({text}, char_length({search})) = {search}"),
+            StrTest::Contains => format!("strpos({text}, {search}) > 0"),
+        }
+    }
+
     fn is_finite(&self, expr: &str) -> String {
         format!("isfinite({expr})")
     }
@@ -50,10 +97,6 @@ impl Dialect for PostgresDialect {
         format!("pg_typeof({expr})::text")
     }
 
-    /// A value made only of `iunreserved` characters is its own IRI-safe
-    /// version, so the whole value is matched against the same class
-    /// first; only the other values pay for the subquery that encodes them
-    /// character by character.
     fn iri_safe(&self, text: &str) -> String {
         let mut class = String::from("[-.0-9A-Z_a-z~");
         for &(from, to) in UCSCHAR {
@@ -67,14 +110,7 @@ impl Dialect for PostgresDialect {
             class.push_str(&format!("{}-{}", escape(from), escape(to)));
         }
         class.push(']');
-        format!(
-            "CASE WHEN {text} ~ '^{class}*$' THEN {text} \
-             WHEN {text} IS NOT NULL THEN (SELECT coalesce(string_agg(\
-             CASE WHEN c ~ '^{class}$' THEN c \
-             ELSE regexp_replace(upper(encode(convert_to(c, 'UTF8'), 'hex')), '(..)', '%\\1', 'g') END, \
-             '' ORDER BY n), '') \
-             FROM generate_series(1, char_length({text})) AS n, substr({text}, n, 1) AS c) END"
-        )
+        percent_encoded(text, &class)
     }
 
     fn hex_lexical(&self, expr: &str) -> String {
@@ -92,6 +128,22 @@ impl Dialect for PostgresDialect {
     fn time_normal(&self, expr: &str) -> String {
         format!("({expr} + interval '0')")
     }
+}
+
+/// `text` with every character outside the bracket expression `class` as
+/// `%XX` per UTF-8 byte, upper case. A value made only of characters of
+/// the class is its own encoding, so the whole value is matched against
+/// the class first; only the other values pay for the subquery that
+/// encodes them character by character. NULL stays NULL.
+fn percent_encoded(text: &str, class: &str) -> String {
+    format!(
+        "CASE WHEN {text} ~ '^{class}*$' THEN {text} \
+         WHEN {text} IS NOT NULL THEN (SELECT coalesce(string_agg(\
+         CASE WHEN c ~ '^{class}$' THEN c \
+         ELSE regexp_replace(upper(encode(convert_to(c, 'UTF8'), 'hex')), '(..)', '%\\1', 'g') END, \
+         '' ORDER BY n), '') \
+         FROM generate_series(1, char_length({text})) AS n, substr({text}, n, 1) AS c) END"
+    )
 }
 
 #[cfg(test)]

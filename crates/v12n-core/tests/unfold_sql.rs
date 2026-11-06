@@ -9,6 +9,7 @@ use v12n_core::catalog::{
 };
 use v12n_core::dialect::{Dialect, PostgresDialect, SqlType};
 use v12n_core::mapping::{BaseIri, LogicalTable, Mapping, MappingIndex};
+use v12n_core::sparql::StrTest;
 use v12n_core::sql::{
     ColumnType, ColumnTypes, Comparison, Lexical, RenderOptions, RenderedSql, SqlPlan, TableKeys,
     TermNormal,
@@ -33,6 +34,13 @@ const POSTGRES_SYNTAX: &[&str] = &[
     "encode(",
     "generate_series",
     "float8send",
+    "char_length",
+    "substr(",
+    "und-x-icu",
+    " LIKE ",
+    "starts_with",
+    "strpos",
+    "right(",
 ];
 
 /// Writes each construct of [`Dialect`] as a marker, such as
@@ -55,6 +63,42 @@ impl Dialect for MarkerDialect {
 
     fn regex_match(&self, text: &str, pattern: &str) -> String {
         format!("<<REGEX_MATCH {text}, {pattern}>>")
+    }
+
+    fn char_length(&self, text: &str) -> String {
+        format!("<<CHAR_LENGTH {text}>>")
+    }
+
+    fn substring(&self, text: &str, start: &str, length: Option<&str>) -> String {
+        match length {
+            Some(length) => format!("<<SUBSTRING {text}, {start}, {length}>>"),
+            None => format!("<<SUBSTRING {text}, {start}>>"),
+        }
+    }
+
+    fn position(&self, text: &str, search: &str) -> String {
+        format!("<<POSITION {text}, {search}>>")
+    }
+
+    fn regex_replace(&self, text: &str, pattern: &str, replacement: &str) -> String {
+        format!("<<REGEX_REPLACE {text}, {pattern}, {replacement}>>")
+    }
+
+    fn encode_for_uri(&self, text: &str) -> String {
+        format!("<<ENCODE_FOR_URI {text}>>")
+    }
+
+    fn case_map(&self, text: &str, upper: bool) -> String {
+        let case = if upper { "UPPER" } else { "LOWER" };
+        format!("<<CASE_MAP_{case} {text}>>")
+    }
+
+    fn like(&self, text: &str, pattern: &str) -> String {
+        format!("<<LIKE {text}, {pattern}>>")
+    }
+
+    fn str_test(&self, test: StrTest, text: &str, search: &str) -> String {
+        format!("<<STR_TEST_{test:?} {text}, {search}>>")
     }
 
     fn is_finite(&self, expr: &str) -> String {
@@ -974,6 +1018,40 @@ fn bind_if_and_coalesce_over_numbers() {
 fn order_by_in() {
     insta::assert_snapshot!(explain_shop_with_types(
         "SELECT ?c ?t WHERE { ?c ex:tier ?t } ORDER BY DESC(?t IN (\"VIP\", \"Gold\")) ?c"
+    ));
+}
+
+/// `STRSTARTS`, `STRENDS` and `CONTAINS` with a constant are `LIKE` on
+/// the column under the code point collation, with the constant escaped
+/// in a parameter; other string functions are computed under it too.
+#[test]
+fn filter_string_functions() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c WHERE { ?c ex:name ?n ; ex:tier ?t \
+         FILTER(STRSTARTS(?n, \"K_m%\") && STRENDS(?t, \"P\") && CONTAINS(LCASE(?n), ?t) \
+         && STRLEN(SUBSTR(?n, 2, 3)) >= 2 && CONCAT(UCASE(?t), \"-\", ?n) != \"VIP-Kim\") }"
+    ));
+}
+
+/// `STRLEN` is the one function on strings whose value is a number, which
+/// a computed variable holds.
+#[test]
+fn bind_strlen() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c ?l WHERE { ?c ex:name ?n BIND(STRLEN(?n) AS ?l) }"
+    ));
+}
+
+/// `STRBEFORE` and `STRAFTER` find the second string with `strpos`,
+/// `ENCODE_FOR_URI` encodes the characters outside the unreserved set,
+/// and `REPLACE` is `regexp_replace` with the translated pattern and
+/// replacement as parameters.
+#[test]
+fn filter_strbefore_strafter_encode_for_uri_and_replace() {
+    insta::assert_snapshot!(explain_shop_with_types(
+        "SELECT ?c WHERE { ?c ex:name ?n ; ex:tier ?t \
+         FILTER(STRBEFORE(?n, \"m\") = \"Ki\" && STRAFTER(?n, ?t) != \"\" \
+         && ENCODE_FOR_URI(?n) = \"Kim\" && REPLACE(?t, \"(I)P\", \"$1-\", \"i\") = \"VI-\") }"
     ));
 }
 

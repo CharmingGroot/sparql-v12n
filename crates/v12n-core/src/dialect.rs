@@ -3,6 +3,8 @@
 
 mod postgres;
 
+use crate::sparql::StrTest;
+
 pub use postgres::PostgresDialect;
 
 /// A type that rendered SQL converts a value to.
@@ -44,6 +46,41 @@ pub trait Dialect {
 
     /// Whether `text` matches the regular expression `pattern`.
     fn regex_match(&self, text: &str, pattern: &str) -> String;
+
+    /// The number of characters of `text`, as an integer.
+    fn char_length(&self, text: &str) -> String;
+
+    /// The characters of `text` from the 1-based position `start`,
+    /// `length` of them or all the rest.
+    fn substring(&self, text: &str, start: &str, length: Option<&str>) -> String;
+
+    /// The 1-based position of the first occurrence of `search` in `text`,
+    /// both under the code point collation, and 0 where there is none.
+    fn position(&self, text: &str, search: &str) -> String;
+
+    /// `text` with each match of the regular expression `pattern` (see
+    /// [`regex_match`](Self::regex_match)) replaced by `replacement`, in
+    /// which `\N` is the `N`th group, `\&` the match and `\\` a backslash.
+    fn regex_replace(&self, text: &str, pattern: &str, replacement: &str) -> String;
+
+    /// `text` with every character outside `A-Z`, `a-z`, `0-9`, `-`, `_`,
+    /// `.` and `~` as `%XX` per UTF-8 byte, upper case (XPath F&O 3.1
+    /// §6.2, fn:encode-for-uri).
+    fn encode_for_uri(&self, text: &str) -> String;
+
+    /// `text` with every character mapped to its upper case (`upper`) or
+    /// its lower case by the full case mappings of Unicode without
+    /// tailoring (XPath F&O 3.1 §5.4.7 and §5.4.8), whatever the locale of
+    /// the database.
+    fn case_map(&self, text: &str, upper: bool) -> String;
+
+    /// Whether `text` matches the `LIKE` pattern `pattern`, whose escape
+    /// character is `\`.
+    fn like(&self, text: &str, pattern: &str) -> String;
+
+    /// Whether `text` starts with, ends with or contains `search`, both
+    /// under the code point collation.
+    fn str_test(&self, test: StrTest, text: &str, search: &str) -> String;
 
     /// Whether the timestamp or date `expr` is neither infinity.
     fn is_finite(&self, expr: &str) -> String;

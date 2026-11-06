@@ -310,6 +310,19 @@ PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运�
 
 无效的模式或标志为错误，与 XPath 相同。
 
+字符串函数 `STRLEN`、`SUBSTR`、`UCASE`、`LCASE`、`STRSTARTS`、`STRENDS`、`CONTAINS`、`STRBEFORE`、`STRAFTER`、`ENCODE_FOR_URI`、`CONCAT` 与 `REPLACE` 遵循 SPARQL 1.1 §17.4.3：
+
+- 参数为字符串字面量，即简单字面量、`xsd:string` 与带语言标签的字面量（§17.4.3.1.1）。其他 term（例如数值、IRI 或未绑定变量）使函数成为错误。
+- `STRSTARTS`、`STRENDS`、`CONTAINS`、`STRBEFORE` 与 `STRAFTER` 的参数必须兼容（§17.4.3.1.2）：两者都没有语言标签、两者标签相同，或仅第一个参数有标签。
+- `SUBSTR`、`UCASE`、`LCASE` 与 `REPLACE` 保留第一个参数的语言标签。所有参数具有相同语言标签时，`CONCAT` 保留该标签，否则给出简单字面量（§17.4.3.12）。`ENCODE_FOR_URI` 给出简单字面量。
+- `STRBEFORE` 与 `STRAFTER` 给出第二个字符串首次出现位置之前与之后的字符，并带有第一个参数的语言标签；第二个字符串不出现时给出简单字面量 `""`（§17.4.3.9、§17.4.3.10）。
+- `ENCODE_FOR_URI` 将 `A-Z`、`a-z`、`0-9`、`-`、`_`、`.` 与 `~` 以外的每个字符按 UTF-8 字节写成大写的 `%XX`（F&O 3.1 §6.2）。
+- `REPLACE(arg, pattern, replacement, flags)` 与 `fn:replace` 相同地替换模式的每个匹配（F&O 3.1 §5.6.4）。模式、替换字符串与标志为简单字面量常量，模式与 `REGEX` 一样翻译。替换字符串中 `$N` 为第 `N` 个分组，`$0` 为整个匹配，`\$` 与 `\\` 为 `$` 与 `\`。匹配空字符串的模式（例如 `a*`）以及含其他 `$` 或 `\` 的替换字符串为错误。
+- 长度与位置按字符（Unicode 码位）计算：`"e\u0301"` 的 `STRLEN` 为 2，一个 emoji 的 `STRLEN` 为 1。`SUBSTR(s, start, length)` 与 XPath 的 `fn:substring` 相同，取从 1 开始计数、满足 `start <= p < start + length` 的位置 `p` 上的字符。起始位置与长度为 `xsd:integer` 常量。
+- `UCASE` 与 `LCASE` 采用不带语言定制的 Unicode 完整大小写映射（XPath F&O 3.1 §5.4.7、§5.4.8）：`UCASE("Straße")` 为 `"STRASSE"`，`LCASE("ΟΔΟΣ")` 为 `"οδος"`。
+
+在 SQL 中，所有计算得到的字符串都在 `COLLATE "C"` 下，因此其比较、查找与连接按码位进行，与列的 collation 无关。`STRLEN` 为 `char_length`，`SUBSTR` 为 `substr`，在 UTF-8 数据库中按码位计数。`UCASE` 与 `LCASE` 为 ICU collation `"und-x-icu"`（root 区域设置）下的 `upper` 与 `lower`，未启用 ICU 构建的 PostgreSQL 服务器会拒绝该语句。与常量比较的 `STRSTARTS`、`STRENDS` 与 `CONTAINS` 为 `LIKE`，常量作为参数传递，其中的 `%`、`_` 与 `\` 被转义；列上 `COLLATE "C"` 的索引或使用 `text_pattern_ops` 的索引可用于 `STRSTARTS`。`STRBEFORE` 与 `STRAFTER` 使用 `strpos` 与 `substr`；`REPLACE` 为带 `g` 标志的 `regexp_replace`，翻译后的模式与替换字符串作为参数传递。XPath 在同一位置有多个匹配时选择第一个分支并依次让贪婪量词尽量多取，PostgreSQL 则选择整个模式的最长匹配，因此 `REPLACE` 只接受两者选择相同匹配的模式：不含 `|`、非贪婪量词与作用于分组的量词，且每个重复的字符集合之后只能出现其不包含的字符。`STRLEN` 为数值，可以作为 `BIND` 与 `SELECT` 表达式的值；其他函数给出字符串，计算得到的变量目前不保存字符串。
+
 以下情形作为不支持的功能拒绝，而不是给出与扩展了 SPARQL 的引擎不同的答案：
 
 - 当数据类型不在上表中时（例如 `xsd:date`），对该数据类型的两个字面量进行排序或比较；
@@ -319,12 +332,15 @@ PostgreSQL 的 `float8` 运算符在这些情形下会报错，因此每个运�
   - `rr:datatype` 为该列自然数据类型以外的数值、布尔或 dateTime 数据类型的列的值；
   - `xsd:float` 与派生整数类型；
   - 超出公元 1 至 9999 年范围或精度细于微秒的 dateTime 常量；
-- 包括 `RAND` 在内的其他函数，以及以 term（变量、常量、算术，以及它们的 `STR`、`LANG`、`DATATYPE`、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF` 或 `COALESCE`）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
-- 在编码不是 UTF-8 的数据库中进行字符串排序和 `REGEX`。
+- 包括 `RAND` 在内的其他函数，以及以 term（变量、常量、算术，以及它们的 `STR`、`LANG`、`DATATYPE`、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE` 或字符串函数）以外的表达式作为操作数，例如作为 `IF`、`COALESCE` 或 `IN` 参数的比较；
+- 模式的匹配在 XPath 与 PostgreSQL 中可能不同、引用第九个之后的分组，或模式、替换字符串、标志不是常量的 `REPLACE`；
+- 非常量或不是 `xsd:integer`（例如 `1.5`）的 `SUBSTR` 起始位置与长度：SPARQL 1.1 中为类型错误，而像 `fn:substring` 那样取整的引擎会给出答案；
+- 作用于 `date` 或 `timestamp` 列的字符串函数，其无穷值为 plain literal；
+- 在编码不是 UTF-8 的数据库中进行字符串排序、`REGEX` 与字符串函数。
 
 ## BIND 与 SELECT 表达式
 
-`BIND(expr AS ?v)` 与 `SELECT (expr AS ?v)` 在每个解中将表达式的值绑定到 `?v`（SPARQL 1.1 §18.5，Extend）。表达式为变量、常量、与 [`FILTER`](#filter) 中相同的算术与数值函数，或结果为算术或数值常量的 `IF` 与 `COALESCE`：
+`BIND(expr AS ?v)` 与 `SELECT (expr AS ?v)` 在每个解中将表达式的值绑定到 `?v`（SPARQL 1.1 §18.5，Extend）。表达式为变量、常量、与 [`FILTER`](#filter) 中相同的算术与数值函数、`STRLEN`，或结果为算术或数值常量的 `IF` 与 `COALESCE`：
 
 - 变量给出其 term，常量给出其自身。
 - 算术给出一个数，其数据类型遵循 XPath 的类型提升，并以规范形式写出（见[字面量](#字面量)）。在整数列上，`?qty * 2` 为 `xsd:integer`，`?qty / 4` 为 `xsd:decimal`。XPath 将 decimal 除法的精度留给实现决定，此处采用 PostgreSQL `numeric` 除法的精度。`?qty * 1.5e0` 为 `xsd:double`，例如 `1.5E0`、`-0.0E0`、`INF` 或 `NaN`。`SELECT DISTINCT` 区分 `-0.0E0` 与 `0.0E0`，它们是不同的 term。
@@ -336,7 +352,7 @@ SPARQL 在 `BIND` 所在组的解上对其求值。v12n 在连接之后，在整
 
 以下情形作为不支持的功能拒绝：
 
-- 变量、常量、算术、数值函数，以及对算术与数值常量的 `IF` 与 `COALESCE` 以外的表达式，例如 `STR`、比较、`IN`，以及结果可以是任意 term 的 `COALESCE(?x, 0)`。在 SQL 中，计算得到的变量只保存数值；
+- 变量、常量、算术、数值函数、`STRLEN`，以及对算术与数值常量的 `IF` 与 `COALESCE` 以外的表达式，例如 `STR`、比较、`IN`、`UCASE` 等字符串函数，以及结果可以是任意 term 的 `COALESCE(?x, 0)`。在 SQL 中，计算得到的变量只保存数值；
 - `OPTIONAL` 或 `UNION` 内部的 `BIND`；
 - 对其所在组可能未绑定、而模式后续部分会绑定的变量使用 `BIND`；
 - 在三元组模式、`FILTER`、`ORDER BY` 或其他表达式中使用由 `BIND` 或 `SELECT` 计算的变量。
@@ -455,4 +471,4 @@ JOIN "orders" t2 ON t2."id" = t1."id" WHERE t1."customer_id" = t0."id" AND …) 
 - 作用于带时区与不带时区的值的比较项；
 - 作用于 `real` 列的比较项；
 - 作用于编码不是 UTF-8 的数据库中字符串的比较项；
-- 与 `FILTER` 中一样，其他函数、算术、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE` 和 SQL 无法计算的字符串形式。
+- 与 `FILTER` 中一样，其他函数、算术、`ABS`、`ROUND`、`CEIL`、`FLOOR`、`IF`、`COALESCE`、`STRSTARTS`、`STRENDS` 与 `CONTAINS` 以外的字符串函数，以及 SQL 无法计算的字符串形式。

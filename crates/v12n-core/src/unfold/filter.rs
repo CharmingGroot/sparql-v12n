@@ -2,12 +2,13 @@
 //! `FILTER` expressions over the terms a branch binds.
 
 use super::{Branch, Env, Exists, Scope, Source};
-use oxrdf::Term;
+use oxrdf::{Literal, Term};
 
 use crate::Error;
-use crate::sparql::{CompareOp, Expression};
+use crate::sparql::{CompareOp, Expression, StrTest};
 use crate::sql::{Condition, Filter, FilterTerm, FilterValue, OrderValue, TermMatch, ValueCases};
-use crate::xpath_regex::{Untranslated, translate};
+use crate::xpath_regex::{Untranslated, translate, translate_replace};
+use crate::xsd::{self, Num, Value};
 
 use super::term::{Equality, TermExpr, TermValue, term_eq};
 
@@ -128,6 +129,11 @@ impl<'a> Context<'_, 'a> {
                 right: r.value.clone(),
                 same_term: same_term(l, r),
             })?,
+            Expression::StrTest(test, a, b) => self.binary(a, b, |l, r| Filter::StrTest {
+                test: *test,
+                text: l.value.clone(),
+                search: r.value.clone(),
+            })?,
             Expression::Bound(variable) => self.bound(variable)?,
             Expression::Exists(pattern) => {
                 let (_, parts) = self
@@ -145,12 +151,6 @@ impl<'a> Context<'_, 'a> {
             Expression::Regex(text, pattern, flags) => {
                 // The pattern and the flags are simple literals (SPARQL 1.1
                 // §17.4.3.14); anything else is a type error.
-                let simple = |term: &Term| match term {
-                    Term::Literal(l) if l.datatype().as_str() == XSD_STRING => {
-                        Some(l.value().to_owned())
-                    }
-                    _ => None,
-                };
                 let flags = match flags {
                     Some(flags) => simple(flags),
                     None => Some(String::new()),
@@ -217,6 +217,136 @@ impl<'a> Context<'_, 'a> {
             Expression::Lang(a) => derived(a, FilterValue::Lang),
             Expression::Datatype(a) => derived(a, FilterValue::Datatype),
             Expression::Negate(a) => derived(a, FilterValue::Negate),
+            Expression::StrLen(a) => derived(a, FilterValue::StrLen),
+            Expression::UCase(a) => derived(a, FilterValue::UCase),
+            Expression::LCase(a) => derived(a, FilterValue::LCase),
+            Expression::Substr(a, start, length) => {
+                let Some((start, length)) = substr_range(start, length.as_ref())? else {
+                    return Ok(Vec::new());
+                };
+                Ok(self
+                    .operand(a)?
+                    .into_iter()
+                    .map(|(guards, leaf)| {
+                        let value = FilterValue::Substr {
+                            text: Box::new(leaf.value),
+                            start,
+                            length,
+                        };
+                        (guards, Leaf { value, term: None })
+                    })
+                    .collect())
+            }
+            // One case per combination of the ways the arguments are bound.
+            Expression::Concat(args) => {
+                let mut out = vec![(Vec::new(), Vec::new())];
+                for arg in args {
+                    let cases = self.operand(arg)?;
+                    let mut next = Vec::with_capacity(out.len() * cases.len());
+                    for (guards, values) in &out {
+                        for (arg_guards, leaf) in &cases {
+                            let mut guards: Vec<Condition> = guards.clone();
+                            guards.extend(arg_guards.iter().cloned());
+                            let mut values: Vec<FilterValue> = values.clone();
+                            values.push(leaf.value.clone());
+                            next.push((guards, values));
+                        }
+                    }
+                    out = next;
+                }
+                Ok(out
+                    .into_iter()
+                    .map(|(guards, values)| {
+                        let value = FilterValue::Concat(values);
+                        (guards, Leaf { value, term: None })
+                    })
+                    .collect())
+            }
+            Expression::EncodeForUri(a) => derived(a, FilterValue::EncodeForUri),
+            Expression::Replace(a, pattern, replacement, flags) => {
+                // The pattern, the replacement and the flags are simple
+                // literals (SPARQL 1.1 §17.4.3.15); anything else is a type
+                // error, and so are an invalid pattern, replacement or flags,
+                // and a pattern that matches the empty string (F&O 3.1
+                // §5.6.4).
+                let flags = match flags {
+                    Some(flags) => simple(flags),
+                    None => Some(String::new()),
+                };
+                let (Some(pattern), Some(replacement), Some(flags)) =
+                    (simple(pattern), simple(replacement), flags)
+                else {
+                    return Ok(Vec::new());
+                };
+                let translated = match translate_replace(&pattern, &flags, &replacement) {
+                    Ok(translated) => translated,
+                    Err(Untranslated::Invalid) => return Ok(Vec::new()),
+                    Err(Untranslated::Unsupported(reason)) => {
+                        return Err(Error::UnsupportedFeature(reason));
+                    }
+                };
+                Ok(self
+                    .operand(a)?
+                    .into_iter()
+                    .map(|(guards, leaf)| {
+                        let value = FilterValue::Replace {
+                            text: Box::new(leaf.value),
+                            pattern: translated.pattern.clone(),
+                            replacement: translated.replacement.clone(),
+                        };
+                        (guards, Leaf { value, term: None })
+                    })
+                    .collect())
+            }
+            // Without the second string in the first, the result is a
+            // simple literal, whatever the language tag of the first
+            // (SPARQL 1.1 §17.4.3.9, §17.4.3.10). Where the first can have
+            // one, the cases tell the two apart by CONTAINS, which is an
+            // error for arguments that are not compatible.
+            Expression::StrBefore(a, b) | Expression::StrAfter(a, b) => {
+                let right = self.operand(b)?;
+                let mut out = Vec::new();
+                for (left_guards, left) in self.operand(a)? {
+                    for (right_guards, right) in &right {
+                        let guards: Vec<Condition> =
+                            left_guards.iter().chain(right_guards).cloned().collect();
+                        let (text, search) = (left.value.clone(), right.value.clone());
+                        let value = match expression {
+                            Expression::StrBefore(..) => FilterValue::StrBefore(
+                                Box::new(text.clone()),
+                                Box::new(search.clone()),
+                            ),
+                            _ => FilterValue::StrAfter(
+                                Box::new(text.clone()),
+                                Box::new(search.clone()),
+                            ),
+                        };
+                        if !may_have_language(&text) {
+                            out.push((guards, Leaf { value, term: None }));
+                            continue;
+                        }
+                        let found = Filter::StrTest {
+                            test: StrTest::Contains,
+                            text,
+                            search,
+                        };
+                        let mut found_guards = guards.clone();
+                        found_guards.push(Condition::Filter(found.clone()));
+                        out.push((found_guards, Leaf { value, term: None }));
+                        let mut missing_guards = guards;
+                        missing_guards.push(Condition::Filter(Filter::Not(Box::new(found))));
+                        let empty = FilterValue::Constant(Literal::new_simple_literal("").into());
+                        out.push((
+                            missing_guards,
+                            Leaf {
+                                value: empty,
+                                term: None,
+                            },
+                        ));
+                    }
+                }
+                Ok(out)
+            }
             Expression::Numeric(function, a) => Ok(self
                 .operand(a)?
                 .into_iter()
@@ -353,6 +483,93 @@ impl<'a> Context<'_, 'a> {
             }
         }
         Ok(out)
+    }
+}
+
+/// The positions that `SUBSTR(source, start, length)` takes, as the start
+/// and the length of PostgreSQL's `substr`: fn:substring takes the
+/// characters at the positions `p` with `start <= p < start + length`,
+/// counted from 1 (SPARQL 1.1 §17.4.3.3), so a start below 1 shortens the
+/// result and a negative length gives the empty string. `None` for a type
+/// error: an argument that is not an `xsd:integer`.
+fn substr_range(start: &Term, length: Option<&Term>) -> Result<Option<(i32, Option<i32>)>, Error> {
+    // No string has more characters than an int4 counts, so larger
+    // positions all give the same result.
+    const LIMIT: i128 = i32::MAX as i128;
+    let Some(start) = substr_integer(start)? else {
+        return Ok(None);
+    };
+    let length = match length.map(substr_integer).transpose()? {
+        Some(None) => return Ok(None),
+        Some(Some(length)) => Some(length),
+        None => None,
+    };
+    let first = start.clamp(1, LIMIT);
+    let count = length.map(|length| {
+        // Past the end of every string where the sum overflows upwards,
+        // before its start where it overflows downwards.
+        let end =
+            start
+                .checked_add(length)
+                .unwrap_or(if length > 0 { i128::MAX } else { i128::MIN });
+        end.saturating_sub(first).clamp(0, LIMIT - first)
+    });
+    let int4 = |n: i128| i32::try_from(n).expect("clamped to the int4 range");
+    Ok(Some((int4(first), count.map(int4))))
+}
+
+/// An `xsd:integer` argument of `SUBSTR`; `None` for a type error.
+fn substr_integer(term: &Term) -> Result<Option<i128>, Error> {
+    let Term::Literal(literal) = term else {
+        return Ok(None);
+    };
+    match xsd::value(literal.value(), literal.datatype().as_str()) {
+        Value::Numeric(n) if n.class == Num::Integer => n
+            .decimal
+            .expect("integers have a decimal form")
+            .parse::<i128>()
+            .map(Some)
+            .map_err(|_| {
+                Error::UnsupportedFeature(
+                    "SUBSTR with a starting location or length beyond the range of a 128-bit \
+                     integer"
+                        .to_owned(),
+                )
+            }),
+        Value::Numeric(_) => Err(Error::UnsupportedFeature(
+            "SUBSTR with a starting location or length that is not an xsd:integer: SPARQL 1.1 \
+             makes it a type error, while engines that round it as fn:substring does differ"
+                .to_owned(),
+        )),
+        Value::Unsupported(_) => Err(Error::UnsupportedFeature(format!(
+            "SUBSTR with a starting location or length of datatype <{}>",
+            literal.datatype().as_str()
+        ))),
+        _ => Ok(None),
+    }
+}
+
+/// The lexical form of a simple literal; `None` for any other term.
+fn simple(term: &Term) -> Option<String> {
+    match term {
+        Term::Literal(l) if l.datatype().as_str() == XSD_STRING => Some(l.value().to_owned()),
+        _ => None,
+    }
+}
+
+/// Whether `value` can be a literal with a language tag.
+fn may_have_language(value: &FilterValue) -> bool {
+    match value {
+        FilterValue::Term(term) => term.language.is_some(),
+        FilterValue::Constant(Term::Literal(literal)) => literal.language().is_some(),
+        FilterValue::Substr { text, .. }
+        | FilterValue::UCase(text)
+        | FilterValue::LCase(text)
+        | FilterValue::Replace { text, .. }
+        | FilterValue::StrBefore(text, _)
+        | FilterValue::StrAfter(text, _) => may_have_language(text),
+        FilterValue::Concat(args) => !args.is_empty() && args.iter().all(may_have_language),
+        _ => false,
     }
 }
 

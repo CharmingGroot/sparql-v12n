@@ -8,7 +8,7 @@ use oxrdf::Term;
 
 use crate::dialect::{Dialect, SqlType};
 use crate::mapping::{BaseIri, LogicalTable, TemplatePart, TermType};
-use crate::sparql::{ArithOp, CompareOp, NumericFunction, QueryForm, TermTest};
+use crate::sparql::{ArithOp, CompareOp, NumericFunction, QueryForm, StrTest, TermTest};
 
 pub(super) const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -348,6 +348,13 @@ pub enum Filter {
         text: FilterValue,
         pattern: String,
     },
+    /// `STRSTARTS`, `STRENDS` or `CONTAINS` (SPARQL 1.1 §17.4.3.6 to
+    /// §17.4.3.8) of `text` and `search`.
+    StrTest {
+        test: StrTest,
+        text: FilterValue,
+        search: FilterValue,
+    },
     /// `EXISTS` (SPARQL 1.1 §17.4.1.4): whether one of these parts, indices
     /// into [`SqlBranch::left_joins`] marked [`LeftJoin::exists`], has a
     /// row; `false` for none. Never an error.
@@ -377,6 +384,37 @@ pub enum FilterValue {
     /// `ABS`, `ROUND`, `CEIL` or `FLOOR` of a number (SPARQL 1.1 §17.4.4),
     /// of the number's class, and an error for anything else.
     Numeric(NumericFunction, Box<FilterValue>),
+    /// `STRLEN`: the number of characters of a string literal (SPARQL 1.1
+    /// §17.4.3.2).
+    StrLen(Box<FilterValue>),
+    /// `SUBSTR` (SPARQL 1.1 §17.4.3.3): the characters from position
+    /// `start` (1-based, at least 1), `length` of them or all the rest.
+    Substr {
+        text: Box<FilterValue>,
+        start: i32,
+        length: Option<i32>,
+    },
+    /// `UCASE` (SPARQL 1.1 §17.4.3.4).
+    UCase(Box<FilterValue>),
+    /// `LCASE` (SPARQL 1.1 §17.4.3.5).
+    LCase(Box<FilterValue>),
+    /// `CONCAT` (SPARQL 1.1 §17.4.3.12).
+    Concat(Vec<FilterValue>),
+    /// `STRBEFORE` (SPARQL 1.1 §17.4.3.9): the characters before the
+    /// first occurrence of the second string, `""` without one.
+    StrBefore(Box<FilterValue>, Box<FilterValue>),
+    /// `STRAFTER` (SPARQL 1.1 §17.4.3.10): the characters after the first
+    /// occurrence of the second string, `""` without one.
+    StrAfter(Box<FilterValue>, Box<FilterValue>),
+    /// `ENCODE_FOR_URI` (SPARQL 1.1 §17.4.3.11).
+    EncodeForUri(Box<FilterValue>),
+    /// `REPLACE` (SPARQL 1.1 §17.4.3.15), with the XPath pattern, flags
+    /// and replacement already written for PostgreSQL's `regexp_replace`.
+    Replace {
+        text: Box<FilterValue>,
+        pattern: String,
+        replacement: String,
+    },
 }
 
 impl FilterValue {
@@ -389,12 +427,19 @@ impl FilterValue {
             | Self::Lang(v)
             | Self::Datatype(v)
             | Self::Negate(v)
+            | Self::StrLen(v)
+            | Self::Substr { text: v, .. }
+            | Self::UCase(v)
+            | Self::LCase(v)
+            | Self::EncodeForUri(v)
+            | Self::Replace { text: v, .. }
             | Self::Numeric(_, v) => v.terms(),
-            Self::Arith(_, a, b) => {
+            Self::Arith(_, a, b) | Self::StrBefore(a, b) | Self::StrAfter(a, b) => {
                 let mut terms = a.terms();
                 terms.extend(b.terms());
                 terms
             }
+            Self::Concat(args) => args.iter().flat_map(Self::terms).collect(),
         }
     }
 
@@ -406,12 +451,19 @@ impl FilterValue {
             | Self::Lang(v)
             | Self::Datatype(v)
             | Self::Negate(v)
+            | Self::StrLen(v)
+            | Self::Substr { text: v, .. }
+            | Self::UCase(v)
+            | Self::LCase(v)
+            | Self::EncodeForUri(v)
+            | Self::Replace { text: v, .. }
             | Self::Numeric(_, v) => v.terms_mut(),
-            Self::Arith(_, a, b) => {
+            Self::Arith(_, a, b) | Self::StrBefore(a, b) | Self::StrAfter(a, b) => {
                 let mut terms = a.terms_mut();
                 terms.extend(b.terms_mut());
                 terms
             }
+            Self::Concat(args) => args.iter_mut().flat_map(Self::terms_mut).collect(),
         }
     }
 }
@@ -492,6 +544,10 @@ impl Filter {
             Self::Test(_, v) | Self::Ebv(v) | Self::NoError(v) | Self::Regex { text: v, .. } => {
                 value(v, f)
             }
+            Self::StrTest { text, search, .. } => {
+                value(text, f);
+                value(search, f);
+            }
         }
     }
 
@@ -535,6 +591,10 @@ impl Filter {
             Self::Test(_, v) | Self::Ebv(v) | Self::NoError(v) | Self::Regex { text: v, .. } => {
                 value(v, f)
             }
+            Self::StrTest { text, search, .. } => {
+                value(text, f);
+                value(search, f);
+            }
         }
     }
 
@@ -544,15 +604,9 @@ impl Filter {
             Self::Exists(_) => true,
             Self::And(a, b) | Self::Or(a, b) => a.has_exists() || b.has_exists(),
             Self::Not(a) => a.has_exists(),
-            Self::Cases(cases) => cases.iter().any(|(_, filter)| filter.has_exists()),
-            Self::Constant(_)
-            | Self::Any(_)
-            | Self::Compare { .. }
-            | Self::SameTerm { .. }
-            | Self::Test(..)
-            | Self::Ebv(_)
-            | Self::NoError(_)
-            | Self::Regex { .. } => false,
+            // Unfolding writes `EXISTS` only as a boolean of its own, never
+            // in the cases of an operand.
+            _ => false,
         }
     }
 

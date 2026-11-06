@@ -1,0 +1,3 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?w WHERE { ?w ex:label ?l FILTER(CONCAT(?l, "!"@en) = "Half off!"@en) }

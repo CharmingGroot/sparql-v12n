@@ -169,6 +169,29 @@ pub enum Expression {
     /// e2) || …` and false for an empty list. `NOT IN` is its negation
     /// (§17.4.1.10).
     In(Box<Expression>, Vec<Expression>),
+    /// `STRLEN` (SPARQL 1.1 §17.4.3.2): the number of characters.
+    StrLen(Box<Expression>),
+    /// `SUBSTR(source, start, length)` (SPARQL 1.1 §17.4.3.3), with the
+    /// starting location and the length constants.
+    Substr(Box<Expression>, Term, Option<Term>),
+    /// `UCASE` (SPARQL 1.1 §17.4.3.4).
+    UCase(Box<Expression>),
+    /// `LCASE` (SPARQL 1.1 §17.4.3.5).
+    LCase(Box<Expression>),
+    /// `STRSTARTS`, `STRENDS` and `CONTAINS` (SPARQL 1.1 §17.4.3.6 to
+    /// §17.4.3.8).
+    StrTest(StrTest, Box<Expression>, Box<Expression>),
+    /// `CONCAT` (SPARQL 1.1 §17.4.3.12).
+    Concat(Vec<Expression>),
+    /// `STRBEFORE` (SPARQL 1.1 §17.4.3.9).
+    StrBefore(Box<Expression>, Box<Expression>),
+    /// `STRAFTER` (SPARQL 1.1 §17.4.3.10).
+    StrAfter(Box<Expression>, Box<Expression>),
+    /// `ENCODE_FOR_URI` (SPARQL 1.1 §17.4.3.11).
+    EncodeForUri(Box<Expression>),
+    /// `REPLACE(arg, pattern, replacement, flags)` (SPARQL 1.1 §17.4.3.15),
+    /// with the pattern, the replacement and the flags constants.
+    Replace(Box<Expression>, Term, Term, Option<Term>),
     /// `EXISTS { P }` (SPARQL 1.1 §8.1, §17.4.1.4): whether `P` has a
     /// solution once the variables of the current solution are replaced
     /// by their values (substitution, §18.6). Never an error, and it binds
@@ -192,7 +215,10 @@ impl Expression {
             | Self::And(a, b)
             | Self::Compare(_, a, b)
             | Self::SameTerm(a, b)
-            | Self::Arith(_, a, b) => {
+            | Self::Arith(_, a, b)
+            | Self::StrTest(_, a, b)
+            | Self::StrBefore(a, b)
+            | Self::StrAfter(a, b) => {
                 a.collect_variables(out);
                 b.collect_variables(out);
             }
@@ -203,13 +229,21 @@ impl Expression {
             | Self::Datatype(a)
             | Self::Regex(a, _, _)
             | Self::Negate(a)
+            | Self::StrLen(a)
+            | Self::Substr(a, _, _)
+            | Self::UCase(a)
+            | Self::LCase(a)
+            | Self::EncodeForUri(a)
+            | Self::Replace(a, ..)
             | Self::Numeric(_, a) => a.collect_variables(out),
             Self::If(c, a, b) => {
                 c.collect_variables(out);
                 a.collect_variables(out);
                 b.collect_variables(out);
             }
-            Self::Coalesce(args) => args.iter().for_each(|a| a.collect_variables(out)),
+            Self::Coalesce(args) | Self::Concat(args) => {
+                args.iter().for_each(|a| a.collect_variables(out))
+            }
             Self::In(a, list) => {
                 a.collect_variables(out);
                 list.iter().for_each(|b| b.collect_variables(out));
@@ -229,33 +263,15 @@ impl Expression {
     fn collect_exists<'e>(&'e self, out: &mut Vec<&'e Pattern>) {
         match self {
             Self::Exists(pattern) => out.push(pattern),
-            Self::Constant(_) | Self::Variable(_) | Self::Bound(_) => {}
-            Self::Or(a, b)
-            | Self::And(a, b)
-            | Self::Compare(_, a, b)
-            | Self::SameTerm(a, b)
-            | Self::Arith(_, a, b) => {
+            Self::Or(a, b) | Self::And(a, b) => {
                 a.collect_exists(out);
                 b.collect_exists(out);
             }
-            Self::Not(a)
-            | Self::Test(_, a)
-            | Self::Str(a)
-            | Self::Lang(a)
-            | Self::Datatype(a)
-            | Self::Regex(a, _, _)
-            | Self::Negate(a)
-            | Self::Numeric(_, a) => a.collect_exists(out),
-            Self::If(c, a, b) => {
-                c.collect_exists(out);
-                a.collect_exists(out);
-                b.collect_exists(out);
-            }
-            Self::Coalesce(args) => args.iter().for_each(|a| a.collect_exists(out)),
-            Self::In(a, list) => {
-                a.collect_exists(out);
-                list.iter().for_each(|b| b.collect_exists(out));
-            }
+            Self::Not(a) => a.collect_exists(out),
+            Self::If(c, ..) => c.collect_exists(out),
+            // The arguments of the other expressions, and the results of
+            // `IF`, are terms (see `operand`), which `EXISTS` is not.
+            _ => {}
         }
     }
 
@@ -273,8 +289,26 @@ impl Expression {
                 | Self::Numeric(..)
                 | Self::If(..)
                 | Self::Coalesce(_)
+                | Self::StrLen(_)
+                | Self::Substr(..)
+                | Self::UCase(_)
+                | Self::LCase(_)
+                | Self::Concat(_)
+                | Self::StrBefore(..)
+                | Self::StrAfter(..)
+                | Self::EncodeForUri(_)
+                | Self::Replace(..)
         )
     }
+}
+
+/// `STRSTARTS`, `STRENDS` and `CONTAINS`: whether the first string starts
+/// with, ends with or contains the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrTest {
+    Starts,
+    Ends,
+    Contains,
 }
 
 /// The arithmetic operators of SPARQL 1.1 §17.3.
@@ -789,6 +823,7 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
         | Expression::Variable(_)
         | Expression::Arith(..)
         | Expression::Negate(_)
+        | Expression::StrLen(_)
         | Expression::Numeric(..) => return Ok(expression),
         // The value of a computed variable is a number in SQL, so every
         // result must be one or an error.
@@ -808,6 +843,18 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
         Expression::Lang(_) => "LANG",
         Expression::Datatype(_) => "DATATYPE",
         Expression::Regex(..) => "REGEX",
+        Expression::StrTest(StrTest::Starts, ..) => "STRSTARTS",
+        Expression::StrTest(StrTest::Ends, ..) => "STRENDS",
+        Expression::StrTest(StrTest::Contains, ..) => "CONTAINS",
+        // A computed variable holds only numbers in SQL (#100).
+        Expression::Substr(..) => "SUBSTR",
+        Expression::UCase(_) => "UCASE",
+        Expression::LCase(_) => "LCASE",
+        Expression::Concat(_) => "CONCAT",
+        Expression::StrBefore(..) => "STRBEFORE",
+        Expression::StrAfter(..) => "STRAFTER",
+        Expression::EncodeForUri(_) => "ENCODE_FOR_URI",
+        Expression::Replace(..) => "REPLACE",
     };
     Err(unsupported(&format!(
         "{what} as the value of BIND and SELECT expressions"
@@ -819,7 +866,10 @@ fn bound_expression(expression: &SparqlExpression) -> Result<Expression, Error> 
 /// error.
 fn numeric_results(expression: &Expression) -> bool {
     match expression {
-        Expression::Arith(..) | Expression::Negate(_) | Expression::Numeric(..) => true,
+        Expression::Arith(..)
+        | Expression::Negate(_)
+        | Expression::StrLen(_)
+        | Expression::Numeric(..) => true,
         Expression::Constant(Term::Literal(literal)) => matches!(
             crate::xsd::value(literal.value(), literal.datatype().as_str()),
             crate::xsd::Value::Numeric(_)
@@ -1163,6 +1213,36 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
         ) if matches!(site, Site::OrderBy) => {
             return Err(in_site(&format!("{function}")));
         }
+        // Expressions in ORDER BY come with #108.
+        SparqlExpression::FunctionCall(
+            function @ (Function::StrLen
+            | Function::SubStr
+            | Function::UCase
+            | Function::LCase
+            | Function::Concat
+            | Function::StrBefore
+            | Function::StrAfter
+            | Function::EncodeForUri
+            | Function::Replace),
+            _,
+        ) if matches!(site, Site::OrderBy) => {
+            return Err(in_site(&format!("the {function} function")));
+        }
+        SparqlExpression::FunctionCall(
+            function @ (Function::StrLen
+            | Function::SubStr
+            | Function::UCase
+            | Function::LCase
+            | Function::StrStarts
+            | Function::StrEnds
+            | Function::Contains
+            | Function::Concat
+            | Function::StrBefore
+            | Function::StrAfter
+            | Function::EncodeForUri
+            | Function::Replace),
+            args,
+        ) => string_function(function, args, site)?,
         SparqlExpression::FunctionCall(function, args) => {
             let [arg] = args.as_slice() else {
                 return Err(match function {
@@ -1274,6 +1354,70 @@ fn expression_in(expression: &SparqlExpression, site: Site) -> Result<Expression
                 .into(),
             )),
         ),
+    })
+}
+
+/// A function on strings (SPARQL 1.1 §17.4.3), whose arguments are terms.
+/// The starting location and the length of `SUBSTR` must be constants.
+fn string_function(
+    function: &Function,
+    args: &[SparqlExpression],
+    site: Site,
+) -> Result<Expression, Error> {
+    let operand = |e: &SparqlExpression| operand(e, site);
+    let constant = |e: &SparqlExpression| match *operand(e)? {
+        Expression::Constant(term) => Ok(term),
+        _ => Err(unsupported(match function {
+            Function::Replace => {
+                "REPLACE with a pattern, replacement or flags that are not constants"
+            }
+            _ => "SUBSTR with a starting location or length that is not a constant",
+        })),
+    };
+    let arity = |n: &str| Error::QuerySyntax(format!("{function} takes {n}"));
+    Ok(match (function, args) {
+        (Function::StrLen, [a]) => Expression::StrLen(operand(a)?),
+        (Function::UCase, [a]) => Expression::UCase(operand(a)?),
+        (Function::LCase, [a]) => Expression::LCase(operand(a)?),
+        (Function::SubStr, [a, start]) => Expression::Substr(operand(a)?, constant(start)?, None),
+        (Function::SubStr, [a, start, length]) => {
+            Expression::Substr(operand(a)?, constant(start)?, Some(constant(length)?))
+        }
+        (Function::SubStr, _) => return Err(arity("two or three arguments")),
+        (Function::StrStarts | Function::StrEnds | Function::Contains, [a, b]) => {
+            let test = match function {
+                Function::StrStarts => StrTest::Starts,
+                Function::StrEnds => StrTest::Ends,
+                _ => StrTest::Contains,
+            };
+            Expression::StrTest(test, operand(a)?, operand(b)?)
+        }
+        (Function::StrStarts | Function::StrEnds | Function::Contains, _) => {
+            return Err(arity("two arguments"));
+        }
+        (Function::Concat, args) => Expression::Concat(
+            args.iter()
+                .map(|a| operand(a).map(|a| *a))
+                .collect::<Result<_, _>>()?,
+        ),
+        (Function::StrBefore, [a, b]) => Expression::StrBefore(operand(a)?, operand(b)?),
+        (Function::StrAfter, [a, b]) => Expression::StrAfter(operand(a)?, operand(b)?),
+        (Function::StrBefore | Function::StrAfter, _) => return Err(arity("two arguments")),
+        (Function::EncodeForUri, [a]) => Expression::EncodeForUri(operand(a)?),
+        (Function::Replace, [a, pattern, replacement]) => Expression::Replace(
+            operand(a)?,
+            constant(pattern)?,
+            constant(replacement)?,
+            None,
+        ),
+        (Function::Replace, [a, pattern, replacement, flags]) => Expression::Replace(
+            operand(a)?,
+            constant(pattern)?,
+            constant(replacement)?,
+            Some(constant(flags)?),
+        ),
+        (Function::Replace, _) => return Err(arity("three or four arguments")),
+        _ => return Err(arity("one argument")),
     })
 }
 
@@ -1467,7 +1611,7 @@ mod tests {
             ("ASK { ?c ex:name ?n } OFFSET 1", "LIMIT and OFFSET in ASK"),
             ("ASK FROM ex:g { ?c ex:name ?n }", "FROM"),
             ("ASK { ?c ?p ?o }", "variable predicates"),
-            ("ASK { ?c ex:name ?n FILTER(UCASE(?n) = \"A\") }", "UCASE"),
+            ("ASK { ?c ex:name ?n FILTER(MD5(?n) = \"A\") }", "MD5"),
         ] {
             let Error::UnsupportedFeature(message) = parse_err(query) else {
                 panic!("{query}")
@@ -1931,6 +2075,123 @@ mod tests {
     }
 
     #[test]
+    fn parse_string_functions() {
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n \
+             FILTER(STRLEN(SUBSTR(?n, -1, 3)) > 1 && STRSTARTS(UCASE(?n), LCASE(\"A\")) \
+             && CONTAINS(CONCAT(?n, \"-\", ?x), \"a-\") && !STRENDS(?n, \"z\")) }",
+        );
+        let Pattern::Filter(_, filter) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        assert_eq!(filter.variables(), ["n", "n", "n", "x", "n"]);
+        let Expression::And(left, ends) = filter else {
+            panic!("{filter:?}")
+        };
+        assert!(matches!(ends.as_ref(), Expression::Not(e)
+            if matches!(e.as_ref(), Expression::StrTest(StrTest::Ends, ..))));
+        let Expression::And(left, contains) = left.as_ref() else {
+            panic!("{left:?}")
+        };
+        let Expression::StrTest(StrTest::Contains, concat, _) = contains.as_ref() else {
+            panic!("{contains:?}")
+        };
+        assert!(matches!(concat.as_ref(), Expression::Concat(args) if args.len() == 3));
+        let Expression::And(length, starts) = left.as_ref() else {
+            panic!("{left:?}")
+        };
+        assert!(matches!(
+            starts.as_ref(),
+            Expression::StrTest(StrTest::Starts, a, b)
+                if matches!(a.as_ref(), Expression::UCase(_))
+                    && matches!(b.as_ref(), Expression::LCase(_))
+        ));
+        let Expression::Compare(CompareOp::Greater, length, _) = length.as_ref() else {
+            panic!("{length:?}")
+        };
+        let Expression::StrLen(substr) = length.as_ref() else {
+            panic!("{length:?}")
+        };
+        assert_eq!(
+            **substr,
+            Expression::Substr(
+                variable("n"),
+                Literal::new_typed_literal(
+                    "-1",
+                    NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer")
+                )
+                .into(),
+                Some(
+                    Literal::new_typed_literal(
+                        "3",
+                        NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer")
+                    )
+                    .into()
+                )
+            )
+        );
+        assert!(length.is_term() && !starts.is_term());
+
+        // STRLEN is a number, which BIND and SELECT compute; a test is a
+        // boolean, which ORDER BY takes.
+        let q = parse_ok("SELECT ?c (STRLEN(?n) AS ?l) WHERE { ?c ex:name ?n }");
+        assert!(matches!(q.bindings[0].expression, Expression::StrLen(_)));
+        let q = parse_ok("SELECT * WHERE { ?c ex:name ?n } ORDER BY DESC(CONTAINS(?n, \"a\"))");
+        assert!(matches!(
+            q.order_by[0].expression,
+            Expression::StrTest(StrTest::Contains, ..)
+        ));
+        assert!(
+            parse_ok("SELECT * WHERE { ?c ex:name ?n FILTER(CONCAT() = \"\") }")
+                .pattern
+                .triple_patterns()
+                .len()
+                == 1
+        );
+    }
+
+    #[test]
+    fn parse_strbefore_strafter_encode_for_uri_and_replace() {
+        let q = parse_ok(
+            "SELECT * WHERE { ?c ex:name ?n \
+             FILTER(STRBEFORE(?n, \"a\") = STRAFTER(?n, ?x) \
+             && ENCODE_FOR_URI(REPLACE(?n, \"a+\", \"b\", \"i\")) != \"\") }",
+        );
+        let Pattern::Filter(_, filter) = &q.pattern else {
+            panic!("{q:?}")
+        };
+        assert_eq!(filter.variables(), ["n", "n", "x", "n"]);
+        let Expression::And(compare, not) = filter else {
+            panic!("{filter:?}")
+        };
+        assert!(matches!(
+            compare.as_ref(),
+            Expression::Compare(CompareOp::Equal, a, b)
+                if matches!(a.as_ref(), Expression::StrBefore(..))
+                    && matches!(b.as_ref(), Expression::StrAfter(..))
+        ));
+        let Expression::Not(compare) = not.as_ref() else {
+            panic!("{not:?}")
+        };
+        let Expression::Compare(CompareOp::Equal, encoded, _) = compare.as_ref() else {
+            panic!("{compare:?}")
+        };
+        let Expression::EncodeForUri(replace) = encoded.as_ref() else {
+            panic!("{encoded:?}")
+        };
+        assert_eq!(
+            **replace,
+            Expression::Replace(
+                variable("n"),
+                Literal::new_simple_literal("a+").into(),
+                Literal::new_simple_literal("b").into(),
+                Some(Literal::new_simple_literal("i").into()),
+            )
+        );
+        assert!(replace.is_term() && encoded.is_term());
+    }
+
+    #[test]
     fn parse_numeric_functions() {
         let q = parse_ok(
             "SELECT * WHERE { ?o ex:amount ?a FILTER(ROUND(?a / 2) = ABS(-?a) && CEIL(FLOOR(?a))) }",
@@ -2073,16 +2334,84 @@ mod tests {
                 "expressions other than terms",
             ),
             (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(STRLEN(?t) > 2) }",
-                "the STRLEN function",
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(MD5(?t) = \"a\") }",
+                "the MD5 function",
             ),
             (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(STR(UCASE(?t)) = \"A\") }",
-                "the UCASE function",
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(STR(SHA1(?t)) = \"A\") }",
+                "the SHA1 function",
             ),
             (
-                "SELECT * WHERE { ?c ex:tier ?t FILTER(UCASE(?t)) }",
-                "the UCASE function",
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(SHA256(?t)) }",
+                "the SHA256 function",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(SUBSTR(?t, STRLEN(?t)) = \"a\") }",
+                "SUBSTR with a starting location or length that is not a constant",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(SUBSTR(?t, 1, ?t) = \"a\") }",
+                "SUBSTR with a starting location or length that is not a constant",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:tier ?t FILTER(CONTAINS(?t, ?t = \"a\")) }",
+                "expressions other than terms",
+            ),
+            (
+                "SELECT (UCASE(?n) AS ?u) WHERE { ?c ex:name ?n }",
+                "UCASE as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n BIND(CONCAT(?n, \"!\") AS ?u) }",
+                "CONCAT as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT (SUBSTR(?n, 2) AS ?u) WHERE { ?c ex:name ?n }",
+                "SUBSTR as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT (LCASE(?n) AS ?u) WHERE { ?c ex:name ?n }",
+                "LCASE as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT (STRBEFORE(?n, \"a\") AS ?u) WHERE { ?c ex:name ?n }",
+                "STRBEFORE as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT (ENCODE_FOR_URI(?n) AS ?u) WHERE { ?c ex:name ?n }",
+                "ENCODE_FOR_URI as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n BIND(REPLACE(?n, \"a\", \"b\") AS ?u) }",
+                "REPLACE as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER(REPLACE(?n, ?n, \"b\") = \"b\") }",
+                "REPLACE with a pattern, replacement or flags that are not constants",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n FILTER(REPLACE(?n, \"a\", STR(?n)) = \"b\") }",
+                "REPLACE with a pattern, replacement or flags that are not constants",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n } ORDER BY STRAFTER(?n, \"a\")",
+                "the STRAFTER function in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n } ORDER BY REPLACE(?n, \"a\", \"b\")",
+                "the REPLACE function in ORDER BY",
+            ),
+            (
+                "SELECT (STRSTARTS(?n, \"a\") AS ?u) WHERE { ?c ex:name ?n }",
+                "STRSTARTS as the value of BIND and SELECT expressions",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n } ORDER BY STRLEN(?n)",
+                "the STRLEN function in ORDER BY",
+            ),
+            (
+                "SELECT * WHERE { ?c ex:name ?n } ORDER BY (CONCAT(?n, \"a\") = \"b\")",
+                "the CONCAT function in ORDER BY",
             ),
             (
                 "SELECT * WHERE { ?c ex:tier ?t FILTER((?t > 1) = true) }",
